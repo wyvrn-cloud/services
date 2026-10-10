@@ -4,7 +4,7 @@ A one-way announcement channel over DIDComm. People subscribe to it from their a
 admins post, and every subscriber receives each post. Nobody can reply. Every post is
 kept, and a web page shows them all.
 
-It speaks [`https://wyvrn.app/announcements/1.0`](https://github.com/wyvrn-cloud/protocols/blob/master/protocols/announcements/1.0/readme.md),
+It speaks [`https://wyvrn.app/announcements/1.0`](https://github.com/wyvrn-cloud/protocols/blob/announcements/protocols/announcements/1.0/readme.md),
 which [Wyvrn](https://wyvrn.app) understands: add the channel's DID as a contact and
 the app subscribes, shows posts as they arrive, and offers a place to write only to
 admins.
