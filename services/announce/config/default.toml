@@ -1,0 +1,38 @@
+# wyvrn-announce configuration. Relative paths are relative to the working directory
+# (the repository root, or /app in the container image).
+
+[server]
+bind = "0.0.0.0:8080"
+# The URL people and their apps reach this server at. It is the DIDComm service
+# endpoint, and where the web pages are.
+public_url = "http://localhost:8080/"
+# "peer": a did:peer:4 derived from the identity's keys and public_url (works anywhere,
+#         including plain-HTTP local setups).
+# "web":  a did:web derived from public_url, whose document this server publishes at
+#         /.well-known/did.json. public_url must then be the HTTPS origin peers resolve.
+did_method = "peer"
+
+[identity]
+# Created on first start; keep it to keep the channel's DID.
+path = "data/identity.json"
+
+[store]
+# Every post, and who is subscribed. Created on first start.
+path = "data/announce.sqlite"
+
+[channel]
+name = "Announcements"
+description = "A one-way announcement channel."
+# A picture for the channel, sent to subscribers as its profile picture (PNG, JPEG, WebP
+# or GIF). Optional.
+# picture = "config/picture.png"
+# Whether a post says who wrote it (the name its author's app gave), to subscribers and
+# on the web pages.
+show_authors = false
+# DIDs that may post, whether or not they have subscribed yet. Others are made admins
+# by an admin, from their app, or with `wyvrn-announce admin add <did>`. An admin whose
+# DID changes (they add or remove a device) stays an admin: the channel follows the
+# change, so this list is only ever needed for the first one.
+admins = []
+# The longest a post may be, in characters.
+max_post_length = 16000

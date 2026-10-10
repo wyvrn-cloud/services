@@ -1,0 +1,4 @@
+[net]
+# Fetch git dependencies with the git CLI, so its credential helpers and any proxy
+# configuration apply.
+git-fetch-with-cli = true
