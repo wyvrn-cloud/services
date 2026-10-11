@@ -88,6 +88,14 @@ settings a deployment most often changes: `ANNOUNCE_BIND`, `ANNOUNCE_PUBLIC_URL`
 `ANNOUNCE_DID_METHOD`, `ANNOUNCE_NAME`, `ANNOUNCE_DESCRIPTION`, `ANNOUNCE_ADMINS`.
 `ANNOUNCE_CONFIG` (or `--config`) names another file.
 
+**Behind a mediator.** A channel needs an address its subscribers' apps can send
+to, and a phone app will only send over HTTPS. One without such an address (run at
+home, or on a laptop) can sit behind a DIDComm mediator instead: set `[mediator]`
+`did`, and the channel registers with it at start, gives out a DID that names the
+mediator as the way in, and collects what arrives there every `poll_seconds`. The
+web pages are still served from `server.bind`, wherever that can be reached from.
+Moving a channel behind a mediator, or out from behind one, changes its DID.
+
 `channel.show_authors` (off by default) adds the name an author's app gave to each of
 their posts, for subscribers and on the web pages. An author's DID is never shown.
 

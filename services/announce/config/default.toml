@@ -36,3 +36,14 @@ show_authors = false
 admins = []
 # The longest a post may be, in characters.
 max_post_length = 16000
+
+# A mediator to be reached through, for a channel that has no address of its own the
+# people it serves can get to: one run at home, or anywhere without HTTPS, which
+# phones require. The channel registers with it at start and collects its messages
+# from it; its DID then names the mediator as the way in, so it is a different DID
+# from the one the channel has without this. Leave out to be reached at public_url.
+# Only with did_method = "peer".
+# [mediator]
+# did = "did:web:mediator.wyvrn.app"
+# How often to collect, in seconds.
+# poll_seconds = 2

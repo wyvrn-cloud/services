@@ -99,6 +99,14 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let identity = Identity::load_or_generate(&config.identity.path)
         .with_context(|| format!("identity file {}", config.identity.path.display()))?;
     let (agent, did_document) = server::build_agent(&config, identity)?;
+    // Behind a mediator, the channel's DID is the one that names it as the way in.
+    if let Some(mediator) = &config.mediator {
+        let mediation = agent
+            .mediate(&mediator.did)
+            .await
+            .with_context(|| format!("asking {} to mediate", mediator.did))?;
+        tracing::info!(mediator = %mediation.mediator_did, "reached through a mediator");
+    }
     tracing::info!(
         did = %agent.did(),
         url = %config.server.public_url,
@@ -119,6 +127,10 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     });
     tokio::spawn(server::run_deliveries(state.clone()));
     tokio::spawn(server::run_reaction_notices(state.clone()));
+    if let Some(mediator) = &config.mediator {
+        let every = std::time::Duration::from_secs(mediator.poll_seconds.max(1));
+        tokio::spawn(server::run_pickups(state.clone(), every));
+    }
     let listener = tokio::net::TcpListener::bind(&config.server.bind)
         .await
         .with_context(|| format!("binding {}", config.server.bind))?;

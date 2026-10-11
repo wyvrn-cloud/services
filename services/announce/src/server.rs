@@ -251,43 +251,10 @@ async fn receive(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
         Err(e) => return (StatusCode::BAD_REQUEST, format!("unpack failed: {e}")).into_response(),
     };
     tracing::debug!(sender = ?received.sender, message_type = received.message_type(), "received");
-    // Nothing is done for someone nobody vouches for: there is no one to answer.
-    let Some(sender) = received.sender.clone() else {
-        return StatusCode::ACCEPTED.into_response();
-    };
-
-    if let Some((prior, new)) = rotation(&state, &received, &sender).await {
-        match state.channel.rotated(&prior, &new, now()) {
-            Ok(Some(notice)) => {
-                tracing::info!(%prior, %new, "a member changed DID");
-                send_later(&state, new, notice);
-            }
-            Ok(None) => {}
-            Err(e) => return internal(e),
-        }
-    }
-
-    let reply = match state.agent.auto_reply(&received) {
-        Some(reply) => Some(reply),
-        None => match state.channel.handle(&sender, &received.message, now()) {
-            Ok(outcome) => {
-                for (did, notice) in outcome.notices {
-                    send_later(&state, did, notice);
-                }
-                if outcome.posted {
-                    state.deliver.notify_one();
-                }
-                if let Some(seq) = outcome.reacted {
-                    state.reacted.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(seq);
-                    state.react.notify_one();
-                }
-                outcome.reply
-            }
-            Err(e) => return internal(e),
-        },
-    };
-    let Some(reply) = reply else {
-        return StatusCode::ACCEPTED.into_response();
+    let reply = match answer(&state, &received).await {
+        Ok(Some(reply)) => reply,
+        Ok(None) => return StatusCode::ACCEPTED.into_response(),
+        Err(e) => return internal(e),
     };
     match state.agent.respond(&received, &reply).await {
         Ok(Some(packed)) => ([(header::CONTENT_TYPE, "application/didcomm-encrypted+json")], packed).into_response(),
@@ -296,6 +263,71 @@ async fn receive(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
             tracing::warn!(error = %e, "couldn't deliver reply");
             (StatusCode::BAD_GATEWAY, format!("couldn't deliver reply: {e}")).into_response()
         }
+    }
+}
+
+/// Acts on one message, however it got here, and returns what to answer it with.
+async fn answer(state: &Arc<AppState>, received: &Received) -> anyhow::Result<Option<Value>> {
+    // Nothing is done for someone nobody vouches for: there is no one to answer.
+    let Some(sender) = received.sender.clone() else {
+        return Ok(None);
+    };
+
+    if let Some((prior, new)) = rotation(state, received, &sender).await {
+        if let Some(notice) = state.channel.rotated(&prior, &new, now())? {
+            tracing::info!(%prior, %new, "a member changed DID");
+            send_later(state, new, notice);
+        }
+    }
+
+    if let Some(reply) = state.agent.auto_reply(received) {
+        return Ok(Some(reply));
+    }
+    let outcome = state.channel.handle(&sender, &received.message, now())?;
+    for (did, notice) in outcome.notices {
+        send_later(state, did, notice);
+    }
+    if outcome.posted {
+        state.deliver.notify_one();
+    }
+    if let Some(seq) = outcome.reacted {
+        state.reacted.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(seq);
+        state.react.notify_one();
+    }
+    Ok(outcome.reply)
+}
+
+/// Collects what the channel's mediator holds for it, for as long as the server
+/// runs -- how a channel behind a mediator is reached at all (`[mediator]`). Each
+/// message is acted on as one posted here directly would be; its answer goes to
+/// the sender's own address, there being no connection to answer on.
+pub async fn run_pickups(state: Arc<AppState>, every: std::time::Duration) {
+    loop {
+        match state.agent.pickup(20).await {
+            Ok(pickup) => {
+                for (id, why) in &pickup.failed {
+                    tracing::warn!(%id, %why, "couldn't read a message the mediator held");
+                }
+                for received in &pickup.messages {
+                    tracing::debug!(sender = ?received.sender, message_type = received.message_type(), "picked up");
+                    match answer(&state, received).await {
+                        Ok(Some(reply)) => {
+                            if let Err(e) = state.agent.respond(received, &reply).await {
+                                tracing::warn!(error = %e, "couldn't deliver reply");
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => tracing::error!(%error, "handling a picked-up message failed"),
+                    }
+                }
+                // More may be waiting than one pickup takes.
+                if pickup.messages.len() >= 20 {
+                    continue;
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "couldn't collect from the mediator"),
+        }
+        tokio::time::sleep(every).await;
     }
 }
 

@@ -11,6 +11,24 @@ pub struct Config {
     pub store: StoreConfig,
     #[serde(default)]
     pub channel: ChannelConfig,
+    /// A mediator to be reached through, for a channel with no address of its own
+    /// that the people it serves can get to. Left out, the channel is reached
+    /// directly at `server.public_url`.
+    #[serde(default)]
+    pub mediator: Option<MediatorConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediatorConfig {
+    /// The mediator's DID, e.g. `did:web:mediator.wyvrn.app`.
+    pub did: String,
+    /// How often the channel collects what the mediator holds for it.
+    #[serde(default = "default_poll_seconds")]
+    pub poll_seconds: u64,
+}
+
+fn default_poll_seconds() -> u64 {
+    2
 }
 
 #[derive(Debug, Clone, Deserialize)]
