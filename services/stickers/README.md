@@ -59,7 +59,7 @@ docker compose up -d stickers
 | `/<name>/<file>` | One picture. A file is named for its hash, so it never changes and is served to be kept. |
 | `/drafts/<instance>/<file>` | A picture of a pack still being made, for its maker's app to show. |
 | `POST /` | `workflow/1.0` messages. Only ones their sender authenticated (authcrypt): anything else is answered 403. |
-| `/did`, `/.well-known/did.json` | The service's own DID. |
+| `/did`, `/.well-known/did.json` | The service's own DID. The app is given that DID (`VITE_STICKER_SERVICE_DID`), never this address: run for real, the service has to be a `did:web` (`STICKERS_DID_METHOD=web`). |
 | `/.well-known/did-configuration.json` | With `STICKERS_DID_METHOD=web`: the service's own DID saying, signed, that this domain is its own. |
 | `/healthz` | `ok`. |
 

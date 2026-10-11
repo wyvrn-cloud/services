@@ -61,8 +61,8 @@ If the first fails with a certificate error, look at `docker compose logs
 caddy`: the usual cause is DNS that doesn't point here yet, or port 80 closed.
 
 Then try it from the app. In a build of Wyvrn, Settings, Profile, **Public
-address**: put `https://id.example` in **From**, pick a name, and choose **Get
-this address**. Afterwards these exist:
+address**: put `did:web:id.example` in **From** (the domain alone will do), pick
+a name, and choose **Get this address**. Afterwards these exist:
 
 ```sh
 curl https://id.example/<name>/did.jsonl   # the address's signed history
@@ -70,9 +70,14 @@ curl https://id.example/<name>/did.json    # the same as a did:web
 curl https://id.example/<name>/whois.vp    # the profile, if one was published
 ```
 
+The app is never given the host's address. It is given the host's DID, looks up
+that DID's document (the one at `/.well-known/did.json`), and writes to wherever
+the document says. So the host has to be a `did:web`, which this setup makes it
+(`DID_HOST_DID_METHOD=web`).
+
 To make a build of the app use this host without typing it, build with
-`VITE_DID_HOST_URL=https://id.example`. To have it mark names under
-`official:` at this host as official, also set `VITE_DID_HOST_DOMAIN=id.example`.
+`VITE_DID_HOST_DID=did:web:id.example`. That also makes names under `official:`
+at this host the ones it marks as official.
 
 ### The host's own DID, and "Official"
 
