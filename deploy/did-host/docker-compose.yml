@@ -1,0 +1,46 @@
+# wyvrn-did-host at a real domain: the host, and Caddy in front of it getting and
+# renewing its certificate. See README.md beside this file.
+#
+#   cp .env.example .env    # and fill it in
+#   docker compose up -d
+services:
+  did-host:
+    build:
+      context: ../..
+      dockerfile: services/did-host/Dockerfile
+    environment:
+      # The host as it appears in the DIDs it hosts, and where holders write to it.
+      DID_HOST_DOMAIN: "${DID_HOST_DOMAIN:?set DID_HOST_DOMAIN in .env}"
+      DID_HOST_PUBLIC_URL: "https://${DID_HOST_DOMAIN}/"
+      # The host itself is did:web:<DID_HOST_DOMAIN>.
+      DID_HOST_DID_METHOD: "web"
+      DID_HOST_ADMINS: "${DID_HOST_ADMINS:-}"
+    volumes:
+      # The host's own keys and every log it hosts. Back this up.
+      - did-host-data:/app/data
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    environment:
+      DID_HOST_DOMAIN: "${DID_HOST_DOMAIN:?set DID_HOST_DOMAIN in .env}"
+      DID_HOST_TLS: "${DID_HOST_TLS:-public}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Other websites this machine serves, among them ones linked to hosted DIDs.
+      - ./sites:/etc/caddy/sites:ro
+      - ./linked:/srv/linked:ro
+      # Certificates. Losing this only means getting them again.
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - did-host
+    restart: unless-stopped
+
+volumes:
+  did-host-data:
+  caddy-data:
+  caddy-config:

@@ -49,3 +49,5 @@ affinidi-secrets-resolver = "0.5"
 bs58 = "0.5"
 ed25519-dalek = "2"
 sha2 = "0.10"
+# Dates in credentials, compared. No clock: the caller says what time it is.
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }

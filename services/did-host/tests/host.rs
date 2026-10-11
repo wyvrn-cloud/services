@@ -499,12 +499,13 @@ async fn a_whois_is_published_by_the_holder_signed_by_the_did_and_about_nothing_
     refused_with(&mallory.ask("publish-whois", json!({ "name": "alice" }), Some(attachment)).await, "e.p.msg.not-holder");
     assert_eq!(fetch(&host, "alice/whois.vp").await.json::<Value>().await.unwrap(), whois);
 
-    // With no attachment she takes it down, and the did:web stops pointing at it.
+    // With no attachment she takes it down. The did:web goes on saying where one
+    // would be, as did:webvh has every such document do: asking there finds none.
     let removed = alice.ask("publish-whois", json!({ "name": "alice" }), None).await;
     assert_eq!(removed["body"]["whois"], false);
     assert_eq!(fetch(&host, "alice/whois.vp").await.status(), 404);
     let web: Value = fetch(&host, "alice/did.json").await.json().await.unwrap();
-    assert!(!web.to_string().contains("LinkedVerifiablePresentation"));
+    assert!(web.to_string().contains("LinkedVerifiablePresentation"));
 }
 
 #[tokio::test]
@@ -944,6 +945,8 @@ async fn an_app_registers_and_is_read_back_with_the_functions_it_will_use() {
                 { "id": format!("{did}#key-2"), "type": "Multikey", "controller": did, "publicKeyMultibase": key_agreement },
             ],
             "authentication": [format!("{did}#key-1")],
+            // What it signs as, it also asserts as: its profile, and a linked website.
+            "assertionMethod": [format!("{did}#key-1")],
             "keyAgreement": [format!("{did}#key-2")],
         })
     };

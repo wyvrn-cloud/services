@@ -37,8 +37,9 @@ fn profile(profile: &Profile) -> Value {
 ///
 /// - `{"need": "<url>"}`: fetch that (as text; a 404 is `null`), add it, ask again.
 /// - `{"failed": "<why>"}`.
-/// - `{"done": {did, didWeb, verified, deactivated, host, document, peer, profile,
-///   profileProblem}}`. `did` is the DID to know the party by (the `did:webvh`
+/// - `{"done": {did, didWeb, verified, deactivated, host, document, linkedDomains,
+///   peer, profile, profileProblem}}`. `linkedDomains` are origins the DID *says*
+///   are its holder's: see [`check_linkage`]. `did` is the DID to know the party by (the `did:webvh`
 ///   where one verified). `verified` is whether its history did, as against being
 ///   its host's word. `peer` is a `did:peer:4` it names that names it back.
 pub async fn read(did: &str, files_json: &str) -> Result<String, String> {
@@ -55,6 +56,7 @@ pub async fn read(did: &str, files_json: &str) -> Result<String, String> {
                 "deactivated": read.resolved.deactivated,
                 "host": place.as_ref().map(|place| place.host.clone()),
                 "name": place.map(|place| place.path.join(":")),
+                "linkedDomains": crate::linkage::linked_origins(&read.resolved.document),
                 "document": read.resolved.document,
                 "peer": read.peer,
                 "profile": read.profile.as_ref().map(profile),
@@ -105,4 +107,38 @@ pub async fn whois(did: &str, profile_json: &str, authentication_secret_jwk: &st
 /// [`write::public_multikey`].
 pub fn public_multikey(secret_jwk: &str) -> Result<String, String> {
     write::public_multikey(secret_jwk)
+}
+
+/// The file a website serves at `/.well-known/did-configuration.json` to say it is
+/// its DID's holder's: one [`linkage::credential`](crate::linkage::credential) for
+/// each of `dids_json` (`[{did, verificationMethod}]`: the DID under each of its
+/// names), all signed with `secret_jwk`. `issued` and `expires` are RFC 3339.
+pub async fn linkage_configuration(origin: &str, dids_json: &str, secret_jwk: &str, issued: &str, expires: &str) -> Result<String, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Named {
+        did: String,
+        verification_method: String,
+    }
+    let dids: Vec<Named> = parse("the DIDs", dids_json)?;
+    let mut credentials = Vec::new();
+    for named in dids {
+        credentials.push(crate::linkage::credential(&named.did, origin, secret_jwk, &named.verification_method, issued, expires).await?);
+    }
+    serde_json::to_string_pretty(&crate::linkage::configuration(credentials)).map_err(|e| e.to_string())
+}
+
+/// [`linkage::check`](crate::linkage::check): whether `origin` and `did` name each
+/// other. `configuration` is what the origin serves at
+/// `/.well-known/did-configuration.json`, and `document_json` the DID's document.
+/// Answers `true`, or fails with which half didn't hold.
+pub fn check_linkage(configuration: &str, origin: &str, did: &str, document_json: &str, now: &str) -> Result<String, String> {
+    let document: Value = parse("the document", document_json)?;
+    crate::linkage::check(configuration.as_bytes(), origin, did, &document, now).map(|()| "true".to_string())
+}
+
+/// [`linkage::origin_of`](crate::linkage::origin_of): a website as typed, as the
+/// origin it is. Fails if it isn't a bare HTTPS one.
+pub fn linkage_origin(text: &str) -> Result<String, String> {
+    crate::linkage::origin_of(text).ok_or_else(|| "That is not a website's address: it should look like example.com".to_string())
 }

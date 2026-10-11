@@ -1,0 +1,24 @@
+# A website linked to a hosted DID, served from this machine.
+#
+# Copy to <name>.caddy, change example.com, and put the file the app made at
+#   ../linked/example.com/.well-known/did-configuration.json
+# then `docker compose restart caddy`.
+#
+# If the website already runs somewhere else, leave this alone and add the file
+# there instead (README.md, "Linking a website").
+
+example.com {
+	# The one file the link needs. Any website may read it, which is what lets
+	# the web app check it; and it isn't cached, so a replaced file is seen.
+	handle /.well-known/did-configuration.json {
+		header Access-Control-Allow-Origin "*"
+		header Cache-Control "no-cache"
+		root * /srv/linked/example.com
+		file_server
+	}
+
+	# The rest of the website, whatever it is.
+	handle {
+		respond "example.com" 200
+	}
+}

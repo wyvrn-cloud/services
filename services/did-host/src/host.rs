@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use crate::config::HostConfig;
 use wyvrn_hosted_did::{keys, whois};
-use crate::log::{self, Checked};
+use crate::log;
 use crate::names::{Name, Reserved};
 use crate::store::{Published, Record, Store};
 
@@ -377,7 +377,7 @@ impl Host {
             &checked.did,
             &checked.version_id,
             &full_log,
-            &serde_json::to_string(&with_whois_service(&checked, hosted.is_some_and(|h| h.whois.is_some()), &self.config.domain, &name))?,
+            &serde_json::to_string(&with_whois_service(checked.web_document.clone(), &self.config.domain, &name))?,
             &holder_keys,
             &all_keys,
             now,
@@ -424,9 +424,9 @@ impl Host {
                 Some(bytes)
             }
         };
-        // The did:web says where its whois is; with none, it says nothing of one.
+        // The did:web says where its whois is, published or not: did:webvh has it so.
         let web_document = record.web_document.as_deref().and_then(|text| serde_json::from_str::<Value>(text).ok()).unwrap_or_default();
-        let web_document = set_whois_service(web_document, whois.is_some(), &self.config.domain, &name);
+        let web_document = with_whois_service(web_document, &self.config.domain, &name);
         self.store.set_whois(&key, whois.as_deref(), &serde_json::to_string(&web_document)?)?;
         self.shown_to_hold(sender, &key)?;
         let record = self.store.get(&key)?;
@@ -542,28 +542,19 @@ fn last_document(log: &str) -> Option<Value> {
 /// The `#whois` service of a `did:web` document: present when there is a whois,
 /// as `did:webvh` asks of a parallel `did:web` (for the `did:webvh` itself the
 /// service is implicit).
-fn set_whois_service(mut web_document: Value, has_whois: bool, host: &str, name: &Name) -> Value {
+/// The parallel `did:web` document with its `#whois` service, which `did:webvh`
+/// has it carry whether or not a whois is published (a reader finds out by asking).
+fn with_whois_service(web_document: Value, host: &str, name: &Name) -> Value {
+    let mut web_document = web_document;
     let did_web = log::did_web_for(host, name);
     let id = format!("{did_web}#whois");
     let mut services: Vec<Value> = web_document["service"].as_array().cloned().unwrap_or_default();
     services.retain(|service| service["id"] != id.as_str() && service["id"] != "#whois");
-    if has_whois {
-        services.push(json!({
-            "id": id,
-            "type": "LinkedVerifiablePresentation",
-            "serviceEndpoint": format!("https://{}/{}/whois.vp", host.replace("%3A", ":"), name.as_url_path()),
-        }));
-    }
-    if services.is_empty() {
-        if let Some(object) = web_document.as_object_mut() {
-            object.remove("service");
-        }
-    } else {
-        web_document["service"] = Value::Array(services);
-    }
+    services.push(json!({
+        "id": id,
+        "type": "LinkedVerifiablePresentation",
+        "serviceEndpoint": format!("https://{}/{}/whois.vp", host.replace("%3A", ":"), name.as_url_path()),
+    }));
+    web_document["service"] = Value::Array(services);
     web_document
-}
-
-fn with_whois_service(checked: &Checked, has_whois: bool, host: &str, name: &Name) -> Value {
-    set_whois_service(checked.web_document.clone(), has_whois, host, name)
 }

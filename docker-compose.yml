@@ -29,6 +29,7 @@ services:
   # write and sign them themselves. It has to be at a real domain over HTTPS to be
   # of use: the DIDs it hosts are fetched from https://<DID_HOST_DOMAIN>/<name>/did.jsonl.
   # As it stands it runs, and can be written to, but nothing it hosts resolves.
+  # For one at a real domain, with HTTPS: deploy/did-host.
   did-host:
     build:
       context: .

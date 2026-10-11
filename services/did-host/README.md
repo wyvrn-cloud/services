@@ -36,7 +36,11 @@ Without Docker: `cargo run` in this directory (`services/did-host`; it reads
 
 ### For real
 
-It needs a domain of its own, served over HTTPS, with every path passed to it:
+**[`deploy/did-host`](../../deploy/did-host) is the guide**: the host and Caddy
+in Docker at your own domain, and linking a website to an address it hosts.
+
+In short, it needs a domain of its own, served over HTTPS, with every path
+passed to it:
 
 ```sh
 DID_HOST_DOMAIN=id.example \
@@ -60,7 +64,7 @@ docker compose up -d did-host
 | Path | What |
 |---|---|
 | `/<name>/did.jsonl` | The `did:webvh` log, as its holder wrote it. |
-| `/<name>/did.json` | The parallel `did:web` document, derived from the log. |
+| `/<name>/did.json` | The parallel `did:web` document, derived from the log as `did:webvh` says to: with its `#files` and `#whois` services, whether or not a whois is published. |
 | `/<name>/whois.vp` | The holder's whois, if it has published one. |
 | `POST /` | `did-hosting/1.0` messages. Only ones their sender authenticated (authcrypt): anything else is answered 403. |
 | `/did`, `/.well-known/did.json` | The host's own DID. |

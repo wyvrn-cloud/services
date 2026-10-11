@@ -4187,6 +4187,7 @@ dependencies = [
  "affinidi-secrets-resolver",
  "base64 0.22.1",
  "bs58",
+ "chrono",
  "didwebvh-rs",
  "ed25519-dalek 2.2.0",
  "serde",

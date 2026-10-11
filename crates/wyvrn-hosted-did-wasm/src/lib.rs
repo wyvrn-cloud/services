@@ -50,3 +50,21 @@ pub async fn hosted_whois(did: String, profile_json: String, authentication_secr
 pub fn hosted_public_multikey(secret_jwk: String) -> Result<String, JsValue> {
     api::public_multikey(&secret_jwk).map_err(rejected)
 }
+
+/// The `did-configuration.json` a website serves to say it is the DID's holder's.
+#[wasm_bindgen(js_name = hostedLinkageConfiguration)]
+pub async fn hosted_linkage_configuration(origin: String, dids_json: String, secret_jwk: String, issued: String, expires: String) -> Result<String, JsValue> {
+    api::linkage_configuration(&origin, &dids_json, &secret_jwk, &issued, &expires).await.map_err(rejected)
+}
+
+/// Whether a website and a DID name each other: `true`, or why not.
+#[wasm_bindgen(js_name = hostedCheckLinkage)]
+pub fn hosted_check_linkage(configuration: String, origin: String, did: String, document_json: String, now: String) -> Result<String, JsValue> {
+    api::check_linkage(&configuration, &origin, &did, &document_json, &now).map_err(rejected)
+}
+
+/// A website as typed, as the HTTPS origin it is.
+#[wasm_bindgen(js_name = hostedLinkageOrigin)]
+pub fn hosted_linkage_origin(text: String) -> Result<String, JsValue> {
+    api::linkage_origin(&text).map_err(rejected)
+}

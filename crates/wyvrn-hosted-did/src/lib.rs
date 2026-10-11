@@ -9,6 +9,8 @@
 //!   as one party; a `did:peer:4` as that party too.
 //! - [`whois`]: a whois presentation against the DID that published it, and the
 //!   profile in it.
+//! - [`linkage`]: a domain the DID says is its holder's, against what that
+//!   domain says back.
 //! - [`keys`]: the keys in a document, and a signature against them.
 //!
 //! - [`write`]: the holder's side -- writing a log, and signing what is uploaded.
@@ -23,6 +25,7 @@
 
 pub mod api;
 pub mod keys;
+pub mod linkage;
 pub mod read;
 pub mod resolve;
 pub mod urls;

@@ -1,3 +1,5 @@
 /target
 # A service run from its own directory keeps its identity and store here.
 data/
+# A deployment's own settings.
+deploy/**/.env

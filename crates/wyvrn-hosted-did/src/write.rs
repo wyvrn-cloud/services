@@ -38,7 +38,7 @@ fn seed_of(secret_jwk: &str) -> Result<[u8; 32], String> {
 
 /// The key as the log library signs with it, under the id it expects of an update
 /// key (`did:key:<multikey>#<multikey>`) unless `kid` says otherwise.
-fn signing_secret(secret_jwk: &str, kid: Option<&str>) -> Result<Secret, String> {
+pub(crate) fn signing_secret(secret_jwk: &str, kid: Option<&str>) -> Result<Secret, String> {
     let seed = seed_of(secret_jwk)?;
     let mut secret = Secret::generate_ed25519(None, Some(&seed));
     let public = secret.get_public_keymultibase().map_err(|e| e.to_string())?;
@@ -150,8 +150,10 @@ fn image_object(image: &Value) -> Value {
 }
 
 /// A whois for `did` saying who it is: a presentation holding one profile
-/// credential it issues about itself, signed with `authentication_secret_jwk`,
-/// which `verification_method` (`<did>#key-1`) names in its document.
+/// credential it issues about itself. Both are signed with
+/// `authentication_secret_jwk`, which `verification_method` (`<did>#key-1`) names
+/// in its document for authentication (the presentation) and for assertions (the
+/// credential).
 pub async fn whois(did: &str, profile: &ProfileFields, authentication_secret_jwk: &str, verification_method: &str, valid_from: &str) -> Result<Value, String> {
     let contexts = json!(["https://www.w3.org/ns/credentials/v2", PROFILE_CONTEXT]);
     let mut subject = json!({ "id": did });
@@ -180,20 +182,29 @@ pub async fn whois(did: &str, profile: &ProfileFields, authentication_secret_jwk
     if let Some(background) = &profile.background {
         subject["wyvrn"] = json!({ "background": image_object(background) });
     }
+    let signer = signing_secret(authentication_secret_jwk, Some(verification_method))?;
+    let proof_contexts = || vec!["https://www.w3.org/ns/credentials/v2".to_string(), PROFILE_CONTEXT.to_string()];
+    // The credential is the DID's own assertion, and signed as one: a presentation
+    // holds verifiable credentials, each good by itself.
+    let mut credential = json!({
+        "@context": contexts,
+        "type": ["VerifiableCredential", PROFILE_CREDENTIAL],
+        "issuer": did,
+        "validFrom": valid_from,
+        "credentialSubject": subject,
+    });
+    let asserted = SignOptions::new().with_proof_purpose("assertionMethod").with_context(proof_contexts());
+    let proof = DataIntegrityProof::sign(&credential, &signer, asserted).await.map_err(|e| e.to_string())?;
+    credential["proof"] = serde_json::to_value(proof).map_err(|e| e.to_string())?;
     let mut presentation = json!({
         "@context": contexts,
         "type": ["VerifiablePresentation"],
         "holder": did,
-        "verifiableCredential": [{
-            "@context": contexts,
-            "type": ["VerifiableCredential", PROFILE_CREDENTIAL],
-            "issuer": did,
-            "validFrom": valid_from,
-            "credentialSubject": subject,
-        }],
+        "verifiableCredential": [credential],
     });
-    let signer = signing_secret(authentication_secret_jwk, Some(verification_method))?;
-    let proof = DataIntegrityProof::sign(&presentation, &signer, SignOptions::new().with_proof_purpose("authentication")).await.map_err(|e| e.to_string())?;
+    // eddsa-jcs-2022 has the proof carry the @context of what it signs.
+    let options = SignOptions::new().with_proof_purpose("authentication").with_context(proof_contexts());
+    let proof = DataIntegrityProof::sign(&presentation, &signer, options).await.map_err(|e| e.to_string())?;
     presentation["proof"] = serde_json::to_value(proof).map_err(|e| e.to_string())?;
     Ok(presentation)
 }

@@ -19,40 +19,72 @@ pub fn check(bytes: &[u8], did: &str, document: &Value) -> Result<Value, String>
     if holder != Some(did) {
         return Err(format!("The presentation's holder is not {did}."));
     }
-    for credential in credentials(&presentation) {
-        if !subjects(credential).iter().all(|subject| subject["id"].as_str() == Some(did)) {
-            return Err(format!("Every credential in a whois has to be about {did}."));
-        }
+    // did:webvh: at least one credential in a whois is about the DID. Others may be
+    // about something else of the holder's, and are nothing to this reader.
+    if !credentials(&presentation).iter().any(|credential| subjects(credential).iter().any(|subject| subject["id"].as_str() == Some(did))) {
+        return Err(format!("A whois has to hold a credential about {did}."));
     }
 
-    let proofs: Vec<Value> = match &presentation["proof"] {
+    // A credential the DID issued and signed has to be what it signed. (One it
+    // issued unsigned rests on the presentation's own proof, which is the DID's too.)
+    for credential in credentials(&presentation) {
+        let issuer = credential["issuer"].as_str().or(credential["issuer"]["id"].as_str());
+        if issuer == Some(did) && !credential["proof"].is_null() && !signed_by(credential, document, "assertionMethod").unwrap_or(false) {
+            return Err("A credential in the whois says the DID issued it, and isn't signed by an assertion key of the DID.".to_string());
+        }
+    }
+    if !signed_by(&presentation, document, "authentication")? {
+        return Err("The presentation's proof doesn't verify against an authentication key of the DID.".to_string());
+    }
+    Ok(presentation)
+}
+
+/// Whether `signed` (a presentation or a credential) carries a proof made by a key
+/// that `document` lists under `relationship`. `Err` if it carries no proof at all.
+pub(crate) fn signed_by(signed: &Value, document: &Value, relationship: &str) -> Result<bool, String> {
+    let proofs: Vec<Value> = match &signed["proof"] {
         Value::Array(many) => many.clone(),
-        Value::Object(_) => vec![presentation["proof"].clone()],
-        _ => return Err("The presentation is not signed.".to_string()),
+        Value::Object(_) => vec![signed["proof"].clone()],
+        _ => return Err("It is not signed.".to_string()),
     };
-    let mut unsigned = presentation.clone();
+    let mut unsigned = signed.clone();
     if let Some(object) = unsigned.as_object_mut() {
         object.remove("proof");
     }
     let methods = document["verificationMethod"].as_array().cloned().unwrap_or_default();
-    let authentication = keys::keys_for(document, "authentication");
+    let allowed = keys::keys_for(document, relationship);
     for proof in proofs {
         let Ok(proof) = serde_json::from_value::<DataIntegrityProof>(proof) else { continue };
-        // The key the proof names, if it is one of the DID's authentication keys.
+        // A proof is for one purpose, and made for a document of one @context: the
+        // signed thing's has to begin with the proof's (eddsa-jcs-2022, verification).
+        if proof.proof_purpose != relationship || !begins_with_context(signed, proof.context.as_deref()) {
+            continue;
+        }
+        // The key the proof names, if the document lists it under the relationship.
         let named = proof.verification_method.clone();
         let fragment = named.rsplit('#').next().unwrap_or_default();
         let key = methods
             .iter()
             .find(|method| method["id"].as_str().is_some_and(|id| id == named || id.rsplit('#').next() == Some(fragment)))
             .and_then(|method| method["publicKeyMultibase"].as_str())
-            .filter(|key| authentication.iter().any(|a| a == key))
+            .filter(|key| allowed.iter().any(|a| a == key))
             .and_then(keys::ed25519_from_multikey);
         let Some(key) = key else { continue };
         if proof.verify_with_public_key(&unsigned, &key, VerifyOptions::default()).is_ok() {
-            return Ok(presentation);
+            return Ok(true);
         }
     }
-    Err("The presentation's proof doesn't verify against an authentication key of the DID.".to_string())
+    Ok(false)
+}
+
+fn begins_with_context(signed: &Value, of_proof: Option<&[String]>) -> bool {
+    let Some(of_proof) = of_proof else { return true };
+    let of_signed: Vec<&str> = match &signed["@context"] {
+        Value::String(one) => vec![one.as_str()],
+        Value::Array(many) => many.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    of_proof.len() <= of_signed.len() && of_proof.iter().zip(&of_signed).all(|(a, b)| a == b)
 }
 
 fn credentials(presentation: &Value) -> Vec<&Value> {
@@ -210,5 +242,47 @@ mod tests {
         // One somebody else issued, even of the profile type, is not the DID's word.
         let others = json!({ "verifiableCredential": [{ "type": ["ProfileCredential"], "issuer": "did:web:other.example", "credentialSubject": { "id": DID, "name": "x" } }] });
         assert_eq!(profile(&others, DID), None);
+    }
+
+    /// A whois as an app writes one, against the document it is signed as.
+    #[tokio::test]
+    async fn a_written_whois_checks_out_and_a_changed_one_does_not() {
+        const SECRET: &str = r#"{"kty":"OKP","crv":"Ed25519","d":"nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}"#;
+        let key = crate::write::public_multikey(SECRET).unwrap();
+        let method = format!("{DID}#key-1");
+        let document = json!({
+            "id": DID,
+            "verificationMethod": [{ "id": method, "type": "Multikey", "controller": DID, "publicKeyMultibase": key }],
+            "authentication": [method],
+            "assertionMethod": [method],
+        });
+        let fields = crate::write::ProfileFields { name: Some("Alice".to_string()), ..Default::default() };
+        let written = crate::write::whois(DID, &fields, SECRET, &method, "2026-10-11T12:00:00Z").await.unwrap();
+
+        let checked = check(written.to_string().as_bytes(), DID, &document).unwrap();
+        assert_eq!(profile(&checked, DID).unwrap().name.as_deref(), Some("Alice"));
+        // Each proof is for its own purpose, and carries the @context of what it signs.
+        assert_eq!(written["proof"]["proofPurpose"], "authentication");
+        assert_eq!(written["proof"]["@context"], written["@context"]);
+        let credential = &written["verifiableCredential"][0];
+        assert_eq!(credential["proof"]["proofPurpose"], "assertionMethod");
+        assert_eq!(credential["proof"]["@context"], credential["@context"]);
+
+        // A name changed after signing breaks the credential's proof, and the
+        // presentation's with it.
+        let mut renamed = written.clone();
+        renamed["verifiableCredential"][0]["credentialSubject"]["name"] = json!("Mallory");
+        assert!(check(renamed.to_string().as_bytes(), DID, &document).is_err());
+        // A document that doesn't list the key for the purpose doesn't vouch for it.
+        let mut no_assertions = document.clone();
+        no_assertions.as_object_mut().unwrap().remove("assertionMethod");
+        assert!(check(written.to_string().as_bytes(), DID, &no_assertions).unwrap_err().contains("assertion key"));
+        let mut no_authentication = document.clone();
+        no_authentication.as_object_mut().unwrap().remove("authentication");
+        assert!(check(written.to_string().as_bytes(), DID, &no_authentication).unwrap_err().contains("authentication key"));
+        // The presentation's proof is not a credential's: one purpose doesn't stand in for another.
+        let mut swapped = written.clone();
+        swapped["proof"] = written["verifiableCredential"][0]["proof"].clone();
+        assert!(check(swapped.to_string().as_bytes(), DID, &document).is_err());
     }
 }

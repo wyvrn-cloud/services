@@ -1,0 +1,22 @@
+# Caddy in front of wyvrn-did-host. It gets a certificate for the domain by
+# itself, which needs the domain's DNS to point here and ports 80 and 443 open.
+
+(tls-public) {
+}
+
+# DID_HOST_TLS=internal: a certificate Caddy signs itself, for trying this on a
+# machine that isn't at the domain. Nothing will trust it, so nothing hosted
+# resolves: it is for checking the setup, not for use.
+(tls-internal) {
+	tls internal
+}
+
+{$DID_HOST_DOMAIN} {
+	import tls-{$DID_HOST_TLS}
+	encode gzip
+	# Everything: the DIDs it hosts are paths of their own, and holders write to /.
+	reverse_proxy did-host:8080
+}
+
+# Other websites: see sites/website.caddy.example.
+import /etc/caddy/sites/*.caddy
