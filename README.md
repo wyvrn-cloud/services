@@ -7,6 +7,7 @@ that they share crates instead of each carrying its own copy of the same plumbin
 |---|---|
 | [`services/announce`](services/announce) | A one-way announcement channel: people subscribe, admins post, everyone subscribed receives it, and a web page shows every post. |
 | [`services/did-host`](services/did-host) | Hosts short, stable `did:webvh` DIDs, and their parallel `did:web`, for agents that write and sign them themselves. |
+| [`services/stickers`](services/stickers) | Hosts sticker and custom-emoji packs. They are made by talking to it, as `workflow/1.0` workflows, and fetched from it over HTTPS. |
 | [`crates/wyvrn-service`](crates/wyvrn-service) | What every DIDComm service does, whatever it is for. |
 | [`crates/wyvrn-hosted-did`](crates/wyvrn-hosted-did) | A hosted DID from both ends: the holder writing and signing its log, and anyone reading it -- from a `did:web` to the `did:webvh` behind it, verified, and its whois profile. Works on what was fetched; the fetching is the caller's. |
 | [`crates/wyvrn-hosted-did-wasm`](crates/wyvrn-hosted-did-wasm) | The same for a web app, as a WebAssembly module. |

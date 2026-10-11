@@ -4225,6 +4225,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyvrn-stickers"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "didcomm-agent",
+ "didcomm-core",
+ "didcomm-crypto-askar",
+ "didcomm-quickstart",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "toml",
+ "tower-http",
+ "tracing",
+ "uuid",
+ "wyvrn-service",
+]
+
+[[package]]
 name = "x25519-dalek"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

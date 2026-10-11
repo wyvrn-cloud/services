@@ -49,6 +49,29 @@ services:
       - did-host-data:/app/data
     restart: unless-stopped
 
+  # A sticker service (services/stickers): hosts sticker and custom-emoji packs,
+  # made by talking to it and fetched from it over HTTP. As it stands: at
+  # http://localhost:8082/, which is enough to try it with a local Wyvrn. A pack's
+  # address starts with STICKERS_PUBLIC_URL, so a real one needs its real address
+  # there, over HTTPS (see services/stickers/README.md).
+  stickers:
+    build:
+      context: .
+      dockerfile: services/stickers/Dockerfile
+    ports:
+      - "${STICKERS_PORT:-8082}:8080"
+    environment:
+      STICKERS_PUBLIC_URL: "${STICKERS_PUBLIC_URL:-http://localhost:8082/}"
+      STICKERS_DID_METHOD: "${STICKERS_DID_METHOD:-peer}"
+      # STICKERS_PUBLIC_URL: "https://stickers.example/"
+      # STICKERS_DID_METHOD: "web"
+      # The DIDs that may take a pack down, separated by commas.
+      STICKERS_ADMINS: "${STICKERS_ADMINS:-}"
+    volumes:
+      - stickers-data:/app/data
+    restart: unless-stopped
+
 volumes:
+  stickers-data:
   did-host-data:
   announce-data:

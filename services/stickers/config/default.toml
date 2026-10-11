@@ -1,0 +1,25 @@
+# wyvrn-stickers: what `cargo run` and the Docker image start with. The environment
+# overrides the settings a deployment most often changes (see README.md).
+
+[server]
+bind = "0.0.0.0:8080"
+# Where the service is reached: its DIDComm endpoint, and where packs are fetched
+# from. A pack's address is <public_url><name>, so this is part of every pack
+# handed out.
+public_url = "http://localhost:8080/"
+# "peer" needs nothing published; "web" makes the service did:web:<its own domain>.
+did_method = "peer"
+
+[identity]
+path = "data/identity.json"
+
+[store]
+path = "data/stickers.sqlite"
+
+[service]
+# The DIDs that may take a pack down.
+admins = []
+
+# To have messages to the service arrive through a mediator instead of at public_url:
+# [mediator]
+# did = "did:web:mediator.wyvrn.app"

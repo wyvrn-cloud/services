@@ -1,0 +1,30 @@
+[package]
+name = "wyvrn-stickers"
+description = "A sticker service: hosts sticker and custom-emoji packs, made over DIDComm with workflow/1.0 and served over HTTPS (stickers/1.0)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+wyvrn-service = { workspace = true }
+didcomm-agent = { workspace = true }
+didcomm-core = { workspace = true }
+didcomm-crypto-askar = { workspace = true }
+didcomm-quickstart = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
