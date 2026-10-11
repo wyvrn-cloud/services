@@ -37,13 +37,13 @@ pub struct AppState {
     pub agent: Agent,
     pub processor: Processor,
     /// Published at `/.well-known/did.json` when the service itself is a `did:web`.
-    pub did_document: Option<Value>,
+    pub did_document: Option<address::Published>,
     /// Resolves the DID a `from_prior` names, to check who signed it.
     pub resolver: Box<dyn DIDResolver>,
 }
 
 /// The agent for `config`: the service's own DID, which makers write to.
-pub fn build_agent(config: &Config, identity: Identity) -> anyhow::Result<(Agent, Option<Value>)> {
+pub fn build_agent(config: &Config, identity: Identity) -> anyhow::Result<(Agent, Option<address::Published>)> {
     let (agent, document) = address::build_agent(identity, &config.server.public_url, config.server.did_method)?;
     let features = Features::standard().with_protocol(PIURI, &["processor"]).with_protocol(STICKERS_PIURI, &["service"]);
     Ok((agent.with_features(features), document))

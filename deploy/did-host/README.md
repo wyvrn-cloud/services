@@ -54,6 +54,7 @@ certificate.
 curl https://id.example/healthz                # ok
 curl https://id.example/did                    # did:web:id.example
 curl https://id.example/.well-known/did.json   # the host's own DID document
+curl https://id.example/.well-known/did-configuration.json   # the host saying the domain is its own
 ```
 
 If the first fails with a certificate error, look at `docker compose logs
@@ -72,6 +73,19 @@ curl https://id.example/<name>/whois.vp    # the profile, if one was published
 To make a build of the app use this host without typing it, build with
 `VITE_DID_HOST_URL=https://id.example`. To have it mark names under
 `official:` at this host as official, also set `VITE_DID_HOST_DOMAIN=id.example`.
+
+### The host's own DID, and "Official"
+
+The host is itself `did:web:id.example`. It links that DID to its own domain
+without being asked: its DID document names `https://id.example`, and it
+serves a `did-configuration.json` it signs itself, afresh each day. Someone who
+looks the host up in the app is shown the domain, and can check it.
+
+Whether the app also marks it **Official** is the app's decision, not the
+host's: a build of the app lists the domains that are the project's own in
+`VITE_OFFICIAL_DOMAINS` (by default the DID host and the sticker service it
+was built for), and marks the `did:web` at each. Nothing a host says about
+itself puts it on that list.
 
 ## 5. Reserved names
 
@@ -94,7 +108,9 @@ can change it, only free the name, which ends its hosting.
 - **Back up the `did-host-data` volume.** It holds the host's own keys and the
   history of every address. An address whose history is lost can be put back
   only by its holder.
-- **Updating:** `git pull && docker compose up -d --build`.
+- **Updating:** `git pull && docker compose up -d --build`. The build keeps its
+  work between runs (a Docker cache mount), so after the first, which takes
+  several minutes, a change is rebuilt in well under one.
 - **There are no rate limits.** Nothing here stops someone reserving names in
   bulk. If the host is open to the public, put a rate limit in front of it.
 

@@ -5,6 +5,7 @@
 #   docker compose up -d
 services:
   did-host:
+    image: wyvrn-did-host
     build:
       context: ../..
       dockerfile: services/did-host/Dockerfile

@@ -60,6 +60,7 @@ docker compose up -d stickers
 | `/drafts/<instance>/<file>` | A picture of a pack still being made, for its maker's app to show. |
 | `POST /` | `workflow/1.0` messages. Only ones their sender authenticated (authcrypt): anything else is answered 403. |
 | `/did`, `/.well-known/did.json` | The service's own DID. |
+| `/.well-known/did-configuration.json` | With `STICKERS_DID_METHOD=web`: the service's own DID saying, signed, that this domain is its own. |
 | `/healthz` | `ok`. |
 
 A pack that was deleted or taken down answers 410.

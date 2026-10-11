@@ -23,12 +23,17 @@ COPY .cargo .cargo
 COPY crates crates
 COPY services services
 
+# The build's output is kept between builds (a cache mount, shared by every
+# service here, since they are one workspace): a change rebuilds what it touches,
+# not every dependency again. A cache mount is not part of the image, so the
+# binary is copied out of it in the same step.
 # aws-lc-rs' cmake build ignores cargo's -j; cap it so constrained builders don't OOM.
 ENV CMAKE_BUILD_PARALLEL_LEVEL=2
 RUN --mount=type=secret,id=github_token,required=false \
     --mount=type=secret,id=ca_bundle,required=false \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target,id=wyvrn-services-target,sharing=locked \
     set -e; \
     if [ -s /run/secrets/ca_bundle ]; then \
         cat /etc/ssl/certs/ca-certificates.crt /run/secrets/ca_bundle > /tmp/ca.pem; \
@@ -39,7 +44,8 @@ RUN --mount=type=secret,id=github_token,required=false \
             GIT_CONFIG_KEY_0="url.https://x-access-token:$(cat /run/secrets/github_token)@github.com/.insteadOf" \
             GIT_CONFIG_VALUE_0="https://github.com/"; \
     fi; \
-    cargo build --release --locked -j 2 -p wyvrn-did-host
+    cargo build --release --locked -j 2 -p wyvrn-did-host; \
+    cp target/release/wyvrn-did-host /usr/local/bin/wyvrn-did-host
 
 FROM debian:bookworm-slim
 # ca-certificates: resolving the DIDs of whoever writes to the host, and answering them.
@@ -47,7 +53,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --home /app didhost
 WORKDIR /app
-COPY --from=builder /build/target/release/wyvrn-did-host /usr/local/bin/wyvrn-did-host
+COPY --from=builder /usr/local/bin/wyvrn-did-host /usr/local/bin/wyvrn-did-host
 COPY services/did-host/config config
 # The host's own identity, and every name and DID log it hosts.
 RUN mkdir -p data && chown didhost data

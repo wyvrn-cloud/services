@@ -4215,6 +4215,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "chrono",
  "didcomm-agent",
  "reqwest",
  "serde",
@@ -4222,6 +4223,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wyvrn-hosted-did",
 ]
 
 [[package]]

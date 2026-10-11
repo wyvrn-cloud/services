@@ -45,7 +45,7 @@ pub struct AppState {
     pub channel: Channel,
     /// Published at `/.well-known/did.json` and `/did.json` when the channel is a
     /// `did:web`.
-    pub did_document: Option<Value>,
+    pub did_document: Option<address::Published>,
     /// Resolves the DID a `from_prior` names, to check who signed it.
     pub resolver: Box<dyn DIDResolver>,
     /// Rung when there is something new to send to subscribers.
@@ -58,7 +58,7 @@ pub struct AppState {
 
 /// The agent for `config`: a `did:web` derived from `server.public_url`, or a
 /// `did:peer:4` derived from the identity's keys and that URL.
-pub fn build_agent(config: &Config, identity: Identity) -> anyhow::Result<(Agent, Option<Value>)> {
+pub fn build_agent(config: &Config, identity: Identity) -> anyhow::Result<(Agent, Option<address::Published>)> {
     let (agent, document) = address::build_agent(identity, &config.server.public_url, config.server.did_method)?;
     let features = Features::standard()
         .with_protocol(channel::PIURI, &["channel"])

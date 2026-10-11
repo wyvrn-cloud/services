@@ -34,11 +34,11 @@ pub struct AppState {
     pub agent: Agent,
     pub host: Host,
     /// Published at `/.well-known/did.json` when the host itself is a `did:web`.
-    pub did_document: Option<Value>,
+    pub did_document: Option<address::Published>,
 }
 
 /// The agent for `config`: the host's own DID, which holders write to.
-pub fn build_agent(config: &Config, identity: Identity) -> anyhow::Result<(Agent, Option<Value>)> {
+pub fn build_agent(config: &Config, identity: Identity) -> anyhow::Result<(Agent, Option<address::Published>)> {
     let (agent, document) = address::build_agent(identity, &config.server.public_url, config.server.did_method)?;
     Ok((agent.with_features(Features::standard().with_protocol(PIURI, &["host"])), document))
 }

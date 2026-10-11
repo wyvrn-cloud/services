@@ -68,6 +68,7 @@ docker compose up -d did-host
 | `/<name>/whois.vp` | The holder's whois, if it has published one. |
 | `POST /` | `did-hosting/1.0` messages. Only ones their sender authenticated (authcrypt): anything else is answered 403. |
 | `/did`, `/.well-known/did.json` | The host's own DID. |
+| `/.well-known/did-configuration.json` | With `DID_HOST_DID_METHOD=web`: the host's own DID saying, signed, that this domain is its own. Its DID document names the domain back, so the two are a linked domain an app can check. Made by the host itself, each day; there is nothing to set up. |
 | `/healthz` | `ok`. |
 
 A name with nothing published under it answers 404 to all three, whether it is
