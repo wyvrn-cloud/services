@@ -888,3 +888,134 @@ async fn a_message_a_mediator_carried_is_known_by_its_senders_key_like_any_other
     // Nor does rubbish do anything.
     wyvrn_service::mediator::deliver(&service, b"not a message").await;
 }
+
+#[tokio::test]
+async fn an_app_registers_and_is_read_back_with_the_functions_it_will_use() {
+    use didcomm_resolver_peer::peer4;
+    use wyvrn_hosted_did::{read, write};
+    let host = start_host(&[]).await;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    // Keys as an app holds them: JWKs.
+    let jwk = || {
+        let key = SigningKey::from_bytes(&rand_seed());
+        json!({ "kty": "OKP", "crv": "Ed25519", "x": b64.encode(key.verifying_key().to_bytes()), "d": b64.encode(key.to_bytes()) }).to_string()
+    };
+    let (authentication, phone_update, tablet_update) = (jwk(), jwk(), jwk());
+    let web = "did:web:id.example:alice";
+
+    // The identity the app writes from: a did:peer:4 that names its short name.
+    let identity = Identity::generate().unwrap();
+    let key_agreement = key_agreement_of(&identity);
+    let peer = peer4::encode(json!({
+        "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1"],
+        "alsoKnownAs": [web],
+        "verificationMethod": [
+            { "id": "#key-1", "type": "Multikey", "publicKeyMultibase": write::public_multikey(&authentication).unwrap() },
+            { "id": "#key-2", "type": "Multikey", "publicKeyMultibase": key_agreement },
+        ],
+        "authentication": ["#key-1"],
+        "keyAgreement": ["#key-2"],
+    }))
+    .unwrap();
+    let agent = Agent::with_did(identity, &peer);
+    let ask = |message_type: &'static str, body: Value, attachment: Option<Value>| {
+        let (agent, to) = (&agent, host.did.clone());
+        async move {
+            let mut message = json!({ "type": format!("{P}{message_type}"), "body": body, "return_route": "all" });
+            if let Some(attachment) = attachment {
+                message["attachments"] = json!([attachment]);
+            }
+            agent.send(&to, &message).await.unwrap().expect("an answer").message
+        }
+    };
+    let attach = |id: &str, media_type: &str, bytes: &[u8]| {
+        json!({ "id": id, "media_type": media_type, "data": { "base64": b64.encode(bytes), "jws": write::sign_attachment(bytes, &authentication).unwrap() } })
+    };
+
+    // Reserve, write the first entry, publish.
+    assert_eq!(kind(&ask("reserve", json!({ "name": "alice" }), None).await), "reservation");
+    let document = |did: &str| {
+        json!({
+            "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1"],
+            "id": did,
+            "alsoKnownAs": [web, peer],
+            "verificationMethod": [
+                { "id": format!("{did}#key-1"), "type": "Multikey", "controller": did, "publicKeyMultibase": write::public_multikey(&authentication).unwrap() },
+                { "id": format!("{did}#key-2"), "type": "Multikey", "controller": did, "publicKeyMultibase": key_agreement },
+            ],
+            "authentication": [format!("{did}#key-1")],
+            "keyAgreement": [format!("{did}#key-2")],
+        })
+    };
+    let phone_key = write::public_multikey(&phone_update).unwrap();
+    let first = write::create(&document("did:webvh:{SCID}:id.example:alice"), &phone_update, std::slice::from_ref(&phone_key)).await.unwrap();
+    assert!(first.did.starts_with("did:webvh:Qm") && first.did.ends_with(":id.example:alice"), "{}", first.did);
+    let published = ask("publish", json!({ "name": "alice" }), Some(attach("log", "text/jsonl", first.entry.as_bytes()))).await;
+    assert_eq!(kind(&published), "published", "{published}");
+    assert_eq!(published["body"]["did"], first.did);
+
+    // A second device gets an update key of its own; then it, not the phone, writes.
+    next_second().await;
+    let both = [phone_key.clone(), write::public_multikey(&tablet_update).unwrap()];
+    let second = write::append(&first.did, &first.log, &document(&first.did), &phone_update, Some(&both)).await.unwrap();
+    let answer = ask("publish", json!({ "name": "alice", "after": first.version_id }), Some(attach("log", "text/jsonl", second.entry.as_bytes()))).await;
+    assert_eq!(kind(&answer), "published", "{answer}");
+    next_second().await;
+    let third = write::append(&first.did, &second.log, &document(&first.did), &tablet_update, None).await.unwrap();
+    let answer = ask("publish", json!({ "name": "alice", "after": second.version_id }), Some(attach("log", "text/jsonl", third.entry.as_bytes()))).await;
+    assert_eq!(kind(&answer), "published", "{answer}");
+    // A key the log never allowed can't continue it, even on the holder's own device.
+    next_second().await;
+    assert!(write::append(&first.did, &third.log, &document(&first.did), &jwk(), None).await.is_err());
+
+    // Who she is.
+    let profile: write::ProfileFields = serde_json::from_value(json!({
+        "kind": "Person", "name": "Alice", "description": "Writes about gardens.",
+        "image": { "contentUrl": "data:image/webp;base64,UklGRg", "encodingFormat": "image/webp", "width": 256, "height": 256 },
+        "background": { "contentUrl": "https://alice.example/bg.webp", "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" },
+    }))
+    .unwrap();
+    let whois = write::whois(&first.did, &profile, &authentication, &format!("{}#key-1", first.did), "2026-10-11T00:00:00Z").await.unwrap();
+    let answer = ask("publish-whois", json!({ "name": "alice" }), Some(attach("whois", "application/vp", whois.to_string().as_bytes()))).await;
+    assert_eq!(answer["body"]["whois"], true, "{answer}");
+
+    // Read back as the app reads: asking with what it has, fetching what it is told to.
+    let mut files = read::Files::new();
+    let mut fetched = Vec::new();
+    let read = loop {
+        match read::read(web, &files).await {
+            read::Step::Need(url) => {
+                let path = url.strip_prefix("https://id.example/").expect("only its own host is asked").to_string();
+                let response = fetch(&host, &path).await;
+                files.insert(url.clone(), (response.status() == 200).then_some(response.text().await.unwrap()));
+                fetched.push(path);
+            }
+            read::Step::Done(read) => break read,
+            read::Step::Failed(why) => panic!("{why}"),
+        }
+    };
+    assert_eq!(fetched, ["alice/did.json", "alice/did.jsonl", "alice/whois.vp"]);
+    assert_eq!(read.resolved.did, first.did);
+    assert_eq!(read.resolved.standing, Standing::Verified);
+    assert_eq!(read.peer.as_deref(), Some(peer.as_str()));
+    let profile = read.profile.expect("a profile");
+    assert_eq!((profile.name.as_deref(), profile.kind.as_deref()), (Some("Alice"), Some("Person")));
+    assert!(profile.image.unwrap().is_inline());
+    assert_eq!(profile.background.unwrap().url, "https://alice.example/bg.webp");
+
+    // The same DID string with a letter of its document changed is no DID at all,
+    // and one that is real but someone else's is not hers.
+    assert!(wyvrn_hosted_did::verify::peer4_document(&peer).is_some());
+    let mut bent = peer.clone();
+    bent.pop();
+    bent.push(if peer.ends_with('1') { '2' } else { '1' });
+    assert!(wyvrn_hosted_did::verify::peer4_document(&bent).is_none());
+    let other = Agent::new(Identity::generate().unwrap()).unwrap().did();
+    let theirs = wyvrn_hosted_did::verify::peer4_document(&other).expect("a real did:peer:4 decodes");
+    assert!(!wyvrn_hosted_did::verify::peer_is_holder(&theirs, web, &read.resolved.document));
+}
+
+fn rand_seed() -> [u8; 32] {
+    let key = Secret::generate_ed25519(None, None);
+    key.get_private_bytes()[..32].try_into().unwrap()
+}

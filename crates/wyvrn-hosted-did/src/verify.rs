@@ -61,6 +61,23 @@ pub fn peer_is_holder(peer_document: &Value, did_web: &str, hosted_document: &Va
     keys::keys_for(peer_document, "keyAgreement").iter().any(|key| hosted.contains(key))
 }
 
+/// The document a long-form `did:peer:4` carries in itself, if it is one and its
+/// hash is that document's: `did:peer:4<hash>:<document>`, where the document is
+/// multibase (base58btc) of the JSON multicodec and the JSON, and the hash is the
+/// multibase of its SHA-256 multihash. Ids in it are relative (`#key-2`).
+pub fn peer4_document(did: &str) -> Option<Value> {
+    use sha2::{Digest, Sha256};
+    let (hash, encoded) = did.strip_prefix("did:peer:4")?.split_once(':')?;
+    let mut multihash = vec![0x12, 0x20];
+    multihash.extend_from_slice(&Sha256::digest(encoded.as_bytes()));
+    if hash.strip_prefix('z')? != bs58::encode(multihash).into_string() {
+        return None;
+    }
+    let bytes = bs58::decode(encoded.strip_prefix('z')?).into_vec().ok()?;
+    // 0x0200, the multicodec for JSON, as a varint.
+    serde_json::from_slice(bytes.strip_prefix(&[0x80, 0x04])?).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

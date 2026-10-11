@@ -11,15 +11,21 @@
 //!   profile in it.
 //! - [`keys`]: the keys in a document, and a signature against them.
 //!
+//! - [`write`]: the holder's side -- writing a log, and signing what is uploaded.
+//! - [`read`]: all of the reading, one file at a time, for a caller that does its
+//!   own fetching.
+//!
 //! [`resolve`] puts them in order around a [`Fetch`], which is the only part that
 //! touches a network: an HTTPS client in an app, the host's own store in the host,
 //! a map of prepared answers in a test.
 
 pub mod keys;
+pub mod read;
 pub mod resolve;
 pub mod urls;
 pub mod verify;
 pub mod whois;
+pub mod write;
 
 pub use resolve::{resolve, whois_of, Fetch, Resolved, Standing};
 pub use whois::{Image, Profile};
