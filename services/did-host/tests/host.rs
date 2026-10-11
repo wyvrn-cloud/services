@@ -444,8 +444,9 @@ async fn a_whois_is_published_by_the_holder_signed_by_the_did_and_about_nothing_
             presentation
         }
     };
+    // Uploaded like the log: the attachment itself signed by the DID's key.
     let send = |holder: &Holder, presentation: &Value| {
-        let attachment = json!([{ "id": "whois", "media_type": "application/vp", "data": { "base64": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(presentation.to_string()) } }]);
+        let attachment = json!([signed_attachment("whois", "application/vp", presentation.to_string().as_bytes(), &alice.auth)]);
         let holder_name = holder.name.clone();
         async move { (holder_name, attachment) }
     };
@@ -481,6 +482,12 @@ async fn a_whois_is_published_by_the_holder_signed_by_the_did_and_about_nothing_
     let about_another = sign(presentation(&did, "did:web:someone.example"), &alice.auth, &did).await;
     let (name, attachment) = send(&alice, &about_another).await;
     refused_with(&alice.ask("publish-whois", json!({ "name": name }), Some(attachment)).await, "e.p.msg.whois-invalid");
+    // A good presentation in an attachment that isn't signed, or is signed by
+    // some other key: every upload has to be the DID's own, on the outside too.
+    let bare = json!([{ "id": "whois", "media_type": "application/vp", "data": { "base64": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(whois.to_string()) } }]);
+    refused_with(&alice.ask("publish-whois", json!({ "name": "alice" }), Some(bare)).await, "e.p.msg.whois-invalid");
+    let by_stranger = json!([signed_attachment("whois", "application/vp", whois.to_string().as_bytes(), &signer())]);
+    refused_with(&alice.ask("publish-whois", json!({ "name": "alice" }), Some(by_stranger)).await, "e.p.msg.whois-invalid");
     // Tampered with after signing.
     let mut changed = whois.clone();
     changed["verifiableCredential"][0]["credentialSubject"]["name"] = json!("Mallory");
@@ -595,7 +602,7 @@ async fn profile_whois(holder: &Holder, name: &str) -> Value {
 }
 
 async fn publish_whois(holder: &Holder, presentation: &Value) {
-    let attachment = json!([{ "id": "whois", "media_type": "application/vp", "data": { "base64": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(presentation.to_string()) } }]);
+    let attachment = json!([signed_attachment("whois", "application/vp", presentation.to_string().as_bytes(), &holder.auth)]);
     let answer = holder.ask("publish-whois", json!({ "name": holder.name }), Some(attachment)).await;
     assert_eq!(kind(&answer), "status", "{answer}");
 }
@@ -796,7 +803,7 @@ async fn listing_someone_elses_key_neither_makes_one_them_nor_keeps_them_out() {
     eve.agent = agent_listing(Identity::generate().unwrap(), &[alices_key.clone()]);
     assert_eq!(eve.ask("status-request", json!({ "name": "alice" }), None).await["body"]["yours"], false);
     let whois = profile_whois(&alice, "Not Alice").await;
-    let attachment = json!([{ "id": "whois", "media_type": "application/vp", "data": { "base64": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(whois.to_string()) } }]);
+    let attachment = json!([signed_attachment("whois", "application/vp", whois.to_string().as_bytes(), &alice.auth)]);
     refused_with(&eve.ask("publish-whois", json!({ "name": "alice" }), Some(attachment)).await, "e.p.msg.not-holder");
 
     // The same trick doesn't take a name someone is in the middle of claiming.
@@ -817,4 +824,31 @@ async fn listing_someone_elses_key_neither_makes_one_them_nor_keeps_them_out() {
     late.reserve().await;
     late.write_first_entry().await;
     refused_with(&late.publish(0, None).await, "e.p.msg.key-in-use");
+}
+
+#[tokio::test]
+async fn a_message_nobody_authenticated_is_turned_away() {
+    let host = start_host(&[]).await;
+    let alice = Holder::new(&host, "alice");
+    let reserve = json!({ "type": format!("{P}reserve"), "body": { "name": "alice" }, "return_route": "all" });
+    let post = |packed: Vec<u8>| {
+        let url = host.url.clone();
+        async move { reqwest::Client::new().post(url).body(packed).send().await.unwrap() }
+    };
+
+    // Encrypted to the host but from nobody (anoncrypt): refused outright, with
+    // nothing held and nothing said in DIDComm, there being nobody to say it to.
+    let anonymous = alice.agent.messaging().pack(&reserve, &host.did, None).await.unwrap().message;
+    let response = post(anonymous).await;
+    assert_eq!(response.status(), 403);
+    assert!(response.text().await.unwrap().contains("authcrypt"));
+    assert!(host.state.host.store.get("alice").unwrap().is_none());
+
+    // The same message, authenticated, is taken.
+    let authenticated = alice.agent.messaging().pack(&reserve, &host.did, Some(&alice.agent.did())).await.unwrap().message;
+    assert_eq!(post(authenticated).await.status(), 200);
+    assert!(host.state.host.store.get("alice").unwrap().is_some());
+
+    // Not DIDComm at all.
+    assert_eq!(post(b"hello".to_vec()).await.status(), 400);
 }

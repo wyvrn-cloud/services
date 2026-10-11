@@ -23,6 +23,3 @@ admins = []
 # Reserved for nobody until an admin assigns them. `reserved_names` defaults to the
 # host's own routes and the names that would pass for the host itself.
 reserved_namespaces = ["official"]
-
-# [mediator]
-# did = "did:web:mediator.wyvrn.app"

@@ -74,40 +74,23 @@ pub struct Host {
     resolver: Box<dyn DIDResolver>,
 }
 
-/// Who sent a message, as far as its keys say.
+/// Who sent a message: the DID it is from, and the one key of that DID's it was
+/// authenticated with.
 pub struct Sender {
     pub did: String,
-    /// The key it authenticated with, where that is known (a message posted to the
-    /// host): the one key it has shown it holds.
-    key: Option<String>,
-    /// Every key-agreement key its DID lists.
-    keys: Vec<String>,
+    key: String,
 }
 
 impl Sender {
-    /// Whether the sender is the party that `theirs` are the keys of.
+    /// Whether the sender is the party that `theirs` are the keys of: the key it
+    /// wrote with is one of them.
     ///
-    /// By the key it used, where that is known: it holds that key, so it is theirs
-    /// if that key is. What else its DID lists doesn't matter either way -- a device
-    /// more or a device fewer than the document has is still the same holder, and
-    /// someone else's key listed beside one's own makes nobody them.
-    ///
-    /// Where the key isn't known (a message collected from a mediator arrives
-    /// already opened), all that is known is that it holds *one* of its DID's keys,
-    /// so every one of them has to be theirs.
+    /// That one key and nothing else. What its DID lists besides doesn't matter
+    /// either way -- a device more or a device fewer than a document has is still
+    /// the same holder, and someone else's key listed beside one's own makes
+    /// nobody them.
     pub fn holds(&self, theirs: &[String]) -> bool {
-        match &self.key {
-            Some(key) => theirs.contains(key),
-            None => !self.keys.is_empty() && self.keys.iter().all(|key| theirs.contains(key)),
-        }
-    }
-
-    /// The keys to know it by again: the one it used, else all its DID lists.
-    fn own_keys(&self) -> Vec<String> {
-        match &self.key {
-            Some(key) => vec![key.clone()],
-            None => self.keys.clone(),
-        }
+        theirs.contains(&self.key)
     }
 }
 
@@ -128,30 +111,26 @@ impl Host {
         }
     }
 
-    /// Who a message is from. `kid` is the id of the key it was authenticated with.
-    async fn sender(&self, did: &str, kid: Option<&str>) -> Sender {
+    /// Who a message is from. `kid` is the id of the key it was authenticated with;
+    /// `None` if that id is not a key-agreement key of the DID it claims to be of.
+    async fn sender(&self, did: &str, kid: &str) -> Option<Sender> {
         let document = match self.resolver.resolve(did).await {
             Ok(document) => document,
             Err(error) => {
                 tracing::debug!(%did, %error, "couldn't resolve a sender's DID");
-                Value::Null
+                return None;
             }
         };
         let keys = keys::keys_for(&document, "keyAgreement");
-        // The key that id names in the sender's own document, if it is one of its
-        // key-agreement keys.
-        let key = kid.and_then(|kid| {
-            let fragment = kid.rsplit('#').next().unwrap_or_default();
-            document["verificationMethod"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|method| method["id"].as_str().is_some_and(|id| id == kid || id.rsplit('#').next() == Some(fragment)))
-                .and_then(|method| method["publicKeyMultibase"].as_str())
-                .filter(|key| keys.iter().any(|k| k == key))
-                .map(str::to_string)
-        });
-        Sender { did: did.to_string(), key, keys }
+        let fragment = kid.rsplit('#').next().unwrap_or_default();
+        let key = document["verificationMethod"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|method| method["id"].as_str().is_some_and(|id| id == kid || id.rsplit('#').next() == Some(fragment)))
+            .and_then(|method| method["publicKeyMultibase"].as_str())
+            .filter(|key| keys.iter().any(|k| k == key))?;
+        Some(Sender { did: did.to_string(), key: key.to_string() })
     }
 
     async fn is_admin(&self, sender: &Sender) -> bool {
@@ -183,14 +162,12 @@ impl Host {
 
     /// Notes that a holder has been heard from: by a key it has shown to be its
     /// own, that its document still lists.
-    pub async fn note_sender(&self, received: &Received, kid: Option<&str>, now: i64) -> anyhow::Result<()> {
+    pub async fn note_sender(&self, received: &Received, kid: &str, now: i64) -> anyhow::Result<()> {
         let Some(did) = received.sender.as_deref() else { return Ok(()) };
-        let sender = self.sender(did, kid).await;
-        for key in sender.own_keys() {
-            for name in self.store.names_proven_with(&key)? {
-                if self.store.get(&name)?.is_some_and(|record| sender.holds(&record.holder_keys)) {
-                    self.store.heard(&name, now)?;
-                }
+        let Some(sender) = self.sender(did, kid).await else { return Ok(()) };
+        for name in self.store.names_proven_with(&sender.key)? {
+            if self.store.get(&name)?.is_some_and(|record| sender.holds(&record.holder_keys)) {
+                self.store.heard(&name, now)?;
             }
         }
         Ok(())
@@ -198,19 +175,14 @@ impl Host {
 
     /// The sender has acted as `name`'s holder with the key it wrote with.
     fn shown_to_hold(&self, sender: &Sender, name: &str) -> anyhow::Result<()> {
-        if let Some(key) = &sender.key {
-            self.store.prove(name, key)?;
-        }
-        Ok(())
+        self.store.prove(name, &sender.key)
     }
 
     /// The name whose DID the sender is the holder of, as its document stands.
     fn name_of(&self, sender: &Sender) -> anyhow::Result<Option<String>> {
-        for key in sender.own_keys() {
-            for name in self.store.names_with_key(&key)? {
-                if self.store.get(&name)?.is_some_and(|record| record.published != Published::No && sender.holds(&record.holder_keys)) {
-                    return Ok(Some(name));
-                }
+        for name in self.store.names_with_key(&sender.key)? {
+            if self.store.get(&name)?.is_some_and(|record| record.published != Published::No && sender.holds(&record.holder_keys)) {
+                return Ok(Some(name));
             }
         }
         Ok(None)
@@ -245,13 +217,16 @@ impl Host {
         })
     }
 
-    /// Acts on one message from an authenticated sender. `None` for a message that
-    /// isn't this protocol's.
-    pub async fn handle(&self, received: &Received, kid: Option<&str>, now: i64) -> anyhow::Result<Option<Value>> {
+    /// Acts on one message, authenticated by its sender with the key `kid` names.
+    /// `None` for a message that isn't this protocol's, or whose sender's DID
+    /// can't be read to see what that key is.
+    pub async fn handle(&self, received: &Received, kid: &str, now: i64) -> anyhow::Result<Option<Value>> {
         let Some(did) = received.sender.as_deref() else {
             return Ok(None);
         };
-        let sender = self.sender(did, kid).await;
+        let Some(sender) = self.sender(did, kid).await else {
+            return Ok(None);
+        };
         let sender = &sender;
         let body = &received.message["body"];
         let answer = match received.message_type() {
@@ -278,9 +253,6 @@ impl Host {
             Ok(name) => name,
             Err(refusal) => return Ok(Err(refusal)),
         };
-        if sender.own_keys().is_empty() {
-            return Ok(Err(Refusal::new("e.p.msg.name-invalid", "Your DID has no key-agreement key this host can see.")));
-        }
         let key = name.as_did_path();
         let record = self.store.get(&key)?;
         match self.state_of(&name, record.as_ref(), now) {
@@ -304,11 +276,11 @@ impl Host {
             }
         }
         // One name per holder: a key already in a document here can't claim another.
-        if self.in_use(&sender.own_keys(), &key)? {
+        if self.in_use(std::slice::from_ref(&sender.key), &key)? {
             return Ok(Err(Refusal::new("e.p.msg.key-in-use", "You already have a DID hosted here under another name.")));
         }
         let expires = now + self.config.hold_seconds;
-        self.store.hold(&key, &sender.own_keys(), expires)?;
+        self.store.hold(&key, std::slice::from_ref(&sender.key), expires)?;
         Ok(Ok((
             RESERVATION,
             json!({
@@ -391,7 +363,7 @@ impl Host {
         all_keys.sort();
         all_keys.dedup();
         let mut to_check = keys::all_keys(&checked.document);
-        to_check.extend(sender.own_keys());
+        to_check.push(sender.key.clone());
         to_check.push(signed_with.clone());
         if self.in_use(&to_check, &key)? {
             return Ok(Err(Refusal::new("e.p.msg.key-in-use", "A key of that document belongs to a DID hosted here under another name.")));
@@ -434,7 +406,14 @@ impl Host {
         let did = record.did.clone().unwrap_or_default();
         let whois = match attachment(message, "whois") {
             None => None,
-            Some((bytes, _)) => {
+            Some((bytes, jws)) => {
+                // Signed like everything uploaded here: by an authentication key of
+                // the document, over the bytes as sent.
+                let authentication = keys::keys_for(&record.log.as_deref().and_then(last_document).unwrap_or_default(), "authentication");
+                let Some(signed_with) = jws.and_then(|jws| keys::signer_among(&bytes, jws, &authentication)).cloned() else {
+                    return Ok(Err(Refusal::new("e.p.msg.whois-invalid", "The attachment is not signed (jws) by an authentication key of the DID.")));
+                };
+                self.store.prove(&key, &signed_with)?;
                 if bytes.len() > self.config.max_whois_bytes {
                     return Ok(Err(Refusal::new("e.p.msg.too-large", "The whois is over this host's limit of {1} bytes.").with(self.config.max_whois_bytes.to_string())));
                 }

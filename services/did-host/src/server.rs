@@ -51,19 +51,25 @@ impl Service for HostService {
         &self.0.agent
     }
 
+    /// Everything here is decided by who is writing, down to the key.
+    fn requires_authcrypt(&self) -> bool {
+        true
+    }
+
     async fn answer(&self, incoming: &Incoming<'_>) -> anyhow::Result<Option<Value>> {
         let received = incoming.received;
-        // Nothing is done for someone nobody vouches for.
-        if received.sender.is_none() {
+        // Nothing is done for someone nobody vouches for. (The endpoint has turned
+        // such a message away already; this is for any other way in.)
+        let Some(kid) = incoming.sender_kid.as_deref() else {
             return Ok(None);
-        }
+        };
         // A ping's answer, and anything else, is a holder saying it is still there:
         // noted before the automatic replies, which are otherwise all a ping gets.
-        self.0.host.note_sender(received, incoming.sender_kid.as_deref(), now()).await?;
+        self.0.host.note_sender(received, kid, now()).await?;
         if let Some(reply) = self.0.agent.auto_reply(received) {
             return Ok(Some(reply));
         }
-        self.0.host.handle(received, incoming.sender_kid.as_deref(), now()).await
+        self.0.host.handle(received, kid, now()).await
     }
 }
 

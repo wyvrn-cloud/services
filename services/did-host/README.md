@@ -62,7 +62,7 @@ docker compose up -d did-host
 | `/<name>/did.jsonl` | The `did:webvh` log, as its holder wrote it. |
 | `/<name>/did.json` | The parallel `did:web` document, derived from the log. |
 | `/<name>/whois.vp` | The holder's whois, if it has published one. |
-| `POST /` | `did-hosting/1.0` messages. |
+| `POST /` | `did-hosting/1.0` messages. Only ones their sender authenticated (authcrypt): anything else is answered 403. |
 | `/did`, `/.well-known/did.json` | The host's own DID. |
 | `/healthz` | `ok`. |
 
@@ -113,17 +113,14 @@ environment overrides `DID_HOST_BIND`, `DID_HOST_PUBLIC_URL`,
 `DID_HOST_DID_METHOD`, `DID_HOST_DOMAIN` and `DID_HOST_ADMINS`. Under `[host]`
 there are also `hold_seconds` (600: how long a name is held for whoever asked),
 `max_labels` (2), `require_portable` (true), `max_log_bytes` and
-`max_whois_bytes`. A `[mediator]` section puts the host's own DIDComm endpoint
-behind a mediator; what it hosts is served over HTTPS either way.
+`max_whois_bytes`.
 
 ## What it does not do yet
 
-- **Behind a mediator it knows a sender less well.** A message posted to the
-  host shows which key it was written with, and everything is decided by that
-  key. One collected from a mediator arrives already opened, with only the
-  sender's DID: then every key that DID lists has to be the document's, and no
-  key is counted as shown to be a holder's (so "one name per holder" is not
-  enforced for what arrives that way). Holders should write to the host directly.
+- **It is not reached through a mediator.** Everything is decided by which key a
+  message was authenticated with, and a message collected from a mediator
+  arrives already opened, without that. It needs a public HTTPS address anyway,
+  to serve what it hosts; holders write to it there.
 - **No witnesses or watchers.** A host that withheld a holder's newer entries
   would not be caught by anything here.
 - **No rate limits.** Put one in front of it.

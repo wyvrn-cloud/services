@@ -40,6 +40,10 @@ pub async fn receive<S: Service>(service: Arc<S>, body: Bytes) -> Response {
         Ok(unpacked) => unpacked.sender_kid,
         Err(_) => None,
     };
+    if service.requires_authcrypt() && sender_kid.is_none() {
+        // There is nobody to answer in DIDComm: say it where the sender will see it.
+        return (StatusCode::FORBIDDEN, "this service only takes messages their sender has authenticated (authcrypt)").into_response();
+    }
     let reply = match service.answer(&Incoming { received: &received, sender_kid }).await {
         Ok(Some(reply)) => reply,
         Ok(None) => return StatusCode::ACCEPTED.into_response(),

@@ -40,6 +40,15 @@ pub struct Incoming<'a> {
 pub trait Service: Send + Sync + 'static {
     fn agent(&self) -> &Agent;
 
+    /// Whether the service takes only messages whose sender authenticated them
+    /// with a key of its own (authcrypt), and has to know which key. One that
+    /// does is never handed anything else: an anonymous message posted to it is
+    /// refused there and then, and it cannot be reached through a mediator, where
+    /// a message arrives already opened and the key is not known.
+    fn requires_authcrypt(&self) -> bool {
+        false
+    }
+
     /// Acts on one message, however it got here (posted to the endpoint, or
     /// collected from a mediator), and returns what to answer it with, if anything.
     fn answer(&self, incoming: &Incoming<'_>) -> impl Future<Output = anyhow::Result<Option<Value>>> + Send;

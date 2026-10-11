@@ -49,6 +49,12 @@ pub async fn register(agent: &Agent, mediator: &MediatorConfig) -> anyhow::Resul
 /// message is acted on as one posted to the service directly would be; its answer
 /// goes to the sender's own address, there being no connection to answer on.
 pub async fn run_pickups<S: Service>(service: Arc<S>, every: Duration) {
+    if service.requires_authcrypt() {
+        // What a mediator hands over is already opened: which key authenticated
+        // it isn't known, and this service won't act without knowing.
+        tracing::error!("this service needs to know which key a message was authenticated with, and can't be reached through a mediator");
+        return;
+    }
     let agent = service.agent();
     loop {
         match agent.pickup(PICKUP_BATCH).await {
