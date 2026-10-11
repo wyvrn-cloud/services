@@ -252,7 +252,15 @@ impl Channel {
         match message_type {
             SUBSCRIBE => {
                 let member = self.store.subscribe(sender, now)?;
-                Ok(Outcome::reply(reply_to(message, SUBSCRIPTION, self.subscription(Some(&member))?)))
+                let mut outcome = Outcome::reply(reply_to(message, SUBSCRIPTION, self.subscription(Some(&member))?));
+                // A name is only kept for a member, and an app tends to give its
+                // profile on first meeting the channel, a moment before it
+                // subscribes: so a subscriber without one is asked.
+                if member.name.is_none() {
+                    let ask = json!({ "id": uuid::Uuid::new_v4().to_string(), "type": REQUEST_PROFILE, "body": {} });
+                    outcome.notices.push((sender.to_string(), ask));
+                }
+                Ok(outcome)
             }
             UNSUBSCRIBE => {
                 self.store.unsubscribe(sender)?;
@@ -477,6 +485,22 @@ mod tests {
         let reply = outcome.reply.as_ref().expect("a reply");
         assert_eq!(reply["type"], PROBLEM_REPORT, "{reply}");
         reply["body"]["code"].as_str().unwrap()
+    }
+
+    #[test]
+    fn a_new_subscriber_with_no_name_is_asked_for_their_profile() {
+        let channel = channel();
+        let subscribe = json!({"id": "s1", "type": SUBSCRIBE, "body": {}});
+
+        let outcome = channel.handle("did:s", &subscribe, 1).unwrap();
+        assert_eq!(outcome.notices.len(), 1);
+        assert_eq!(outcome.notices[0].0, "did:s");
+        assert_eq!(outcome.notices[0].1["type"], REQUEST_PROFILE);
+
+        // Once they have given one, subscribing again asks nothing.
+        let profile = json!({"id": "p1", "type": PROFILE, "body": {"profile": {"displayName": "Sam"}}});
+        channel.handle("did:s", &profile, 2).unwrap();
+        assert!(channel.handle("did:s", &subscribe, 3).unwrap().notices.is_empty());
     }
 
     #[test]

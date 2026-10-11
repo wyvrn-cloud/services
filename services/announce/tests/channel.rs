@@ -73,9 +73,18 @@ impl Peer {
         }
     }
 
+    /// Nothing more of what the channel is for. (Being asked for a profile, which it
+    /// does of a subscriber it has no name for, is beside the point of every test
+    /// that asks this.)
     async fn nothing_more(&self) {
-        let waited = tokio::time::timeout(Duration::from_millis(400), self.inbox.lock().await.recv()).await;
-        assert!(waited.is_err(), "expected nothing more, got {:?}", waited.unwrap());
+        loop {
+            let waited = tokio::time::timeout(Duration::from_millis(400), self.inbox.lock().await.recv()).await;
+            match waited {
+                Ok(Some(message)) if message["type"] == "https://didcomm.org/user-profile/1.0/request-profile" => continue,
+                Ok(other) => panic!("expected nothing more, got {other:?}"),
+                Err(_) => return,
+            }
+        }
     }
 }
 
