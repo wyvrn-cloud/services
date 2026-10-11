@@ -3,7 +3,7 @@
 use didwebvh_rs::DIDWebVHState;
 use serde_json::Value;
 
-use crate::keys;
+use wyvrn_hosted_did::keys;
 use crate::names::Name;
 
 /// A log that verifies, and what it says.

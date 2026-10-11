@@ -126,6 +126,15 @@ behind a mediator; what it hosts is served over HTTPS either way.
   would not be caught by anything here.
 - **No rate limits.** Put one in front of it.
 
+## Reading what it hosts
+
+The other side of this -- being given `did:web:id.example:alice` and ending up
+with a verified DID and a profile -- is [`crates/wyvrn-hosted-did`](../../crates/wyvrn-hosted-did).
+It decides everything from bytes it is handed, and is given a `Fetch` to get
+them with. That is what lets the tests here resolve `https://id.example/...`
+without a network: the fetch is answered by the host under test, or by a
+prepared answer where the test is of a host that lies.
+
 ## Development
 
 ```sh
@@ -133,4 +142,5 @@ cargo test -p wyvrn-did-host
 ```
 
 `tests/host.rs` runs the server and has holders write real `did:webvh` logs,
-publish them over DIDComm, and fetch them back.
+publish them over DIDComm, and fetch them back; then resolves them as someone
+given the short name would, including from a host that serves something else.

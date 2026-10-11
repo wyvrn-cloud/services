@@ -17,6 +17,7 @@ publish = false
 # `name = { workspace = true }` (adding features of its own where it needs them).
 [workspace.dependencies]
 wyvrn-service = { path = "crates/wyvrn-service" }
+wyvrn-hosted-did = { path = "crates/wyvrn-hosted-did" }
 
 # Tracks didcomm's default branch; pin a tag (tag = "...") once it publishes releases.
 didcomm-agent = { git = "https://github.com/wyvrn-cloud/didcomm" }

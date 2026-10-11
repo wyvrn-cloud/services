@@ -1,13 +1,12 @@
 //! The protocol: what each `did-hosting/1.0` message does.
 
-use affinidi_data_integrity::{DataIntegrityProof, VerifyOptions};
 use base64::Engine;
 use didcomm_agent::Received;
 use didcomm_core::resolver::DIDResolver;
 use serde_json::{json, Value};
 
 use crate::config::HostConfig;
-use crate::keys;
+use wyvrn_hosted_did::{keys, whois};
 use crate::log::{self, Checked};
 use crate::names::{Name, Reserved};
 use crate::store::{Published, Record, Store};
@@ -328,7 +327,7 @@ impl Host {
                     return Ok(Err(Refusal::new("e.p.msg.too-large", "The whois is over this host's limit of {1} bytes.").with(self.config.max_whois_bytes.to_string())));
                 }
                 let document: Value = record.log.as_deref().and_then(|log| last_document(log)).unwrap_or_default();
-                if let Err(why) = check_whois(&bytes, &did, &document) {
+                if let Err(why) = whois::check(&bytes, &did, &document) {
                     return Ok(Err(Refusal::new("e.p.msg.whois-invalid", why)));
                 }
                 Some(bytes)
@@ -469,51 +468,4 @@ fn set_whois_service(mut web_document: Value, has_whois: bool, host: &str, name:
 
 fn with_whois_service(checked: &Checked, has_whois: bool, host: &str, name: &Name) -> Value {
     set_whois_service(checked.web_document.clone(), has_whois, host, name)
-}
-
-/// A whois is a presentation held by the DID, signed by one of its authentication
-/// keys, and about nothing but the DID.
-fn check_whois(bytes: &[u8], did: &str, document: &Value) -> Result<(), String> {
-    let presentation: Value = serde_json::from_slice(bytes).map_err(|_| "The whois is not JSON.".to_string())?;
-    let holder = presentation["holder"].as_str().or(presentation["holder"]["id"].as_str());
-    if holder != Some(did) {
-        return Err(format!("The presentation's holder is not {did}."));
-    }
-    for credential in presentation["verifiableCredential"].as_array().into_iter().flatten() {
-        let subject = &credential["credentialSubject"];
-        let subjects: Vec<&Value> = match subject {
-            Value::Array(many) => many.iter().collect(),
-            one => vec![one],
-        };
-        if !subjects.iter().all(|s| s["id"].as_str() == Some(did)) {
-            return Err(format!("Every credential in a whois has to be about {did}."));
-        }
-    }
-
-    let proofs: Vec<Value> = match &presentation["proof"] {
-        Value::Array(many) => many.clone(),
-        Value::Object(_) => vec![presentation["proof"].clone()],
-        _ => return Err("The presentation is not signed.".to_string()),
-    };
-    let mut unsigned = presentation.clone();
-    unsigned.as_object_mut().map(|object| object.remove("proof"));
-    let methods = document["verificationMethod"].as_array().cloned().unwrap_or_default();
-    let authentication = keys::keys_for(document, "authentication");
-    for proof in proofs {
-        let Ok(proof) = serde_json::from_value::<DataIntegrityProof>(proof) else { continue };
-        // The key the proof names, if it is one of the DID's authentication keys.
-        let method_id = proof.verification_method.clone();
-        let fragment = method_id.rsplit('#').next().unwrap_or_default().to_string();
-        let key = methods
-            .iter()
-            .find(|m| m["id"].as_str().is_some_and(|id| id == method_id || id.rsplit('#').next() == Some(fragment.as_str())))
-            .and_then(|m| m["publicKeyMultibase"].as_str())
-            .filter(|key| authentication.iter().any(|a| a == key))
-            .and_then(keys::ed25519_from_multikey);
-        let Some(key) = key else { continue };
-        if proof.verify_with_public_key(&unsigned, &key, VerifyOptions::default()).is_ok() {
-            return Ok(());
-        }
-    }
-    Err("The presentation's proof doesn't verify against an authentication key of the DID.".to_string())
 }

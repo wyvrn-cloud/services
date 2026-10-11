@@ -1,0 +1,87 @@
+//! Deciding that a DID is what it claims, from what was fetched.
+
+use didwebvh_rs::DIDWebVHState;
+use serde_json::Value;
+
+use crate::keys;
+use crate::urls::Location;
+
+/// What a `did:webvh` log comes to, once it has verified.
+#[derive(Debug, Clone)]
+pub struct Verified {
+    pub document: Value,
+    pub version_id: String,
+    pub deactivated: bool,
+}
+
+/// Verifies `log` as the history of `did`: its SCID against the first entry, each
+/// entry against the one before, every proof against the keys allowed to update at
+/// that point. The error says what is wrong.
+pub async fn log(did: &str, log: &str) -> Result<Verified, String> {
+    let mut state = DIDWebVHState::default();
+    let (_, metadata) = state.resolve_log(did, log, None).await.map_err(|e| format!("the log doesn't verify: {e}"))?;
+    let last = state.log_entries().last().ok_or("the log is empty")?;
+    let document = last.get_did_document().map_err(|e| format!("the log gives no document: {e}"))?;
+    if document["id"].as_str() != Some(did) {
+        return Err(format!("the log is not {did}'s"));
+    }
+    Ok(Verified { document, version_id: metadata.version_id, deactivated: metadata.deactivated })
+}
+
+/// The DIDs a document says are also its subject.
+pub fn also_known_as(document: &Value) -> Vec<&str> {
+    document["alsoKnownAs"].as_array().into_iter().flatten().filter_map(Value::as_str).collect()
+}
+
+/// The `did:webvh` a `did:web` document says it is the shadow of: one it names
+/// that is at its own host and path. One somewhere else is another DID's business.
+pub fn webvh_behind<'a>(did_web: &str, web_document: &'a Value) -> Option<&'a str> {
+    let here = Location::of(did_web)?;
+    also_known_as(web_document)
+        .into_iter()
+        .find(|did| did.starts_with("did:webvh:") && Location::of(did).is_some_and(|there| there.same_place(&here)))
+}
+
+/// Whether a `did:webvh` document names `did_web` back: without that, anyone's
+/// `did:web` could claim to be the short name of someone else's `did:webvh`.
+pub fn names_back(webvh_document: &Value, did_web: &str) -> bool {
+    also_known_as(webvh_document).contains(&did_web)
+}
+
+/// Whether a `did:peer:4` (by its own document, which it carries) is the party a
+/// hosted DID belongs to: it names the hosted DID's `did:web`, and shares a
+/// key-agreement key with the hosted document. The first is its word; the second
+/// is what makes that word the holder's, since only the holder's log could have
+/// put that key in the hosted document.
+pub fn peer_is_holder(peer_document: &Value, did_web: &str, hosted_document: &Value) -> bool {
+    if !also_known_as(peer_document).contains(&did_web) {
+        return false;
+    }
+    let hosted = keys::keys_for(hosted_document, "keyAgreement");
+    keys::keys_for(peer_document, "keyAgreement").iter().any(|key| hosted.contains(key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_did_web_points_only_at_a_did_webvh_in_its_own_place() {
+        let document = json!({ "alsoKnownAs": ["did:peer:4zQm", "did:webvh:QmOther:elsewhere.example:alice", "did:webvh:QmScid:id.example:alice"] });
+        assert_eq!(webvh_behind("did:web:id.example:alice", &document), Some("did:webvh:QmScid:id.example:alice"));
+        assert_eq!(webvh_behind("did:web:id.example:bob", &document), None);
+        assert_eq!(webvh_behind("did:web:id.example:alice", &json!({})), None);
+    }
+
+    #[test]
+    fn a_peer_did_is_the_holder_when_it_says_so_and_shares_a_key() {
+        let hosted = json!({ "id": "did:webvh:Qm:id.example:alice", "verificationMethod": [{ "id": "#k", "publicKeyMultibase": "z6LSalice" }], "keyAgreement": ["#k"] });
+        let peer = |aka: &[&str], key: &str| json!({ "id": "did:peer:4x", "alsoKnownAs": aka, "verificationMethod": [{ "id": "#k", "publicKeyMultibase": key }], "keyAgreement": ["#k"] });
+        let web = "did:web:id.example:alice";
+        assert!(peer_is_holder(&peer(&[web], "z6LSalice"), web, &hosted));
+        // Saying so with someone else's key, or having the key and not saying so.
+        assert!(!peer_is_holder(&peer(&[web], "z6LSmallory"), web, &hosted));
+        assert!(!peer_is_holder(&peer(&[], "z6LSalice"), web, &hosted));
+    }
+}

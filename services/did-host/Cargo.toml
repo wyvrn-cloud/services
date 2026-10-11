@@ -9,16 +9,14 @@ publish.workspace = true
 
 [dependencies]
 wyvrn-service = { workspace = true }
+wyvrn-hosted-did = { workspace = true }
 didcomm-agent = { workspace = true }
 didcomm-core = { workspace = true }
 didcomm-quickstart = { workspace = true }
 didwebvh-rs = { workspace = true }
-affinidi-data-integrity = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
-bs58 = { workspace = true }
-ed25519-dalek = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -28,6 +26,8 @@ tower-http = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+affinidi-data-integrity = { workspace = true }
+ed25519-dalek = { workspace = true }
 # The tests write real did:webvh logs, as a holder would.
 affinidi-secrets-resolver = { workspace = true }
 reqwest = { workspace = true }

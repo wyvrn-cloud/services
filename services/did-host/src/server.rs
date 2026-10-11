@@ -154,7 +154,14 @@ pub async fn check_staleness(state: &Arc<AppState>, now: i64) -> anyhow::Result<
             }
             Some(_) => {}
             None if now - record.heard_at > config.ask_after_days * DAY => {
-                let Some(did) = record.did.as_deref() else { continue };
+                // Asked at the did:peer:4 its document names, where it names one: that
+                // carries its own document, so nothing has to be fetched to reach it
+                // -- least of all this host's own files, from itself.
+                let document = record.log.as_deref().and_then(|log| log.lines().last()).and_then(|line| serde_json::from_str::<Value>(line).ok());
+                let peer = document.as_ref().and_then(|entry| {
+                    wyvrn_hosted_did::verify::also_known_as(&entry["state"]).into_iter().find(|did| did.starts_with("did:peer:")).map(str::to_string)
+                });
+                let Some(did) = peer.as_deref().or(record.did.as_deref()) else { continue };
                 // Any authenticated message back counts as an answer (Host::handle).
                 let ping = json!({
                     "type": "https://didcomm.org/trust-ping/2.0/ping",

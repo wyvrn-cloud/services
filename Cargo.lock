@@ -4160,7 +4160,6 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
- "bs58",
  "didcomm-agent",
  "didcomm-core",
  "didcomm-quickstart",
@@ -4175,7 +4174,22 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
+ "wyvrn-hosted-did",
  "wyvrn-service",
+]
+
+[[package]]
+name = "wyvrn-hosted-did"
+version = "0.0.1"
+dependencies = [
+ "affinidi-data-integrity",
+ "base64 0.22.1",
+ "bs58",
+ "didwebvh-rs",
+ "ed25519-dalek 2.2.0",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -10,6 +10,7 @@ use didcomm_agent::{Agent, Identity};
 use didwebvh_rs::{log_entry::LogEntryMethods, parameters::Parameters, DIDWebVHState, Multibase};
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
+use wyvrn_hosted_did::{Fetch, Standing};
 use wyvrn_did_host::{
     host::Host,
     server::{self, AppState},
@@ -504,4 +505,177 @@ async fn a_holder_ends_its_did_and_a_silent_one_goes_stale_until_it_speaks() {
     // Anything from Bob is an answer: he is there, and the name is his as before.
     assert_eq!(state_of_bob().await, "published");
     assert!(host.state.host.store.get("bob").unwrap().unwrap().asked_at.is_none());
+}
+
+/// Fetching as a resolver would, with the network left out: `https://id.example/…`
+/// is answered by the host under test, unless a prepared answer stands in for it.
+struct FromHost<'a> {
+    host: &'a Running,
+    instead: std::collections::HashMap<String, Option<Vec<u8>>>,
+    asked: std::sync::Mutex<Vec<String>>,
+}
+
+impl<'a> FromHost<'a> {
+    fn new(host: &'a Running) -> Self {
+        Self { host, instead: Default::default(), asked: Default::default() }
+    }
+
+    fn with(mut self, url: &str, body: Option<&str>) -> Self {
+        self.instead.insert(url.to_string(), body.map(|text| text.as_bytes().to_vec()));
+        self
+    }
+}
+
+impl Fetch for FromHost<'_> {
+    async fn get(&self, url: &str) -> Result<Option<Vec<u8>>, String> {
+        self.asked.lock().unwrap().push(url.to_string());
+        if let Some(prepared) = self.instead.get(url) {
+            return Ok(prepared.clone());
+        }
+        let path = url.strip_prefix(&format!("https://{DOMAIN}/")).ok_or_else(|| format!("{url} is not at the host"))?;
+        let response = fetch(self.host, path).await;
+        match response.status().as_u16() {
+            200 => Ok(Some(response.bytes().await.unwrap().to_vec())),
+            404 => Ok(None),
+            other => Err(format!("{url}: {other}")),
+        }
+    }
+}
+
+async fn profile_whois(holder: &Holder, name: &str) -> Value {
+    let did = holder.did();
+    let mut presentation = json!({
+        "@context": ["https://www.w3.org/ns/credentials/v2", "https://wyvrn.app/ns/profile/v1"],
+        "type": ["VerifiablePresentation"],
+        "holder": did,
+        "verifiableCredential": [{
+            "@context": ["https://www.w3.org/ns/credentials/v2", "https://wyvrn.app/ns/profile/v1"],
+            "type": ["VerifiableCredential", "ProfileCredential"],
+            "issuer": did,
+            "credentialSubject": {
+                "id": did, "type": "Person", "name": name, "description": "Writes about gardens.",
+                "image": { "type": "ImageObject", "contentUrl": "data:image/webp;base64,UklGRg", "encodingFormat": "image/webp", "width": 256, "height": 256 },
+            },
+        }],
+    });
+    let mut key = holder.auth.clone();
+    key.id = format!("{did}#key-1");
+    let proof = DataIntegrityProof::sign(&presentation, &key, SignOptions::new().with_proof_purpose("authentication")).await.unwrap();
+    presentation["proof"] = serde_json::to_value(proof).unwrap();
+    presentation
+}
+
+async fn publish_whois(holder: &Holder, presentation: &Value) {
+    let attachment = json!([{ "id": "whois", "media_type": "application/vp", "data": { "base64": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(presentation.to_string()) } }]);
+    let answer = holder.ask("publish-whois", json!({ "name": holder.name }), Some(attachment)).await;
+    assert_eq!(kind(&answer), "status", "{answer}");
+}
+
+#[tokio::test]
+async fn someone_given_the_short_name_reaches_the_verified_did_and_its_profile() {
+    let host = start_host(&[]).await;
+    let mut alice = Holder::new(&host, "alice");
+    alice.register().await;
+    publish_whois(&alice, &profile_whois(&alice, "Alice").await).await;
+    let web = "did:web:id.example:alice";
+
+    // Bob is given the short name. He ends up knowing Alice by the did:webvh, with
+    // its history verified, and reads who she says she is -- having sent her nothing.
+    let fetcher = FromHost::new(&host);
+    let resolved = wyvrn_hosted_did::resolve(web, &fetcher).await.unwrap();
+    assert_eq!(resolved.did, alice.did());
+    assert_eq!(resolved.did_web.as_deref(), Some(web));
+    assert_eq!(resolved.standing, Standing::Verified);
+    let profile = wyvrn_hosted_did::whois_of(&resolved, &fetcher).await.unwrap().expect("a profile");
+    assert_eq!(profile.name.as_deref(), Some("Alice"));
+    assert!(profile.image.unwrap().is_inline());
+    // Three files, all at the host the name is at: nobody else learns Bob looked.
+    assert_eq!(
+        *fetcher.asked.lock().unwrap(),
+        ["https://id.example/alice/did.json", "https://id.example/alice/did.jsonl", "https://id.example/alice/whois.vp"]
+    );
+
+    // Given the did:webvh itself, the same party, and the short name it goes by.
+    let direct = wyvrn_hosted_did::resolve(&alice.did(), &FromHost::new(&host)).await.unwrap();
+    assert_eq!((direct.did.as_str(), direct.did_web.as_deref(), direct.standing), (alice.did().as_str(), Some(web), Standing::Verified));
+
+    // A message from the did:peer:4 her document names is hers: it names the short
+    // name back, and holds a key of the document. Someone else's doesn't.
+    let peer_document = |agent: &Agent, also: &[&str]| {
+        let mut document = agent.identity().did_document(&agent.did(), "https://example.invalid/");
+        document["alsoKnownAs"] = json!(also);
+        document
+    };
+    assert!(wyvrn_hosted_did::verify::peer_is_holder(&peer_document(&alice.agent, &[web]), web, &resolved.document));
+    let mallory = Agent::new(Identity::generate().unwrap()).unwrap();
+    assert!(!wyvrn_hosted_did::verify::peer_is_holder(&peer_document(&mallory, &[web]), web, &resolved.document));
+}
+
+#[tokio::test]
+async fn a_host_cannot_pass_off_another_history_under_the_short_name() {
+    let host = start_host(&[]).await;
+    let mut alice = Holder::new(&host, "alice");
+    alice.register().await;
+    let web = "did:web:id.example:alice";
+    let real_log = fetch(&host, "alice/did.jsonl").await.text().await.unwrap();
+    let real_web = fetch(&host, "alice/did.json").await.text().await.unwrap();
+
+    // A log altered after it was signed: the did:webvh doesn't verify, so all that
+    // is left is the did:web, on the host's word and marked as such.
+    let altered = FromHost::new(&host).with("https://id.example/alice/did.jsonl", Some(&real_log.replace("#key-2", "#key-9")));
+    let resolved = wyvrn_hosted_did::resolve(web, &altered).await.unwrap();
+    assert_eq!((resolved.did.as_str(), resolved.standing), (web, Standing::HostsWord));
+    // Asked for by its did:webvh, there is nothing to fall back to.
+    assert!(wyvrn_hosted_did::resolve(&alice.did(), &altered).await.is_err());
+
+    // The log gone: the same.
+    let missing = FromHost::new(&host).with("https://id.example/alice/did.jsonl", None);
+    assert_eq!(wyvrn_hosted_did::resolve(web, &missing).await.unwrap().standing, Standing::HostsWord);
+
+    // Mallory's own, perfectly valid did:webvh, which the host's did:web for
+    // "alice" is made to point at. It is in another place, so it isn't followed;
+    // and one in the right place that doesn't name the did:web back isn't accepted.
+    let mut mallory = Holder::new(&host, "mallory");
+    mallory.register().await;
+    let pointing_away = real_web.replace(&alice.did(), &mallory.did());
+    let elsewhere = FromHost::new(&host).with("https://id.example/alice/did.json", Some(&pointing_away));
+    let resolved = wyvrn_hosted_did::resolve(web, &elsewhere).await.unwrap();
+    assert_eq!((resolved.did.as_str(), resolved.standing), (web, Standing::HostsWord));
+    assert!(!elsewhere.asked.lock().unwrap().iter().any(|url| url.contains("mallory")));
+
+    // A document served for the name that is some other DID's is not taken at all.
+    let not_its_own = FromHost::new(&host).with("https://id.example/alice/did.json", Some(&real_web.replace(web, "did:web:id.example:alicia")));
+    assert!(wyvrn_hosted_did::resolve(web, &not_its_own).await.is_err());
+
+    // A whois that isn't hers: signed by Mallory for Mallory, served at Alice's.
+    publish_whois(&mallory, &profile_whois(&mallory, "Alice").await).await;
+    let mallorys = fetch(&host, "mallory/whois.vp").await.text().await.unwrap();
+    let swapped = FromHost::new(&host).with("https://id.example/alice/whois.vp", Some(&mallorys));
+    let resolved = wyvrn_hosted_did::resolve(web, &swapped).await.unwrap();
+    assert_eq!(resolved.standing, Standing::Verified);
+    assert!(wyvrn_hosted_did::whois_of(&resolved, &swapped).await.is_err());
+}
+
+#[tokio::test]
+async fn a_name_given_to_someone_else_leads_to_a_different_did() {
+    let admin = Agent::new(Identity::generate().unwrap()).unwrap();
+    let host = start_host(&[admin.did()]).await;
+    let web = "did:web:id.example:alice";
+    let mut first = Holder::new(&host, "alice");
+    first.register().await;
+    let before = wyvrn_hosted_did::resolve(web, &FromHost::new(&host)).await.unwrap();
+
+    let free = json!({ "type": format!("{P}free"), "body": { "name": "alice" }, "return_route": "all" });
+    admin.send(&host.did, &free).await.unwrap().unwrap();
+    assert!(wyvrn_hosted_did::resolve(web, &FromHost::new(&host)).await.is_err());
+
+    let mut second = Holder::new(&host, "alice");
+    second.register().await;
+    let after = wyvrn_hosted_did::resolve(web, &FromHost::new(&host)).await.unwrap();
+    // The short name is the same; who it names is not, and that shows: an app that
+    // kept the did:webvh it first resolved sees a different one.
+    assert_eq!(before.did_web, after.did_web);
+    assert_eq!((before.standing, after.standing), (Standing::Verified, Standing::Verified));
+    assert_ne!(before.did, after.did);
+    assert_eq!(after.did, second.did());
 }
