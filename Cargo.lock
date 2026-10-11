@@ -4196,6 +4196,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyvrn-hosted-did-wasm"
+version = "0.0.1"
+dependencies = [
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wyvrn-hosted-did",
+]
+
+[[package]]
 name = "wyvrn-service"
 version = "0.0.1"
 dependencies = [

@@ -15,10 +15,13 @@
 //! - [`read`]: all of the reading, one file at a time, for a caller that does its
 //!   own fetching.
 //!
+//! - [`api`]: the lot as text in and text out, for an app to call.
+//!
 //! [`resolve`] puts them in order around a [`Fetch`], which is the only part that
 //! touches a network: an HTTPS client in an app, the host's own store in the host,
 //! a map of prepared answers in a test.
 
+pub mod api;
 pub mod keys;
 pub mod read;
 pub mod resolve;
