@@ -317,15 +317,17 @@ async fn a_subscribers_reaction_is_counted_for_every_subscriber_and_on_the_web_p
     };
     reader.agent.send(&channel.did, &react(json!(["🎉"]), server::now())).await.unwrap();
 
-    // Both are told how many; each is told what is theirs, and neither who.
+    // Both are told how many, and each what is theirs. A subscriber isn't told
+    // who; an admin, who can list the subscribers anyway, is.
     let told_reader = reader.next_of(channel::REACTIONS).await;
     assert_eq!(told_reader["body"]["id"], post_id);
     assert_eq!(told_reader["body"]["counts"], json!({"🎉": 1}));
     assert_eq!(told_reader["body"]["yours"], json!(["🎉"]));
+    assert!(told_reader["body"].get("who").is_none());
     let told_admin = admin.next_of(channel::REACTIONS).await;
     assert_eq!(told_admin["body"]["counts"], json!({"🎉": 1}));
     assert_eq!(told_admin["body"]["yours"], json!([]));
-    assert!(!told_admin.to_string().contains(&reader.did()));
+    assert_eq!(told_admin["body"]["who"], json!({"🎉": [reader.did()]}));
 
     let page = reqwest::get(format!("{}posts/1", channel.url)).await.unwrap().text().await.unwrap();
     assert!(page.contains("🎉 <span>1</span>"), "{page}");

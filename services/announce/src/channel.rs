@@ -24,6 +24,10 @@ pub const REACTIONS: &str = "https://wyvrn.app/announcements/1.0/reactions";
 /// How a subscriber reacts to a post: message-reactions/1.0, as in any conversation.
 pub const MESSAGE_REACTIONS_PIURI: &str = "https://wyvrn.app/message-reactions/1.0";
 pub const MESSAGE_REACTIONS: &str = "https://wyvrn.app/message-reactions/1.0/reactions";
+/// How many of an emoji's reactors an admin is named. The count says how many
+/// there are; a DID can run to a couple of kilobytes, and a popular post to
+/// thousands of reactions.
+pub const MAX_NAMED_REACTORS: usize = 50;
 /// message-reactions/1.0: a message shows at most this many different emoji.
 pub const MAX_DISTINCT_REACTIONS: usize = 20;
 
@@ -156,15 +160,27 @@ impl Channel {
     }
 
     /// A post's reactions as one member is told of them: the counts everyone gets,
-    /// and what that member has on it themselves.
+    /// and what that member has on it themselves. An admin is also told who: an
+    /// admin can already list the channel's subscribers, so it tells them nothing
+    /// about who is here that they couldn't find out.
     fn reactions_body(&self, post: &Post, member: &str, now: i64) -> anyhow::Result<Value> {
-        Ok(json!({
+        let mut body = json!({
             "id": post.id,
             "seq": post.seq,
             "counts": self.reaction_counts(post.seq)?,
             "yours": self.store.reactions_of(post.seq, member)?,
             "at": now,
-        }))
+        });
+        if self.store.member(member)?.is_some_and(|m| m.role == Role::Admin) {
+            body["who"] = Value::Object(
+                self.store
+                    .reactors(post.seq)?
+                    .into_iter()
+                    .map(|(emoji, names)| (emoji, json!(names.into_iter().take(MAX_NAMED_REACTORS).collect::<Vec<_>>())))
+                    .collect(),
+            );
+        }
+        Ok(body)
     }
 
     /// The `reactions` message telling `member` where post `seq`'s reactions stand.
@@ -284,7 +300,11 @@ impl Channel {
                         // Only where there are any: most posts have none.
                         if let Ok(reactions) = self.reactions_body(post, sender, now) {
                             if reactions["counts"].as_object().is_some_and(|counts| !counts.is_empty()) {
-                                entry["reactions"] = json!({"counts": reactions["counts"], "yours": reactions["yours"], "at": now});
+                                let mut account = json!({"counts": reactions["counts"], "yours": reactions["yours"], "at": now});
+                                if let Some(who) = reactions.get("who") {
+                                    account["who"] = who.clone();
+                                }
+                                entry["reactions"] = account;
                             }
                         }
                         entry
@@ -686,12 +706,20 @@ mod tests {
         assert_eq!(told["type"], REACTIONS);
         assert_eq!(told["body"], json!({"id": post.id, "seq": 1, "counts": {"👍": 2, "❤️": 1}, "yours": ["👍", "❤️"], "at": 40}));
         assert!(!told.to_string().contains("did:a"));
-        assert_eq!(channel.reactions_notice(1, "did:a", 40).unwrap().unwrap()["body"]["yours"], json!(["👍"]));
+        // An admin, who can list the subscribers anyway, is told who as well: by
+        // name where they gave one.
+        channel.store.set_name("did:s", Some("Sam")).unwrap();
+        let admin = channel.reactions_notice(1, "did:a", 40).unwrap().unwrap();
+        assert_eq!(admin["body"]["yours"], json!(["👍"]));
+        assert_eq!(admin["body"]["who"], json!({"👍": ["Sam", "did:a"], "❤️": ["Sam"]}));
+        let asked = channel.handle("did:a", &message(HISTORY_REQUEST, json!({})), 41).unwrap().reply.unwrap();
+        assert_eq!(asked["body"]["announcements"][0]["reactions"]["who"]["❤️"], json!(["Sam"]));
 
         // The log says the same to whoever asks for it.
         let history = channel.handle("did:s", &message(HISTORY_REQUEST, json!({})), 41).unwrap().reply.unwrap();
         assert_eq!(history["body"]["announcements"][0]["reactions"]["counts"], json!({"👍": 2, "❤️": 1}));
         assert_eq!(history["body"]["announcements"][0]["reactions"]["yours"], json!(["👍", "❤️"]));
+        assert!(history["body"]["announcements"][0]["reactions"].get("who").is_none());
     }
 
     #[test]

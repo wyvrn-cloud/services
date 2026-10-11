@@ -366,6 +366,29 @@ impl Store {
         Ok(counts)
     }
 
+    /// Who has each emoji on post `seq`: a name where the member gave one, their DID
+    /// where they didn't, earliest first. For an admin's eyes only.
+    pub fn reactors(&self, seq: i64) -> Result<Vec<(String, Vec<String>)>> {
+        let connection = self.connection();
+        let mut statement = connection.prepare(
+            "SELECT reactions.emoji, COALESCE(members.name, reactions.did)
+             FROM reactions LEFT JOIN members ON members.did = reactions.did
+             WHERE reactions.seq = ?1 ORDER BY reactions.at, reactions.did",
+        )?;
+        let sets: Vec<(String, String)> =
+            statement.query_map([seq], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<Result<_>>()?;
+        let mut reactors: Vec<(String, Vec<String>)> = Vec::new();
+        for (set, who) in sets {
+            for emoji in serde_json::from_str::<Vec<String>>(&set).unwrap_or_default() {
+                match reactors.iter_mut().find(|(known, _)| *known == emoji) {
+                    Some((_, names)) => names.push(who.clone()),
+                    None => reactors.push((emoji, vec![who.clone()])),
+                }
+            }
+        }
+        Ok(reactors)
+    }
+
     pub fn latest_seq(&self) -> Result<i64> {
         self.connection().query_row("SELECT COALESCE(MAX(seq), 0) FROM posts", [], |row| row.get(0))
     }
