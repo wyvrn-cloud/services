@@ -97,10 +97,14 @@ impl Store {
                 heard_at INTEGER NOT NULL DEFAULT 0,
                 asked_at INTEGER
             );
-            -- Every key of every published document, and the one name it is under.
+            -- Every key any version of a hosted document has had, by name; and
+            -- whether the name's holder has shown it holds it (a message
+            -- authenticated with it) rather than only listed it.
             CREATE TABLE IF NOT EXISTS keys (
-                key TEXT PRIMARY KEY,
-                name TEXT NOT NULL
+                key TEXT NOT NULL,
+                name TEXT NOT NULL,
+                proven INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (key, name)
             );
             CREATE INDEX IF NOT EXISTS keys_by_name ON keys (name);",
         )?;
@@ -156,21 +160,38 @@ impl Store {
         Ok(())
     }
 
-    /// The name, other than `except`, that has a published document with `key` in it.
-    pub fn name_with_key(&self, key: &str, except: &str) -> anyhow::Result<Option<String>> {
-        Ok(self.db().query_row("SELECT name FROM keys WHERE key = ?1 AND name <> ?2", [key, except], |row| row.get(0)).optional()?)
+    /// A name, other than `except`, whose holder has shown it holds `key`.
+    pub fn name_proven_with(&self, key: &str, except: &str) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .db()
+            .query_row("SELECT name FROM keys WHERE key = ?1 AND name <> ?2 AND proven = 1 LIMIT 1", [key, except], |row| row.get(0))
+            .optional()?)
     }
 
-    /// The published name whose holder has all of `keys`: who a sender is, if anyone.
-    pub fn name_held_by(&self, keys: &[String]) -> anyhow::Result<Option<String>> {
-        let Some(first) = keys.first() else { return Ok(None) };
-        let name: Option<String> = self.db().query_row("SELECT name FROM keys WHERE key = ?1", [first], |row| row.get(0)).optional()?;
-        let Some(name) = name else { return Ok(None) };
-        let holder = self.get(&name)?.map(|record| record.holder_keys).unwrap_or_default();
-        Ok(keys.iter().all(|key| holder.contains(key)).then_some(name))
+    /// The names whose holder has shown it holds `key`.
+    pub fn names_proven_with(&self, key: &str) -> anyhow::Result<Vec<String>> {
+        let db = self.db();
+        let mut statement = db.prepare("SELECT name FROM keys WHERE key = ?1 AND proven = 1")?;
+        let names = statement.query_map([key], |row| row.get(0))?.collect::<Result<_, _>>()?;
+        Ok(names)
     }
 
-    /// Puts a checked log under `name`. `keys` is every key of its document.
+    /// The names with `key` in any version of their document.
+    pub fn names_with_key(&self, key: &str) -> anyhow::Result<Vec<String>> {
+        let db = self.db();
+        let mut statement = db.prepare("SELECT name FROM keys WHERE key = ?1")?;
+        let names = statement.query_map([key], |row| row.get(0))?.collect::<Result<_, _>>()?;
+        Ok(names)
+    }
+
+    /// `name`'s holder has authenticated with `key`.
+    pub fn prove(&self, name: &str, key: &str) -> anyhow::Result<()> {
+        self.db().execute("UPDATE keys SET proven = 1 WHERE key = ?1 AND name = ?2", [key, name])?;
+        Ok(())
+    }
+
+    /// Puts a checked log under `name`. `keys` is every key any version of its
+    /// document has had: they are added to what is remembered, never taken away.
     #[allow(clippy::too_many_arguments)]
     pub fn publish(
         &self,
@@ -193,9 +214,8 @@ impl Store {
              WHERE name = ?1",
             params![name, published.as_str(), did, version_id, log, web_document, serde_json::to_string(holder_keys)?, now],
         )?;
-        tx.execute("DELETE FROM keys WHERE name = ?1", [name])?;
         for key in keys {
-            tx.execute("INSERT OR REPLACE INTO keys (key, name) VALUES (?1, ?2)", [key.as_str(), name])?;
+            tx.execute("INSERT OR IGNORE INTO keys (key, name) VALUES (?1, ?2)", [key.as_str(), name])?;
         }
         tx.commit()?;
         Ok(())

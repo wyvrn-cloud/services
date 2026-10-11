@@ -118,10 +118,12 @@ behind a mediator; what it hosts is served over HTTPS either way.
 
 ## What it does not do yet
 
-- **It knows a sender by its DID, not by the key it used.** The protocol says the
-  sender's key is to be one of the document's. What is checked is that *every*
-  key-agreement key of the sender's DID is in the document, which amounts to the
-  same thing and needs nothing the DIDComm library doesn't pass on.
+- **Behind a mediator it knows a sender less well.** A message posted to the
+  host shows which key it was written with, and everything is decided by that
+  key. One collected from a mediator arrives already opened, with only the
+  sender's DID: then every key that DID lists has to be the document's, and no
+  key is counted as shown to be a holder's (so "one name per holder" is not
+  enforced for what arrives that way). Holders should write to the host directly.
 - **No witnesses or watchers.** A host that withheld a holder's newer entries
   would not be caught by anything here.
 - **No rate limits.** Put one in front of it.

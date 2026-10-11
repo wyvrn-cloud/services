@@ -4163,6 +4163,7 @@ dependencies = [
  "didcomm-agent",
  "didcomm-core",
  "didcomm-quickstart",
+ "didcomm-resolver-peer",
  "didwebvh-rs",
  "ed25519-dalek 2.2.0",
  "reqwest",

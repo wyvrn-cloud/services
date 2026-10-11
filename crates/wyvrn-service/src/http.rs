@@ -11,7 +11,7 @@ use axum::{
     Router,
 };
 
-use crate::Service;
+use crate::{Incoming, Service};
 
 /// Something went wrong that is not the caller's doing: logged, and not described
 /// to them.
@@ -32,7 +32,15 @@ pub async fn receive<S: Service>(service: Arc<S>, body: Bytes) -> Response {
         Err(e) => return (StatusCode::BAD_REQUEST, format!("unpack failed: {e}")).into_response(),
     };
     tracing::debug!(sender = ?received.sender, message_type = received.message_type(), "received");
-    let reply = match service.answer(&received).await {
+    // Which key it was authenticated with: `receive` says whose, and a service
+    // that decides by the key (not every key of a DID is the same party's word)
+    // needs to know which. Opened a second time to learn it; the first already
+    // established that it opens.
+    let sender_kid = match agent.messaging().unpack_verified(&body).await {
+        Ok(unpacked) => unpacked.sender_kid,
+        Err(_) => None,
+    };
+    let reply = match service.answer(&Incoming { received: &received, sender_kid }).await {
         Ok(Some(reply)) => reply,
         Ok(None) => return StatusCode::ACCEPTED.into_response(),
         Err(e) => return internal(e),

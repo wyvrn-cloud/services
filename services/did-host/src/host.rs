@@ -74,16 +74,41 @@ pub struct Host {
     resolver: Box<dyn DIDResolver>,
 }
 
-/// Whether whoever authenticated with one of `sender` is the party that holds
-/// `theirs`: every key the sender's DID lists is one of theirs.
-///
-/// "Every", because all that is known of the sender is its DID: the message was
-/// authenticated with *one* of that DID's key-agreement keys, and which one is not
-/// passed on. If all of them are the party's, whichever it was is. (A DID made up
-/// to list someone else's key beside its own does not pass: its own key is not
-/// theirs.)
-fn is_party(sender: &[String], theirs: &[String]) -> bool {
-    !sender.is_empty() && sender.iter().all(|key| theirs.contains(key))
+/// Who sent a message, as far as its keys say.
+pub struct Sender {
+    pub did: String,
+    /// The key it authenticated with, where that is known (a message posted to the
+    /// host): the one key it has shown it holds.
+    key: Option<String>,
+    /// Every key-agreement key its DID lists.
+    keys: Vec<String>,
+}
+
+impl Sender {
+    /// Whether the sender is the party that `theirs` are the keys of.
+    ///
+    /// By the key it used, where that is known: it holds that key, so it is theirs
+    /// if that key is. What else its DID lists doesn't matter either way -- a device
+    /// more or a device fewer than the document has is still the same holder, and
+    /// someone else's key listed beside one's own makes nobody them.
+    ///
+    /// Where the key isn't known (a message collected from a mediator arrives
+    /// already opened), all that is known is that it holds *one* of its DID's keys,
+    /// so every one of them has to be theirs.
+    pub fn holds(&self, theirs: &[String]) -> bool {
+        match &self.key {
+            Some(key) => theirs.contains(key),
+            None => !self.keys.is_empty() && self.keys.iter().all(|key| theirs.contains(key)),
+        }
+    }
+
+    /// The keys to know it by again: the one it used, else all its DID lists.
+    fn own_keys(&self) -> Vec<String> {
+        match &self.key {
+            Some(key) => vec![key.clone()],
+            None => self.keys.clone(),
+        }
+    }
 }
 
 impl Host {
@@ -103,13 +128,92 @@ impl Host {
         }
     }
 
-    async fn is_admin(&self, sender: &str, sender_keys: &[String]) -> bool {
+    /// Who a message is from. `kid` is the id of the key it was authenticated with.
+    async fn sender(&self, did: &str, kid: Option<&str>) -> Sender {
+        let document = match self.resolver.resolve(did).await {
+            Ok(document) => document,
+            Err(error) => {
+                tracing::debug!(%did, %error, "couldn't resolve a sender's DID");
+                Value::Null
+            }
+        };
+        let keys = keys::keys_for(&document, "keyAgreement");
+        // The key that id names in the sender's own document, if it is one of its
+        // key-agreement keys.
+        let key = kid.and_then(|kid| {
+            let fragment = kid.rsplit('#').next().unwrap_or_default();
+            document["verificationMethod"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|method| method["id"].as_str().is_some_and(|id| id == kid || id.rsplit('#').next() == Some(fragment)))
+                .and_then(|method| method["publicKeyMultibase"].as_str())
+                .filter(|key| keys.iter().any(|k| k == key))
+                .map(str::to_string)
+        });
+        Sender { did: did.to_string(), key, keys }
+    }
+
+    async fn is_admin(&self, sender: &Sender) -> bool {
         for admin in &self.config.admins {
-            if admin == sender || is_party(sender_keys, &self.keys_of(admin).await) {
+            if *admin == sender.did || sender.holds(&self.keys_of(admin).await) {
                 return true;
             }
         }
         false
+    }
+
+    /// Whether one of `keys` has been shown to be held by the holder of a DID
+    /// under a name other than `except`: one name to a holder.
+    ///
+    /// "Shown to be held", not merely listed: a document can list any public key,
+    /// and a key someone else's document lists must not stop its real owner from
+    /// having a name. A key counts as a name's once its owner has acted as that
+    /// name's holder with it: published under it, or asked after it by name. Both
+    /// take the document listing the key (the holder's word) and a message about
+    /// that name authenticated with it (the key owner's).
+    fn in_use(&self, keys: &[String], except: &str) -> anyhow::Result<bool> {
+        for key in keys {
+            if self.store.name_proven_with(key, except)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Notes that a holder has been heard from: by a key it has shown to be its
+    /// own, that its document still lists.
+    pub async fn note_sender(&self, received: &Received, kid: Option<&str>, now: i64) -> anyhow::Result<()> {
+        let Some(did) = received.sender.as_deref() else { return Ok(()) };
+        let sender = self.sender(did, kid).await;
+        for key in sender.own_keys() {
+            for name in self.store.names_proven_with(&key)? {
+                if self.store.get(&name)?.is_some_and(|record| sender.holds(&record.holder_keys)) {
+                    self.store.heard(&name, now)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The sender has acted as `name`'s holder with the key it wrote with.
+    fn shown_to_hold(&self, sender: &Sender, name: &str) -> anyhow::Result<()> {
+        if let Some(key) = &sender.key {
+            self.store.prove(name, key)?;
+        }
+        Ok(())
+    }
+
+    /// The name whose DID the sender is the holder of, as its document stands.
+    fn name_of(&self, sender: &Sender) -> anyhow::Result<Option<String>> {
+        for key in sender.own_keys() {
+            for name in self.store.names_with_key(&key)? {
+                if self.store.get(&name)?.is_some_and(|record| record.published != Published::No && sender.holds(&record.holder_keys)) {
+                    return Ok(Some(name));
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub fn state_of(&self, name: &Name, record: Option<&Record>, now: i64) -> State {
@@ -143,23 +247,20 @@ impl Host {
 
     /// Acts on one message from an authenticated sender. `None` for a message that
     /// isn't this protocol's.
-    pub async fn handle(&self, received: &Received, now: i64) -> anyhow::Result<Option<Value>> {
-        let Some(sender) = received.sender.as_deref() else {
+    pub async fn handle(&self, received: &Received, kid: Option<&str>, now: i64) -> anyhow::Result<Option<Value>> {
+        let Some(did) = received.sender.as_deref() else {
             return Ok(None);
         };
-        let sender_keys = self.keys_of(sender).await;
-        // Anything from a holder says it is still there.
-        if let Some(name) = self.store.name_held_by(&sender_keys)? {
-            self.store.heard(&name, now)?;
-        }
+        let sender = self.sender(did, kid).await;
+        let sender = &sender;
         let body = &received.message["body"];
         let answer = match received.message_type() {
-            RESERVE => self.reserve(&sender_keys, body, now).await?,
-            PUBLISH => self.publish(&sender_keys, &received.message, now).await?,
-            PUBLISH_WHOIS => self.publish_whois(&sender_keys, &received.message, now)?,
-            STATUS_REQUEST => self.status(sender, &sender_keys, body, now).await?,
-            ASSIGN => self.assign(sender, &sender_keys, body, now).await?,
-            FREE => self.free(sender, &sender_keys, body, now).await?,
+            RESERVE => self.reserve(sender, body, now).await?,
+            PUBLISH => self.publish(sender, &received.message, now).await?,
+            PUBLISH_WHOIS => self.publish_whois(sender, &received.message, now)?,
+            STATUS_REQUEST => self.status(sender, body, now).await?,
+            ASSIGN => self.assign(sender, body, now).await?,
+            FREE => self.free(sender, body, now).await?,
             _ => return Ok(None),
         };
         Ok(Some(match answer {
@@ -172,12 +273,12 @@ impl Host {
         }))
     }
 
-    async fn reserve(&self, sender_keys: &[String], body: &Value, now: i64) -> anyhow::Result<Answer> {
+    async fn reserve(&self, sender: &Sender, body: &Value, now: i64) -> anyhow::Result<Answer> {
         let name = match self.name(body) {
             Ok(name) => name,
             Err(refusal) => return Ok(Err(refusal)),
         };
-        if sender_keys.is_empty() {
+        if sender.own_keys().is_empty() {
             return Ok(Err(Refusal::new("e.p.msg.name-invalid", "Your DID has no key-agreement key this host can see.")));
         }
         let key = name.as_did_path();
@@ -185,7 +286,7 @@ impl Host {
         match self.state_of(&name, record.as_ref(), now) {
             State::Free => {}
             State::Held => {
-                if !record.as_ref().is_some_and(|r| is_party(sender_keys, &r.hold_keys)) {
+                if !record.as_ref().is_some_and(|r| sender.holds(&r.hold_keys)) {
                     return Ok(Err(Refusal::new("e.p.msg.name-taken", "Someone else is claiming that name right now.")));
                 }
             }
@@ -194,7 +295,7 @@ impl Host {
                     Some(did) => self.keys_of(did).await,
                     None => Vec::new(),
                 };
-                if !is_party(sender_keys, &assigned) {
+                if !sender.holds(&assigned) {
                     return Ok(Err(Refusal::new("e.p.msg.name-reserved", "That name is set aside.")));
                 }
             }
@@ -203,13 +304,11 @@ impl Host {
             }
         }
         // One name per holder: a key already in a document here can't claim another.
-        for sender_key in sender_keys {
-            if self.store.name_with_key(sender_key, &key)?.is_some() {
-                return Ok(Err(Refusal::new("e.p.msg.key-in-use", "You already have a DID hosted here under another name.")));
-            }
+        if self.in_use(&sender.own_keys(), &key)? {
+            return Ok(Err(Refusal::new("e.p.msg.key-in-use", "You already have a DID hosted here under another name.")));
         }
         let expires = now + self.config.hold_seconds;
-        self.store.hold(&key, sender_keys, expires)?;
+        self.store.hold(&key, &sender.own_keys(), expires)?;
         Ok(Ok((
             RESERVATION,
             json!({
@@ -221,7 +320,7 @@ impl Host {
         )))
     }
 
-    async fn publish(&self, sender_keys: &[String], message: &Value, now: i64) -> anyhow::Result<Answer> {
+    async fn publish(&self, sender: &Sender, message: &Value, now: i64) -> anyhow::Result<Answer> {
         let name = match self.name(&message["body"]) {
             Ok(name) => name,
             Err(refusal) => return Ok(Err(refusal)),
@@ -247,7 +346,7 @@ impl Host {
                 format!("{}\n{added}", hosted.log.as_deref().unwrap_or_default())
             }
             (State::Deactivated, _) => return Ok(Err(Refusal::new("e.p.msg.name-taken", "The DID under that name has been ended."))),
-            (State::Held, _) if record.as_ref().is_some_and(|r| is_party(sender_keys, &r.hold_keys)) => added.to_string(),
+            (State::Held, _) if record.as_ref().is_some_and(|r| sender.holds(&r.hold_keys)) => added.to_string(),
             _ => return Ok(Err(Refusal::new("e.p.msg.not-held", "Reserve the name first: it isn't held for you."))),
         };
         if full_log.len() > self.config.max_log_bytes {
@@ -267,26 +366,35 @@ impl Host {
         } else if self.config.require_portable && !checked.portable {
             return Ok(Err(Refusal::new("e.p.msg.log-invalid", "This host asks for \"portable\": true in a DID's first entry, so that it can be moved later.")));
         }
-        // 5: the sender holds the document's keys. On an update the sender may be
-        // one the entry itself has just added or removed, so either document's will do:
-        // that the entry is validly signed is what makes it the holder's.
+        // 5: the sender is one of the document's own: the key it wrote with is a
+        // key-agreement key of it. On an update that may be a device the entry itself
+        // has just added or removed, so either document's will do -- that the entry
+        // is validly signed is what makes it the holder's.
         let mut holder_keys = checked.key_agreement();
         let mut allowed = holder_keys.clone();
         if let Some(hosted) = hosted {
             allowed.extend(hosted.holder_keys.iter().cloned());
         }
-        if !is_party(sender_keys, &allowed) {
-            return Ok(Err(Refusal::new("e.p.msg.not-holder", "Your DID's key-agreement keys are not all in that document.")));
+        if !sender.holds(&allowed) {
+            return Ok(Err(Refusal::new("e.p.msg.not-holder", "The key you wrote with is not a key-agreement key of that document.")));
         }
-        if !jws.is_some_and(|jws| keys::signed_by_one_of(&bytes, jws, &checked.authentication())) {
+        let authentication = checked.authentication();
+        let Some(signed_with) = jws.and_then(|jws| keys::signer_among(&bytes, jws, &authentication)).cloned() else {
             return Ok(Err(Refusal::new("e.p.msg.log-invalid", "The attachment is not signed (jws) by an authentication key of the document.")));
-        }
-        // 6: its keys are nobody else's.
-        let all_keys = keys::all_keys(&checked.document);
-        for document_key in &all_keys {
-            if self.store.name_with_key(document_key, &key)?.is_some() {
-                return Ok(Err(Refusal::new("e.p.msg.key-in-use", "A key of that document is in a DID hosted here under another name.")));
-            }
+        };
+        // 6: its keys are nobody else's -- none that another name's holder has shown
+        // it holds, in that name's document now or at any time before. Remembering
+        // every version is what stops a key taken out of one document (a device
+        // removed) from being free to take a second name.
+        let mut all_keys: Vec<String> =
+            full_log.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).flat_map(|entry| keys::all_keys(&entry["state"])).collect();
+        all_keys.sort();
+        all_keys.dedup();
+        let mut to_check = keys::all_keys(&checked.document);
+        to_check.extend(sender.own_keys());
+        to_check.push(signed_with.clone());
+        if self.in_use(&to_check, &key)? {
+            return Ok(Err(Refusal::new("e.p.msg.key-in-use", "A key of that document belongs to a DID hosted here under another name.")));
         }
 
         holder_keys.sort();
@@ -302,6 +410,10 @@ impl Host {
             &all_keys,
             now,
         )?;
+        // The keys this was written with and signed with are now known to be the
+        // holder's.
+        self.shown_to_hold(sender, &key)?;
+        self.store.prove(&key, &signed_with)?;
         tracing::info!(name = %key, did = %checked.did, version = %checked.version_id, "published");
         Ok(Ok((
             PUBLISHED,
@@ -309,14 +421,14 @@ impl Host {
         )))
     }
 
-    fn publish_whois(&self, sender_keys: &[String], message: &Value, now: i64) -> anyhow::Result<Answer> {
+    fn publish_whois(&self, sender: &Sender, message: &Value, now: i64) -> anyhow::Result<Answer> {
         let name = match self.name(&message["body"]) {
             Ok(name) => name,
             Err(refusal) => return Ok(Err(refusal)),
         };
         let key = name.as_did_path();
         let record = self.store.get(&key)?;
-        let Some(record) = record.filter(|r| matches!(r.published, Published::Yes | Published::Stale) && is_party(sender_keys, &r.holder_keys)) else {
+        let Some(record) = record.filter(|r| matches!(r.published, Published::Yes | Published::Stale) && sender.holds(&r.holder_keys)) else {
             return Ok(Err(Refusal::new("e.p.msg.not-holder", "You don't hold a DID under that name.")));
         };
         let did = record.did.clone().unwrap_or_default();
@@ -337,6 +449,7 @@ impl Host {
         let web_document = record.web_document.as_deref().and_then(|text| serde_json::from_str::<Value>(text).ok()).unwrap_or_default();
         let web_document = set_whois_service(web_document, whois.is_some(), &self.config.domain, &name);
         self.store.set_whois(&key, whois.as_deref(), &serde_json::to_string(&web_document)?)?;
+        self.shown_to_hold(sender, &key)?;
         let record = self.store.get(&key)?;
         Ok(Ok((STATUS, self.status_body(&name, record.as_ref(), true, now))))
     }
@@ -352,33 +465,39 @@ impl Host {
         body
     }
 
-    async fn status(&self, sender: &str, sender_keys: &[String], body: &Value, now: i64) -> anyhow::Result<Answer> {
+    async fn status(&self, sender: &Sender, body: &Value, now: i64) -> anyhow::Result<Answer> {
         let name = match body.get("name") {
             Some(_) => match self.name(body) {
                 Ok(name) => name,
                 Err(refusal) => return Ok(Err(refusal)),
             },
             // None asked for: the name the sender holds, if any.
-            None => match self.store.name_held_by(sender_keys)?.and_then(|name| Name::parse(&name, usize::MAX)) {
+            None => match self.name_of(sender)?.and_then(|name| Name::parse(&name, usize::MAX)) {
                 Some(name) => name,
                 None => return Ok(Ok((STATUS, json!({ "state": "free", "yours": false })))),
             },
         };
+        let asked_by_name = body.get("name").is_some();
         let record = self.store.get(&name.as_did_path())?;
         let yours = match self.state_of(&name, record.as_ref(), now) {
-            State::Published | State::Stale | State::Deactivated => record.as_ref().is_some_and(|r| is_party(sender_keys, &r.holder_keys)),
-            State::Held => record.as_ref().is_some_and(|r| is_party(sender_keys, &r.hold_keys)),
+            State::Published | State::Stale | State::Deactivated => record.as_ref().is_some_and(|r| sender.holds(&r.holder_keys)),
+            State::Held => record.as_ref().is_some_and(|r| sender.holds(&r.hold_keys)),
             State::Reserved => match record.as_ref().and_then(|r| r.assigned.as_deref()) {
-                Some(did) => did == sender || is_party(sender_keys, &self.keys_of(did).await),
+                Some(did) => did == sender.did || sender.holds(&self.keys_of(did).await),
                 None => false,
             },
             State::Free => false,
         };
+        // Asking after one's own DID by its name is a device saying it is that
+        // holder's: how one that never publishes (the second phone) comes to count.
+        if yours && asked_by_name && record.as_ref().is_some_and(|r| r.published != Published::No) {
+            self.shown_to_hold(sender, &name.as_did_path())?;
+        }
         Ok(Ok((STATUS, self.status_body(&name, record.as_ref(), yours, now))))
     }
 
-    async fn assign(&self, sender: &str, sender_keys: &[String], body: &Value, now: i64) -> anyhow::Result<Answer> {
-        if !self.is_admin(sender, sender_keys).await {
+    async fn assign(&self, sender: &Sender, body: &Value, now: i64) -> anyhow::Result<Answer> {
+        if !self.is_admin(sender).await {
             return Ok(Err(Refusal::new("e.p.msg.not-admin", "Only this host's admins decide who may claim a name.")));
         }
         let text = body["name"].as_str().unwrap_or_default();
@@ -402,13 +521,13 @@ impl Host {
             return Ok(Err(Refusal::new("e.p.msg.name-taken", "A DID is hosted under that name. Free it first.")));
         }
         self.store.assign(&key, holder)?;
-        tracing::info!(name = %key, holder = holder.unwrap_or("nobody"), by = %sender, "assigned");
+        tracing::info!(name = %key, holder = holder.unwrap_or("nobody"), by = %sender.did, "assigned");
         let record = self.store.get(&key)?;
         Ok(Ok((STATUS, self.status_body(&name, record.as_ref(), false, now))))
     }
 
-    async fn free(&self, sender: &str, sender_keys: &[String], body: &Value, now: i64) -> anyhow::Result<Answer> {
-        if !self.is_admin(sender, sender_keys).await {
+    async fn free(&self, sender: &Sender, body: &Value, now: i64) -> anyhow::Result<Answer> {
+        if !self.is_admin(sender).await {
             return Ok(Err(Refusal::new("e.p.msg.not-admin", "Only this host's admins can free a name.")));
         }
         let name = match self.name(body) {
@@ -418,7 +537,7 @@ impl Host {
         let key = name.as_did_path();
         let was = self.store.get(&key)?.and_then(|r| r.did);
         self.store.free(&key)?;
-        tracing::info!(name = %key, did = was.as_deref().unwrap_or("-"), by = %sender, why = body["comment"].as_str().unwrap_or("-"), "freed");
+        tracing::info!(name = %key, did = was.as_deref().unwrap_or("-"), by = %sender.did, why = body["comment"].as_str().unwrap_or("-"), "freed");
         Ok(Ok((STATUS, self.status_body(&name, None, false, now))))
     }
 }

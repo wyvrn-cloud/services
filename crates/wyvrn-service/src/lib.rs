@@ -26,13 +26,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use didcomm_agent::{Agent, Received};
 use serde_json::Value;
 
+/// A message that has arrived, and what is known of how.
+pub struct Incoming<'a> {
+    pub received: &'a Received,
+    /// The id of the key the sender authenticated with (`did:…#key-2`): *which* of
+    /// its DID's keys it holds, not only that it holds one. Known for a message
+    /// posted to the endpoint. `None` for one collected from a mediator, which
+    /// arrives already opened, and for one nobody authenticated.
+    pub sender_kid: Option<String>,
+}
+
 /// A service, as the plumbing here sees it: an agent, and what it answers.
 pub trait Service: Send + Sync + 'static {
     fn agent(&self) -> &Agent;
 
     /// Acts on one message, however it got here (posted to the endpoint, or
     /// collected from a mediator), and returns what to answer it with, if anything.
-    fn answer(&self, received: &Received) -> impl Future<Output = anyhow::Result<Option<Value>>> + Send;
+    fn answer(&self, incoming: &Incoming<'_>) -> impl Future<Output = anyhow::Result<Option<Value>>> + Send;
 }
 
 /// Now, in seconds since the epoch: what DIDComm's `created_time` counts in.

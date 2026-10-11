@@ -12,13 +12,13 @@ use axum::{
     routing::get,
     Router,
 };
-use didcomm_agent::{Agent, Features, Identity, Received};
+use didcomm_agent::{Agent, Features, Identity};
 use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
 use wyvrn_service::{
     address,
     http::{internal, receive},
-    now, Service,
+    now, Incoming, Service,
 };
 
 use crate::config::Config;
@@ -51,15 +51,19 @@ impl Service for HostService {
         &self.0.agent
     }
 
-    async fn answer(&self, received: &Received) -> anyhow::Result<Option<Value>> {
+    async fn answer(&self, incoming: &Incoming<'_>) -> anyhow::Result<Option<Value>> {
+        let received = incoming.received;
         // Nothing is done for someone nobody vouches for.
         if received.sender.is_none() {
             return Ok(None);
         }
+        // A ping's answer, and anything else, is a holder saying it is still there:
+        // noted before the automatic replies, which are otherwise all a ping gets.
+        self.0.host.note_sender(received, incoming.sender_kid.as_deref(), now()).await?;
         if let Some(reply) = self.0.agent.auto_reply(received) {
             return Ok(Some(reply));
         }
-        self.0.host.handle(received, now()).await
+        self.0.host.handle(received, incoming.sender_kid.as_deref(), now()).await
     }
 }
 

@@ -26,6 +26,9 @@ tower-http = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# The tests make did:peer:4s that list several keys: a holder with several devices,
+# and one made up to list a key that isn't its own.
+didcomm-resolver-peer = { workspace = true }
 affinidi-data-integrity = { workspace = true }
 ed25519-dalek = { workspace = true }
 # The tests write real did:webvh logs, as a holder would.

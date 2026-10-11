@@ -26,7 +26,7 @@ use crate::config::Config;
 use wyvrn_service::{
     address,
     http::{internal, receive},
-    Service,
+    Incoming, Service,
 };
 pub use wyvrn_service::{address::did_web_for, now};
 use crate::web;
@@ -215,8 +215,8 @@ impl Service for ChannelService {
         &self.0.agent
     }
 
-    async fn answer(&self, received: &Received) -> anyhow::Result<Option<Value>> {
-        answer(&self.0, received).await
+    async fn answer(&self, incoming: &Incoming<'_>) -> anyhow::Result<Option<Value>> {
+        answer(&self.0, incoming.received).await
     }
 }
 

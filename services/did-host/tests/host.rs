@@ -45,6 +45,25 @@ async fn start_host(admins: &[String]) -> Running {
     Running { did, url, state }
 }
 
+fn key_agreement_of(identity: &Identity) -> String {
+    let document = identity.did_document("did:example:x", "https://example.invalid/");
+    document["verificationMethod"][1]["publicKeyMultibase"].as_str().unwrap().to_string()
+}
+
+/// An agent whose `did:peer:4` lists, beside its own key-agreement key, `others`:
+/// the keys of its other devices -- or keys that aren't its own at all.
+fn agent_listing(identity: Identity, others: &[String]) -> Agent {
+    use didcomm_resolver_peer::{peer4, KeyPurpose};
+    let document = identity.did_document("did:example:x", "https://example.invalid/");
+    let authentication = document["verificationMethod"][0]["publicKeyMultibase"].as_str().unwrap().to_string();
+    let own = key_agreement_of(&identity);
+    // `#key-2` is the one the agent holds, as `Agent::with_did` expects.
+    let mut keys = vec![(KeyPurpose::Authentication, authentication.as_str()), (KeyPurpose::KeyAgreement, own.as_str())];
+    keys.extend(others.iter().map(|key| (KeyPurpose::KeyAgreement, key.as_str())));
+    let did = peer4::generate(&keys, &[]).unwrap();
+    Agent::with_did(identity, &did)
+}
+
 fn signer() -> Secret {
     let mut key = Secret::generate_ed25519(None, None);
     let public = key.get_public_keymultibase().unwrap();
@@ -63,6 +82,9 @@ struct Holder {
     log: DIDWebVHState,
     name: String,
     host: String,
+    /// The key-agreement keys of this holder's other devices, which its document
+    /// lists beside this one's.
+    other_devices: Vec<String>,
 }
 
 impl Holder {
@@ -74,28 +96,35 @@ impl Holder {
             log: DIDWebVHState::default(),
             name: name.to_string(),
             host: host.did.clone(),
+            other_devices: Vec::new(),
         }
     }
 
     fn key_agreement(&self) -> String {
-        let document = self.agent.identity().did_document("did:example:x", "https://example.invalid/");
-        document["verificationMethod"][1]["publicKeyMultibase"].as_str().unwrap().to_string()
+        key_agreement_of(self.agent.identity())
     }
 
     /// The DID document the holder publishes, with `{SCID}` where the log's hash goes.
     fn document(&self, extra_services: Value) -> Value {
         // Before the first entry there is no hash to put in it yet.
         let did = if self.log.log_entries().is_empty() { format!("did:webvh:{{SCID}}:{DOMAIN}:{}", self.name) } else { self.did() };
+        let mut methods = vec![
+            json!({ "id": format!("{did}#key-1"), "type": "Multikey", "controller": did, "publicKeyMultibase": self.auth.get_public_keymultibase().unwrap() }),
+            json!({ "id": format!("{did}#key-2"), "type": "Multikey", "controller": did, "publicKeyMultibase": self.key_agreement() }),
+        ];
+        let mut key_agreement = vec![format!("{did}#key-2")];
+        for (index, key) in self.other_devices.iter().enumerate() {
+            let id = format!("{did}#key-{}", index + 3);
+            methods.push(json!({ "id": id, "type": "Multikey", "controller": did, "publicKeyMultibase": key }));
+            key_agreement.push(id);
+        }
         json!({
             "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1"],
             "id": did,
             "alsoKnownAs": [format!("did:web:{DOMAIN}:{}", self.name), self.agent.did()],
-            "verificationMethod": [
-                { "id": format!("{did}#key-1"), "type": "Multikey", "controller": did, "publicKeyMultibase": self.auth.get_public_keymultibase().unwrap() },
-                { "id": format!("{did}#key-2"), "type": "Multikey", "controller": did, "publicKeyMultibase": self.key_agreement() },
-            ],
+            "verificationMethod": methods,
             "authentication": [format!("{did}#key-1")],
-            "keyAgreement": [format!("{did}#key-2")],
+            "keyAgreement": key_agreement,
             "service": extra_services,
         })
     }
@@ -678,4 +707,114 @@ async fn a_name_given_to_someone_else_leads_to_a_different_did() {
     assert_eq!((before.standing, after.standing), (Standing::Verified, Standing::Verified));
     assert_ne!(before.did, after.did);
     assert_eq!(after.did, second.did());
+}
+
+#[tokio::test]
+async fn any_of_a_holders_devices_acts_for_it_whatever_else_its_did_lists() {
+    let host = start_host(&[]).await;
+    // Alice has a phone and a tablet. Her document lists both; each writes to the
+    // host as itself, from a DID that lists only its own key.
+    let tablet = Agent::new(Identity::generate().unwrap()).unwrap();
+    let mut alice = Holder::new(&host, "alice");
+    alice.other_devices = vec![key_agreement_of(tablet.identity())];
+    alice.register().await;
+    let phone = std::mem::replace(&mut alice.agent, tablet);
+
+    // The tablet: not the device that registered, and its DID has one key where the
+    // document has two. It is hers all the same.
+    assert_eq!(alice.ask("status-request", json!({}), None).await["body"]["yours"], true);
+    publish_whois(&alice, &profile_whois(&alice, "Alice").await).await;
+
+    // The phone again, from a DID that also lists a watch the document doesn't have
+    // yet: a key more than the document is no bar either, and it is this device
+    // that adds it.
+    let watch = key_agreement_of(&Identity::generate().unwrap());
+    let phone_identity = Identity::from_json(&phone.identity().to_json().unwrap()).unwrap();
+    alice.agent = agent_listing(phone_identity, &[alice.other_devices[0].clone(), watch.clone()]);
+    assert_eq!(alice.ask("status-request", json!({}), None).await["body"]["yours"], true);
+    let before = alice.version_id();
+    alice.other_devices.push(watch);
+    next_second().await;
+    alice.log.update_document(alice.document(json!([])), &alice.update).await.unwrap();
+    assert_eq!(kind(&alice.publish(1, Some(&before)).await), "published");
+    let web: Value = fetch(&host, "alice/did.json").await.json().await.unwrap();
+    assert_eq!(web["keyAgreement"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn a_device_taken_out_of_a_did_cannot_take_a_second_name() {
+    let host = start_host(&[]).await;
+    let tablet = Agent::new(Identity::generate().unwrap()).unwrap();
+    let tablet_key = key_agreement_of(tablet.identity());
+    let mut alice = Holder::new(&host, "alice");
+    alice.other_devices = vec![tablet_key.clone()];
+    alice.register().await;
+
+    // The tablet is one of hers, and has said so: it asked after her DID by name.
+    let as_tablet = |message_type: &'static str, body: Value| {
+        let (tablet, to) = (&tablet, host.did.clone());
+        async move {
+            let message = json!({ "type": format!("{P}{message_type}"), "body": body, "return_route": "all" });
+            tablet.send(&to, &message).await.unwrap().expect("an answer").message
+        }
+    };
+    assert_eq!(as_tablet("status-request", json!({ "name": "alice" })).await["body"]["yours"], true);
+
+    // She removes it. It is no longer her DID's...
+    let before = alice.version_id();
+    alice.other_devices.clear();
+    next_second().await;
+    alice.log.update_document(alice.document(json!([])), &alice.update).await.unwrap();
+    assert_eq!(kind(&alice.publish(1, Some(&before)).await), "published");
+    assert_eq!(as_tablet("status-request", json!({ "name": "alice" })).await["body"]["yours"], false);
+    // ...and its key is not thereby free to claim another name: it was hers.
+    refused_with(&as_tablet("reserve", json!({ "name": "alice-again" })).await, "e.p.msg.key-in-use");
+    // Nor can someone else's document list it.
+    let mut carol = Holder::new(&host, "carol");
+    carol.other_devices = vec![tablet_key];
+    carol.reserve().await;
+    carol.write_first_entry().await;
+    refused_with(&carol.publish(0, None).await, "e.p.msg.key-in-use");
+}
+
+#[tokio::test]
+async fn listing_someone_elses_key_neither_makes_one_them_nor_keeps_them_out() {
+    let host = start_host(&[]).await;
+    let mut alice = Holder::new(&host, "alice");
+    let alices_key = alice.key_agreement();
+
+    // Mallory puts Alice's public key in her own document, before Alice has a name.
+    // It is only a public key: listing it shows nothing, and doesn't use up Alice's.
+    let mut mallory = Holder::new(&host, "mallory");
+    mallory.other_devices = vec![alices_key.clone()];
+    mallory.register().await;
+    alice.register().await;
+
+    // A DID made up to list Alice's key beside Mallory's own is still Mallory:
+    // what she wrote with is her own key, and that is not in Alice's document.
+    let mut eve = Holder::new(&host, "alice");
+    eve.agent = agent_listing(Identity::generate().unwrap(), &[alices_key.clone()]);
+    assert_eq!(eve.ask("status-request", json!({ "name": "alice" }), None).await["body"]["yours"], false);
+    let whois = profile_whois(&alice, "Not Alice").await;
+    let attachment = json!([{ "id": "whois", "media_type": "application/vp", "data": { "base64": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(whois.to_string()) } }]);
+    refused_with(&eve.ask("publish-whois", json!({ "name": "alice" }), Some(attachment)).await, "e.p.msg.not-holder");
+
+    // The same trick doesn't take a name someone is in the middle of claiming.
+    let mut bob = Holder::new(&host, "bob");
+    assert_eq!(kind(&bob.reserve().await), "reservation");
+    let mut thief = Holder::new(&host, "bob");
+    thief.agent = agent_listing(Identity::generate().unwrap(), &[bob.key_agreement()]);
+    refused_with(&thief.reserve().await, "e.p.msg.name-taken");
+    thief.other_devices = vec![bob.key_agreement()];
+    thief.write_first_entry().await;
+    refused_with(&thief.publish(0, None).await, "e.p.msg.not-held");
+    bob.write_first_entry().await;
+    assert_eq!(kind(&bob.publish(0, None).await), "published");
+
+    // Once Alice has shown the key is hers, nobody else's document may carry it.
+    let mut late = Holder::new(&host, "late");
+    late.other_devices = vec![alices_key];
+    late.reserve().await;
+    late.write_first_entry().await;
+    refused_with(&late.publish(0, None).await, "e.p.msg.key-in-use");
 }

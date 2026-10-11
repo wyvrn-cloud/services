@@ -9,7 +9,7 @@ use anyhow::Context;
 use didcomm_agent::Agent;
 use serde::Deserialize;
 
-use crate::Service;
+use crate::{Incoming, Service};
 
 /// How many messages one pickup asks for.
 const PICKUP_BATCH: usize = 20;
@@ -58,7 +58,7 @@ pub async fn run_pickups<S: Service>(service: Arc<S>, every: Duration) {
                 }
                 for received in &pickup.messages {
                     tracing::debug!(sender = ?received.sender, message_type = received.message_type(), "picked up");
-                    match service.answer(received).await {
+                    match service.answer(&Incoming { received, sender_kid: None }).await {
                         Ok(Some(reply)) => {
                             if let Err(e) = agent.respond(received, &reply).await {
                                 tracing::warn!(error = %e, "couldn't deliver reply");

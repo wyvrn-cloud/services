@@ -24,6 +24,7 @@ didcomm-agent = { git = "https://github.com/wyvrn-cloud/didcomm" }
 didcomm-core = { git = "https://github.com/wyvrn-cloud/didcomm" }
 didcomm-crypto-askar = { git = "https://github.com/wyvrn-cloud/didcomm" }
 didcomm-quickstart = { git = "https://github.com/wyvrn-cloud/didcomm" }
+didcomm-resolver-peer = { git = "https://github.com/wyvrn-cloud/didcomm" }
 
 anyhow = "1"
 axum = "0.8"

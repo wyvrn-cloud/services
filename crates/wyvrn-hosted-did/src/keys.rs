@@ -54,29 +54,23 @@ pub fn ed25519_from_multikey(multikey: &str) -> Option<[u8; 32]> {
     key.try_into().ok()
 }
 
-/// Whether `jws` (`{protected, signature}`) is a detached EdDSA signature over
-/// `payload` by one of `keys` (multikeys): the JWS signing input is
-/// `protected + "." + base64url(payload)`.
-pub fn signed_by_one_of(payload: &[u8], jws: &Value, keys: &[String]) -> bool {
+/// Which of `keys` (multikeys) made `jws` (`{protected, signature}`), a detached
+/// EdDSA signature over `payload`: the JWS signing input is
+/// `protected + "." + base64url(payload)`. `None` if none of them did.
+pub fn signer_among<'a>(payload: &[u8], jws: &Value, keys: &'a [String]) -> Option<&'a String> {
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let (Some(protected), Some(signature)) = (jws["protected"].as_str(), jws["signature"].as_str()) else {
-        return false;
-    };
-    let header: Value = match b64.decode(protected).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()) {
-        Some(header) => header,
-        None => return false,
-    };
+    let (protected, signature) = (jws["protected"].as_str()?, jws["signature"].as_str()?);
+    let header: Value = serde_json::from_slice(&b64.decode(protected).ok()?).ok()?;
     if header["alg"] != "EdDSA" {
-        return false;
+        return None;
     }
-    let Some(signature) = b64.decode(signature).ok().and_then(|bytes| Signature::from_slice(&bytes).ok()) else {
-        return false;
-    };
+    let signature = Signature::from_slice(&b64.decode(signature).ok()?).ok()?;
     let input = format!("{protected}.{}", b64.encode(payload));
-    keys.iter()
-        .filter_map(|key| ed25519_from_multikey(key))
-        .filter_map(|bytes| VerifyingKey::from_bytes(&bytes).ok())
-        .any(|key| key.verify(input.as_bytes(), &signature).is_ok())
+    keys.iter().find(|key| {
+        ed25519_from_multikey(key)
+            .and_then(|bytes| VerifyingKey::from_bytes(&bytes).ok())
+            .is_some_and(|key| key.verify(input.as_bytes(), &signature).is_ok())
+    })
 }
 
 #[cfg(test)]
