@@ -1,7 +1,8 @@
 # wyvrn-announce
 
 A one-way announcement channel over DIDComm. People subscribe to it from their app,
-admins post, and every subscriber receives each post. Nobody can reply. Every post is
+admins post, and every subscriber receives each post. Nobody can reply; subscribers
+can react to a post with emoji, and everyone is shown how many reacted with what, never who. Every post is
 kept, and a web page shows them all.
 
 It speaks [`https://wyvrn.app/announcements/1.0`](https://github.com/wyvrn-cloud/protocols/blob/announcements/protocols/announcements/1.0/readme.md),

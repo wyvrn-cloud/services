@@ -86,6 +86,9 @@ article :is(h1, h2, h3) { line-height: 1.3; margin: .8em 0 .4em; }
 article h1 { font-size: 1.35rem; } article h2 { font-size: 1.15rem; } article h3 { font-size: 1rem; }
 article > :nth-child(2) { margin-top: 0; }
 article > :last-child { margin-bottom: 0; }
+article .reactions { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0 0; padding: 0; list-style: none; }
+article .reactions li { padding: 1px 9px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg); font-size: .9rem; }
+article .reactions span { color: var(--dim); font-size: .8rem; font-weight: 600; }
 article img { max-width: 100%; }
 article pre { padding: 10px; overflow-x: auto; background: var(--bg); border-radius: 6px; }
 article code { font-size: .9em; }
@@ -113,8 +116,17 @@ fn page(info: &ChannelInfo, title: &str, body: &str) -> String {
 
 fn article(channel: &Channel, post: &Post) -> String {
     let author = channel.author_of(post).map(|name| format!(" · {}", escape(name))).unwrap_or_default();
+    // How many reacted with what. Who is never shown: subscribers aren't public.
+    let counts = channel.store.reaction_counts(post.seq).unwrap_or_default();
+    let reactions = if counts.is_empty() {
+        String::new()
+    } else {
+        let each: String =
+            counts.iter().map(|(emoji, count)| format!("<li>{} <span>{count}</span></li>", escape(emoji))).collect();
+        format!("<ul class=\"reactions\" aria-label=\"Reactions\">{each}</ul>")
+    };
     format!(
-        "<article id=\"post-{seq}\"><p class=\"meta\"><a href=\"/posts/{seq}\"><time datetime=\"{iso}\">{date}</time></a>{author}</p>{content}</article>",
+        "<article id=\"post-{seq}\"><p class=\"meta\"><a href=\"/posts/{seq}\"><time datetime=\"{iso}\">{date}</time></a>{author}</p>{content}{reactions}</article>",
         seq = post.seq,
         iso = rfc3339(post.posted_at),
         date = date(post.posted_at),

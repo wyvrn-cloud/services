@@ -114,8 +114,11 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         did_document,
         resolver: didcomm_quickstart::default_resolver(),
         deliver: Notify::new(),
+        reacted: Default::default(),
+        react: Notify::new(),
     });
     tokio::spawn(server::run_deliveries(state.clone()));
+    tokio::spawn(server::run_reaction_notices(state.clone()));
     let listener = tokio::net::TcpListener::bind(&config.server.bind)
         .await
         .with_context(|| format!("binding {}", config.server.bind))?;

@@ -112,8 +112,11 @@ async fn start_channel(admins: &[String]) -> Running {
         did_document,
         resolver: didcomm_quickstart::default_resolver(),
         deliver: Notify::new(),
+        reacted: Default::default(),
+        react: Notify::new(),
     });
     tokio::spawn(server::run_deliveries(state.clone()));
+    tokio::spawn(server::run_reaction_notices(state.clone()));
     let app = server::router(state.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     Running { did, url, state }
@@ -272,4 +275,64 @@ async fn an_admin_who_changes_did_stays_one_and_the_did_left_behind_is_nobody() 
     assert_eq!(channel.state.channel.store.latest_seq().unwrap(), 1);
     // And posts go to the DID they have now, not the one they left.
     before.nothing_more().await;
+}
+
+#[tokio::test]
+async fn a_subscribers_reaction_is_counted_for_every_subscriber_and_on_the_web_page() {
+    let admin = Peer::start().await;
+    let reader = Peer::start().await;
+    let channel = start_channel(&[admin.did()]).await;
+    for peer in [&admin, &reader] {
+        peer.send(&channel.did, channel::SUBSCRIBE, json!({})).await;
+        peer.next_of(channel::SUBSCRIPTION).await;
+    }
+    admin.send(&channel.did, channel::POST, json!({"content": "Version 2 is out"})).await;
+    let post = reader.next_of(channel::ANNOUNCEMENT).await;
+    let post_id = post["id"].as_str().unwrap();
+
+    // The channel says it takes reactions, the way any app that does says so.
+    let disclosed = reader
+        .agent
+        .request(
+            &channel.did,
+            &json!({
+                "type": "https://didcomm.org/discover-features/2.0/queries",
+                "body": {"queries": [{"feature-type": "protocol", "match": "*"}]},
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(disclosed.message["body"]["disclosures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["id"] == channel::MESSAGE_REACTIONS_PIURI));
+
+    let react = |emoji: Value, at: i64| {
+        json!({
+            "type": channel::MESSAGE_REACTIONS,
+            "created_time": at,
+            "body": {"to": {"id": post_id, "author": channel.did}, "emoji": emoji},
+        })
+    };
+    reader.agent.send(&channel.did, &react(json!(["🎉"]), server::now())).await.unwrap();
+
+    // Both are told how many; each is told what is theirs, and neither who.
+    let told_reader = reader.next_of(channel::REACTIONS).await;
+    assert_eq!(told_reader["body"]["id"], post_id);
+    assert_eq!(told_reader["body"]["counts"], json!({"🎉": 1}));
+    assert_eq!(told_reader["body"]["yours"], json!(["🎉"]));
+    let told_admin = admin.next_of(channel::REACTIONS).await;
+    assert_eq!(told_admin["body"]["counts"], json!({"🎉": 1}));
+    assert_eq!(told_admin["body"]["yours"], json!([]));
+    assert!(!told_admin.to_string().contains(&reader.did()));
+
+    let page = reqwest::get(format!("{}posts/1", channel.url)).await.unwrap().text().await.unwrap();
+    assert!(page.contains("🎉 <span>1</span>"), "{page}");
+
+    // Taking it back is told too, and leaves the page as it was.
+    reader.agent.send(&channel.did, &react(json!([]), server::now() + 1)).await.unwrap();
+    assert_eq!(admin.next_of(channel::REACTIONS).await["body"]["counts"], json!({}));
+    let page = reqwest::get(format!("{}posts/1", channel.url)).await.unwrap().text().await.unwrap();
+    assert!(!page.contains("class=\"reactions\""), "{page}");
 }

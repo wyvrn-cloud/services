@@ -17,6 +17,15 @@ pub const HISTORY: &str = "https://wyvrn.app/announcements/1.0/history";
 pub const SUBSCRIBERS_REQUEST: &str = "https://wyvrn.app/announcements/1.0/subscribers-request";
 pub const SUBSCRIBERS: &str = "https://wyvrn.app/announcements/1.0/subscribers";
 pub const SET_ROLE: &str = "https://wyvrn.app/announcements/1.0/set-role";
+/// What the channel tells subscribers of a post's reactions: how many of each, and
+/// each subscriber's own. Never who.
+pub const REACTIONS: &str = "https://wyvrn.app/announcements/1.0/reactions";
+
+/// How a subscriber reacts to a post: message-reactions/1.0, as in any conversation.
+pub const MESSAGE_REACTIONS_PIURI: &str = "https://wyvrn.app/message-reactions/1.0";
+pub const MESSAGE_REACTIONS: &str = "https://wyvrn.app/message-reactions/1.0/reactions";
+/// message-reactions/1.0: a message shows at most this many different emoji.
+pub const MAX_DISTINCT_REACTIONS: usize = 20;
 
 pub const USER_PROFILE: &str = "https://didcomm.org/user-profile/1.0";
 pub const PROFILE: &str = "https://didcomm.org/user-profile/1.0/profile";
@@ -62,12 +71,29 @@ pub struct Outcome {
     pub notices: Vec<(String, Value)>,
     /// Whether there is now something to send to subscribers.
     pub posted: bool,
+    /// The post whose reactions changed, which subscribers are to be told of.
+    pub reacted: Option<i64>,
 }
 
 impl Outcome {
     fn reply(reply: Value) -> Self {
         Self { reply: Some(reply), ..Self::default() }
     }
+}
+
+/// Whether `text` could be one emoji. What a reaction arrives as is a stranger's
+/// text, shown to everyone: nothing with a letter, a space or a control character
+/// in it, nothing long, and something that is at least a symbol. Apps check again
+/// before showing it, and the web pages escape it.
+pub fn is_emoji(text: &str) -> bool {
+    let keycap = text.contains('\u{20E3}');
+    !text.is_empty()
+        && text.len() <= 64
+        && text.chars().count() <= 16
+        && text.chars().all(|c| {
+            !c.is_alphabetic() && !c.is_whitespace() && !c.is_control() && (!c.is_ascii() || (keycap && "#*0123456789".contains(c)))
+        })
+        && text.chars().any(|c| c as u32 >= 0xA9)
 }
 
 fn thread_of(message: &Value) -> Option<&str> {
@@ -122,6 +148,29 @@ impl Channel {
             body["author"] = json!(author);
         }
         body
+    }
+
+    /// How many members have each emoji on a post, as an object.
+    pub fn reaction_counts(&self, seq: i64) -> anyhow::Result<Value> {
+        Ok(Value::Object(self.store.reaction_counts(seq)?.into_iter().map(|(emoji, count)| (emoji, json!(count))).collect()))
+    }
+
+    /// A post's reactions as one member is told of them: the counts everyone gets,
+    /// and what that member has on it themselves.
+    fn reactions_body(&self, post: &Post, member: &str, now: i64) -> anyhow::Result<Value> {
+        Ok(json!({
+            "id": post.id,
+            "seq": post.seq,
+            "counts": self.reaction_counts(post.seq)?,
+            "yours": self.store.reactions_of(post.seq, member)?,
+            "at": now,
+        }))
+    }
+
+    /// The `reactions` message telling `member` where post `seq`'s reactions stand.
+    pub fn reactions_notice(&self, seq: i64, member: &str, now: i64) -> anyhow::Result<Option<Value>> {
+        let Some(post) = self.store.post(seq)? else { return Ok(None) };
+        Ok(Some(json!({"type": REACTIONS, "body": self.reactions_body(&post, member, now)?})))
     }
 
     /// Who a post is said to be by, where the channel says.
@@ -232,6 +281,12 @@ impl Channel {
                     .map(|post| {
                         let mut entry = self.announcement_body(post);
                         entry["id"] = json!(post.id);
+                        // Only where there are any: most posts have none.
+                        if let Ok(reactions) = self.reactions_body(post, sender, now) {
+                            if reactions["counts"].as_object().is_some_and(|counts| !counts.is_empty()) {
+                                entry["reactions"] = json!({"counts": reactions["counts"], "yours": reactions["yours"], "at": now});
+                            }
+                        }
                         entry
                     })
                     .collect();
@@ -240,6 +295,43 @@ impl Channel {
                     HISTORY,
                     json!({"announcements": announcements, "latest_seq": self.store.latest_seq()?}),
                 )))
+            }
+            MESSAGE_REACTIONS => {
+                // A subscriber's whole set of reactions to one post. Reacting is not
+                // posting: it is open to every subscriber, and says nothing.
+                if !member.as_ref().is_some_and(|m| m.subscribed) {
+                    return Ok(Outcome::reply(problem(
+                        message,
+                        "e.p.trust.not-authorized",
+                        "Only a subscriber of this channel can react to its posts.",
+                    )));
+                }
+                // A statement that doesn't say when can't be put in order, and one
+                // about something that isn't a post here is about nothing.
+                let (Some(stated_at), Some(target)) = (message["created_time"].as_i64(), message["body"]["to"]["id"].as_str())
+                else {
+                    return Ok(Outcome::default());
+                };
+                let Some(post) = self.store.post_by_id(target)? else { return Ok(Outcome::default()) };
+                let already: Vec<String> = self.store.reaction_counts(post.seq)?.into_iter().map(|(emoji, _)| emoji).collect();
+                let mut distinct = already.len();
+                let mut emoji: Vec<String> = Vec::new();
+                for entry in message["body"]["emoji"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                    if !is_emoji(entry) || emoji.iter().any(|e| e == entry) {
+                        continue;
+                    }
+                    // One already on the post can always be joined; a new one only
+                    // while the post has room.
+                    if !already.iter().any(|e| e == entry) {
+                        if distinct >= MAX_DISTINCT_REACTIONS {
+                            continue;
+                        }
+                        distinct += 1;
+                    }
+                    emoji.push(entry.to_string());
+                }
+                let changed = self.store.set_reactions(post.seq, sender, &emoji, stated_at)?;
+                Ok(Outcome { reacted: changed.then_some(post.seq), ..Outcome::default() })
             }
             SUBSCRIBERS_REQUEST => {
                 if !is_admin {
@@ -566,6 +658,94 @@ mod tests {
         // A profile that doesn't ask for one back gets nothing.
         assert!(channel.handle("did:s", &message(PROFILE, json!({"profile": {}})), 12).unwrap().reply.is_none());
         assert_eq!(channel.store.member("did:s").unwrap().unwrap().name.as_deref(), Some("Sam"));
+    }
+
+    fn react(channel: &Channel, did: &str, post_id: &str, emoji: Value, at: i64) -> Outcome {
+        let statement = json!({
+            "id": "r", "type": MESSAGE_REACTIONS, "created_time": at,
+            "body": {"to": {"id": post_id, "author": "did:channel"}, "emoji": emoji},
+        });
+        channel.handle(did, &statement, at).unwrap()
+    }
+
+    fn posted(channel: &Channel) -> Post {
+        with_admin(channel, "did:a");
+        channel.handle("did:a", &message(POST, json!({"content": "Version 1"})), 20).unwrap();
+        channel.store.post(1).unwrap().unwrap()
+    }
+
+    #[test]
+    fn subscribers_react_and_everyone_is_told_how_many_never_who() {
+        let channel = channel();
+        let post = posted(&channel);
+        channel.handle("did:s", &message(SUBSCRIBE, json!({})), 21).unwrap();
+        assert_eq!(react(&channel, "did:s", &post.id, json!(["👍", "❤️"]), 30).reacted, Some(1));
+        assert_eq!(react(&channel, "did:a", &post.id.to_uppercase(), json!(["👍"]), 31).reacted, Some(1));
+
+        let told = channel.reactions_notice(1, "did:s", 40).unwrap().unwrap();
+        assert_eq!(told["type"], REACTIONS);
+        assert_eq!(told["body"], json!({"id": post.id, "seq": 1, "counts": {"👍": 2, "❤️": 1}, "yours": ["👍", "❤️"], "at": 40}));
+        assert!(!told.to_string().contains("did:a"));
+        assert_eq!(channel.reactions_notice(1, "did:a", 40).unwrap().unwrap()["body"]["yours"], json!(["👍"]));
+
+        // The log says the same to whoever asks for it.
+        let history = channel.handle("did:s", &message(HISTORY_REQUEST, json!({})), 41).unwrap().reply.unwrap();
+        assert_eq!(history["body"]["announcements"][0]["reactions"]["counts"], json!({"👍": 2, "❤️": 1}));
+        assert_eq!(history["body"]["announcements"][0]["reactions"]["yours"], json!(["👍", "❤️"]));
+    }
+
+    #[test]
+    fn a_statement_replaces_the_last_unless_it_is_older_and_an_empty_one_removes() {
+        let channel = channel();
+        let post = posted(&channel);
+        channel.handle("did:s", &message(SUBSCRIBE, json!({})), 21).unwrap();
+        react(&channel, "did:s", &post.id, json!(["👍"]), 30);
+        assert_eq!(react(&channel, "did:s", &post.id, json!(["❤️"]), 40).reacted, Some(1));
+        assert_eq!(react(&channel, "did:s", &post.id, json!(["👍"]), 35).reacted, None);
+        assert_eq!(react(&channel, "did:s", &post.id, json!(["❤️"]), 45).reacted, None, "saying the same again is no change");
+        assert_eq!(channel.reaction_counts(1).unwrap(), json!({"❤️": 1}));
+        assert_eq!(react(&channel, "did:s", &post.id, json!([]), 50).reacted, Some(1));
+        assert_eq!(channel.reaction_counts(1).unwrap(), json!({}));
+        assert_eq!(react(&channel, "did:s", &post.id, json!(["👍"]), 48).reacted, None);
+    }
+
+    #[test]
+    fn only_a_subscriber_reacts_only_to_a_post_and_only_with_emoji() {
+        let channel = channel();
+        let post = posted(&channel);
+        assert_eq!(code(&react(&channel, "did:stranger", &post.id, json!(["👍"]), 30)), "e.p.trust.not-authorized");
+        channel.handle("did:s", &message(SUBSCRIBE, json!({})), 21).unwrap();
+        let nothing = react(&channel, "did:s", "no-such-post", json!(["👍"]), 30);
+        assert!(nothing.reply.is_none() && nothing.reacted.is_none());
+        react(&channel, "did:s", &post.id, json!(["<b>hi</b>", "ok", "👍", "👍", " ", "1️⃣", "7", 5]), 31);
+        assert_eq!(channel.store.reactions_of(1, "did:s").unwrap(), ["👍", "1️⃣"]);
+        // Reacting is not a way to post.
+        assert_eq!(channel.store.latest_seq().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_post_takes_twenty_different_emoji_and_no_more() {
+        let channel = channel();
+        let post = posted(&channel);
+        channel.handle("did:s", &message(SUBSCRIBE, json!({})), 21).unwrap();
+        let many: Vec<String> = (0..25).map(|i| char::from_u32(0x1F600 + i).unwrap().to_string()).collect();
+        react(&channel, "did:a", &post.id, json!(many[..20]), 30);
+        // A twenty-first isn't taken, though one already there can be joined.
+        react(&channel, "did:s", &post.id, json!([many[22], many[0]]), 31);
+        assert_eq!(channel.store.reactions_of(1, "did:s").unwrap(), [many[0].clone()]);
+        assert_eq!(channel.store.reaction_counts(1).unwrap().len(), MAX_DISTINCT_REACTIONS);
+    }
+
+    #[test]
+    fn reactions_go_with_a_member_who_changes_did() {
+        let channel = channel();
+        let post = posted(&channel);
+        channel.handle("did:s", &message(SUBSCRIBE, json!({})), 21).unwrap();
+        react(&channel, "did:s", &post.id, json!(["👍"]), 30);
+        channel.rotated("did:s", "did:s2", 40).unwrap();
+        assert_eq!(channel.store.reactions_of(1, "did:s2").unwrap(), ["👍"]);
+        react(&channel, "did:s2", &post.id, json!([]), 50);
+        assert_eq!(channel.reaction_counts(1).unwrap(), json!({}));
     }
 
     #[test]

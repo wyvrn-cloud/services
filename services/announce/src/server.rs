@@ -44,6 +44,10 @@ pub struct AppState {
     pub resolver: Box<dyn DIDResolver>,
     /// Rung when there is something new to send to subscribers.
     pub deliver: Notify,
+    /// Posts whose reactions changed and that subscribers haven't been told of yet.
+    pub reacted: std::sync::Mutex<std::collections::BTreeSet<i64>>,
+    /// Rung when `reacted` gains one.
+    pub react: Notify,
 }
 
 pub fn now() -> i64 {
@@ -64,7 +68,9 @@ pub fn build_agent(config: &Config, identity: Identity) -> anyhow::Result<(Agent
     };
     let features = Features::standard()
         .with_protocol(channel::PIURI, &["channel"])
-        .with_protocol(channel::USER_PROFILE, &[]);
+        .with_protocol(channel::USER_PROFILE, &[])
+        // Subscribers react to posts as they would to any message.
+        .with_protocol(channel::MESSAGE_REACTIONS_PIURI, &["observer"]);
     Ok((agent.with_features(features), document))
 }
 
@@ -211,6 +217,9 @@ async fn api_posts(State(state): State<Arc<AppState>>, Query(paging): Query<Pagi
                 if let Some(author) = state.channel.author_of(post) {
                     entry["author"] = json!(author);
                 }
+                if let Ok(counts) = state.channel.reaction_counts(post.seq) {
+                    entry["reactions"] = counts;
+                }
                 entry
             }).collect::<Vec<_>>(),
         }))
@@ -267,6 +276,10 @@ async fn receive(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
                 }
                 if outcome.posted {
                     state.deliver.notify_one();
+                }
+                if let Some(seq) = outcome.reacted {
+                    state.reacted.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(seq);
+                    state.react.notify_one();
                 }
                 outcome.reply
             }
@@ -325,6 +338,52 @@ pub async fn deliver_pending(state: &Arc<AppState>) -> anyhow::Result<()> {
     }
     while sends.join_next().await.is_some() {}
     Ok(())
+}
+
+/// How long reactions to a post are gathered before subscribers are told. Telling
+/// everyone is a message each, so a burst of reactions is told once, not each time.
+const REACTIONS_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Tells every subscriber where the reactions to `seqs` now stand: how many of
+/// each, and their own. Best-effort; whoever misses it hears with the next change,
+/// or reads it from the log.
+pub async fn tell_reactions(state: &Arc<AppState>, seqs: Vec<i64>) -> anyhow::Result<()> {
+    let limit = Arc::new(Semaphore::new(DELIVERY_CONCURRENCY));
+    let mut sends = tokio::task::JoinSet::new();
+    for member in state.channel.store.subscribers()? {
+        let state = state.clone();
+        let limit = limit.clone();
+        let seqs = seqs.clone();
+        sends.spawn(async move {
+            let _permit = limit.acquire().await;
+            for seq in seqs {
+                let notice = match state.channel.reactions_notice(seq, &member.did, now()) {
+                    Ok(Some(notice)) => notice,
+                    Ok(None) => continue,
+                    Err(error) => return tracing::error!(%error, "couldn't read a post's reactions"),
+                };
+                if let Err(error) = state.agent.send(&member.did, &notice).await {
+                    return tracing::debug!(did = %member.did, seq, %error, "couldn't tell a subscriber of reactions");
+                }
+            }
+        });
+    }
+    while sends.join_next().await.is_some() {}
+    Ok(())
+}
+
+/// Tells subscribers of changed reactions, a little after they change. Runs for as
+/// long as the server does.
+pub async fn run_reaction_notices(state: Arc<AppState>) {
+    loop {
+        state.react.notified().await;
+        tokio::time::sleep(REACTIONS_SETTLE).await;
+        let seqs: Vec<i64> =
+            std::mem::take(&mut *state.reacted.lock().unwrap_or_else(|poisoned| poisoned.into_inner())).into_iter().collect();
+        if let Err(error) = tell_reactions(&state, seqs).await {
+            tracing::error!(%error, "telling subscribers of reactions failed");
+        }
+    }
 }
 
 /// Delivers whenever there is something new, and again every so often for whoever

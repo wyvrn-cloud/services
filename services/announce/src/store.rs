@@ -130,6 +130,15 @@ impl Store {
                 did TEXT PRIMARY KEY,
                 became TEXT NOT NULL,
                 at INTEGER NOT NULL
+            );
+            -- What each member has on each post: their whole set, as last stated.
+            -- An emptied set is kept, so an older statement can't bring it back.
+            CREATE TABLE IF NOT EXISTS reactions (
+                seq INTEGER NOT NULL,
+                did TEXT NOT NULL,
+                emoji TEXT NOT NULL,
+                at INTEGER NOT NULL,
+                PRIMARY KEY (seq, did)
             );",
         )?;
         Ok(Self { connection: Mutex::new(connection) })
@@ -267,6 +276,10 @@ impl Store {
                 }
             }
         }
+        // Their reactions go with them. Where they had reacted to a post as both,
+        // what the new DID said stands.
+        transaction.execute("UPDATE OR IGNORE reactions SET did = ?2 WHERE did = ?1", params![prior, new])?;
+        transaction.execute("DELETE FROM reactions WHERE did = ?1", [prior])?;
         transaction.execute(
             "INSERT OR REPLACE INTO superseded (did, became, at) VALUES (?1, ?2, ?3)",
             params![prior, new, now],
@@ -289,6 +302,68 @@ impl Store {
         self.connection()
             .query_row(&format!("SELECT {POST_COLUMNS} FROM posts WHERE seq = ?1"), [seq], post_from)
             .optional()
+    }
+
+    /// The post sent out under `id`. Ids are compared as DIDComm compares them,
+    /// without regard to case.
+    pub fn post_by_id(&self, id: &str) -> Result<Option<Post>> {
+        self.connection()
+            .query_row(&format!("SELECT {POST_COLUMNS} FROM posts WHERE lower(id) = lower(?1)"), [id], post_from)
+            .optional()
+    }
+
+    /// Makes `emoji` the whole of what `did` has on post `seq`, as stated at `at`.
+    /// Returns whether anything changed: a statement no newer than the one held is
+    /// ignored, and so is one that says the same.
+    pub fn set_reactions(&self, seq: i64, did: &str, emoji: &[String], at: i64) -> Result<bool> {
+        let connection = self.connection();
+        let held: Option<(String, i64)> = connection
+            .query_row("SELECT emoji, at FROM reactions WHERE seq = ?1 AND did = ?2", params![seq, did], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()?;
+        let stated = serde_json::to_string(emoji).unwrap_or_else(|_| "[]".into());
+        if let Some((held_emoji, held_at)) = &held {
+            if *held_at >= at {
+                return Ok(false);
+            }
+            if *held_emoji == stated {
+                connection.execute("UPDATE reactions SET at = ?3 WHERE seq = ?1 AND did = ?2", params![seq, did, at])?;
+                return Ok(false);
+            }
+        }
+        connection.execute(
+            "INSERT OR REPLACE INTO reactions (seq, did, emoji, at) VALUES (?1, ?2, ?3, ?4)",
+            params![seq, did, stated, at],
+        )?;
+        Ok(held.is_some() || !emoji.is_empty())
+    }
+
+    /// What `did` has on post `seq`.
+    pub fn reactions_of(&self, seq: i64, did: &str) -> Result<Vec<String>> {
+        let held: Option<String> = self
+            .connection()
+            .query_row("SELECT emoji FROM reactions WHERE seq = ?1 AND did = ?2", params![seq, did], |row| row.get(0))
+            .optional()?;
+        Ok(held.and_then(|emoji| serde_json::from_str(&emoji).ok()).unwrap_or_default())
+    }
+
+    /// Each emoji on post `seq` with how many members have it there, in the order
+    /// the emoji first appeared. Never who.
+    pub fn reaction_counts(&self, seq: i64) -> Result<Vec<(String, i64)>> {
+        let connection = self.connection();
+        let mut statement = connection.prepare("SELECT emoji FROM reactions WHERE seq = ?1 ORDER BY at, did")?;
+        let sets: Vec<String> = statement.query_map([seq], |row| row.get(0))?.collect::<Result<_>>()?;
+        let mut counts: Vec<(String, i64)> = Vec::new();
+        for set in sets {
+            for emoji in serde_json::from_str::<Vec<String>>(&set).unwrap_or_default() {
+                match counts.iter_mut().find(|(known, _)| *known == emoji) {
+                    Some((_, count)) => *count += 1,
+                    None => counts.push((emoji, 1)),
+                }
+            }
+        }
+        Ok(counts)
     }
 
     pub fn latest_seq(&self) -> Result<i64> {
