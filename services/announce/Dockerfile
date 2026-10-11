@@ -1,3 +1,6 @@
+# Built from the root of the repository, which is the workspace this service is a
+# member of (docker-compose.yml does: `context: .`, `dockerfile: services/announce/Dockerfile`).
+#
 # Optional build secrets:
 #   github_token -- only if a git dependency is private (wyvrn-cloud/didcomm is public):
 #                   --secret id=github_token,env=GITHUB_TOKEN
@@ -15,7 +18,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends git cmake gcc p
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo .cargo
-COPY src src
+# The whole workspace: cargo needs every member's manifest to read the lock file,
+# and this service's own crates are among them.
+COPY crates crates
+COPY services services
 
 # aws-lc-rs' cmake build ignores cargo's -j; cap it so constrained builders don't OOM.
 ENV CMAKE_BUILD_PARALLEL_LEVEL=2
@@ -33,7 +39,7 @@ RUN --mount=type=secret,id=github_token,required=false \
             GIT_CONFIG_KEY_0="url.https://x-access-token:$(cat /run/secrets/github_token)@github.com/.insteadOf" \
             GIT_CONFIG_VALUE_0="https://github.com/"; \
     fi; \
-    cargo build --release --locked -j 2
+    cargo build --release --locked -j 2 -p wyvrn-announce
 
 FROM debian:bookworm-slim
 # ca-certificates: did:web resolution, and sending to subscribers' HTTPS mediators.
@@ -42,7 +48,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && useradd --system --home /app announce
 WORKDIR /app
 COPY --from=builder /build/target/release/wyvrn-announce /usr/local/bin/wyvrn-announce
-COPY config config
+COPY services/announce/config config
 # The identity (and with it the DID), every post, and who is subscribed.
 RUN mkdir -p data && chown announce data
 VOLUME /app/data

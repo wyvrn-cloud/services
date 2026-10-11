@@ -4125,8 +4125,23 @@ dependencies = [
  "toml",
  "tower-http",
  "tracing",
- "tracing-subscriber",
  "uuid",
+ "wyvrn-service",
+]
+
+[[package]]
+name = "wyvrn-service"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "didcomm-agent",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

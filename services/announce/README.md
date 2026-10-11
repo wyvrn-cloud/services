@@ -12,15 +12,17 @@ admins.
 
 ## Running it
 
+From the root of this repository:
+
 ```sh
-docker compose up
+docker compose up announce
 ```
 
 That serves the channel at <http://localhost:8080/> under a `did:peer:4`, which is
 enough to try it against a local Wyvrn. It logs its DID at startup, and `GET /did`
 returns it.
 
-Without Docker: `cargo run` (reads `config/default.toml`).
+Without Docker: `cargo run` in this directory (`services/announce`; it reads `config/default.toml` from there).
 
 ### For real
 
@@ -31,7 +33,7 @@ ANNOUNCE_PUBLIC_URL=https://updates.example/ \
 ANNOUNCE_DID_METHOD=web \
 ANNOUNCE_NAME="Wyvrn Updates" \
 ANNOUNCE_DESCRIPTION="Release notes and news from the Wyvrn team." \
-docker compose up -d
+docker compose up -d announce
 ```
 
 The channel is then `did:web:updates.example`, and publishes its DID document at

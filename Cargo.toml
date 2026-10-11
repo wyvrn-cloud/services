@@ -1,0 +1,39 @@
+# Wyvrn's services, in one workspace so that they share crates: what every
+# DIDComm service has to do (an identity and an address, a mediator to be reached
+# through, an endpoint that receives and answers) lives in `crates/`, and each
+# service in `services/` is what is particular to it.
+[workspace]
+resolver = "2"
+members = ["crates/*", "services/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/wyvrn-cloud/services"
+publish = false
+
+# One version of each dependency for every member: a member says
+# `name = { workspace = true }` (adding features of its own where it needs them).
+[workspace.dependencies]
+wyvrn-service = { path = "crates/wyvrn-service" }
+
+# Tracks didcomm's default branch; pin a tag (tag = "...") once it publishes releases.
+didcomm-agent = { git = "https://github.com/wyvrn-cloud/didcomm" }
+didcomm-core = { git = "https://github.com/wyvrn-cloud/didcomm" }
+didcomm-crypto-askar = { git = "https://github.com/wyvrn-cloud/didcomm" }
+didcomm-quickstart = { git = "https://github.com/wyvrn-cloud/didcomm" }
+
+anyhow = "1"
+axum = "0.8"
+base64 = "0.22"
+reqwest = "0.13"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+toml = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }

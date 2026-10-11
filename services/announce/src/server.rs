@@ -2,7 +2,7 @@
 //! posts out to subscribers.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use axum::{
     body::Bytes,
@@ -22,7 +22,13 @@ use tokio::sync::{Notify, Semaphore};
 use tower_http::cors::CorsLayer;
 
 use crate::channel::{self, Channel, ChannelInfo};
-use crate::config::{Config, DidMethod};
+use crate::config::Config;
+use wyvrn_service::{
+    address,
+    http::{internal, receive},
+    Service,
+};
+pub use wyvrn_service::{address::did_web_for, now};
 use crate::web;
 
 /// How many subscribers are sent to at once.
@@ -50,22 +56,10 @@ pub struct AppState {
     pub react: Notify,
 }
 
-pub fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
-}
-
 /// The agent for `config`: a `did:web` derived from `server.public_url`, or a
 /// `did:peer:4` derived from the identity's keys and that URL.
 pub fn build_agent(config: &Config, identity: Identity) -> anyhow::Result<(Agent, Option<Value>)> {
-    let endpoint = &config.server.public_url;
-    let (agent, document) = match config.server.did_method {
-        DidMethod::Peer => (Agent::with_endpoint(identity, endpoint)?, None),
-        DidMethod::Web => {
-            let did = did_web_for(endpoint)?;
-            let document = identity.did_document(&did, endpoint);
-            (Agent::with_did(identity, &did), Some(document))
-        }
-    };
+    let (agent, document) = address::build_agent(identity, &config.server.public_url, config.server.did_method)?;
     let features = Features::standard()
         .with_protocol(channel::PIURI, &["channel"])
         .with_protocol(channel::USER_PROFILE, &[])
@@ -100,52 +94,18 @@ pub fn channel_info(config: &Config) -> anyhow::Result<ChannelInfo> {
     })
 }
 
-/// The `did:web` for a URL: host (`:port` percent-encoded), then any path segments
-/// joined by `:` -- `https://example.com:8443/news/` → `did:web:example.com%3A8443:news`.
-pub fn did_web_for(url: &str) -> anyhow::Result<String> {
-    let url = reqwest::Url::parse(url)?;
-    let host = url.host_str().ok_or_else(|| anyhow::anyhow!("{url} has no host"))?;
-    let mut did = format!("did:web:{host}");
-    if let Some(port) = url.port() {
-        did.push_str(&format!("%3A{port}"));
-    }
-    for segment in url.path_segments().into_iter().flatten().filter(|s| !s.is_empty()) {
-        did.push(':');
-        did.push_str(segment);
-    }
-    Ok(did)
-}
-
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/", get(index).post(receive))
+        .route("/", get(index).post(|State(state): State<Arc<AppState>>, body: Bytes| receive(Arc::new(ChannelService(state)), body)))
         .route("/posts/{seq}", get(post_page))
         .route("/feed.xml", get(feed))
         .route("/api/channel", get(api_channel))
         .route("/api/posts", get(api_posts))
-        .route("/did", get(did))
-        .route("/.well-known/did.json", get(did_document))
-        .route("/did.json", get(did_document))
+        .merge(address::routes(state.agent.did(), state.did_document.clone()))
         .route("/healthz", get(|| async { "ok" }))
         // A browser app sends its messages, and resolves a did:web, from another origin.
         .layer(CorsLayer::permissive())
         .with_state(state)
-}
-
-fn internal(error: impl std::fmt::Display) -> Response {
-    tracing::error!(%error, "request failed");
-    (StatusCode::INTERNAL_SERVER_ERROR, "something went wrong").into_response()
-}
-
-async fn did(State(state): State<Arc<AppState>>) -> String {
-    state.agent.did()
-}
-
-async fn did_document(State(state): State<Arc<AppState>>) -> Response {
-    match &state.did_document {
-        Some(document) => Json(document.clone()).into_response(),
-        None => (StatusCode::NOT_FOUND, "this channel's DID is not a did:web").into_response(),
-    }
 }
 
 #[derive(Deserialize)]
@@ -245,24 +205,18 @@ async fn rotation(state: &AppState, received: &Received, sender: &str) -> Option
     }
 }
 
-async fn receive(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
-    let received = match state.agent.receive(&body).await {
-        Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("unpack failed: {e}")).into_response(),
-    };
-    tracing::debug!(sender = ?received.sender, message_type = received.message_type(), "received");
-    let reply = match answer(&state, &received).await {
-        Ok(Some(reply)) => reply,
-        Ok(None) => return StatusCode::ACCEPTED.into_response(),
-        Err(e) => return internal(e),
-    };
-    match state.agent.respond(&received, &reply).await {
-        Ok(Some(packed)) => ([(header::CONTENT_TYPE, "application/didcomm-encrypted+json")], packed).into_response(),
-        Ok(None) => StatusCode::ACCEPTED.into_response(),
-        Err(e) => {
-            tracing::warn!(error = %e, "couldn't deliver reply");
-            (StatusCode::BAD_GATEWAY, format!("couldn't deliver reply: {e}")).into_response()
-        }
+/// The channel as the shared plumbing sees it (`wyvrn_service::Service`): its
+/// agent, and what it answers. Around the `Arc`, because answering can leave
+/// something to send later, which outlives the request.
+pub struct ChannelService(pub Arc<AppState>);
+
+impl Service for ChannelService {
+    fn agent(&self) -> &Agent {
+        &self.0.agent
+    }
+
+    async fn answer(&self, received: &Received) -> anyhow::Result<Option<Value>> {
+        answer(&self.0, received).await
     }
 }
 
@@ -295,40 +249,6 @@ async fn answer(state: &Arc<AppState>, received: &Received) -> anyhow::Result<Op
         state.react.notify_one();
     }
     Ok(outcome.reply)
-}
-
-/// Collects what the channel's mediator holds for it, for as long as the server
-/// runs -- how a channel behind a mediator is reached at all (`[mediator]`). Each
-/// message is acted on as one posted here directly would be; its answer goes to
-/// the sender's own address, there being no connection to answer on.
-pub async fn run_pickups(state: Arc<AppState>, every: std::time::Duration) {
-    loop {
-        match state.agent.pickup(20).await {
-            Ok(pickup) => {
-                for (id, why) in &pickup.failed {
-                    tracing::warn!(%id, %why, "couldn't read a message the mediator held");
-                }
-                for received in &pickup.messages {
-                    tracing::debug!(sender = ?received.sender, message_type = received.message_type(), "picked up");
-                    match answer(&state, received).await {
-                        Ok(Some(reply)) => {
-                            if let Err(e) = state.agent.respond(received, &reply).await {
-                                tracing::warn!(error = %e, "couldn't deliver reply");
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(error) => tracing::error!(%error, "handling a picked-up message failed"),
-                    }
-                }
-                // More may be waiting than one pickup takes.
-                if pickup.messages.len() >= 20 {
-                    continue;
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "couldn't collect from the mediator"),
-        }
-        tokio::time::sleep(every).await;
-    }
 }
 
 /// Sends `message` to `did` without holding up whoever caused it.

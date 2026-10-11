@@ -1,31 +1,32 @@
 [package]
 name = "wyvrn-announce"
-version = "0.0.1"
-edition = "2021"
-license = "Apache-2.0"
 description = "A one-way announcement channel over DIDComm: people subscribe, admins post, everyone subscribed receives it, and a web page shows every post"
-publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [dependencies]
-# Tracks didcomm's default branch; pin a tag (tag = "...") once it publishes releases.
-didcomm-agent = { git = "https://github.com/wyvrn-cloud/didcomm" }
-didcomm-core = { git = "https://github.com/wyvrn-cloud/didcomm" }
-didcomm-crypto-askar = { git = "https://github.com/wyvrn-cloud/didcomm" }
-didcomm-quickstart = { git = "https://github.com/wyvrn-cloud/didcomm" }
-anyhow = "1"
-axum = "0.8"
-base64 = "0.22"
+wyvrn-service = { workspace = true }
+didcomm-agent = { workspace = true }
+didcomm-core = { workspace = true }
+didcomm-crypto-askar = { workspace = true }
+didcomm-quickstart = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
-reqwest = "0.13"
-rusqlite = { version = "0.37", features = ["bundled"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 time = { version = "0.3", features = ["formatting", "macros"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
-toml = "0.8"
-tower-http = { version = "0.6", features = ["cors"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1", features = ["v4"] }
+tokio = { workspace = true }
+toml = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
+# The tests post to the channel as an app would.
+reqwest = { workspace = true }

@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+pub use wyvrn_service::{address::DidMethod, mediator::MediatorConfig};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -19,32 +20,11 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct MediatorConfig {
-    /// The mediator's DID, e.g. `did:web:mediator.wyvrn.app`.
-    pub did: String,
-    /// How often the channel collects what the mediator holds for it.
-    #[serde(default = "default_poll_seconds")]
-    pub poll_seconds: u64,
-}
-
-fn default_poll_seconds() -> u64 {
-    2
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     pub bind: String,
     pub public_url: String,
     #[serde(default)]
     pub did_method: DidMethod,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DidMethod {
-    #[default]
-    Peer,
-    Web,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -111,11 +91,7 @@ impl Config {
             config.server.public_url = url;
         }
         if let Some(method) = env("ANNOUNCE_DID_METHOD") {
-            config.server.did_method = match method.to_lowercase().as_str() {
-                "peer" => DidMethod::Peer,
-                "web" => DidMethod::Web,
-                other => anyhow::bail!("ANNOUNCE_DID_METHOD is {other:?}; expected \"peer\" or \"web\""),
-            };
+            config.server.did_method = DidMethod::parse(&method, "ANNOUNCE_DID_METHOD")?;
         }
         if let Some(name) = env("ANNOUNCE_NAME") {
             config.channel.name = name;

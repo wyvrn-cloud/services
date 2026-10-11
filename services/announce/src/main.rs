@@ -87,11 +87,7 @@ fn set_role(config: &Config, did: &str, role: Role) -> anyhow::Result<()> {
 }
 
 async fn serve(config: Config) -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    wyvrn_service::logging::init();
 
     let channel = Channel { store: open_store(&config)?, info: server::channel_info(&config)? };
     channel.name_admins(&config.channel.admins, server::now())?;
@@ -101,11 +97,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let (agent, did_document) = server::build_agent(&config, identity)?;
     // Behind a mediator, the channel's DID is the one that names it as the way in.
     if let Some(mediator) = &config.mediator {
-        let mediation = agent
-            .mediate(&mediator.did)
-            .await
-            .with_context(|| format!("asking {} to mediate", mediator.did))?;
-        tracing::info!(mediator = %mediation.mediator_did, "reached through a mediator");
+        wyvrn_service::mediator::register(&agent, mediator).await?;
     }
     tracing::info!(
         did = %agent.did(),
@@ -128,16 +120,8 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     tokio::spawn(server::run_deliveries(state.clone()));
     tokio::spawn(server::run_reaction_notices(state.clone()));
     if let Some(mediator) = &config.mediator {
-        let every = std::time::Duration::from_secs(mediator.poll_seconds.max(1));
-        tokio::spawn(server::run_pickups(state.clone(), every));
+        let service = Arc::new(server::ChannelService(state.clone()));
+        tokio::spawn(wyvrn_service::mediator::run_pickups(service, mediator.poll_every()));
     }
-    let listener = tokio::net::TcpListener::bind(&config.server.bind)
-        .await
-        .with_context(|| format!("binding {}", config.server.bind))?;
-    axum::serve(listener, server::router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
-    Ok(())
+    wyvrn_service::http::serve(&config.server.bind, server::router(state)).await
 }

@@ -1,9 +1,15 @@
-# `docker compose up` runs the channel at http://localhost:8080/ as a did:peer:4, which
-# is enough to try it with a local Wyvrn. For a real one, put it behind HTTPS and set
-# the two commented lines (see README.md).
+# Every service in this repository, each to be started by name:
+# `docker compose up announce`. Each is built from this directory, the workspace
+# its crate is a member of.
 services:
+  # An announcement channel (services/announce). As it stands: at
+  # http://localhost:8080/ as a did:peer:4, which is enough to try it with a local
+  # Wyvrn. For a real one, put it behind HTTPS and set the two commented lines (see
+  # services/announce/README.md).
   announce:
-    build: .
+    build:
+      context: .
+      dockerfile: services/announce/Dockerfile
     ports:
       - "${ANNOUNCE_PORT:-8080}:8080"
     environment:
