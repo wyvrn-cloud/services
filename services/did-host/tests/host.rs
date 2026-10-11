@@ -852,3 +852,39 @@ async fn a_message_nobody_authenticated_is_turned_away() {
     // Not DIDComm at all.
     assert_eq!(post(b"hello".to_vec()).await.status(), 400);
 }
+
+#[tokio::test]
+async fn a_message_a_mediator_carried_is_known_by_its_senders_key_like_any_other() {
+    let host = start_host(&[]).await;
+    let service = Arc::new(server::HostService(host.state.clone()));
+    let mut alice = Holder::new(&host, "alice");
+    // What a mediator hands over is the sender's sealed message, as sent. Given
+    // that, the host does what it would have done had it been posted.
+    async fn seal(agent: &Agent, to: &str, message: Value) -> Vec<u8> {
+        agent.messaging().pack(&message, to, Some(&agent.did())).await.unwrap().message
+    }
+
+    let reserve = json!({ "type": format!("{P}reserve"), "body": { "name": "alice" } });
+    wyvrn_service::mediator::deliver(&service, &seal(&alice.agent, &host.did, reserve).await).await;
+    assert!(!host.state.host.store.get("alice").unwrap().expect("held").hold_keys.is_empty());
+
+    alice.write_first_entry().await;
+    let publish = json!({ "type": format!("{P}publish"), "body": { "name": "alice" }, "attachments": [alice.log_attachment(0)] });
+    wyvrn_service::mediator::deliver(&service, &seal(&alice.agent, &host.did, publish).await).await;
+    assert_eq!(fetch(&host, "alice/did.jsonl").await.status(), 200);
+    assert_eq!(host.state.host.store.get("alice").unwrap().unwrap().did, Some(alice.did()));
+
+    // And it is the key that counts there too: the same name can't be had again
+    // by the same holder, and someone else carried in gets no further than posted.
+    let again = json!({ "type": format!("{P}reserve"), "body": { "name": "alice-two" } });
+    wyvrn_service::mediator::deliver(&service, &seal(&alice.agent, &host.did, again).await).await;
+    assert!(host.state.host.store.get("alice-two").unwrap().is_none());
+
+    // One nobody authenticated is dropped, carried as posted.
+    let bob = Holder::new(&host, "bob");
+    let anonymous = bob.agent.messaging().pack(&json!({ "type": format!("{P}reserve"), "body": { "name": "bob" } }), &host.did, None).await.unwrap().message;
+    wyvrn_service::mediator::deliver(&service, &anonymous).await;
+    assert!(host.state.host.store.get("bob").unwrap().is_none());
+    // Nor does rubbish do anything.
+    wyvrn_service::mediator::deliver(&service, b"not a message").await;
+}

@@ -30,9 +30,10 @@ use serde_json::Value;
 pub struct Incoming<'a> {
     pub received: &'a Received,
     /// The id of the key the sender authenticated with (`did:…#key-2`): *which* of
-    /// its DID's keys it holds, not only that it holds one. Known for a message
-    /// posted to the endpoint. `None` for one collected from a mediator, which
-    /// arrives already opened, and for one nobody authenticated.
+    /// its DID's keys it holds, not only that it holds one. `None` for a message
+    /// nobody authenticated (anoncrypt). The same whether it was posted to the
+    /// endpoint or carried by a mediator: a mediator hands on the sender's sealed
+    /// message, and it is opened here either way.
     pub sender_kid: Option<String>,
 }
 
@@ -41,10 +42,9 @@ pub trait Service: Send + Sync + 'static {
     fn agent(&self) -> &Agent;
 
     /// Whether the service takes only messages whose sender authenticated them
-    /// with a key of its own (authcrypt), and has to know which key. One that
-    /// does is never handed anything else: an anonymous message posted to it is
-    /// refused there and then, and it cannot be reached through a mediator, where
-    /// a message arrives already opened and the key is not known.
+    /// with a key of its own (authcrypt). One that does is never handed anything
+    /// else: an anonymous message posted to it is refused there and then, and one
+    /// a mediator carried is dropped.
     fn requires_authcrypt(&self) -> bool {
         false
     }

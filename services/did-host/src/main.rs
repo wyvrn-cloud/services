@@ -104,6 +104,9 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let identity = Identity::load_or_generate(&config.identity.path)
         .with_context(|| format!("identity file {}", config.identity.path.display()))?;
     let (agent, did_document) = server::build_agent(&config, identity)?;
+    if let Some(mediator) = &config.mediator {
+        wyvrn_service::mediator::register(&agent, mediator).await?;
+    }
     let host = host(&config)?;
     tracing::info!(
         did = %agent.did(),
@@ -115,5 +118,9 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 
     let state = Arc::new(AppState { agent, host, did_document });
     tokio::spawn(server::run_staleness_checks(state.clone()));
+    if let Some(mediator) = &config.mediator {
+        let service = Arc::new(server::HostService(state.clone()));
+        tokio::spawn(wyvrn_service::mediator::run_pickups(service, mediator.poll_every()));
+    }
     wyvrn_service::http::serve(&config.server.bind, server::router(state)).await
 }

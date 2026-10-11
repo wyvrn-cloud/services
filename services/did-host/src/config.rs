@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-pub use wyvrn_service::address::DidMethod;
+pub use wyvrn_service::{address::DidMethod, mediator::MediatorConfig};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -11,6 +11,11 @@ pub struct Config {
     pub identity: PathConfig,
     pub store: PathConfig,
     pub host: HostConfig,
+    /// A mediator for the host's own DIDComm endpoint to be reached through. The
+    /// DIDs it hosts are served over HTTPS either way, so the host itself always
+    /// needs a public web address; this only moves where messages to it arrive.
+    #[serde(default)]
+    pub mediator: Option<MediatorConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

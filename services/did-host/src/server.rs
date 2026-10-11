@@ -58,8 +58,8 @@ impl Service for HostService {
 
     async fn answer(&self, incoming: &Incoming<'_>) -> anyhow::Result<Option<Value>> {
         let received = incoming.received;
-        // Nothing is done for someone nobody vouches for. (The endpoint has turned
-        // such a message away already; this is for any other way in.)
+        // Nothing is done for someone nobody vouches for. (Such a message has been
+        // turned away before it gets here, posted or carried by a mediator alike.)
         let Some(kid) = incoming.sender_kid.as_deref() else {
             return Ok(None);
         };

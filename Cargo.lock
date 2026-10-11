@@ -4199,6 +4199,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "didcomm-agent",
  "reqwest",
  "serde",
