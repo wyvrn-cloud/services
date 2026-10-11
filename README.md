@@ -6,6 +6,7 @@ that they share crates instead of each carrying its own copy of the same plumbin
 | | |
 |---|---|
 | [`services/announce`](services/announce) | A one-way announcement channel: people subscribe, admins post, everyone subscribed receives it, and a web page shows every post. |
+| [`services/did-host`](services/did-host) | Hosts short, stable `did:webvh` DIDs, and their parallel `did:web`, for agents that write and sign them themselves. |
 | [`crates/wyvrn-service`](crates/wyvrn-service) | What every DIDComm service does, whatever it is for. |
 
 The mediator is not here: it is its own repository, with its own workspace.

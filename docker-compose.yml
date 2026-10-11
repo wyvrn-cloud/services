@@ -25,5 +25,29 @@ services:
       - announce-data:/app/data
     restart: unless-stopped
 
+  # A DID host (services/did-host): short, stable did:webvh DIDs for agents that
+  # write and sign them themselves. It has to be at a real domain over HTTPS to be
+  # of use: the DIDs it hosts are fetched from https://<DID_HOST_DOMAIN>/<name>/did.jsonl.
+  # As it stands it runs, and can be written to, but nothing it hosts resolves.
+  did-host:
+    build:
+      context: .
+      dockerfile: services/did-host/Dockerfile
+    ports:
+      - "${DID_HOST_PORT:-8081}:8080"
+    environment:
+      DID_HOST_PUBLIC_URL: "${DID_HOST_PUBLIC_URL:-http://localhost:8081/}"
+      DID_HOST_DID_METHOD: "${DID_HOST_DID_METHOD:-peer}"
+      DID_HOST_DOMAIN: "${DID_HOST_DOMAIN:-id.localhost.example}"
+      # DID_HOST_PUBLIC_URL: "https://id.example/"
+      # DID_HOST_DID_METHOD: "web"
+      # DID_HOST_DOMAIN: "id.example"
+      # The DIDs that decide who may claim a reserved name, separated by commas.
+      DID_HOST_ADMINS: "${DID_HOST_ADMINS:-}"
+    volumes:
+      - did-host-data:/app/data
+    restart: unless-stopped
+
 volumes:
+  did-host-data:
   announce-data:

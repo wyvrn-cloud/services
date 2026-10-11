@@ -37,3 +37,12 @@ tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+
+# did:webvh logs: checked with the same crate the DIDComm library resolves them
+# with. Without its own network code: a host is handed logs, it doesn't fetch them.
+didwebvh-rs = { version = "0.7", default-features = false }
+# Signed presentations (a hosted DID's whois).
+affinidi-data-integrity = "0.7"
+affinidi-secrets-resolver = "0.5"
+bs58 = "0.5"
+ed25519-dalek = "2"

@@ -1,0 +1,28 @@
+# wyvrn-did-host: what `cargo run` and the Docker image start with. The environment
+# overrides the settings a deployment most often changes (see README.md).
+
+[server]
+bind = "0.0.0.0:8080"
+# The host's own DIDComm endpoint: where `publish` and the rest are sent.
+public_url = "http://localhost:8080/"
+# "peer" needs nothing published; "web" makes the host did:web:<its own domain>.
+did_method = "peer"
+
+[identity]
+path = "data/identity.json"
+
+[store]
+path = "data/did-host.sqlite"
+
+[host]
+# The host as it appears in the DIDs it hosts. A real domain name, served over
+# HTTPS: did:webvh:<SCID>:<domain>:<name> is fetched from https://<domain>/<name>/did.jsonl.
+domain = "id.localhost.example"
+# The DIDs that decide who may claim a reserved name.
+admins = []
+# Reserved for nobody until an admin assigns them. `reserved_names` defaults to the
+# host's own routes and the names that would pass for the host itself.
+reserved_namespaces = ["official"]
+
+# [mediator]
+# did = "did:web:mediator.wyvrn.app"
