@@ -4152,6 +4152,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyvrn-community"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "didcomm-agent",
+ "didcomm-core",
+ "didcomm-crypto-askar",
+ "didcomm-quickstart",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tower-http",
+ "tracing",
+ "uuid",
+ "wyvrn-service",
+]
+
+[[package]]
 name = "wyvrn-did-host"
 version = "0.0.1"
 dependencies = [

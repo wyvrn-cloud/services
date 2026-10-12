@@ -6,6 +6,7 @@ that they share crates instead of each carrying its own copy of the same plumbin
 | | |
 |---|---|
 | [`services/announce`](services/announce) | A one-way announcement channel: people subscribe, admins post, everyone subscribed receives it, and a web page shows every post. |
+| [`services/community`](services/community) | A community server: channels that the people let in, and nobody else, read and post in. A post can ask a question, answered as a form. |
 | [`services/did-host`](services/did-host) | Hosts short, stable `did:webvh` DIDs, and their parallel `did:web`, for agents that write and sign them themselves. |
 | [`services/stickers`](services/stickers) | Hosts sticker and custom-emoji packs. They are made by talking to it, as `workflow/1.0` workflows, and fetched from it over HTTPS. |
 | [`crates/wyvrn-service`](crates/wyvrn-service) | What every DIDComm service does, whatever it is for. |

@@ -1,0 +1,16 @@
+//! A community server: channels that the people let in, and nobody else, read and
+//! post in.
+//!
+//! - [`community`]: community/1.0, the protocol members' apps speak to it.
+//! - [`questions`]: answering a question a post asks, as a workflow/1.0 form.
+//! - [`store`]: who is let in, the channels, and what was said.
+//! - [`server`]: the endpoint, and sending what is posted to everyone who joined.
+//!
+//! It knows nothing of who its members are or what they are for. Something that
+//! posts on a program's behalf (a bot) is a member like any other.
+
+pub mod community;
+pub mod config;
+pub mod questions;
+pub mod server;
+pub mod store;

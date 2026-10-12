@@ -71,7 +71,31 @@ services:
       - stickers-data:/app/data
     restart: unless-stopped
 
+  # A community server (services/community): channels that the people let in, and
+  # nobody else, read and post in. Nobody is let in until COMMUNITY_ADMINS names
+  # someone (the ID their app shows for them), or one is added from here:
+  #   docker compose exec community wyvrn-community add <did> admin
+  community:
+    build:
+      context: .
+      dockerfile: services/community/Dockerfile
+    ports:
+      - "${COMMUNITY_PORT:-8083}:8080"
+    environment:
+      COMMUNITY_PUBLIC_URL: "${COMMUNITY_PUBLIC_URL:-http://localhost:8083/}"
+      COMMUNITY_DID_METHOD: "${COMMUNITY_DID_METHOD:-peer}"
+      # COMMUNITY_PUBLIC_URL: "https://community.example/"
+      # COMMUNITY_DID_METHOD: "web"
+      COMMUNITY_NAME: "${COMMUNITY_NAME:-A community}"
+      # DIDs, separated by commas.
+      COMMUNITY_ADMINS: "${COMMUNITY_ADMINS:-}"
+      COMMUNITY_MEMBERS: "${COMMUNITY_MEMBERS:-}"
+    volumes:
+      - community-data:/app/data
+    restart: unless-stopped
+
 volumes:
+  community-data:
   stickers-data:
   did-host-data:
   announce-data:

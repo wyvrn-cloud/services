@@ -1,0 +1,31 @@
+# wyvrn-community: what `cargo run` and the Docker image start with. The environment
+# overrides the settings a deployment most often changes (see README.md).
+
+[server]
+bind = "0.0.0.0:8080"
+# Where the server is reached: its DIDComm endpoint.
+public_url = "http://localhost:8080/"
+# "peer" needs nothing published; "web" makes the server did:web:<its own domain>.
+did_method = "peer"
+
+[identity]
+path = "data/identity.json"
+
+[store]
+path = "data/community.sqlite"
+
+[community]
+name = "A community"
+description = ""
+# Who is let in. Nobody else is answered. An admin can also let people in, and
+# make other admins, from their app; the lists here are added to what the
+# server already holds each time it starts, and never take anyone out.
+admins = []
+members = []
+# Whether a member who isn't an admin may open a channel.
+members_may_create_channels = false
+
+# To have messages to the server arrive through a mediator instead of at public_url
+# (a server at home, or one a phone app has to reach):
+# [mediator]
+# did = "did:web:mediator.wyvrn.app"
