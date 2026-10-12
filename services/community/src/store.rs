@@ -98,7 +98,10 @@ pub struct Store {
 type Result<T> = rusqlite::Result<T>;
 
 const MEMBER_COLUMNS: &str = "did, role, name, joined, since, delivered";
-const POST_COLUMNS: &str = "serial, channel, seq, id, content, posted_at, author_did, author_name, question, answer, answered_by";
+// A post's author is called what they are called now, where they are still a
+// member; what they were called when they wrote it, otherwise.
+const POST_COLUMNS: &str = "serial, channel, seq, id, content, posted_at, author_did, \
+    COALESCE((SELECT name FROM members WHERE members.did = posts.author_did), author_name), question, answer, answered_by";
 const CHANNEL_COLUMNS: &str =
     "id, name, topic, closed, created_at, created_by, (SELECT COALESCE(MAX(seq), 0) FROM posts WHERE posts.channel = channels.id)";
 

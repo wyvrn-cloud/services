@@ -24,6 +24,7 @@ pub const MEMBERS_REQUEST: &str = "https://wyvrn.app/community/1.0/members-reque
 pub const MEMBERS: &str = "https://wyvrn.app/community/1.0/members";
 pub const SET_MEMBER: &str = "https://wyvrn.app/community/1.0/set-member";
 
+pub const USER_PROFILE: &str = "https://didcomm.org/user-profile/1.0";
 pub const PROFILE: &str = "https://didcomm.org/user-profile/1.0/profile";
 pub const PROBLEM_REPORT: &str = "https://didcomm.org/report-problem/2.0/problem-report";
 
@@ -160,7 +161,7 @@ pub fn answer_text(question: &Value, answers: &[Value]) -> String {
             if let Some(other) = answer["other"].as_str().filter(|other| !other.is_empty()) {
                 said.push(other.to_string());
             }
-            format!("**{}** {}", about.trim_end_matches(['?', ':']), said.join(", "))
+            format!("**{}** {}", about.trim_end_matches(':'), said.join(", "))
         })
         .collect::<Vec<_>>()
         .join("\n")

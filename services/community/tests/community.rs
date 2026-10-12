@@ -325,7 +325,7 @@ async fn a_question_is_answered_as_a_form_by_whoever_gets_there_first() {
     let answer = bot.next_of(&format!("{C}message")).await["body"].clone();
     let answer = if answer["id"] == "q1" { bot.next_message().await } else { answer };
     assert_eq!(answer["author"]["did"], admin.did());
-    assert_eq!(answer["content"], "**Library** Zod\n**Which checks should run** Lint, Build, and format");
+    assert_eq!(answer["content"], "**Library** Zod\n**Which checks should run?** Lint, Build, and format");
     assert_eq!(answer["answer"], json!({ "to": "q1", "answers": [ { "chosen": ["Zod"] }, { "chosen": ["Lint", "Build"], "other": "and format" } ] }));
 
     // Whoever was part-way through is told it has been answered, and can't answer it.

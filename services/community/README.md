@@ -70,9 +70,15 @@ the server can read them. A channel here is not end-to-end encrypted between its
 members; each member's messages are encrypted to the server, and the server's to
 each member.
 
+## In the app
+
+Add the server's DID as a contact. Someone on its list sees the community in
+their chats with its channels under it; someone who isn't sees "Waiting to be
+let in". In a channel, `/ask Which one? | This | That` posts a question with
+those answers (`/ask*` lets several be chosen).
+
 ## Not built
 
-- The app's side: nothing in Wyvrn shows a community yet.
 - Editing or deleting a post, reactions, and replies.
 - Limits on how fast anyone posts.
 - Removing someone does not tell their app; it is told the next time it asks.

@@ -46,7 +46,12 @@ pub struct AppState {
 /// The agent for `config`: the server's own DID, which members write to.
 pub fn build_agent(config: &Config, identity: Identity) -> anyhow::Result<(Agent, Option<address::Published>)> {
     let (agent, document) = address::build_agent(identity, &config.server.public_url, config.server.did_method)?;
-    let features = Features::standard().with_protocol(community::PIURI, &["server"]).with_protocol(questions::PIURI, &["processor"]);
+    let features = Features::standard()
+        .with_protocol(community::PIURI, &["server"])
+        .with_protocol(questions::PIURI, &["processor"])
+        // A member's app sends its profile to whoever takes one: how the server
+        // learns what to call them.
+        .with_protocol(community::USER_PROFILE, &[]);
     Ok((agent.with_features(features), document))
 }
 
