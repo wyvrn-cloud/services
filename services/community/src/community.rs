@@ -25,6 +25,24 @@ pub const MEMBERS_REQUEST: &str = "https://wyvrn.app/community/1.0/members-reque
 pub const MEMBERS: &str = "https://wyvrn.app/community/1.0/members";
 pub const SET_MEMBER: &str = "https://wyvrn.app/community/1.0/set-member";
 pub const SET_PROFILE: &str = "https://wyvrn.app/community/1.0/set-profile";
+pub const EDIT: &str = "https://wyvrn.app/community/1.0/edit";
+pub const DELETE: &str = "https://wyvrn.app/community/1.0/delete";
+pub const PIN: &str = "https://wyvrn.app/community/1.0/pin";
+pub const REACT: &str = "https://wyvrn.app/community/1.0/react";
+pub const CREATE_THREAD: &str = "https://wyvrn.app/community/1.0/create-thread";
+pub const CHANGED: &str = "https://wyvrn.app/community/1.0/changed";
+pub const CHANGES_REQUEST: &str = "https://wyvrn.app/community/1.0/changes-request";
+pub const CHANGES: &str = "https://wyvrn.app/community/1.0/changes";
+
+/// Who a post calls on when it calls on everyone in the community.
+pub const EVERYONE: &str = "everyone";
+/// As many as one post may call on by name.
+const MAX_MENTIONS: usize = 50;
+/// As many different emoji as one post takes, and as one member puts on it.
+const MAX_REACTIONS: usize = 20;
+const MAX_THREAD_NAME: usize = 80;
+/// As many changed posts as one `changes` carries.
+const CHANGES_BATCH: usize = 100;
 
 pub const USER_PROFILE: &str = "https://didcomm.org/user-profile/1.0";
 pub const PROFILE: &str = "https://didcomm.org/user-profile/1.0/profile";
@@ -66,6 +84,9 @@ pub struct Outcome {
     pub channels_changed: bool,
     /// Whether the community's name, description or picture changed.
     pub profile_changed: bool,
+    /// Posts that changed (edited, taken back, pinned, reacted to, grown into a
+    /// thread): everyone who has joined is sent each as it now stands.
+    pub changed: Vec<String>,
 }
 
 impl Outcome {
@@ -96,6 +117,24 @@ pub fn problem(message: &Value, code: &str, comment: &str) -> Value {
         report["ack"] = json!([id]);
     }
     report
+}
+
+/// Whether `text` could be one emoji. What a reaction arrives as is someone's text,
+/// shown to everyone: nothing with a letter, a space or a control character in it,
+/// nothing long, and something that is at least a symbol. (A custom emoji is
+/// written as it is in text, a picture alone: `![party_cat](https://…/cat.png)`.)
+pub fn is_emoji(text: &str) -> bool {
+    if let Some(custom) = text.strip_prefix("![").and_then(|rest| rest.strip_suffix(')')) {
+        let Some((name, address)) = custom.split_once("](") else { return false };
+        let named = !name.is_empty() && name.len() <= 34 && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == ':');
+        return named && text.len() <= 200 && address.starts_with("https://") && !address.contains(|c: char| c.is_whitespace() || c.is_control() || "()<>\"".contains(c));
+    }
+    let keycap = text.contains('\u{20E3}');
+    !text.is_empty()
+        && text.len() <= 64
+        && text.chars().count() <= 16
+        && text.chars().all(|c| !c.is_alphabetic() && !c.is_whitespace() && !c.is_control() && (!c.is_ascii() || (keycap && "#*0123456789".contains(c))))
+        && text.chars().any(|c| c as u32 >= 0xA9)
 }
 
 fn refuse(message: &Value, code: &str, comment: &str) -> anyhow::Result<Outcome> {
@@ -207,6 +246,9 @@ impl Community {
             "joined": member.joined,
             "members_may_create_channels": self.config.members_may_create_channels,
             "channels": channels,
+            // Where the last change to any post stands: an app holding less asks for
+            // what it missed (`changes-request`).
+            "latest_rev": self.store.latest_rev()?,
         }))
     }
 
@@ -233,7 +275,67 @@ impl Community {
         if let Some(answer) = &post.answer {
             body["answer"] = answer.clone();
         }
+        // What has been said of it since: each only where there is something to say.
+        if post.rev > 0 {
+            body["rev"] = json!(post.rev);
+        }
+        if let Some(reply_to) = &post.reply_to {
+            body["reply_to"] = json!(reply_to);
+        }
+        if let Some(thread) = &post.thread {
+            body["thread"] = json!(thread);
+        }
+        if !post.mentions.is_empty() {
+            body["mentions"] = json!(post.mentions);
+        }
+        if let Some(edited_at) = post.edited_at {
+            body["edited_at"] = json!(edited_at);
+        }
+        if post.deleted {
+            body["deleted"] = json!(true);
+        }
+        if post.pinned {
+            body["pinned"] = json!(true);
+        }
+        if !post.reactions.is_empty() {
+            body["reactions"] = post.reactions.iter().map(|(emoji, by)| json!({ "emoji": emoji, "by": by })).collect();
+        }
+        if let Some(thread) = &post.grew {
+            let mut grew = json!({ "created_by": thread.created_by, "created_at": thread.created_at, "count": thread.count });
+            if let Some(name) = &thread.name {
+                grew["name"] = json!(name);
+            }
+            body["grew"] = grew;
+        }
         body
+    }
+
+    /// A post as it now stands, sent to everyone who has joined when it changes.
+    pub fn changed_notice(&self, post: &Post) -> Value {
+        json!({ "type": CHANGED, "id": uuid::Uuid::new_v4().to_string(), "body": Self::message_body(post) })
+    }
+
+    /// Who a post may call on, from what it asks to: members by DID, and
+    /// `everyone` for an admin. Anyone else named is left out, not refused: a
+    /// member taken out since the post was written is nobody's mistake.
+    fn mentions_of(&self, body: &Value, member: &Member) -> anyhow::Result<Vec<String>> {
+        let mut mentions = Vec::new();
+        for named in body["mentions"].as_array().into_iter().flatten().filter_map(Value::as_str).take(MAX_MENTIONS * 2) {
+            let allowed = if named == EVERYONE { member.role == Role::Admin } else { self.store.member(named)?.is_some() };
+            if allowed && !mentions.iter().any(|known| known == named) && mentions.len() < MAX_MENTIONS {
+                mentions.push(named.to_string());
+            }
+        }
+        Ok(mentions)
+    }
+
+    /// The post a message names by `id`, if the sender may see it: any member may
+    /// see any post.
+    fn named_post(&self, body: &Value) -> anyhow::Result<Option<Post>> {
+        match body["id"].as_str().filter(|id| !id.is_empty()) {
+            Some(id) => Ok(self.store.post_by_id(id)?),
+            None => Ok(None),
+        }
     }
 
     /// A post, as it is sent to everyone who has joined.
@@ -264,6 +366,15 @@ impl Community {
             })
             .collect();
         Ok(json!({ "members": members }))
+    }
+
+    /// The answer to a message that changed the post `id`: the post as it now
+    /// stands, which everyone else who has joined is sent too.
+    fn changed_answer(&self, message: &Value, id: &str) -> anyhow::Result<Outcome> {
+        let Some(post) = self.store.post_by_id(id)? else {
+            return refuse(message, "e.p.msg.unknown-post", "There is no such post.");
+        };
+        Ok(Outcome { reply: Some(reply_to(message, CHANGED, Self::message_body(&post))), changed: vec![post.id], ..Outcome::default() })
     }
 
     fn may_manage_channels(&self, member: &Member) -> bool {
@@ -417,8 +528,134 @@ impl Community {
                     }
                     return Ok(Outcome::reply(reply_to(message, POSTED, json!({ "channel": existing.channel, "seq": existing.seq, "id": existing.id }))));
                 }
+                // What it answers, and the thread it is in: both posts of this channel.
+                let answered = match body["reply_to"].as_str().filter(|id| !id.is_empty()) {
+                    Some(answered) => match self.store.post_by_id(answered)?.filter(|post| post.channel == channel.id) {
+                        Some(post) => Some(post),
+                        None => return refuse(message, "e.p.msg.unknown-post", "The post that answers isn't in this channel."),
+                    },
+                    None => None,
+                };
+                let thread = match body["thread"].as_str().filter(|id| !id.is_empty()) {
+                    Some(thread) => match self.store.thread(thread)?.filter(|thread| thread.channel == channel.id) {
+                        Some(thread) => Some(thread.id),
+                        None => return refuse(message, "e.p.msg.unknown-thread", "There is no such thread in this channel."),
+                    },
+                    // An answer to a post in a thread is in that thread.
+                    None => answered.as_ref().and_then(|post| post.thread.clone()),
+                };
+                let mentions = self.mentions_of(body, &member)?;
                 let post = self.store.add_post(&channel.id, &id, content, &member, question.as_ref(), None, now)?;
-                Ok(Outcome { reply: Some(reply_to(message, POSTED, json!({ "channel": post.channel, "seq": post.seq, "id": post.id }))), posted: true, ..Outcome::default() })
+                self.store.set_written_with(&post.id, answered.as_ref().map(|post| post.id.as_str()), thread.as_deref(), &mentions)?;
+                let mut outcome = Outcome { reply: Some(reply_to(message, POSTED, json!({ "channel": post.channel, "seq": post.seq, "id": post.id }))), posted: true, ..Outcome::default() };
+                // The post a thread grew from says how many are in it now.
+                if let Some(thread) = thread {
+                    self.store.touch_thread(&thread)?;
+                    outcome.changed.push(thread);
+                }
+                Ok(outcome)
+            }
+
+            EDIT | DELETE => {
+                let Some(post) = self.named_post(body)? else {
+                    return refuse(message, "e.p.msg.unknown-post", "There is no such post.");
+                };
+                // A post is its author's to change, and nobody else's.
+                if post.author_did != sender {
+                    return refuse(message, "e.p.trust.not-authorized", "Only whoever wrote a post changes it or takes it back.");
+                }
+                if post.deleted {
+                    return refuse(message, "e.p.msg.deleted", "That post was taken back.");
+                }
+                if message_type == DELETE {
+                    self.store.delete_post(&post.id)?;
+                } else {
+                    let content = body["content"].as_str().unwrap_or_default().trim();
+                    if content.is_empty() {
+                        return refuse(message, "e.p.msg.empty", "A post needs something in it.");
+                    }
+                    if content.chars().count() > self.config.max_post_length {
+                        return refuse(message, "e.p.msg.too-long", "That is longer than a post can be here.");
+                    }
+                    // Who it calls on is said again with it; left out, it is as it was.
+                    let mentions = if body.get("mentions").is_some() { self.mentions_of(body, &member)? } else { post.mentions.clone() };
+                    if content != post.content || mentions != post.mentions {
+                        self.store.edit_post(&post.id, content, &mentions, now)?;
+                    }
+                }
+                self.changed_answer(message, &post.id)
+            }
+
+            PIN => {
+                let Some(post) = self.named_post(body)? else {
+                    return refuse(message, "e.p.msg.unknown-post", "There is no such post.");
+                };
+                // Whoever may change the channel says what is pinned in it.
+                let opened = self.store.channel(&post.channel)?.is_some_and(|channel| channel.created_by == sender);
+                if member.role != Role::Admin && !opened {
+                    return refuse(message, "e.p.trust.not-authorized", "Only an admin, or whoever opened the channel, pins a post in it.");
+                }
+                if post.deleted {
+                    return refuse(message, "e.p.msg.deleted", "That post was taken back.");
+                }
+                let pinned = body["pinned"].as_bool().unwrap_or(true);
+                if pinned != post.pinned {
+                    self.store.set_pinned(&post.id, pinned)?;
+                }
+                self.changed_answer(message, &post.id)
+            }
+
+            REACT => {
+                let Some(post) = self.named_post(body)? else {
+                    return refuse(message, "e.p.msg.unknown-post", "There is no such post.");
+                };
+                if post.deleted {
+                    return refuse(message, "e.p.msg.deleted", "That post was taken back.");
+                }
+                let Some(listed) = body["emoji"].as_array() else {
+                    return refuse(message, "e.p.msg.invalid-reaction", "A reaction is a list of emoji: all of this member's on the post, which may be none.");
+                };
+                let emoji: Vec<String> = listed.iter().filter_map(Value::as_str).map(str::to_string).collect();
+                if emoji.len() != listed.len() || emoji.len() > MAX_REACTIONS || !emoji.iter().all(|emoji| is_emoji(emoji)) {
+                    return refuse(message, "e.p.msg.invalid-reaction", "A reaction is an emoji, and a post takes twenty of them from one member.");
+                }
+                // A post takes so many different ones, whoever they are from.
+                let known: Vec<&String> = post.reactions.iter().map(|(emoji, _)| emoji).collect();
+                let new = emoji.iter().filter(|emoji| !known.contains(emoji)).count();
+                if known.len() + new > MAX_REACTIONS && new > 0 {
+                    return refuse(message, "e.p.msg.too-many", "That post has as many different reactions as one takes.");
+                }
+                self.store.set_reactions(&post.id, sender, &emoji, now)?;
+                self.changed_answer(message, &post.id)
+            }
+
+            CREATE_THREAD => {
+                let Some(post) = self.named_post(body)? else {
+                    return refuse(message, "e.p.msg.unknown-post", "There is no such post.");
+                };
+                if post.thread.is_some() {
+                    return refuse(message, "e.p.msg.in-thread", "A thread doesn't grow from a post in a thread.");
+                }
+                // Only someone in the conversation it grows from: whoever wrote the
+                // post, what it answers, or an answer to it.
+                let mut chain = self.store.chain_authors(&post.id)?;
+                chain.extend(self.store.repliers(&post.id)?);
+                if !chain.iter().any(|author| author == sender) {
+                    return refuse(message, "e.p.trust.not-authorized", "A thread is started by someone who wrote in the replies it grows from.");
+                }
+                let name = line(&body["name"], MAX_THREAD_NAME);
+                self.store.add_thread(&post.id, &post.channel, name.as_deref(), sender, now)?;
+                self.changed_answer(message, &post.id)
+            }
+
+            CHANGES_REQUEST => {
+                let after = body["after_rev"].as_i64().unwrap_or(0).max(0);
+                let mut posts = self.store.posts_changed_after(after, CHANGES_BATCH + 1)?;
+                let more = posts.len() > CHANGES_BATCH;
+                posts.truncate(CHANGES_BATCH);
+                let upto = posts.last().map_or(after, |post| post.rev);
+                let messages: Vec<Value> = posts.iter().map(Self::message_body).collect();
+                Ok(Outcome::reply(reply_to(message, CHANGES, json!({ "messages": messages, "rev": upto, "more": more }))))
             }
 
             HISTORY_REQUEST => {
@@ -426,13 +663,18 @@ impl Community {
                     return refuse(message, "e.p.msg.unknown-channel", "There is no such channel.");
                 };
                 let limit = body["limit"].as_u64().map_or(DEFAULT_HISTORY_LIMIT, |limit| (limit as usize).clamp(1, MAX_HISTORY_LIMIT));
-                let mut posts = self.store.channel_posts_before(&channel.id, body["before"].as_i64(), limit + 1)?;
+                let thread = body["thread"].as_str().filter(|id| !id.is_empty());
+                let mut posts = self.store.channel_posts_before(&channel.id, thread, body["before"].as_i64(), limit + 1)?;
                 let more = posts.len() > limit;
                 posts.truncate(limit);
                 // Oldest first, as they are read.
                 posts.reverse();
                 let messages: Vec<Value> = posts.iter().map(Self::message_body).collect();
-                Ok(Outcome::reply(reply_to(message, HISTORY, json!({ "channel": channel.id, "messages": messages, "more": more }))))
+                let mut history = json!({ "channel": channel.id, "messages": messages, "more": more });
+                if let Some(thread) = thread {
+                    history["thread"] = json!(thread);
+                }
+                Ok(Outcome::reply(reply_to(message, HISTORY, history)))
             }
 
             MEMBERS_REQUEST => Ok(Outcome::reply(reply_to(message, MEMBERS, self.members_body()?))),

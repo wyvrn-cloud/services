@@ -171,6 +171,17 @@ impl Service for CommunityService {
                 }
             }
         }
+        // A post that changed is sent, as it now stands, to everyone who has joined:
+        // whoever asked included, for their other devices. Not kept for anyone who
+        // can't be reached now: they ask for what changed when they are back.
+        for id in &outcome.changed {
+            if let Some(post) = state.community.store.post_by_id(id)? {
+                let notice = state.community.changed_notice(&post);
+                for member in state.community.store.joined()? {
+                    send_later(state, member.did, notice.clone());
+                }
+            }
+        }
         if outcome.posted {
             state.deliver.notify_one();
         }

@@ -214,6 +214,110 @@ async fn an_admin_opens_channels_and_everyone_who_joined_is_told() {
 }
 
 #[tokio::test]
+async fn a_post_is_answered_reacted_to_changed_pinned_and_taken_back_and_everyone_is_told() {
+    let server = start_server("").await;
+    let (admin, member, away) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member, &away]);
+    let channel = open_channel(&admin, "general").await;
+    admin.community("join", json!({})).await;
+    member.community("join", json!({})).await;
+    let changed = format!("{C}changed");
+
+    admin.community("post", json!({ "channel": channel, "id": "p1", "content": "Shall we ship?" })).await;
+    // An answer names what it answers, and calls on whom it likes among the members.
+    let answer = member.community("post", json!({ "channel": channel, "id": "p2", "content": "Yes @admin", "reply_to": "p1", "mentions": [admin.did(), "did:example:nobody", "everyone"] })).await;
+    assert_eq!(kind(&answer), "posted", "{answer}");
+    admin.next_message().await;
+    let got = admin.next_message().await;
+    assert_eq!((got["id"].as_str(), got["reply_to"].as_str()), (Some("p2"), Some("p1")));
+    // Someone who isn't a member is left out, and only an admin calls on everyone.
+    assert_eq!(got["mentions"], json!([admin.did()]));
+    member.next_message().await;
+    member.next_message().await;
+    assert_eq!(member.community("post", json!({ "channel": channel, "content": "to nothing", "reply_to": "nope" })).await["body"]["code"], "e.p.msg.unknown-post");
+
+    // A reaction is all of one member's emoji on a post; everyone is told who put what.
+    let reacted = member.community("react", json!({ "id": "p1", "emoji": ["👍", "🎉"] })).await;
+    assert_eq!(kind(&reacted), "changed", "{reacted}");
+    assert_eq!(reacted["body"]["reactions"], json!([{ "emoji": "🎉", "by": [member.did()] }, { "emoji": "👍", "by": [member.did()] }]));
+    assert_eq!(admin.next_of(&changed).await["body"]["reactions"].as_array().unwrap().len(), 2);
+    member.next_of(&changed).await;
+    admin.community("react", json!({ "id": "p1", "emoji": ["👍"] })).await;
+    let now = member.community("react", json!({ "id": "p1", "emoji": ["👍"] })).await;
+    assert_eq!(now["body"]["reactions"], json!([{ "emoji": "👍", "by": [member.did(), admin.did()] }]));
+    assert_eq!(member.community("react", json!({ "id": "p1", "emoji": ["thumbs up"] })).await["body"]["code"], "e.p.msg.invalid-reaction");
+    assert_eq!(member.community("react", json!({ "id": "nope", "emoji": ["👍"] })).await["body"]["code"], "e.p.msg.unknown-post");
+
+    // A post is changed by whoever wrote it, and nobody else.
+    assert_eq!(admin.community("edit", json!({ "id": "p2", "content": "No" })).await["body"]["code"], "e.p.trust.not-authorized");
+    let edited = member.community("edit", json!({ "id": "p2", "content": "Yes, on Friday" })).await;
+    assert_eq!(edited["body"]["content"], "Yes, on Friday");
+    assert!(edited["body"]["edited_at"].is_i64());
+    // (Who it calls on is as it was, said again or not.)
+    assert_eq!(edited["body"]["mentions"], json!([admin.did()]));
+
+    // Pinned by an admin, or by whoever opened the channel.
+    assert_eq!(member.community("pin", json!({ "id": "p1" })).await["body"]["code"], "e.p.trust.not-authorized");
+    assert_eq!(admin.community("pin", json!({ "id": "p1" })).await["body"]["pinned"], true);
+    assert_eq!(admin.community("pin", json!({ "id": "p1", "pinned": false })).await["body"].get("pinned"), None);
+
+    // Taken back, its place is kept and what it said is gone.
+    assert_eq!(admin.community("delete", json!({ "id": "p2" })).await["body"]["code"], "e.p.trust.not-authorized");
+    let gone = member.community("delete", json!({ "id": "p2" })).await;
+    assert_eq!((gone["body"]["deleted"].as_bool(), gone["body"]["content"].as_str(), gone["body"]["seq"].as_i64()), (Some(true), Some(""), Some(2)));
+    assert_eq!(member.community("edit", json!({ "id": "p2", "content": "again" })).await["body"]["code"], "e.p.msg.deleted");
+
+    // Someone who was away asks what changed since what they hold, and is given
+    // each post once, as it now stands.
+    let community = away.community("join", json!({})).await;
+    let latest = community["body"]["latest_rev"].as_i64().unwrap();
+    assert!(latest > 0);
+    let missed = away.community("changes-request", json!({ "after_rev": 0 })).await;
+    assert_eq!(kind(&missed), "changes");
+    let posts = missed["body"]["messages"].as_array().unwrap();
+    assert_eq!(posts.iter().map(|post| post["id"].as_str().unwrap()).collect::<Vec<_>>(), ["p1", "p2"]);
+    assert_eq!(posts[0]["reactions"][0]["by"], json!([member.did(), admin.did()]));
+    assert_eq!(posts[1]["deleted"], true);
+    assert_eq!((missed["body"]["rev"].as_i64(), missed["body"]["more"].as_bool()), (Some(latest), Some(false)));
+    assert_eq!(away.community("changes-request", json!({ "after_rev": latest })).await["body"]["messages"], json!([]));
+}
+
+#[tokio::test]
+async fn a_thread_grows_from_a_post_and_what_is_said_in_it_is_read_there() {
+    let server = start_server("").await;
+    let (admin, member, bystander) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member, &bystander]);
+    let channel = open_channel(&admin, "general").await;
+    admin.community("post", json!({ "channel": channel, "id": "root", "content": "Where shall we meet?" })).await;
+    member.community("post", json!({ "channel": channel, "id": "a1", "content": "The usual place", "reply_to": "root" })).await;
+
+    // Only someone who wrote in the replies it grows from starts one.
+    assert_eq!(bystander.community("create-thread", json!({ "id": "root" })).await["body"]["code"], "e.p.trust.not-authorized");
+    let grown = member.community("create-thread", json!({ "id": "root", "name": "  Meeting   place " })).await;
+    assert_eq!(kind(&grown), "changed", "{grown}");
+    assert_eq!(grown["body"]["grew"]["name"], "Meeting place");
+    assert_eq!(grown["body"]["grew"]["count"], 0);
+    assert_eq!(grown["body"]["grew"]["created_by"], member.did());
+
+    // Said in the thread, a post is the thread's, and the post it grew from counts it.
+    let said = admin.community("post", json!({ "channel": channel, "id": "t1", "content": "By the fountain", "thread": "root" })).await;
+    assert_eq!(kind(&said), "posted", "{said}");
+    // ...as is an answer to it, with nothing said of the thread.
+    member.community("post", json!({ "channel": channel, "id": "t2", "content": "Fine", "reply_to": "t1" })).await;
+    assert_eq!(admin.community("post", json!({ "channel": channel, "content": "x", "thread": "a1" })).await["body"]["code"], "e.p.msg.unknown-thread");
+    assert_eq!(admin.community("create-thread", json!({ "id": "t1" })).await["body"]["code"], "e.p.msg.in-thread");
+
+    let ids = |page: &Value| page["body"]["messages"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    // The channel reads as it did before the thread, with the count on what it grew from.
+    let main = bystander.community("history-request", json!({ "channel": channel })).await;
+    assert_eq!(ids(&main), ["root", "a1"]);
+    assert_eq!(main["body"]["messages"][0]["grew"]["count"], 2);
+    let thread = bystander.community("history-request", json!({ "channel": channel, "thread": "root" })).await;
+    assert_eq!(ids(&thread), ["t1", "t2"]);
+    assert_eq!(thread["body"]["messages"][1]["thread"], "root");
+}
+
+#[tokio::test]
 async fn members_may_open_channels_where_the_community_says_so() {
     let server = start_server("members_may_create_channels = true").await;
     let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);

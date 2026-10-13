@@ -71,6 +71,36 @@ pub struct Post {
     pub answer: Option<Value>,
     /// Who answered the question it asks, once someone has.
     pub answered_by: Option<String>,
+    /// Where it stands among every change made here: each post, and each change to
+    /// one, takes the next number. 0 for a post from before changes were counted.
+    pub rev: i64,
+    /// The post it answers.
+    pub reply_to: Option<String>,
+    /// The thread it is in: the id of the post the thread grew from.
+    pub thread: Option<String>,
+    /// Who it calls on: DIDs, and `everyone`.
+    pub mentions: Vec<String>,
+    pub edited_at: Option<i64>,
+    /// Taken back by its author. What it said is gone; its place is kept.
+    pub deleted: bool,
+    pub pinned: bool,
+    /// Each emoji on it, and who put it there, in the order they were first put.
+    pub reactions: Vec<(String, Vec<String>)>,
+    /// The thread that grew from it, if one did.
+    pub grew: Option<Thread>,
+}
+
+/// A thread: a side conversation grown from one post of a channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Thread {
+    /// The post it grew from.
+    pub id: String,
+    pub channel: String,
+    pub name: Option<String>,
+    pub created_by: String,
+    pub created_at: i64,
+    /// How many posts are in it.
+    pub count: i64,
 }
 
 /// Someone part-way through answering a question (a workflow/1.0 instance).
@@ -97,7 +127,14 @@ const MEMBER_COLUMNS: &str = "did, role, name, joined, since, delivered";
 // A post's author is called what they are called now, where they are still a
 // member; what they were called when they wrote it, otherwise.
 const POST_COLUMNS: &str = "serial, channel, seq, id, content, posted_at, author_did, \
-    COALESCE((SELECT name FROM members WHERE members.did = posts.author_did), author_name), question, answer, answered_by";
+    COALESCE((SELECT name FROM members WHERE members.did = posts.author_did), author_name), question, answer, answered_by, \
+    (SELECT rev FROM post_state WHERE post_state.post = posts.id), \
+    (SELECT reply_to FROM post_state WHERE post_state.post = posts.id), \
+    (SELECT thread FROM post_state WHERE post_state.post = posts.id), \
+    (SELECT mentions FROM post_state WHERE post_state.post = posts.id), \
+    (SELECT edited_at FROM post_state WHERE post_state.post = posts.id), \
+    (SELECT deleted FROM post_state WHERE post_state.post = posts.id), \
+    (SELECT pinned FROM post_state WHERE post_state.post = posts.id)";
 const CHANNEL_COLUMNS: &str =
     "id, name, topic, closed, created_at, created_by, (SELECT COALESCE(MAX(seq), 0) FROM posts WHERE posts.channel = channels.id)";
 
@@ -123,6 +160,16 @@ fn post_from(row: &Row) -> Result<Post> {
         question: json_from(row.get(8)?),
         answer: json_from(row.get(9)?),
         answered_by: row.get(10)?,
+        rev: row.get::<Option<i64>>(11)?.unwrap_or(0),
+        reply_to: row.get(12)?,
+        thread: row.get(13)?,
+        mentions: row.get::<Option<String>>(14)?.and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default(),
+        edited_at: row.get(15)?,
+        deleted: row.get::<Option<bool>>(16)?.unwrap_or(false),
+        pinned: row.get::<Option<bool>>(17)?.unwrap_or(false),
+        // Read after, each by a query of its own (`Store::filled`).
+        reactions: Vec::new(),
+        grew: None,
     })
 }
 
@@ -183,6 +230,33 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         answered_by TEXT,
         UNIQUE (channel, seq)
     );
+    -- What has been said of a post since it was written, and where it stands among
+    -- every change (rev). Beside posts, not in it: a store from before any of this
+    -- gains the table, and a post with no row here is as it was written.
+    CREATE TABLE IF NOT EXISTS post_state (
+        post TEXT PRIMARY KEY,
+        rev INTEGER NOT NULL DEFAULT 0,
+        reply_to TEXT,
+        thread TEXT,
+        mentions TEXT,
+        edited_at INTEGER,
+        deleted INTEGER NOT NULL DEFAULT 0,
+        pinned INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS reactions (
+        post TEXT NOT NULL,
+        did TEXT NOT NULL,
+        emoji TEXT NOT NULL,
+        at INTEGER NOT NULL,
+        PRIMARY KEY (post, did, emoji)
+    );
+    CREATE TABLE IF NOT EXISTS threads (
+        id TEXT PRIMARY KEY,
+        channel TEXT NOT NULL,
+        name TEXT,
+        created_by TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS answering (
         id TEXT PRIMARY KEY,
         owner TEXT NOT NULL,
@@ -231,6 +305,30 @@ fn schema() -> Schema {
                 answer MEDIUMTEXT,
                 answered_by {MYSQL_DID},
                 UNIQUE (channel, seq)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS post_state (
+                post VARCHAR(255) NOT NULL PRIMARY KEY,
+                rev BIGINT NOT NULL DEFAULT 0,
+                reply_to VARCHAR(255),
+                thread VARCHAR(255),
+                mentions MEDIUMTEXT,
+                edited_at BIGINT,
+                deleted BIGINT NOT NULL DEFAULT 0,
+                pinned BIGINT NOT NULL DEFAULT 0
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS reactions (
+                post VARCHAR(255) NOT NULL,
+                did {MYSQL_DID} NOT NULL,
+                emoji VARCHAR(200) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+                at BIGINT NOT NULL,
+                PRIMARY KEY (post, did(255), emoji)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS threads (
+                id VARCHAR(255) NOT NULL PRIMARY KEY,
+                channel VARCHAR(255) NOT NULL,
+                name TEXT,
+                created_by {MYSQL_DID} NOT NULL,
+                created_at BIGINT NOT NULL
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS answering (
                 id VARCHAR(255) NOT NULL PRIMARY KEY,
@@ -393,6 +491,171 @@ impl Store {
         self.db.lock().query_value("SELECT COALESCE(MAX(serial), 0) FROM posts", params![])
     }
 
+    /// A post just read, with what is read apart from it: its reactions, and the
+    /// thread that grew from it.
+    fn filled(&self, mut post: Post) -> Result<Post> {
+        let mut db = self.db.lock();
+        let put = db.query("SELECT emoji, did FROM reactions WHERE post = ?1 ORDER BY at, emoji, did", params![post.id.clone()], |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)))?;
+        for (emoji, did) in put {
+            match post.reactions.iter_mut().find(|(known, _)| *known == emoji) {
+                Some((_, by)) => by.push(did),
+                None => post.reactions.push((emoji, vec![did])),
+            }
+        }
+        drop(db);
+        post.grew = self.thread(&post.id)?;
+        Ok(post)
+    }
+
+    fn all_filled(&self, posts: Vec<Post>) -> Result<Vec<Post>> {
+        posts.into_iter().map(|post| self.filled(post)).collect()
+    }
+
+    /// Gives `post` the next place among changes, making the record of what is said
+    /// of it if there is none yet.
+    fn touch(db: &mut wyvrn_service::db::Session<'_>, post: &str) -> Result<i64> {
+        let rev: i64 = db.query_value("SELECT COALESCE(MAX(rev), 0) + 1 FROM post_state", params![])?;
+        if db.execute("UPDATE post_state SET rev = ?2 WHERE post = ?1", params![post, rev])? == 0 {
+            db.execute("INSERT INTO post_state (post, rev) VALUES (?1, ?2)", params![post, rev])?;
+        }
+        Ok(rev)
+    }
+
+    /// The place the last change took: what someone who has all of them holds.
+    pub fn latest_rev(&self) -> Result<i64> {
+        self.db.lock().query_value("SELECT COALESCE(MAX(rev), 0) FROM post_state", params![])
+    }
+
+    /// Every post written or changed after `rev`, in the order that happened.
+    pub fn posts_changed_after(&self, rev: i64, limit: usize) -> Result<Vec<Post>> {
+        let posts = self.db.lock().query(
+            &format!("SELECT {POST_COLUMNS} FROM posts JOIN post_state state ON state.post = posts.id WHERE state.rev > ?1 ORDER BY state.rev LIMIT ?2"),
+            params![rev, limit as i64],
+            post_from,
+        )?;
+        self.all_filled(posts)
+    }
+
+    /// What a post is said to answer, be in and call on, set as it is written.
+    pub fn set_written_with(&self, id: &str, reply_to: Option<&str>, thread: Option<&str>, mentions: &[String]) -> Result<()> {
+        let mut db = self.db.lock();
+        Self::touch(&mut db, id)?;
+        let mentions = (!mentions.is_empty()).then(|| serde_json::to_string(mentions).unwrap_or_default());
+        db.execute("UPDATE post_state SET reply_to = ?2, thread = ?3, mentions = ?4 WHERE post = ?1", params![id, reply_to, thread, mentions])?;
+        Ok(())
+    }
+
+    pub fn edit_post(&self, id: &str, content: &str, mentions: &[String], now: i64) -> Result<()> {
+        let mut db = self.db.lock();
+        db.execute("UPDATE posts SET content = ?2 WHERE id = ?1", params![id, content])?;
+        Self::touch(&mut db, id)?;
+        let mentions = (!mentions.is_empty()).then(|| serde_json::to_string(mentions).unwrap_or_default());
+        db.execute("UPDATE post_state SET edited_at = ?2, mentions = ?3 WHERE post = ?1", params![id, now, mentions])?;
+        Ok(())
+    }
+
+    /// Takes a post back: what it said and asked is gone, and so is what was put on it.
+    pub fn delete_post(&self, id: &str) -> Result<()> {
+        let mut db = self.db.lock();
+        db.execute("UPDATE posts SET content = '', question = NULL, answer = NULL WHERE id = ?1", params![id])?;
+        db.execute("DELETE FROM reactions WHERE post = ?1", params![id])?;
+        Self::touch(&mut db, id)?;
+        db.execute("UPDATE post_state SET deleted = 1, pinned = 0, mentions = NULL WHERE post = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn set_pinned(&self, id: &str, pinned: bool) -> Result<()> {
+        let mut db = self.db.lock();
+        Self::touch(&mut db, id)?;
+        db.execute("UPDATE post_state SET pinned = ?2 WHERE post = ?1", params![id, pinned])?;
+        Ok(())
+    }
+
+    /// Makes `emoji` the whole of what `did` has put on a post. `false` if that is
+    /// what was there already.
+    pub fn set_reactions(&self, id: &str, did: &str, emoji: &[String], now: i64) -> Result<bool> {
+        let mut db = self.db.lock();
+        let had: Vec<String> = db.query("SELECT emoji FROM reactions WHERE post = ?1 AND did = ?2 ORDER BY emoji", params![id, did], |row| row.get::<String>(0))?;
+        let mut wanted = emoji.to_vec();
+        wanted.sort();
+        wanted.dedup();
+        if had == wanted {
+            return Ok(false);
+        }
+        for gone in had.iter().filter(|emoji| !wanted.contains(emoji)) {
+            db.execute("DELETE FROM reactions WHERE post = ?1 AND did = ?2 AND emoji = ?3", params![id, did, gone.clone()])?;
+        }
+        for new in wanted.iter().filter(|emoji| !had.contains(emoji)) {
+            db.execute("INSERT OR IGNORE INTO reactions (post, did, emoji, at) VALUES (?1, ?2, ?3, ?4)", params![id, did, new.clone(), now])?;
+        }
+        Self::touch(&mut db, id)?;
+        Ok(true)
+    }
+
+    /// How many different emoji a post has on it.
+    pub fn reaction_kinds(&self, id: &str) -> Result<i64> {
+        self.db.lock().query_value("SELECT COUNT(DISTINCT emoji) FROM reactions WHERE post = ?1", params![id])
+    }
+
+    // --- Threads ---------------------------------------------------------------
+
+    pub fn thread(&self, id: &str) -> Result<Option<Thread>> {
+        self.db.lock().query_row(
+            "SELECT id, channel, name, created_by, created_at, (SELECT COUNT(*) FROM post_state WHERE post_state.thread = threads.id) FROM threads WHERE id = ?1",
+            params![id],
+            |row| Ok(Thread { id: row.get(0)?, channel: row.get(1)?, name: row.get(2)?, created_by: row.get(3)?, created_at: row.get(4)?, count: row.get(5)? }),
+        )
+    }
+
+    /// Grows a thread from the post `id`. `false` if one had grown from it already.
+    pub fn add_thread(&self, id: &str, channel: &str, name: Option<&str>, by: &str, now: i64) -> Result<bool> {
+        let mut db = self.db.lock();
+        let made = db.execute("INSERT OR IGNORE INTO threads (id, channel, name, created_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![id, channel, name, by, now])? > 0;
+        if made {
+            Self::touch(&mut db, id)?;
+        }
+        Ok(made)
+    }
+
+    /// Notes that the thread `id` has changed (a post was added to it), so that the
+    /// post it grew from is told of again with its count.
+    pub fn touch_thread(&self, id: &str) -> Result<()> {
+        Self::touch(&mut self.db.lock(), id).map(|_| ())
+    }
+
+    /// The posts a reply chain is made of: `id`, what it answers, and so on back.
+    pub fn chain_authors(&self, id: &str) -> Result<Vec<String>> {
+        let mut authors = Vec::new();
+        let mut at = Some(id.to_string());
+        // (A chain is as long as people made it; a loop in one is nobody's doing.)
+        for _ in 0..200 {
+            let Some(id) = at else { break };
+            let Some(post) = self.post_by_id(&id)? else { break };
+            authors.push(post.author_did);
+            at = post.reply_to;
+        }
+        Ok(authors)
+    }
+
+    /// Everyone who has answered `id`, or answered an answer to it: the rest of its chain.
+    pub fn repliers(&self, id: &str) -> Result<Vec<String>> {
+        let mut authors = Vec::new();
+        let mut frontier = vec![id.to_string()];
+        for _ in 0..200 {
+            let Some(at) = frontier.pop() else { break };
+            let answers = self.db.lock().query(
+                "SELECT posts.id, posts.author_did FROM posts JOIN post_state state ON state.post = posts.id WHERE state.reply_to = ?1",
+                params![at],
+                |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)),
+            )?;
+            for (answer, author) in answers {
+                authors.push(author);
+                frontier.push(answer);
+            }
+        }
+        Ok(authors)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn add_post(&self, channel: &str, id: &str, content: &str, author: &Member, question: Option<&Value>, answer: Option<&Value>, now: i64) -> Result<Post> {
         let mut db = self.db.lock();
@@ -408,7 +671,8 @@ impl Store {
     }
 
     pub fn post_by_id(&self, id: &str) -> Result<Option<Post>> {
-        self.db.lock().query_row(&format!("SELECT {POST_COLUMNS} FROM posts WHERE id = ?1"), params![id], post_from)
+        let post = self.db.lock().query_row(&format!("SELECT {POST_COLUMNS} FROM posts WHERE id = ?1"), params![id], post_from)?;
+        post.map(|post| self.filled(post)).transpose()
     }
 
     /// Records who answered the question `id` asks. `false` if someone already had.
@@ -418,16 +682,29 @@ impl Store {
 
     /// Every post after `serial`, oldest first: what is still to send to someone.
     pub fn posts_after(&self, serial: i64, limit: usize) -> Result<Vec<Post>> {
-        self.db.lock().query(&format!("SELECT {POST_COLUMNS} FROM posts WHERE serial > ?1 ORDER BY serial LIMIT ?2"), params![serial, limit as i64], post_from)
+        let posts = self.db.lock().query(&format!("SELECT {POST_COLUMNS} FROM posts WHERE serial > ?1 ORDER BY serial LIMIT ?2"), params![serial, limit as i64], post_from)?;
+        self.all_filled(posts)
     }
 
     /// A channel's posts before `before` (its newest, with none given), newest first.
-    pub fn channel_posts_before(&self, channel: &str, before: Option<i64>, limit: usize) -> Result<Vec<Post>> {
-        self.db.lock().query(
-            &format!("SELECT {POST_COLUMNS} FROM posts WHERE channel = ?1 AND seq < ?2 ORDER BY seq DESC LIMIT ?3"),
-            params![channel, before.unwrap_or(i64::MAX), limit as i64],
-            post_from,
-        )
+    ///
+    /// With `thread`, the posts in that thread; without, the channel's own, which
+    /// are the ones in no thread.
+    pub fn channel_posts_before(&self, channel: &str, thread: Option<&str>, before: Option<i64>, limit: usize) -> Result<Vec<Post>> {
+        const IN_THREAD: &str = "(SELECT thread FROM post_state WHERE post_state.post = posts.id)";
+        let posts = match thread {
+            Some(thread) => self.db.lock().query(
+                &format!("SELECT {POST_COLUMNS} FROM posts WHERE channel = ?1 AND seq < ?2 AND {IN_THREAD} = ?4 ORDER BY seq DESC LIMIT ?3"),
+                params![channel, before.unwrap_or(i64::MAX), limit as i64, thread],
+                post_from,
+            )?,
+            None => self.db.lock().query(
+                &format!("SELECT {POST_COLUMNS} FROM posts WHERE channel = ?1 AND seq < ?2 AND {IN_THREAD} IS NULL ORDER BY seq DESC LIMIT ?3"),
+                params![channel, before.unwrap_or(i64::MAX), limit as i64],
+                post_from,
+            )?,
+        };
+        self.all_filled(posts)
     }
 
     // --- Answering a question --------------------------------------------------
