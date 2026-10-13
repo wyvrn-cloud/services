@@ -80,8 +80,8 @@ pub struct Post {
     pub reply_snippet: Option<String>,
     /// The thread it is in: the id of the post the thread grew from.
     pub thread: Option<String>,
-    /// Who it calls on: DIDs, and `everyone`.
-    pub mentions: Vec<String>,
+    /// Who it calls on, and what it writes each as.
+    pub mentions: Vec<Mention>,
     pub edited_at: Option<i64>,
     /// Taken back by its author. What it said is gone; its place is kept.
     pub deleted: bool,
@@ -90,6 +90,14 @@ pub struct Post {
     pub reactions: Vec<(String, Vec<String>)>,
     /// The thread that grew from it, if one did.
     pub grew: Option<Thread>,
+}
+
+/// Someone a post calls on: a member's DID or `everyone`, and the name the post
+/// writes them as (`@name`), which is how an app finds them in its text.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Mention {
+    pub who: String,
+    pub name: String,
 }
 
 /// A thread: a side conversation grown from one post of a channel.
@@ -548,7 +556,7 @@ impl Store {
 
     /// What a post is said to answer, be in and call on, set as it is written.
     /// `reply` is the post answered, its author, and the answerer's quotation of it.
-    pub fn set_written_with(&self, id: &str, reply: Option<(&str, &str, Option<&str>)>, thread: Option<&str>, mentions: &[String]) -> Result<()> {
+    pub fn set_written_with(&self, id: &str, reply: Option<(&str, &str, Option<&str>)>, thread: Option<&str>, mentions: &[Mention]) -> Result<()> {
         let mut db = self.db.lock();
         Self::touch(&mut db, id)?;
         let mentions = (!mentions.is_empty()).then(|| serde_json::to_string(mentions).unwrap_or_default());
@@ -563,7 +571,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn edit_post(&self, id: &str, content: &str, mentions: &[String], now: i64) -> Result<()> {
+    pub fn edit_post(&self, id: &str, content: &str, mentions: &[Mention], now: i64) -> Result<()> {
         let mut db = self.db.lock();
         db.execute("UPDATE posts SET content = ?2 WHERE id = ?1", params![id, content])?;
         Self::touch(&mut db, id)?;

@@ -7,7 +7,7 @@
 use serde_json::{json, Map, Value};
 
 use crate::config::CommunityConfig;
-use crate::store::{Channel, Member, Post, Role, Store};
+use crate::store::{Channel, Member, Mention, Post, Role, Store};
 use wyvrn_service::profile::{Change, Changed, Kept};
 
 pub const PIURI: &str = "https://wyvrn.app/community/1.0";
@@ -47,6 +47,7 @@ pub const CHANGES: &str = "https://wyvrn.app/community/1.0/changes";
 pub const EVERYONE: &str = "everyone";
 /// As many as one post may call on by name.
 const MAX_MENTIONS: usize = 50;
+const MAX_MENTION_NAME: usize = 40;
 /// As many different emoji as one post takes, and as one member puts on it.
 const MAX_REACTIONS: usize = 20;
 const MAX_THREAD_NAME: usize = 80;
@@ -332,15 +333,18 @@ impl Community {
         json!({ "type": CHANGED, "id": uuid::Uuid::new_v4().to_string(), "body": Self::message_body(post) })
     }
 
-    /// Who a post may call on, from what it asks to: members by DID, and
-    /// `everyone` for an admin. Anyone else named is left out, not refused: a
-    /// member taken out since the post was written is nobody's mistake.
-    fn mentions_of(&self, body: &Value, member: &Member) -> anyhow::Result<Vec<String>> {
-        let mut mentions = Vec::new();
-        for named in body["mentions"].as_array().into_iter().flatten().filter_map(Value::as_str).take(MAX_MENTIONS * 2) {
-            let allowed = if named == EVERYONE { member.role == Role::Admin } else { self.store.member(named)?.is_some() };
-            if allowed && !mentions.iter().any(|known| known == named) && mentions.len() < MAX_MENTIONS {
-                mentions.push(named.to_string());
+    /// Who a post may call on, from what it asks to: each `{ who, name }`, `who` a
+    /// member's DID, or `everyone` for an admin, and `name` what the post writes
+    /// them as. Anyone else named is left out, not refused: a member taken out
+    /// since the post was written is nobody's mistake.
+    fn mentions_of(&self, body: &Value, member: &Member) -> anyhow::Result<Vec<Mention>> {
+        let mut mentions: Vec<Mention> = Vec::new();
+        for named in body["mentions"].as_array().into_iter().flatten().take(MAX_MENTIONS * 2) {
+            let Some(who) = named["who"].as_str() else { continue };
+            let allowed = if who == EVERYONE { member.role == Role::Admin } else { self.store.member(who)?.is_some() };
+            if allowed && !mentions.iter().any(|known| known.who == who) && mentions.len() < MAX_MENTIONS {
+                let name = line(&named["name"], MAX_MENTION_NAME).unwrap_or_else(|| if who == EVERYONE { EVERYONE.to_string() } else { String::new() });
+                mentions.push(Mention { who: who.to_string(), name });
             }
         }
         Ok(mentions)

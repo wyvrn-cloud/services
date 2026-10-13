@@ -225,14 +225,14 @@ async fn a_post_is_answered_reacted_to_changed_pinned_and_taken_back_and_everyon
 
     admin.community("post", json!({ "channel": channel, "id": "p1", "content": "Shall we ship?" })).await;
     // An answer names what it answers, and calls on whom it likes among the members.
-    let answer = member.community("post", json!({ "channel": channel, "id": "p2", "content": "Yes @admin", "reply_to": { "id": "p1", "author": admin.did(), "snippet": "Shall we ship?" }, "mentions": [admin.did(), "did:example:nobody", "everyone"] })).await;
+    let answer = member.community("post", json!({ "channel": channel, "id": "p2", "content": "Yes @admin", "reply_to": { "id": "p1", "author": admin.did(), "snippet": "Shall we ship?" }, "mentions": [{ "who": admin.did(), "name": " admin " }, { "who": "did:example:nobody", "name": "x" }, { "who": "everyone" }] })).await;
     assert_eq!(kind(&answer), "posted", "{answer}");
     admin.next_message().await;
     let got = admin.next_message().await;
     assert_eq!(got["id"], "p2");
     assert_eq!(got["reply_to"], json!({ "id": "p1", "author": admin.did(), "snippet": "Shall we ship?" }));
     // Someone who isn't a member is left out, and only an admin calls on everyone.
-    assert_eq!(got["mentions"], json!([admin.did()]));
+    assert_eq!(got["mentions"], json!([{ "who": admin.did(), "name": "admin" }]));
     member.next_message().await;
     member.next_message().await;
     assert_eq!(member.community("post", json!({ "channel": channel, "content": "to nothing", "reply_to": { "id": "nope", "author": admin.did() } })).await["body"]["code"], "e.p.msg.unknown-post");
@@ -265,7 +265,7 @@ async fn a_post_is_answered_reacted_to_changed_pinned_and_taken_back_and_everyon
     assert_eq!(edited["body"]["content"], "Yes, on Friday");
     assert!(edited["body"]["edited_at"].is_i64());
     // (Who it calls on is as it was, said again or not.)
-    assert_eq!(edited["body"]["mentions"], json!([admin.did()]));
+    assert_eq!(edited["body"]["mentions"], json!([{ "who": admin.did(), "name": "admin" }]));
 
     // Pinned by an admin, or by whoever opened the channel.
     assert_eq!(member.ask("https://wyvrn.app/message-pins/1.0/pin", json!({ "to": { "id": "p1" } })).await["body"]["code"], "e.p.trust.not-authorized");
