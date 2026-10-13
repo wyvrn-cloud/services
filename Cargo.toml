@@ -27,6 +27,7 @@ didcomm-quickstart = { git = "https://github.com/wyvrn-cloud/didcomm" }
 didcomm-resolver-peer = { git = "https://github.com/wyvrn-cloud/didcomm" }
 
 anyhow = "1"
+async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
 reqwest = "0.13"

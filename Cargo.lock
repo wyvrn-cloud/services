@@ -4410,6 +4410,7 @@ name = "wyvrn-announce"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "didcomm-agent",
@@ -4426,6 +4427,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
+ "wyvrn-hosted-did",
  "wyvrn-service",
 ]
 
@@ -4516,6 +4518,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "didcomm-agent",
+ "didcomm-core",
  "mysql",
  "reqwest",
  "rusqlite",

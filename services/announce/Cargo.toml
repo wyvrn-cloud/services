@@ -27,5 +27,8 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# A resolver of the tests' own, for a DID that would be fetched from a host.
+async-trait = { workspace = true }
+wyvrn-hosted-did = { workspace = true }
 # The tests post to the channel as an app would.
 reqwest = { workspace = true }

@@ -40,6 +40,9 @@ pub struct AppState {
 /// The agent for `config`: the host's own DID, which holders write to.
 pub fn build_agent(config: &Config, identity: Identity) -> anyhow::Result<(Agent, Option<address::Published>)> {
     let (agent, document) = address::build_agent(identity, &config.server.public_url, config.server.did_method)?;
+    // Who it is, for whoever looks its DID up before writing to it.
+    let profile = config.profile.or("DID_HOST", "Public addresses", "Hosts public addresses: short names that people and services are found by.");
+    let document = document.map(|document| document.with_profile(&profile)).transpose()?;
     Ok((agent.with_features(Features::standard().with_protocol(PIURI, &["host"])), document))
 }
 

@@ -33,6 +33,9 @@ services:
       DID_HOST_DID_METHOD: "web"
       DID_HOST_ADMINS: "${DID_HOST_ADMINS:-}"
       DID_HOST_DATABASE_URL: "${DID_HOST_DATABASE_URL:?set DID_HOST_DATABASE_URL in .env}"
+      # Who it says it is, to someone looking its DID up (../../README.md).
+      DID_HOST_PROFILE_NAME: "${DID_HOST_PROFILE_NAME:-}"
+      DID_HOST_PROFILE_DESCRIPTION: "${DID_HOST_PROFILE_DESCRIPTION:-}"
 
   # Sticker and custom-emoji packs. The app is built to use
   # did:web:stickers.wyvrn.app unless told otherwise (VITE_STICKER_SERVICE_DID).
@@ -49,6 +52,9 @@ services:
       STICKERS_DID_METHOD: "web"
       STICKERS_ADMINS: "${STICKERS_ADMINS:-}"
       STICKERS_DATABASE_URL: "${STICKERS_DATABASE_URL:?set STICKERS_DATABASE_URL in .env}"
+      # Who it says it is, to someone looking its DID up (../../README.md).
+      STICKERS_PROFILE_NAME: "${STICKERS_PROFILE_NAME:-}"
+      STICKERS_PROFILE_DESCRIPTION: "${STICKERS_PROFILE_DESCRIPTION:-}"
 
   # A community server. No app is built to expect one: people are given its DID.
   community:
@@ -67,6 +73,9 @@ services:
       COMMUNITY_ADMINS: "${COMMUNITY_ADMINS:-}"
       COMMUNITY_MEMBERS: "${COMMUNITY_MEMBERS:-}"
       COMMUNITY_DATABASE_URL: "${COMMUNITY_DATABASE_URL:?set COMMUNITY_DATABASE_URL in .env}"
+      # Who it says it is, to someone looking its DID up (../../README.md).
+      COMMUNITY_PROFILE_NAME: "${COMMUNITY_PROFILE_NAME:-}"
+      COMMUNITY_PROFILE_DESCRIPTION: "${COMMUNITY_PROFILE_DESCRIPTION:-}"
 
   # An announcement channel. Likewise: people are given its DID.
   announce:
@@ -85,3 +94,6 @@ services:
       ANNOUNCE_DESCRIPTION: "${ANNOUNCE_DESCRIPTION:-A one-way announcement channel.}"
       ANNOUNCE_ADMINS: "${ANNOUNCE_ADMINS:-}"
       ANNOUNCE_DATABASE_URL: "${ANNOUNCE_DATABASE_URL:?set ANNOUNCE_DATABASE_URL in .env}"
+      # Who it says it is, to someone looking its DID up (../../README.md).
+      ANNOUNCE_PROFILE_NAME: "${ANNOUNCE_PROFILE_NAME:-}"
+      ANNOUNCE_PROFILE_DESCRIPTION: "${ANNOUNCE_PROFILE_DESCRIPTION:-}"

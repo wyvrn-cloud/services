@@ -16,6 +16,10 @@ pub struct Config {
     /// needs a public web address; this only moves where messages to it arrive.
     #[serde(default)]
     pub mediator: Option<MediatorConfig>,
+    /// Who the service says it is, to someone looking its DID up: a name, a
+    /// description and a picture, each optional.
+    #[serde(default)]
+    pub profile: wyvrn_service::address::ProfileConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]

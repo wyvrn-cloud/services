@@ -95,6 +95,31 @@ struct Running {
 }
 
 async fn start_channel(admins: &[String]) -> Running {
+    start_channel_resolving(admins, didcomm_quickstart::default_resolver()).await
+}
+
+/// A resolver that also knows the documents it is given: for a DID that would be
+/// fetched from a host.
+struct Knowing {
+    documents: std::collections::HashMap<String, Value>,
+    otherwise: Box<dyn didcomm_core::resolver::DIDResolver>,
+}
+
+#[async_trait::async_trait]
+impl didcomm_core::resolver::DIDResolver for Knowing {
+    async fn resolve(&self, did: &str) -> Result<Value, didcomm_core::resolver::ResolutionError> {
+        match self.documents.get(did) {
+            Some(document) => Ok(document.clone()),
+            None => self.otherwise.resolve(did).await,
+        }
+    }
+
+    async fn is_resolvable(&self, did: &str) -> bool {
+        self.documents.contains_key(did) || self.otherwise.is_resolvable(did).await
+    }
+}
+
+async fn start_channel_resolving(admins: &[String], resolver: Box<dyn didcomm_core::resolver::DIDResolver>) -> Running {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let config: wyvrn_announce::config::Config = toml::from_str(&format!(
@@ -119,7 +144,8 @@ async fn start_channel(admins: &[String]) -> Running {
         agent,
         channel,
         did_document,
-        resolver: didcomm_quickstart::default_resolver(),
+        resolver,
+        admins: admins.to_vec(),
         deliver: Notify::new(),
         reacted: Default::default(),
         react: Notify::new(),
@@ -129,6 +155,37 @@ async fn start_channel(admins: &[String]) -> Running {
     let app = server::router(state.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     Running { did, url, state }
+}
+
+#[tokio::test]
+async fn an_admin_named_by_a_public_address_is_one_when_they_write_from_their_own_did() {
+    const ADDRESS: &str = "did:webvh:QmScid:id.example:ada";
+    let ada = Peer::start().await;
+    let someone = Peer::start().await;
+    // Ada's public address: another DID, whose document lists the key her app
+    // writes with among its key-agreement keys.
+    let resolver = didcomm_quickstart::default_resolver();
+    let own = resolver.resolve(&ada.did()).await.unwrap();
+    let agreement = wyvrn_hosted_did::keys::keys_for(&own, "keyAgreement");
+    let address = json!({
+        "id": ADDRESS,
+        "verificationMethod": [{ "id": format!("{ADDRESS}#device-1"), "type": "Multikey", "controller": ADDRESS, "publicKeyMultibase": agreement[0] }],
+        "keyAgreement": [format!("{ADDRESS}#device-1")],
+    });
+    let knowing = Knowing { documents: [(ADDRESS.to_string(), address)].into(), otherwise: resolver };
+    let channel = start_channel_resolving(&[ADDRESS.to_string()], Box::new(knowing)).await;
+
+    // Someone else is nobody: the address names Ada's key, not theirs.
+    someone.send(&channel.did, channel::SUBSCRIBE, json!({})).await;
+    assert_eq!(someone.next_of(channel::SUBSCRIPTION).await["body"]["role"], "subscriber");
+    someone.send(&channel.did, channel::POST, json!({"content": "let me in"})).await;
+    assert_eq!(someone.next_of(channel::PROBLEM_REPORT).await["body"]["code"], "e.p.trust.not-authorized");
+
+    // Ada writes from her own DID, and is the admin the address was named as.
+    ada.send(&channel.did, channel::SUBSCRIBE, json!({})).await;
+    assert_eq!(ada.next_of(channel::SUBSCRIPTION).await["body"]["role"], "admin");
+    ada.send(&channel.did, channel::POST, json!({"content": "From the address's holder."})).await;
+    assert_eq!(someone.next_of(channel::ANNOUNCEMENT).await["body"]["content"], "From the address's holder.");
 }
 
 #[tokio::test]

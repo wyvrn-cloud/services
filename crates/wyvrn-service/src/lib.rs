@@ -13,6 +13,8 @@
 //! - [`db`]: where a service keeps what it keeps -- a SQLite file, or a MySQL
 //!   database it is given the address of.
 //! - [`identity`]: the service's own keys, in a file or in that database.
+//! - [`named`]: someone the settings name by a public address, recognised by the
+//!   key they write with.
 //! - [`logging`], [`now`]: the same start-up and the same clock for all of them.
 //!
 //! A service keeps what is its own: its configuration file, its store, its
@@ -24,6 +26,7 @@ pub mod http;
 pub mod identity;
 pub mod logging;
 pub mod mediator;
+pub mod named;
 
 use std::future::Future;
 use std::time::{SystemTime, UNIX_EPOCH};

@@ -46,6 +46,9 @@ pub struct AppState {
 /// The agent for `config`: the server's own DID, which members write to.
 pub fn build_agent(config: &Config, identity: Identity) -> anyhow::Result<(Agent, Option<address::Published>)> {
     let (agent, document) = address::build_agent(identity, &config.server.public_url, config.server.did_method)?;
+    // Who it is, for whoever looks its DID up before writing to it.
+    let profile = config.profile.or("COMMUNITY", &config.community.name, &config.community.description);
+    let document = document.map(|document| document.with_profile(&profile)).transpose()?;
     let features = Features::standard()
         .with_protocol(community::PIURI, &["server"])
         .with_protocol(questions::PIURI, &["processor"])
@@ -109,6 +112,26 @@ impl Service for CommunityService {
         // and nothing of what is in it.
         if let Some(reply) = state.agent.auto_reply(received) {
             return Ok(Some(reply));
+        }
+
+        // Someone the configuration names by their public address writes from their
+        // account's DID: they are who it names, under the DID they write from.
+        let store = &state.community.store;
+        let config = &state.community.config;
+        let kid = incoming.sender_kid.as_deref();
+        if !store.is_superseded(&sender)? {
+            let role = store.member(&sender)?.map(|member| member.role);
+            if role != Some(crate::store::Role::Admin) {
+                if let Some(named) = wyvrn_service::named::holder_among(state.resolver.as_ref(), &config.admins, &sender, kid).await {
+                    store.set_member(&sender, crate::store::Role::Admin, now())?;
+                    tracing::info!(%sender, %named, "an admin named by their public address wrote, and is one under the DID they write from");
+                } else if role.is_none() {
+                    if let Some(named) = wyvrn_service::named::holder_among(state.resolver.as_ref(), &config.members, &sender, kid).await {
+                        store.admit(&sender, crate::store::Role::Member, now())?;
+                        tracing::info!(%sender, %named, "a member named by their public address wrote, and is let in under the DID they write from");
+                    }
+                }
+            }
         }
 
         // A question's answer, from someone let in. (Anyone else falls through, and

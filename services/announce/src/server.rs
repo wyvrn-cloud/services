@@ -48,6 +48,9 @@ pub struct AppState {
     pub did_document: Option<address::Published>,
     /// Resolves the DID a `from_prior` names, to check who signed it.
     pub resolver: Box<dyn DIDResolver>,
+    /// The admins the configuration names. One named by a public address is known
+    /// when they first write, by the key they write with.
+    pub admins: Vec<String>,
     /// Rung when there is something new to send to subscribers.
     pub deliver: Notify,
     /// Posts whose reactions changed and that subscribers haven't been told of yet.
@@ -60,6 +63,11 @@ pub struct AppState {
 /// `did:peer:4` derived from the identity's keys and that URL.
 pub fn build_agent(config: &Config, identity: Identity) -> anyhow::Result<(Agent, Option<address::Published>)> {
     let (agent, document) = address::build_agent(identity, &config.server.public_url, config.server.did_method)?;
+    // Who it is, for whoever looks its DID up before writing to it.
+    let mut profile = config.profile.or("ANNOUNCE", &config.channel.name, &config.channel.description);
+    // The channel's own picture, unless the profile is given another.
+    profile.picture = profile.picture.or_else(|| config.channel.picture.clone());
+    let document = document.map(|document| document.with_profile(&profile)).transpose()?;
     let features = Features::standard()
         .with_protocol(channel::PIURI, &["channel"])
         .with_protocol(channel::USER_PROFILE, &[])
@@ -216,12 +224,12 @@ impl Service for ChannelService {
     }
 
     async fn answer(&self, incoming: &Incoming<'_>) -> anyhow::Result<Option<Value>> {
-        answer(&self.0, incoming.received).await
+        answer(&self.0, incoming.received, incoming.sender_kid.as_deref()).await
     }
 }
 
 /// Acts on one message, however it got here, and returns what to answer it with.
-async fn answer(state: &Arc<AppState>, received: &Received) -> anyhow::Result<Option<Value>> {
+async fn answer(state: &Arc<AppState>, received: &Received, sender_kid: Option<&str>) -> anyhow::Result<Option<Value>> {
     // Nothing is done for someone nobody vouches for: there is no one to answer.
     let Some(sender) = received.sender.clone() else {
         return Ok(None);
@@ -236,6 +244,15 @@ async fn answer(state: &Arc<AppState>, received: &Received) -> anyhow::Result<Op
 
     if let Some(reply) = state.agent.auto_reply(received) {
         return Ok(Some(reply));
+    }
+    // An admin the configuration names by their public address writes from their
+    // account's DID: they are the admin, under the DID they write from.
+    let known = state.channel.store.member(&sender)?.is_some_and(|member| member.role == crate::store::Role::Admin);
+    if !known && !state.channel.store.is_superseded(&sender)? {
+        if let Some(named) = wyvrn_service::named::holder_among(state.resolver.as_ref(), &state.admins, &sender, sender_kid).await {
+            state.channel.store.set_role(&sender, crate::store::Role::Admin, now())?;
+            tracing::info!(%sender, %named, "an admin named by their public address wrote, and is one under the DID they write from");
+        }
     }
     let outcome = state.channel.handle(&sender, &received.message, now())?;
     for (did, notice) in outcome.notices {

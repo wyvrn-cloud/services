@@ -116,6 +116,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         channel,
         did_document,
         resolver: didcomm_quickstart::default_resolver(),
+        admins: config.channel.admins.clone(),
         deliver: Notify::new(),
         reacted: Default::default(),
         react: Notify::new(),

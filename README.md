@@ -31,6 +31,41 @@ For real ones, on a machine that already has a web server and a database:
 [`deploy/services`](deploy/services). For only the DID host, with a Caddy of
 its own: [`deploy/did-host`](deploy/did-host).
 
+## Who a service says it is
+
+A service that is a `did:web` publishes a profile: a name, a description and a
+picture, signed with its own key (`/whois.vp`, named in its DID document as
+did:webvh's `#whois`). An app that looks the DID up before adding it shows that
+profile, and nothing has to be registered anywhere.
+
+```sh
+ANNOUNCE_PROFILE_NAME="Wyvrn updates"
+ANNOUNCE_PROFILE_DESCRIPTION="News about Wyvrn."
+ANNOUNCE_PROFILE_PICTURE=/app/profile.png    # PNG, JPEG, WebP or GIF, at most 200 KB
+```
+
+`<SERVICE>_PROFILE_NAME`, `_PROFILE_DESCRIPTION` and `_PROFILE_PICTURE`, or a
+`[profile]` section in the configuration file (`name`, `description`,
+`picture`). Left out, the name and description are what the service is called
+anyway (`ANNOUNCE_NAME`, `COMMUNITY_NAME`; "Stickers"; "Public addresses"), and
+the announcement channel's picture is its `channel.picture`. In Docker the
+picture is a file mounted into the container.
+
+Whether an app marks the service **Official** is the app's to say, not the
+service's: Wyvrn marks the `did:web` of each domain it was built to take as the
+project's own (`VITE_OFFICIAL_DOMAINS`).
+
+## Who the settings name
+
+A setting that names people (`ANNOUNCE_ADMINS`, `COMMUNITY_ADMINS`,
+`COMMUNITY_MEMBERS`) takes the DID their app writes from, or their **public
+address** (`did:webvh:…:id.example:alice`, or its `did:web`). An app writes
+from its account's DID, never from the address, so an address is matched by
+key: whoever writes with a key the address's document lists is who it names,
+and is given the role under the DID they write from, the first time they
+write. (`crates/wyvrn-service`'s `named`; the DID host has always taken its
+admins this way.)
+
 ## Where a service keeps its data
 
 In a SQLite file under `data/`, with nothing to set up. Or in MySQL or MariaDB,
@@ -77,6 +112,7 @@ WYVRN_TEST_DATABASE_URL=mysql://root:test@127.0.0.1:13306/mysql cargo test --wor
   reach (behind a home router; serving a phone app that refuses plain HTTP)
   registers with a mediator and collects from it instead. Messages that arrive
   that way are handled exactly as posted ones are.
+- **A profile.** Who the service says it is, signed, for an app to show.
 - **A store.** A SQLite file or a MySQL database, behind the same statements.
 - **Start-up.** Logging, and serving until the container is stopped.
 

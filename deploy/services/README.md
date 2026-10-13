@@ -107,6 +107,18 @@ and it listens on 8080.
       STICKERS_DATABASE_URL: "mysql://wyvrn:password@mysql:3306/wyvrn_stickers"
 ```
 
+Optional, for any of them: who it says it is when someone looks its DID up
+(`<SERVICE>_PROFILE_NAME`, `_PROFILE_DESCRIPTION`, and `_PROFILE_PICTURE` for a
+picture mounted into the container), as
+[the root README](../../README.md#who-a-service-says-it-is) has it:
+
+```yaml
+    environment:
+      ANNOUNCE_PROFILE_PICTURE: "/app/profile.png"
+    volumes:
+      - ./updates.png:/app/profile.png:ro
+```
+
 `docker-compose.yml` here has the same for `community` and `announce`. With
 Caddy in the same compose file, it reaches them by name (`reverse_proxy
 did-host:8080`) and they need no `ports`.
