@@ -84,6 +84,30 @@ That DID is what the app is given: `VITE_DID_HOST_DID` and
 `VITE_STICKER_SERVICE_DID` at build time, unless the domains are
 `id.wyvrn.app` and `stickers.wyvrn.app`, which it expects already.
 
+### A rate limit
+
+The services limit nothing themselves, and stock Caddy has no rate limit: it
+comes as a module, [`caddy-ratelimit`](https://github.com/mholt/caddy-ratelimit),
+that Caddy is built with.
+
+- Caddy installed on the machine: `xcaddy build --with github.com/mholt/caddy-ratelimit`,
+  and put the binary it makes in place of the one there
+  (`caddy list-modules | grep rate_limit` says whether it took).
+- Caddy in Docker: build its image with the module, and use that image.
+
+  ```dockerfile
+  FROM caddy:2-builder AS builder
+  RUN xcaddy build --with github.com/mholt/caddy-ratelimit
+  FROM caddy:2
+  COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+  ```
+
+`Caddyfile.example` then limits each address to 60 messages and 600 reads a
+minute; past that it answers `429` with a `Retry-After`. Those numbers are a
+starting point, not measured: one person making a pack sends a few messages a
+minute, and opening a pack reads one picture per sticker. The counts are kept
+in that Caddy's memory, so they are per Caddy and start again when it does.
+
 ## 5. Keep it
 
 - **The databases** hold everything a service was told: back them up as you do
@@ -92,8 +116,6 @@ That DID is what the app is given: `VITE_DID_HOST_DID` and
   small file, `identity.json`: the service's own keys. Back it up too. Without
   it the service comes back with new keys under the same DID, and anyone
   holding the old document has to fetch it again.
-- **Nothing here limits how fast it is asked.** Put a rate limit in front (in
-  the web server) before the address is public.
 - Updating: `git pull`, `docker compose build`, `docker compose up -d`.
 
 ## A service's own commands

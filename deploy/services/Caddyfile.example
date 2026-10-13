@@ -6,15 +6,50 @@
 # not this machine: put it on this stack's network (wyvrn-services_default) and
 # name the services instead (did-host:8080, stickers:8080, ...).
 
+# How fast one address may ask. The services limit nothing themselves. This
+# needs a Caddy built with the rate-limit module, which the stock one is not
+# (README.md, "A rate limit"); without it, take out the two `import` lines.
+#
+# A message to a service is a POST, and each is opened and checked: that is what
+# costs, so it is what is held tightest. Reads are documents and pictures, many at
+# once when a pack is opened. Several people behind one address share its count.
+(wyvrn-limits) {
+	rate_limit {
+		zone writes {
+			match {
+				method POST
+			}
+			key {remote_host}
+			events 60
+			window 1m
+		}
+		zone reads {
+			match {
+				method GET HEAD
+			}
+			key {remote_host}
+			events 600
+			window 1m
+		}
+	}
+}
+
 id.example {
 	encode gzip
-	# Everything: the DIDs it hosts are paths of their own, and holders write to /.
-	reverse_proxy 127.0.0.1:8181
+	# `route` keeps these in the order written: the limit, then the service.
+	route {
+		import wyvrn-limits
+		# Everything: the DIDs it hosts are paths of their own, and holders write to /.
+		reverse_proxy 127.0.0.1:8181
+	}
 }
 
 stickers.example {
 	encode gzip
-	reverse_proxy 127.0.0.1:8182
+	route {
+		import wyvrn-limits
+		reverse_proxy 127.0.0.1:8182
+	}
 }
 
 # community.example {
