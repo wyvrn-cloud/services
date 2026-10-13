@@ -25,10 +25,19 @@ pub const MEMBERS_REQUEST: &str = "https://wyvrn.app/community/1.0/members-reque
 pub const MEMBERS: &str = "https://wyvrn.app/community/1.0/members";
 pub const SET_MEMBER: &str = "https://wyvrn.app/community/1.0/set-member";
 pub const SET_PROFILE: &str = "https://wyvrn.app/community/1.0/set-profile";
-pub const EDIT: &str = "https://wyvrn.app/community/1.0/edit";
-pub const DELETE: &str = "https://wyvrn.app/community/1.0/delete";
-pub const PIN: &str = "https://wyvrn.app/community/1.0/pin";
-pub const REACT: &str = "https://wyvrn.app/community/1.0/react";
+// A post is answered, reacted to, changed, taken back and pinned as any message
+// is, by the protocols that already say how, addressed to the server: it is the
+// server that keeps the post.
+pub const MESSAGE_EDITS: &str = "https://wyvrn.app/message-edits/1.0";
+pub const EDIT: &str = "https://wyvrn.app/message-edits/1.0/edit";
+pub const DELETE: &str = "https://wyvrn.app/message-edits/1.0/delete";
+pub const MESSAGE_PINS: &str = "https://wyvrn.app/message-pins/1.0";
+pub const PIN: &str = "https://wyvrn.app/message-pins/1.0/pin";
+pub const UNPIN: &str = "https://wyvrn.app/message-pins/1.0/unpin";
+pub const MESSAGE_REACTIONS: &str = "https://wyvrn.app/message-reactions/1.0";
+pub const REACT: &str = "https://wyvrn.app/message-reactions/1.0/reactions";
+/// As long as a quotation of the post answered is kept (chat-message/1.0).
+const MAX_SNIPPET: usize = 100;
 pub const CREATE_THREAD: &str = "https://wyvrn.app/community/1.0/create-thread";
 pub const CHANGED: &str = "https://wyvrn.app/community/1.0/changed";
 pub const CHANGES_REQUEST: &str = "https://wyvrn.app/community/1.0/changes-request";
@@ -279,8 +288,16 @@ impl Community {
         if post.rev > 0 {
             body["rev"] = json!(post.rev);
         }
+        // A message reference, as chat-message/1.0 has it.
         if let Some(reply_to) = &post.reply_to {
-            body["reply_to"] = json!(reply_to);
+            let mut reference = json!({ "id": reply_to });
+            if let Some(author) = &post.reply_author {
+                reference["author"] = json!(author);
+            }
+            if let Some(snippet) = &post.reply_snippet {
+                reference["snippet"] = json!(snippet);
+            }
+            body["reply_to"] = reference;
         }
         if let Some(thread) = &post.thread {
             body["thread"] = json!(thread);
@@ -329,13 +346,20 @@ impl Community {
         Ok(mentions)
     }
 
-    /// The post a message names by `id`, if the sender may see it: any member may
-    /// see any post.
+    /// The post a message reference names (`{ id, author }`): the one with that id,
+    /// if whoever is said to have written it did. A reference that names another
+    /// author is to no post here.
+    fn referred(&self, reference: &Value) -> anyhow::Result<Option<Post>> {
+        let id = reference["id"].as_str().or(reference.as_str()).filter(|id| !id.is_empty());
+        let Some(post) = id.map(|id| self.store.post_by_id(id)).transpose()?.flatten() else { return Ok(None) };
+        Ok(match reference["author"].as_str() {
+            Some(author) if author != post.author_did => None,
+            _ => Some(post),
+        })
+    }
+
     fn named_post(&self, body: &Value) -> anyhow::Result<Option<Post>> {
-        match body["id"].as_str().filter(|id| !id.is_empty()) {
-            Some(id) => Ok(self.store.post_by_id(id)?),
-            None => Ok(None),
-        }
+        self.referred(&body["to"])
     }
 
     /// A post, as it is sent to everyone who has joined.
@@ -529,13 +553,15 @@ impl Community {
                     return Ok(Outcome::reply(reply_to(message, POSTED, json!({ "channel": existing.channel, "seq": existing.seq, "id": existing.id }))));
                 }
                 // What it answers, and the thread it is in: both posts of this channel.
-                let answered = match body["reply_to"].as_str().filter(|id| !id.is_empty()) {
-                    Some(answered) => match self.store.post_by_id(answered)?.filter(|post| post.channel == channel.id) {
+                let answered = match body.get("reply_to").filter(|reference| !reference.is_null()) {
+                    Some(reference) => match self.referred(reference)?.filter(|post| post.channel == channel.id) {
                         Some(post) => Some(post),
                         None => return refuse(message, "e.p.msg.unknown-post", "The post that answers isn't in this channel."),
                     },
                     None => None,
                 };
+                // The quotation is the answerer's: what the post said as they answered it.
+                let snippet = line(&body["reply_to"]["snippet"], MAX_SNIPPET);
                 let thread = match body["thread"].as_str().filter(|id| !id.is_empty()) {
                     Some(thread) => match self.store.thread(thread)?.filter(|thread| thread.channel == channel.id) {
                         Some(thread) => Some(thread.id),
@@ -546,7 +572,8 @@ impl Community {
                 };
                 let mentions = self.mentions_of(body, &member)?;
                 let post = self.store.add_post(&channel.id, &id, content, &member, question.as_ref(), None, now)?;
-                self.store.set_written_with(&post.id, answered.as_ref().map(|post| post.id.as_str()), thread.as_deref(), &mentions)?;
+                let reply = answered.as_ref().map(|post| (post.id.as_str(), post.author_did.as_str(), snippet.as_deref()));
+                self.store.set_written_with(&post.id, reply, thread.as_deref(), &mentions)?;
                 let mut outcome = Outcome { reply: Some(reply_to(message, POSTED, json!({ "channel": post.channel, "seq": post.seq, "id": post.id }))), posted: true, ..Outcome::default() };
                 // The post a thread grew from says how many are in it now.
                 if let Some(thread) = thread {
@@ -586,7 +613,7 @@ impl Community {
                 self.changed_answer(message, &post.id)
             }
 
-            PIN => {
+            PIN | UNPIN => {
                 let Some(post) = self.named_post(body)? else {
                     return refuse(message, "e.p.msg.unknown-post", "There is no such post.");
                 };
@@ -598,7 +625,7 @@ impl Community {
                 if post.deleted {
                     return refuse(message, "e.p.msg.deleted", "That post was taken back.");
                 }
-                let pinned = body["pinned"].as_bool().unwrap_or(true);
+                let pinned = message_type == PIN;
                 if pinned != post.pinned {
                     self.store.set_pinned(&post.id, pinned)?;
                 }

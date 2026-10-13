@@ -225,47 +225,58 @@ async fn a_post_is_answered_reacted_to_changed_pinned_and_taken_back_and_everyon
 
     admin.community("post", json!({ "channel": channel, "id": "p1", "content": "Shall we ship?" })).await;
     // An answer names what it answers, and calls on whom it likes among the members.
-    let answer = member.community("post", json!({ "channel": channel, "id": "p2", "content": "Yes @admin", "reply_to": "p1", "mentions": [admin.did(), "did:example:nobody", "everyone"] })).await;
+    let answer = member.community("post", json!({ "channel": channel, "id": "p2", "content": "Yes @admin", "reply_to": { "id": "p1", "author": admin.did(), "snippet": "Shall we ship?" }, "mentions": [admin.did(), "did:example:nobody", "everyone"] })).await;
     assert_eq!(kind(&answer), "posted", "{answer}");
     admin.next_message().await;
     let got = admin.next_message().await;
-    assert_eq!((got["id"].as_str(), got["reply_to"].as_str()), (Some("p2"), Some("p1")));
+    assert_eq!(got["id"], "p2");
+    assert_eq!(got["reply_to"], json!({ "id": "p1", "author": admin.did(), "snippet": "Shall we ship?" }));
     // Someone who isn't a member is left out, and only an admin calls on everyone.
     assert_eq!(got["mentions"], json!([admin.did()]));
     member.next_message().await;
     member.next_message().await;
-    assert_eq!(member.community("post", json!({ "channel": channel, "content": "to nothing", "reply_to": "nope" })).await["body"]["code"], "e.p.msg.unknown-post");
+    assert_eq!(member.community("post", json!({ "channel": channel, "content": "to nothing", "reply_to": { "id": "nope", "author": admin.did() } })).await["body"]["code"], "e.p.msg.unknown-post");
+    // ...nor to a post said to be someone else's.
+    assert_eq!(member.community("post", json!({ "channel": channel, "content": "to nothing", "reply_to": { "id": "p1", "author": member.did() } })).await["body"]["code"], "e.p.msg.unknown-post");
 
     // A reaction is all of one member's emoji on a post; everyone is told who put what.
-    let reacted = member.community("react", json!({ "id": "p1", "emoji": ["👍", "🎉"] })).await;
+    let reacted = member.ask("https://wyvrn.app/message-reactions/1.0/reactions", json!({ "to": { "id": "p1" }, "emoji": ["👍", "🎉"] })).await;
     assert_eq!(kind(&reacted), "changed", "{reacted}");
     assert_eq!(reacted["body"]["reactions"], json!([{ "emoji": "🎉", "by": [member.did()] }, { "emoji": "👍", "by": [member.did()] }]));
     assert_eq!(admin.next_of(&changed).await["body"]["reactions"].as_array().unwrap().len(), 2);
     member.next_of(&changed).await;
-    admin.community("react", json!({ "id": "p1", "emoji": ["👍"] })).await;
-    let now = member.community("react", json!({ "id": "p1", "emoji": ["👍"] })).await;
-    assert_eq!(now["body"]["reactions"], json!([{ "emoji": "👍", "by": [member.did(), admin.did()] }]));
-    assert_eq!(member.community("react", json!({ "id": "p1", "emoji": ["thumbs up"] })).await["body"]["code"], "e.p.msg.invalid-reaction");
-    assert_eq!(member.community("react", json!({ "id": "nope", "emoji": ["👍"] })).await["body"]["code"], "e.p.msg.unknown-post");
+    admin.ask("https://wyvrn.app/message-reactions/1.0/reactions", json!({ "to": { "id": "p1" }, "emoji": ["👍"] })).await;
+    let now = member.ask("https://wyvrn.app/message-reactions/1.0/reactions", json!({ "to": { "id": "p1" }, "emoji": ["👍"] })).await;
+    // (Two who reacted in the same second are in no particular order.)
+    let by = |post: &Value| {
+        let mut by: Vec<String> = post["reactions"][0]["by"].as_array().unwrap().iter().map(|did| did.as_str().unwrap().to_string()).collect();
+        by.sort();
+        by
+    };
+    let mut both = vec![member.did(), admin.did()];
+    both.sort();
+    assert_eq!((now["body"]["reactions"][0]["emoji"].as_str(), by(&now["body"])), (Some("👍"), both.clone()));
+    assert_eq!(member.ask("https://wyvrn.app/message-reactions/1.0/reactions", json!({ "to": { "id": "p1" }, "emoji": ["thumbs up"] })).await["body"]["code"], "e.p.msg.invalid-reaction");
+    assert_eq!(member.ask("https://wyvrn.app/message-reactions/1.0/reactions", json!({ "to": { "id": "nope" }, "emoji": ["👍"] })).await["body"]["code"], "e.p.msg.unknown-post");
 
     // A post is changed by whoever wrote it, and nobody else.
-    assert_eq!(admin.community("edit", json!({ "id": "p2", "content": "No" })).await["body"]["code"], "e.p.trust.not-authorized");
-    let edited = member.community("edit", json!({ "id": "p2", "content": "Yes, on Friday" })).await;
+    assert_eq!(admin.ask("https://wyvrn.app/message-edits/1.0/edit", json!({ "to": { "id": "p2" }, "content": "No" })).await["body"]["code"], "e.p.trust.not-authorized");
+    let edited = member.ask("https://wyvrn.app/message-edits/1.0/edit", json!({ "to": { "id": "p2" }, "content": "Yes, on Friday" })).await;
     assert_eq!(edited["body"]["content"], "Yes, on Friday");
     assert!(edited["body"]["edited_at"].is_i64());
     // (Who it calls on is as it was, said again or not.)
     assert_eq!(edited["body"]["mentions"], json!([admin.did()]));
 
     // Pinned by an admin, or by whoever opened the channel.
-    assert_eq!(member.community("pin", json!({ "id": "p1" })).await["body"]["code"], "e.p.trust.not-authorized");
-    assert_eq!(admin.community("pin", json!({ "id": "p1" })).await["body"]["pinned"], true);
-    assert_eq!(admin.community("pin", json!({ "id": "p1", "pinned": false })).await["body"].get("pinned"), None);
+    assert_eq!(member.ask("https://wyvrn.app/message-pins/1.0/pin", json!({ "to": { "id": "p1" } })).await["body"]["code"], "e.p.trust.not-authorized");
+    assert_eq!(admin.ask("https://wyvrn.app/message-pins/1.0/pin", json!({ "to": { "id": "p1" } })).await["body"]["pinned"], true);
+    assert_eq!(admin.ask("https://wyvrn.app/message-pins/1.0/unpin", json!({ "to": { "id": "p1" } })).await["body"].get("pinned"), None);
 
     // Taken back, its place is kept and what it said is gone.
-    assert_eq!(admin.community("delete", json!({ "id": "p2" })).await["body"]["code"], "e.p.trust.not-authorized");
-    let gone = member.community("delete", json!({ "id": "p2" })).await;
+    assert_eq!(admin.ask("https://wyvrn.app/message-edits/1.0/delete", json!({ "to": { "id": "p2" } })).await["body"]["code"], "e.p.trust.not-authorized");
+    let gone = member.ask("https://wyvrn.app/message-edits/1.0/delete", json!({ "to": { "id": "p2" } })).await;
     assert_eq!((gone["body"]["deleted"].as_bool(), gone["body"]["content"].as_str(), gone["body"]["seq"].as_i64()), (Some(true), Some(""), Some(2)));
-    assert_eq!(member.community("edit", json!({ "id": "p2", "content": "again" })).await["body"]["code"], "e.p.msg.deleted");
+    assert_eq!(member.ask("https://wyvrn.app/message-edits/1.0/edit", json!({ "to": { "id": "p2" }, "content": "again" })).await["body"]["code"], "e.p.msg.deleted");
 
     // Someone who was away asks what changed since what they hold, and is given
     // each post once, as it now stands.
@@ -276,7 +287,7 @@ async fn a_post_is_answered_reacted_to_changed_pinned_and_taken_back_and_everyon
     assert_eq!(kind(&missed), "changes");
     let posts = missed["body"]["messages"].as_array().unwrap();
     assert_eq!(posts.iter().map(|post| post["id"].as_str().unwrap()).collect::<Vec<_>>(), ["p1", "p2"]);
-    assert_eq!(posts[0]["reactions"][0]["by"], json!([member.did(), admin.did()]));
+    assert_eq!(by(&posts[0]), both);
     assert_eq!(posts[1]["deleted"], true);
     assert_eq!((missed["body"]["rev"].as_i64(), missed["body"]["more"].as_bool()), (Some(latest), Some(false)));
     assert_eq!(away.community("changes-request", json!({ "after_rev": latest })).await["body"]["messages"], json!([]));
@@ -289,11 +300,11 @@ async fn a_thread_grows_from_a_post_and_what_is_said_in_it_is_read_there() {
     server.admit(&[&admin, &member, &bystander]);
     let channel = open_channel(&admin, "general").await;
     admin.community("post", json!({ "channel": channel, "id": "root", "content": "Where shall we meet?" })).await;
-    member.community("post", json!({ "channel": channel, "id": "a1", "content": "The usual place", "reply_to": "root" })).await;
+    member.community("post", json!({ "channel": channel, "id": "a1", "content": "The usual place", "reply_to": { "id": "root" } })).await;
 
     // Only someone who wrote in the replies it grows from starts one.
-    assert_eq!(bystander.community("create-thread", json!({ "id": "root" })).await["body"]["code"], "e.p.trust.not-authorized");
-    let grown = member.community("create-thread", json!({ "id": "root", "name": "  Meeting   place " })).await;
+    assert_eq!(bystander.community("create-thread", json!({ "to": { "id": "root" } })).await["body"]["code"], "e.p.trust.not-authorized");
+    let grown = member.community("create-thread", json!({ "to": { "id": "root" }, "name": "  Meeting   place " })).await;
     assert_eq!(kind(&grown), "changed", "{grown}");
     assert_eq!(grown["body"]["grew"]["name"], "Meeting place");
     assert_eq!(grown["body"]["grew"]["count"], 0);
@@ -303,9 +314,9 @@ async fn a_thread_grows_from_a_post_and_what_is_said_in_it_is_read_there() {
     let said = admin.community("post", json!({ "channel": channel, "id": "t1", "content": "By the fountain", "thread": "root" })).await;
     assert_eq!(kind(&said), "posted", "{said}");
     // ...as is an answer to it, with nothing said of the thread.
-    member.community("post", json!({ "channel": channel, "id": "t2", "content": "Fine", "reply_to": "t1" })).await;
+    member.community("post", json!({ "channel": channel, "id": "t2", "content": "Fine", "reply_to": { "id": "t1" } })).await;
     assert_eq!(admin.community("post", json!({ "channel": channel, "content": "x", "thread": "a1" })).await["body"]["code"], "e.p.msg.unknown-thread");
-    assert_eq!(admin.community("create-thread", json!({ "id": "t1" })).await["body"]["code"], "e.p.msg.in-thread");
+    assert_eq!(admin.community("create-thread", json!({ "to": { "id": "t1" } })).await["body"]["code"], "e.p.msg.in-thread");
 
     let ids = |page: &Value| page["body"]["messages"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
     // The channel reads as it did before the thread, with the count on what it grew from.

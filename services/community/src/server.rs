@@ -54,7 +54,11 @@ pub fn build_agent(config: &Config, identity: Identity) -> anyhow::Result<(Agent
         .with_protocol(questions::PIURI, &["processor"])
         // A member's app sends its profile to whoever takes one: how the server
         // learns what to call them.
-        .with_protocol(community::USER_PROFILE, &[]);
+        .with_protocol(community::USER_PROFILE, &[])
+        // A post is reacted to, changed, taken back and pinned as any message is.
+        .with_protocol(community::MESSAGE_REACTIONS, &["observer"])
+        .with_protocol(community::MESSAGE_EDITS, &["observer"])
+        .with_protocol(community::MESSAGE_PINS, &["participant"]);
     Ok((agent.with_features(features), document))
 }
 

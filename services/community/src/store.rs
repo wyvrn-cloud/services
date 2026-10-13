@@ -74,8 +74,10 @@ pub struct Post {
     /// Where it stands among every change made here: each post, and each change to
     /// one, takes the next number. 0 for a post from before changes were counted.
     pub rev: i64,
-    /// The post it answers.
+    /// The post it answers, who wrote that, and what it said as this was written.
     pub reply_to: Option<String>,
+    pub reply_author: Option<String>,
+    pub reply_snippet: Option<String>,
     /// The thread it is in: the id of the post the thread grew from.
     pub thread: Option<String>,
     /// Who it calls on: DIDs, and `everyone`.
@@ -134,7 +136,9 @@ const POST_COLUMNS: &str = "serial, channel, seq, id, content, posted_at, author
     (SELECT mentions FROM post_state WHERE post_state.post = posts.id), \
     (SELECT edited_at FROM post_state WHERE post_state.post = posts.id), \
     (SELECT deleted FROM post_state WHERE post_state.post = posts.id), \
-    (SELECT pinned FROM post_state WHERE post_state.post = posts.id)";
+    (SELECT pinned FROM post_state WHERE post_state.post = posts.id), \
+    (SELECT reply_author FROM post_state WHERE post_state.post = posts.id), \
+    (SELECT reply_snippet FROM post_state WHERE post_state.post = posts.id)";
 const CHANNEL_COLUMNS: &str =
     "id, name, topic, closed, created_at, created_by, (SELECT COALESCE(MAX(seq), 0) FROM posts WHERE posts.channel = channels.id)";
 
@@ -167,6 +171,8 @@ fn post_from(row: &Row) -> Result<Post> {
         edited_at: row.get(15)?,
         deleted: row.get::<Option<bool>>(16)?.unwrap_or(false),
         pinned: row.get::<Option<bool>>(17)?.unwrap_or(false),
+        reply_author: row.get(18)?,
+        reply_snippet: row.get(19)?,
         // Read after, each by a query of its own (`Store::filled`).
         reactions: Vec::new(),
         grew: None,
@@ -237,6 +243,8 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         post TEXT PRIMARY KEY,
         rev INTEGER NOT NULL DEFAULT 0,
         reply_to TEXT,
+        reply_author TEXT,
+        reply_snippet TEXT,
         thread TEXT,
         mentions TEXT,
         edited_at INTEGER,
@@ -310,6 +318,8 @@ fn schema() -> Schema {
                 post VARCHAR(255) NOT NULL PRIMARY KEY,
                 rev BIGINT NOT NULL DEFAULT 0,
                 reply_to VARCHAR(255),
+                reply_author {MYSQL_DID},
+                reply_snippet TEXT,
                 thread VARCHAR(255),
                 mentions MEDIUMTEXT,
                 edited_at BIGINT,
@@ -537,11 +547,19 @@ impl Store {
     }
 
     /// What a post is said to answer, be in and call on, set as it is written.
-    pub fn set_written_with(&self, id: &str, reply_to: Option<&str>, thread: Option<&str>, mentions: &[String]) -> Result<()> {
+    /// `reply` is the post answered, its author, and the answerer's quotation of it.
+    pub fn set_written_with(&self, id: &str, reply: Option<(&str, &str, Option<&str>)>, thread: Option<&str>, mentions: &[String]) -> Result<()> {
         let mut db = self.db.lock();
         Self::touch(&mut db, id)?;
         let mentions = (!mentions.is_empty()).then(|| serde_json::to_string(mentions).unwrap_or_default());
-        db.execute("UPDATE post_state SET reply_to = ?2, thread = ?3, mentions = ?4 WHERE post = ?1", params![id, reply_to, thread, mentions])?;
+        let (reply_to, author, snippet) = match reply {
+            Some((id, author, snippet)) => (Some(id), Some(author), snippet),
+            None => (None, None, None),
+        };
+        db.execute(
+            "UPDATE post_state SET reply_to = ?2, thread = ?3, mentions = ?4, reply_author = ?5, reply_snippet = ?6 WHERE post = ?1",
+            params![id, reply_to, thread, mentions, author, snippet],
+        )?;
         Ok(())
     }
 
