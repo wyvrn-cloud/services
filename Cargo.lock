@@ -92,6 +92,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "affinidi-data-integrity"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad2d289fc4df366539b3a6eba73c9eb37abb4d5342fa6773105af3ae895bfaba"
+dependencies = [
+ "affinidi-crypto",
+ "affinidi-did-common",
+ "affinidi-rdf-encoding",
+ "affinidi-secrets-resolver",
+ "async-trait",
+ "chrono",
+ "ed25519-dalek 3.0.0",
+ "multibase",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "sha2 0.11.0",
+ "thiserror 2.0.21",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "affinidi-did-common"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1250,7 +1273,7 @@ source = "git+https://github.com/wyvrn-cloud/didcomm#daa87e7293c892b0f2be6e143a0
 dependencies = [
  "async-trait",
  "didcomm-core",
- "didwebvh-rs",
+ "didwebvh-rs 0.7.0",
  "reqwest",
  "serde_json",
  "thiserror 1.0.69",
@@ -1276,7 +1299,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa08dc5af02f6bc159c10271195f467a894b3b4fe67da9796009ee2da785043"
 dependencies = [
- "affinidi-data-integrity",
+ "affinidi-data-integrity 0.7.14",
  "affinidi-did-common",
  "affinidi-secrets-resolver",
  "ahash",
@@ -1286,6 +1309,32 @@ dependencies = [
  "getrandom 0.4.3",
  "percent-encoding",
  "reqwest",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "serde_with",
+ "sha2 0.11.0",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "didwebvh-rs"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f02bdbaaffc5b0bec1e3f8049e5e415476cfd56d23bc6bf692419e674ded93f9"
+dependencies = [
+ "affinidi-data-integrity 0.8.0",
+ "affinidi-did-common",
+ "affinidi-secrets-resolver",
+ "ahash",
+ "async-trait",
+ "base58",
+ "chrono",
+ "getrandom 0.4.3",
+ "percent-encoding",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
@@ -4876,7 +4925,7 @@ dependencies = [
 name = "wyvrn-did-host"
 version = "0.0.1"
 dependencies = [
- "affinidi-data-integrity",
+ "affinidi-data-integrity 0.7.14",
  "affinidi-secrets-resolver",
  "anyhow",
  "axum",
@@ -4886,7 +4935,7 @@ dependencies = [
  "didcomm-core",
  "didcomm-quickstart",
  "didcomm-resolver-peer",
- "didwebvh-rs",
+ "didwebvh-rs 0.8.0",
  "ed25519-dalek 2.2.0",
  "reqwest",
  "serde",
@@ -4904,12 +4953,12 @@ dependencies = [
 name = "wyvrn-hosted-did"
 version = "0.0.1"
 dependencies = [
- "affinidi-data-integrity",
+ "affinidi-data-integrity 0.7.14",
  "affinidi-secrets-resolver",
  "base64 0.22.1",
  "bs58",
  "chrono",
- "didwebvh-rs",
+ "didwebvh-rs 0.8.0",
  "ed25519-dalek 2.2.0",
  "serde",
  "serde_json",
