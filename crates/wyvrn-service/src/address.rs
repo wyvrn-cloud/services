@@ -61,15 +61,39 @@ pub struct ProfileConfig {
     pub description: Option<String>,
     /// A picture's file: PNG, JPEG, WebP or GIF, at most [`MAX_PICTURE_BYTES`].
     pub picture: Option<std::path::PathBuf>,
+    /// A wide picture shown across the top of the profile (about 3 to 1), and one
+    /// shown behind it. Files as `picture` is, of the same kinds and limit each.
+    pub banner: Option<std::path::PathBuf>,
+    pub background: Option<std::path::PathBuf>,
 }
 
-/// A profile is fetched whole by whoever looks the service up, picture and all.
+/// A profile is fetched whole by whoever looks the service up, pictures and all.
 pub const MAX_PICTURE_BYTES: usize = 200 * 1024;
+
+/// A picture's file as it goes into a profile: inside it, so that showing it
+/// fetches nothing more.
+fn picture_object(path: &std::path::Path, what: &str) -> anyhow::Result<Value> {
+    use base64::Engine;
+    let media_type = match path.extension().and_then(|e| e.to_str()).map(str::to_lowercase).as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        _ => anyhow::bail!("the profile {what} {} is not a .png, .jpg, .webp or .gif", path.display()),
+    };
+    let bytes = std::fs::read(path).map_err(|e| anyhow::anyhow!("reading the profile {what} {}: {e}", path.display()))?;
+    if bytes.len() > MAX_PICTURE_BYTES {
+        anyhow::bail!("the profile {what} {} is {} KB; at most {} KB", path.display(), bytes.len() / 1024, MAX_PICTURE_BYTES / 1024);
+    }
+    let url = format!("data:{media_type};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
+    Ok(serde_json::json!({ "contentUrl": url, "encodingFormat": media_type }))
+}
 
 impl ProfileConfig {
     /// What the configuration says, overridden by the environment
     /// (`<prefix>_PROFILE_NAME`, `<prefix>_PROFILE_DESCRIPTION`,
-    /// `<prefix>_PROFILE_PICTURE`), and failing both, `name` and `description`:
+    /// `<prefix>_PROFILE_PICTURE`, `<prefix>_PROFILE_BANNER`,
+    /// `<prefix>_PROFILE_BACKGROUND`), and failing both, `name` and `description`:
     /// what the service is called anyway.
     pub fn or(&self, prefix: &str, name: &str, description: &str) -> Self {
         let env = |setting: &str| std::env::var(format!("{prefix}_PROFILE_{setting}")).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
@@ -78,36 +102,21 @@ impl ProfileConfig {
             name: said(env("NAME").or_else(|| self.name.clone()), name),
             description: said(env("DESCRIPTION").or_else(|| self.description.clone()), description),
             picture: env("PICTURE").map(Into::into).or_else(|| self.picture.clone()),
+            banner: env("BANNER").map(Into::into).or_else(|| self.banner.clone()),
+            background: env("BACKGROUND").map(Into::into).or_else(|| self.background.clone()),
         }
     }
 
     fn fields(&self) -> anyhow::Result<wyvrn_hosted_did::write::ProfileFields> {
-        use base64::Engine;
-        let image = match &self.picture {
-            None => None,
-            Some(path) => {
-                let media_type = match path.extension().and_then(|e| e.to_str()).map(str::to_lowercase).as_deref() {
-                    Some("png") => "image/png",
-                    Some("jpg" | "jpeg") => "image/jpeg",
-                    Some("webp") => "image/webp",
-                    Some("gif") => "image/gif",
-                    _ => anyhow::bail!("the profile picture {} is not a .png, .jpg, .webp or .gif", path.display()),
-                };
-                let bytes = std::fs::read(path).map_err(|e| anyhow::anyhow!("reading the profile picture {}: {e}", path.display()))?;
-                if bytes.len() > MAX_PICTURE_BYTES {
-                    anyhow::bail!("the profile picture {} is {} KB; at most {} KB", path.display(), bytes.len() / 1024, MAX_PICTURE_BYTES / 1024);
-                }
-                // In the profile itself: showing it fetches nothing more.
-                let url = format!("data:{media_type};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
-                Some(serde_json::json!({ "contentUrl": url, "encodingFormat": media_type }))
-            }
-        };
+        let pictured = |path: &Option<std::path::PathBuf>, what: &str| path.as_deref().map(|path| picture_object(path, what)).transpose();
         Ok(wyvrn_hosted_did::write::ProfileFields {
             // A service is nobody's person.
             kind: Some("Organization".to_string()),
             name: self.name.clone(),
             description: self.description.clone(),
-            image,
+            image: pictured(&self.picture, "picture")?,
+            banner: pictured(&self.banner, "banner")?,
+            background: pictured(&self.background, "background")?,
             ..Default::default()
         })
     }
@@ -276,7 +285,7 @@ mod tests {
         let (_, published) = build_agent(Identity::generate().unwrap(), "https://updates.example/", DidMethod::Web).unwrap();
         let picture = std::env::temp_dir().join(format!("wyvrn-profile-test-{}.png", std::process::id()));
         std::fs::write(&picture, [0x89, b'P', b'N', b'G']).unwrap();
-        let profile = ProfileConfig { name: None, description: None, picture: Some(picture.clone()) }.or("WYVRN_TEST_NOTHING", "Updates", "What is new.");
+        let profile = ProfileConfig { picture: Some(picture.clone()), banner: Some(picture.clone()), background: Some(picture.clone()), ..Default::default() }.or("WYVRN_TEST_NOTHING", "Updates", "What is new.");
         let published = published.unwrap().with_profile(&profile).unwrap();
         std::fs::remove_file(&picture).unwrap();
 
@@ -288,6 +297,8 @@ mod tests {
         let read = wyvrn_hosted_did::whois::profile(&checked, "did:web:updates.example").unwrap();
         assert_eq!((read.kind.as_deref(), read.name.as_deref(), read.description.as_deref()), (Some("Organization"), Some("Updates"), Some("What is new.")));
         assert!(read.image.unwrap().url.starts_with("data:image/png;base64,"));
+        // Its banner and its background the same way: inside the profile.
+        assert!(read.banner.unwrap().is_inline() && read.background.unwrap().is_inline());
 
         // Over plain HTTP, and with nothing to say, there is none.
         let (_, local) = build_agent(Identity::generate().unwrap(), "http://localhost:8081/", DidMethod::Web).unwrap();
