@@ -39,7 +39,7 @@ docker compose up -d announce
 The channel is then `did:web:updates.example`, and publishes its DID document at
 `/.well-known/did.json`. The `announce-data` volume holds its keys, every post and the
 list of subscribers: keep it, and back it up. With `ANNOUNCE_DATABASE_URL` set, all
-but the keys is in that MySQL database instead
+of it is in that MySQL database instead
 ([where a service keeps its data](../../README.md#where-a-service-keeps-its-data)).
 
 A `did:webvh` is not supported for the channel's own DID yet. Subscribers may be any

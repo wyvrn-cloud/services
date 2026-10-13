@@ -49,7 +49,7 @@ docker compose up -d stickers
   every pack already handed out.
 - With `STICKERS_DID_METHOD=web` the service itself is `did:web:stickers.example`.
 - The `stickers-data` volume holds the service's own keys and every pack. Keep
-  it, and back it up. With `STICKERS_DATABASE_URL` set, all but the keys is in
+  it, and back it up. With `STICKERS_DATABASE_URL` set, all of it is in
   that MySQL database instead
   ([where a service keeps its data](../../README.md#where-a-service-keeps-its-data)).
 

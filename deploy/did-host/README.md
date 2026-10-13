@@ -112,7 +112,7 @@ can change it, only free the name, which ends its hosting.
 
 - **Back up the `did-host-data` volume.** It holds the host's own keys and the
   history of every address. An address whose history is lost can be put back
-  only by its holder. With `DID_HOST_DATABASE_URL` set, all but the keys is in
+  only by its holder. With `DID_HOST_DATABASE_URL` set, all of it is in
   that MySQL database instead, and that is what to back up
   ([where a service keeps its data](../../README.md#where-a-service-keeps-its-data)).
 - **Updating:** `git pull && docker compose up -d --build`. The build keeps its

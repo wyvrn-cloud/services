@@ -12,6 +12,7 @@
 //!   address of its own that the people it serves can get to.
 //! - [`db`]: where a service keeps what it keeps -- a SQLite file, or a MySQL
 //!   database it is given the address of.
+//! - [`identity`]: the service's own keys, in a file or in that database.
 //! - [`logging`], [`now`]: the same start-up and the same clock for all of them.
 //!
 //! A service keeps what is its own: its configuration file, its store, its
@@ -20,6 +21,7 @@
 pub mod address;
 pub mod db;
 pub mod http;
+pub mod identity;
 pub mod logging;
 pub mod mediator;
 

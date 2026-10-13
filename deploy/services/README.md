@@ -73,16 +73,18 @@ The first start builds from source, which takes several minutes.
 Build the images where the source is, and carry them over:
 
 ```sh
-docker compose -f deploy/services/docker-compose.yml build did-host stickers
+# From the root of this repository.
+docker build -f services/did-host/Dockerfile -t wyvrn-did-host .
+docker build -f services/stickers/Dockerfile -t wyvrn-stickers .
 docker save wyvrn-did-host wyvrn-stickers | gzip | ssh you@server 'gunzip | docker load'
 ```
 
-(`build` reads no `.env`. The images are for the processor they were built on:
-for a server of another kind, `docker buildx build --platform linux/arm64 -f
-services/did-host/Dockerfile -t wyvrn-did-host .` from the repository root.)
+(An image is for the processor it was built on. For a server of another kind:
+`docker buildx build --platform linux/arm64 …`.)
 
-Then a service in your compose file is its image, its settings and a volume
-for its keys. Everything it needs is in the image; it listens on 8080.
+Then a service in your compose file is its image and its settings.
+Everything it needs is in the image, everything it keeps is in its database,
+and it listens on 8080.
 
 ```yaml
   did-host:
@@ -94,8 +96,6 @@ for its keys. Everything it needs is in the image; it listens on 8080.
       DID_HOST_DID_METHOD: "web"
       DID_HOST_ADMINS: ""
       DID_HOST_DATABASE_URL: "mysql://wyvrn:password@mysql:3306/wyvrn_did_host"
-    volumes:
-      - did-host-data:/app/data
 
   stickers:
     image: wyvrn-stickers
@@ -105,8 +105,6 @@ for its keys. Everything it needs is in the image; it listens on 8080.
       STICKERS_DID_METHOD: "web"
       STICKERS_ADMINS: ""
       STICKERS_DATABASE_URL: "mysql://wyvrn:password@mysql:3306/wyvrn_stickers"
-    volumes:
-      - stickers-data:/app/data
 ```
 
 `docker-compose.yml` here has the same for `community` and `announce`. With
@@ -157,10 +155,10 @@ in that Caddy's memory, so they are per Caddy and start again when it does.
 
 - **The databases** hold everything a service was told: back them up as you do
   the mediator's.
-- **Each service's volume** (`wyvrn-services_did-host-data`, ...) now holds one
-  small file, `identity.json`: the service's own keys. Back it up too. Without
-  it the service comes back with new keys under the same DID, and anyone
-  holding the old document has to fetch it again.
+- That is all there is to keep: a service's own keys are in its database too
+  (unencrypted, as the file they used to be in was: whoever can read the
+  database can be the service). A container can be remade, or the service
+  moved to another machine, with nothing carried over but its settings.
 - Updating: `git pull`, `docker compose build`, `docker compose up -d`.
 
 ## A service's own commands

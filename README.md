@@ -46,8 +46,11 @@ Each service needs **a database of its own**: their tables share names, and one
 started on another's refuses to run. It makes its tables itself. A password
 with anything but letters and digits in it is percent-encoded.
 
-The service's own keys stay in a file either way (`data/identity.json`), so its
-volume is still worth keeping.
+Its own keys go with the rest: `data/identity.json` beside a SQLite file, and in
+the database for a service that has one (so its volume holds nothing, and the
+container can be remade freely). They are stored unencrypted in both. A
+service given a database after it already had that file takes its keys from
+the file, once, and is the service it was.
 
 Nothing moves a SQLite file's contents into MySQL: choose before there is
 anything to lose.

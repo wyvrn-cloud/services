@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use didcomm_agent::Identity;
 use wyvrn_service::now;
 use wyvrn_stickers::{
     config::Config,
@@ -77,8 +76,9 @@ fn remove(config: &Config, name: &str) -> anyhow::Result<()> {
 async fn serve(config: Config) -> anyhow::Result<()> {
     wyvrn_service::logging::init();
 
-    let identity = Identity::load_or_generate(&config.identity.path)
-        .with_context(|| format!("identity file {}", config.identity.path.display()))?;
+    // Kept with the store: in the database, for a service that has one.
+    let location = wyvrn_service::db::Location::from_env("STICKERS", &config.store.path)?;
+    let identity = wyvrn_service::identity::load_or_generate(&location, &config.identity.path, "stickers")?;
     let (agent, did_document) = server::build_agent(&config, identity)?;
     if let Some(mediator) = &config.mediator {
         wyvrn_service::mediator::register(&agent, mediator).await?;

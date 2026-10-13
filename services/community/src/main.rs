@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use didcomm_agent::Identity;
 use tokio::sync::Notify;
 use wyvrn_community::{
     community::Community,
@@ -90,7 +89,9 @@ fn add(config: &Config, did: &str, role: Role) -> anyhow::Result<()> {
 async fn serve(config: Config) -> anyhow::Result<()> {
     wyvrn_service::logging::init();
 
-    let identity = Identity::load_or_generate(&config.identity.path).with_context(|| format!("identity file {}", config.identity.path.display()))?;
+    // Kept with the store: in the database, for a service that has one.
+    let location = wyvrn_service::db::Location::from_env("COMMUNITY", &config.store.path)?;
+    let identity = wyvrn_service::identity::load_or_generate(&location, &config.identity.path, "community")?;
     let (agent, did_document) = server::build_agent(&config, identity)?;
     if let Some(mediator) = &config.mediator {
         wyvrn_service::mediator::register(&agent, mediator).await?;

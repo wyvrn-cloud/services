@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use didcomm_agent::Identity;
 use tokio::sync::Notify;
 use wyvrn_announce::{
     channel::Channel,
@@ -95,8 +94,9 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let channel = Channel { store: open_store(&config)?, info: server::channel_info(&config)? };
     channel.name_admins(&config.channel.admins, server::now())?;
 
-    let identity = Identity::load_or_generate(&config.identity.path)
-        .with_context(|| format!("identity file {}", config.identity.path.display()))?;
+    // Kept with the store: in the database, for a service that has one.
+    let location = wyvrn_service::db::Location::from_env("ANNOUNCE", &config.store.path)?;
+    let identity = wyvrn_service::identity::load_or_generate(&location, &config.identity.path, "announce")?;
     let (agent, did_document) = server::build_agent(&config, identity)?;
     // Behind a mediator, the channel's DID is the one that names it as the way in.
     if let Some(mediator) = &config.mediator {

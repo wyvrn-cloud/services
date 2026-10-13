@@ -1,7 +1,8 @@
 # Wyvrn's services on a machine that already has a web server in front (Caddy,
 # nginx, ...) and a MySQL or MariaDB server: each service listens on this
 # machine only, for that web server to pass its domain to, and keeps what it
-# keeps in a database of its own. See README.md beside this file.
+# keeps -- its own keys among it -- in a database of its own: nothing is left in
+# the containers. See README.md beside this file.
 #
 #   cp .env.example .env    # and fill it in
 #   docker compose up -d                                         # the DID host and the sticker service
@@ -32,9 +33,6 @@ services:
       DID_HOST_DID_METHOD: "web"
       DID_HOST_ADMINS: "${DID_HOST_ADMINS:-}"
       DID_HOST_DATABASE_URL: "${DID_HOST_DATABASE_URL:?set DID_HOST_DATABASE_URL in .env}"
-    volumes:
-      # The host's own keys (identity.json), and nothing else. Back this up.
-      - did-host-data:/app/data
 
   # Sticker and custom-emoji packs. The app is built to use
   # did:web:stickers.wyvrn.app unless told otherwise (VITE_STICKER_SERVICE_DID).
@@ -51,8 +49,6 @@ services:
       STICKERS_DID_METHOD: "web"
       STICKERS_ADMINS: "${STICKERS_ADMINS:-}"
       STICKERS_DATABASE_URL: "${STICKERS_DATABASE_URL:?set STICKERS_DATABASE_URL in .env}"
-    volumes:
-      - stickers-data:/app/data
 
   # A community server. No app is built to expect one: people are given its DID.
   community:
@@ -71,8 +67,6 @@ services:
       COMMUNITY_ADMINS: "${COMMUNITY_ADMINS:-}"
       COMMUNITY_MEMBERS: "${COMMUNITY_MEMBERS:-}"
       COMMUNITY_DATABASE_URL: "${COMMUNITY_DATABASE_URL:?set COMMUNITY_DATABASE_URL in .env}"
-    volumes:
-      - community-data:/app/data
 
   # An announcement channel. Likewise: people are given its DID.
   announce:
@@ -91,11 +85,3 @@ services:
       ANNOUNCE_DESCRIPTION: "${ANNOUNCE_DESCRIPTION:-A one-way announcement channel.}"
       ANNOUNCE_ADMINS: "${ANNOUNCE_ADMINS:-}"
       ANNOUNCE_DATABASE_URL: "${ANNOUNCE_DATABASE_URL:?set ANNOUNCE_DATABASE_URL in .env}"
-    volumes:
-      - announce-data:/app/data
-
-volumes:
-  did-host-data:
-  stickers-data:
-  community-data:
-  announce-data:
