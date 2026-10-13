@@ -97,6 +97,15 @@ pub fn sign_attachment(bytes: &[u8], authentication_secret_jwk: &str) -> Result<
     write::sign_attachment(bytes, authentication_secret_jwk).map(|jws| jws.to_string())
 }
 
+/// Which of `keys_json` (an array of Ed25519 multikeys) signed `bytes`, by the
+/// detached signature `jws_json` (`{protected, signature}`, as
+/// [`sign_attachment`] makes one): that key, or an empty string if none did.
+pub fn signed_by(bytes: &[u8], jws_json: &str, keys_json: &str) -> Result<String, String> {
+    let jws: Value = parse("the signature", jws_json)?;
+    let keys: Vec<String> = parse("the keys", keys_json)?;
+    Ok(crate::keys::signer_among(bytes, &jws, &keys).cloned().unwrap_or_default())
+}
+
 /// [`write::whois`]: the signed presentation, as JSON. `profile_json` is
 /// `{kind, name, description, image, logo, banner, background}`, all optional.
 pub async fn whois(did: &str, profile_json: &str, authentication_secret_jwk: &str, verification_method: &str, valid_from: &str) -> Result<String, String> {

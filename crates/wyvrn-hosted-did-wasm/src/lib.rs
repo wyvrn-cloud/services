@@ -39,6 +39,11 @@ pub fn hosted_sign_attachment(bytes: &[u8], authentication_secret_jwk: String) -
     api::sign_attachment(bytes, &authentication_secret_jwk).map_err(rejected)
 }
 
+#[wasm_bindgen(js_name = hostedSignedBy)]
+pub fn hosted_signed_by(bytes: &[u8], jws_json: String, keys_json: String) -> Result<String, JsValue> {
+    api::signed_by(bytes, &jws_json, &keys_json).map_err(rejected)
+}
+
 /// A signed whois saying who the DID is.
 #[wasm_bindgen(js_name = hostedWhois)]
 pub async fn hosted_whois(did: String, profile_json: String, authentication_secret_jwk: String, verification_method: String, valid_from: String) -> Result<String, JsValue> {
