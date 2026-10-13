@@ -10,12 +10,15 @@
 //! - [`http`]: the endpoint messages are posted to, and serving until told to stop.
 //! - [`mediator`]: being reached through a mediator instead, for a service with no
 //!   address of its own that the people it serves can get to.
+//! - [`db`]: where a service keeps what it keeps -- a SQLite file, or a MySQL
+//!   database it is given the address of.
 //! - [`logging`], [`now`]: the same start-up and the same clock for all of them.
 //!
 //! A service keeps what is its own: its configuration file, its store, its
 //! protocol, its pages.
 
 pub mod address;
+pub mod db;
 pub mod http;
 pub mod logging;
 pub mod mediator;

@@ -16,8 +16,10 @@ services:
       # The host itself is did:web:<DID_HOST_DOMAIN>.
       DID_HOST_DID_METHOD: "web"
       DID_HOST_ADMINS: "${DID_HOST_ADMINS:-}"
+      # In MySQL or MariaDB instead of a file in the volume (../../README.md).
+      DID_HOST_DATABASE_URL: "${DID_HOST_DATABASE_URL:-}"
     volumes:
-      # The host's own keys and every log it hosts. Back this up.
+      # The host's own keys and (unless a database is named) every log it hosts. Back this up.
       - did-host-data:/app/data
     restart: unless-stopped
 

@@ -27,6 +27,40 @@ README says what it needs set for a real deployment.
 Without Docker, from a service's directory: `cargo run` (it reads its `config/`
 from there, and keeps its data in `data/`).
 
+For real ones, on a machine that already has a web server and a database:
+[`deploy/services`](deploy/services). For only the DID host, with a Caddy of
+its own: [`deploy/did-host`](deploy/did-host).
+
+## Where a service keeps its data
+
+In a SQLite file under `data/`, with nothing to set up. Or in MySQL or MariaDB,
+when the environment gives it a database:
+
+```sh
+STICKERS_DATABASE_URL=mysql://user:password@host:3306/wyvrn_stickers
+```
+
+`<SERVICE>_DATABASE_URL` (`ANNOUNCE_`, `COMMUNITY_`, `DID_HOST_`, `STICKERS_`),
+or plain `DATABASE_URL` for a service run alone. `mariadb://` is the same thing.
+Each service needs **a database of its own**: their tables share names, and one
+started on another's refuses to run. It makes its tables itself. A password
+with anything but letters and digits in it is percent-encoded.
+
+The service's own keys stay in a file either way (`data/identity.json`), so its
+volume is still worth keeping.
+
+Nothing moves a SQLite file's contents into MySQL: choose before there is
+anything to lose.
+
+`crates/wyvrn-service`'s `db` module is what makes one set of statements serve
+both, and says what a statement may not use. Every test that uses a store runs
+against MySQL too, each in a database made for it:
+
+```sh
+docker run -d --rm -e MYSQL_ROOT_PASSWORD=test -p 127.0.0.1:13306:3306 mysql:8
+WYVRN_TEST_DATABASE_URL=mysql://root:test@127.0.0.1:13306/mysql cargo test --workspace
+```
+
 ## What is shared
 
 `wyvrn-service` is the part of a service that is the same in all of them:
@@ -40,6 +74,7 @@ from there, and keeps its data in `data/`).
   reach (behind a home router; serving a phone app that refuses plain HTTP)
   registers with a mediator and collects from it instead. Messages that arrive
   that way are handled exactly as posted ones are.
+- **A store.** A SQLite file or a MySQL database, behind the same statements.
 - **Start-up.** Logging, and serving until the container is stopped.
 
 A service implements one trait, `Service`: its agent, and what it answers a message

@@ -31,6 +31,9 @@ axum = "0.8"
 base64 = "0.22"
 reqwest = "0.13"
 rusqlite = { version = "0.37", features = ["bundled"] }
+# A service's store in MySQL or MariaDB instead (crates/wyvrn-service's `db`).
+# Without the C zlib, and with the TLS the rest of the workspace already builds.
+mysql = { version = "28", default-features = false, features = ["minimal-rust", "buffer-pool", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }

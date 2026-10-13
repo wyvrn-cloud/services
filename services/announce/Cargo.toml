@@ -17,7 +17,6 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
-rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 time = { version = "0.3", features = ["formatting", "macros"] }

@@ -21,6 +21,9 @@ services:
       ANNOUNCE_DESCRIPTION: "${ANNOUNCE_DESCRIPTION:-A one-way announcement channel.}"
       # The DIDs that may post, separated by commas. Only needed for the first admin.
       ANNOUNCE_ADMINS: "${ANNOUNCE_ADMINS:-}"
+      # In MySQL or MariaDB instead of a file in the volume: mysql://user:password@host/database,
+      # a database of this service's own (README.md).
+      ANNOUNCE_DATABASE_URL: "${ANNOUNCE_DATABASE_URL:-}"
     volumes:
       - announce-data:/app/data
     restart: unless-stopped
@@ -45,6 +48,9 @@ services:
       # DID_HOST_DOMAIN: "id.example"
       # The DIDs that decide who may claim a reserved name, separated by commas.
       DID_HOST_ADMINS: "${DID_HOST_ADMINS:-}"
+      # In MySQL or MariaDB instead of a file in the volume: mysql://user:password@host/database,
+      # a database of this service's own (README.md).
+      DID_HOST_DATABASE_URL: "${DID_HOST_DATABASE_URL:-}"
     volumes:
       - did-host-data:/app/data
     restart: unless-stopped
@@ -67,6 +73,9 @@ services:
       # STICKERS_DID_METHOD: "web"
       # The DIDs that may take a pack down, separated by commas.
       STICKERS_ADMINS: "${STICKERS_ADMINS:-}"
+      # In MySQL or MariaDB instead of a file in the volume: mysql://user:password@host/database,
+      # a database of this service's own (README.md).
+      STICKERS_DATABASE_URL: "${STICKERS_DATABASE_URL:-}"
     volumes:
       - stickers-data:/app/data
     restart: unless-stopped
@@ -90,6 +99,9 @@ services:
       # DIDs, separated by commas.
       COMMUNITY_ADMINS: "${COMMUNITY_ADMINS:-}"
       COMMUNITY_MEMBERS: "${COMMUNITY_MEMBERS:-}"
+      # In MySQL or MariaDB instead of a file in the volume: mysql://user:password@host/database,
+      # a database of this service's own (README.md).
+      COMMUNITY_DATABASE_URL: "${COMMUNITY_DATABASE_URL:-}"
     volumes:
       - community-data:/app/data
     restart: unless-stopped

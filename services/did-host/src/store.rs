@@ -1,10 +1,8 @@
 //! What the host keeps: for each name, who may claim it, who is claiming it, and
 //! the DID published under it.
 
-use std::path::Path;
-use std::sync::Mutex;
-
-use rusqlite::{params, Connection, OptionalExtension};
+use wyvrn_service::db::{Db, Location, Row, Schema, MYSQL_DID, MYSQL_TABLE};
+use wyvrn_service::params;
 
 /// What is published under a name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,65 +60,86 @@ pub struct Record {
 }
 
 pub struct Store {
-    db: Mutex<Connection>,
+    db: Db,
 }
 
 const COLUMNS: &str = "name, published, reserved, assigned, hold_keys, hold_expires, did, version_id, log, web_document, holder_keys, whois, heard_at, asked_at";
 
+/// `keys` and `key` are words of MySQL's own, so they are always written quoted.
+const SQLITE: &str = r#"CREATE TABLE IF NOT EXISTS names (
+        name TEXT PRIMARY KEY,
+        published TEXT NOT NULL DEFAULT 'no',
+        reserved INTEGER NOT NULL DEFAULT 0,
+        assigned TEXT,
+        hold_keys TEXT NOT NULL DEFAULT '[]',
+        hold_expires INTEGER NOT NULL DEFAULT 0,
+        did TEXT,
+        version_id TEXT,
+        log TEXT,
+        web_document TEXT,
+        holder_keys TEXT NOT NULL DEFAULT '[]',
+        whois BLOB,
+        heard_at INTEGER NOT NULL DEFAULT 0,
+        asked_at INTEGER
+    );
+    -- Every key any version of a hosted document has had, by name; and
+    -- whether the name's holder has shown it holds it (a message
+    -- authenticated with it) rather than only listed it.
+    CREATE TABLE IF NOT EXISTS "keys" (
+        "key" TEXT NOT NULL,
+        name TEXT NOT NULL,
+        proven INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY ("key", name)
+    );
+    CREATE INDEX IF NOT EXISTS keys_by_name ON "keys" (name);"#;
+
+fn schema() -> Schema {
+    static MYSQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let mysql = MYSQL.get_or_init(|| {
+        format!(
+            r#"CREATE TABLE IF NOT EXISTS names (
+                name VARCHAR(255) NOT NULL PRIMARY KEY,
+                published VARCHAR(16) NOT NULL DEFAULT 'no',
+                reserved BIGINT NOT NULL DEFAULT 0,
+                assigned {MYSQL_DID},
+                hold_keys TEXT NOT NULL,
+                hold_expires BIGINT NOT NULL DEFAULT 0,
+                did {MYSQL_DID},
+                version_id VARCHAR(255),
+                log LONGTEXT,
+                web_document LONGTEXT,
+                holder_keys TEXT NOT NULL,
+                whois MEDIUMBLOB,
+                heard_at BIGINT NOT NULL DEFAULT 0,
+                asked_at BIGINT
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS "keys" (
+                "key" VARCHAR(255) NOT NULL,
+                name VARCHAR(255) NOT NULL,
+                proven BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY ("key", name),
+                INDEX keys_by_name (name)
+            ) {MYSQL_TABLE}"#
+        )
+    });
+    Schema { sqlite: SQLITE, mysql }
+}
+
 impl Store {
-    pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        if let Some(parent) = path.as_ref().parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)?;
-        }
-        Self::with(Connection::open(path)?)
+    pub fn open(location: &Location) -> anyhow::Result<Self> {
+        Ok(Self { db: Db::open(location, &schema(), "did-host")? })
     }
 
     pub fn in_memory() -> anyhow::Result<Self> {
-        Self::with(Connection::open_in_memory()?)
+        Ok(Self { db: Db::scratch(&schema())? })
     }
 
-    fn with(db: Connection) -> anyhow::Result<Self> {
-        db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS names (
-                name TEXT PRIMARY KEY,
-                published TEXT NOT NULL DEFAULT 'no',
-                reserved INTEGER NOT NULL DEFAULT 0,
-                assigned TEXT,
-                hold_keys TEXT NOT NULL DEFAULT '[]',
-                hold_expires INTEGER NOT NULL DEFAULT 0,
-                did TEXT,
-                version_id TEXT,
-                log TEXT,
-                web_document TEXT,
-                holder_keys TEXT NOT NULL DEFAULT '[]',
-                whois BLOB,
-                heard_at INTEGER NOT NULL DEFAULT 0,
-                asked_at INTEGER
-            );
-            -- Every key any version of a hosted document has had, by name; and
-            -- whether the name's holder has shown it holds it (a message
-            -- authenticated with it) rather than only listed it.
-            CREATE TABLE IF NOT EXISTS keys (
-                key TEXT NOT NULL,
-                name TEXT NOT NULL,
-                proven INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (key, name)
-            );
-            CREATE INDEX IF NOT EXISTS keys_by_name ON keys (name);",
-        )?;
-        Ok(Self { db: Mutex::new(db) })
-    }
-
-    fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.db.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {
+    fn read(row: &Row) -> wyvrn_service::db::Result<Record> {
         let list = |text: String| serde_json::from_str::<Vec<String>>(&text).unwrap_or_default();
         Ok(Record {
             name: row.get(0)?,
-            published: Published::parse(&row.get::<_, String>(1)?),
-            reserved: row.get::<_, i64>(2)? != 0,
+            published: Published::parse(&row.get::<String>(1)?),
+            reserved: row.get(2)?,
             assigned: row.get(3)?,
             hold_keys: list(row.get(4)?),
             hold_expires: row.get(5)?,
@@ -136,57 +155,44 @@ impl Store {
     }
 
     pub fn get(&self, name: &str) -> anyhow::Result<Option<Record>> {
-        Ok(self.db().query_row(&format!("SELECT {COLUMNS} FROM names WHERE name = ?1"), [name], Self::read).optional()?)
+        Ok(self.db.lock().query_row(&format!("SELECT {COLUMNS} FROM names WHERE name = ?1"), params![name], Self::read)?)
     }
 
     pub fn all(&self) -> anyhow::Result<Vec<Record>> {
-        let db = self.db();
-        let mut statement = db.prepare(&format!("SELECT {COLUMNS} FROM names ORDER BY name"))?;
-        let records = statement.query_map([], Self::read)?.collect::<Result<_, _>>()?;
-        Ok(records)
+        Ok(self.db.lock().query(&format!("SELECT {COLUMNS} FROM names ORDER BY name"), params![], Self::read)?)
     }
 
-    fn ensure(db: &Connection, name: &str) -> rusqlite::Result<()> {
-        db.execute("INSERT OR IGNORE INTO names (name) VALUES (?1)", [name]).map(|_| ())
-    }
+    /// The lists are written out: MySQL gives a text column no default.
+    const ENSURE: &'static str = "INSERT OR IGNORE INTO names (name, hold_keys, holder_keys) VALUES (?1, '[]', '[]')";
 
     /// Holds `name` for whoever has `keys`, until `expires`. They hold nothing else.
     pub fn hold(&self, name: &str, keys: &[String], expires: i64) -> anyhow::Result<()> {
-        let db = self.db();
+        let mut db = self.db.lock();
         let keys = serde_json::to_string(keys)?;
-        db.execute("UPDATE names SET hold_keys = '[]', hold_expires = 0 WHERE hold_keys = ?1", [&keys])?;
-        Self::ensure(&db, name)?;
+        db.execute("UPDATE names SET hold_keys = '[]', hold_expires = 0 WHERE hold_keys = ?1", params![keys])?;
+        db.execute(Self::ENSURE, params![name])?;
         db.execute("UPDATE names SET hold_keys = ?2, hold_expires = ?3 WHERE name = ?1", params![name, keys, expires])?;
         Ok(())
     }
 
     /// A name, other than `except`, whose holder has shown it holds `key`.
     pub fn name_proven_with(&self, key: &str, except: &str) -> anyhow::Result<Option<String>> {
-        Ok(self
-            .db()
-            .query_row("SELECT name FROM keys WHERE key = ?1 AND name <> ?2 AND proven = 1 LIMIT 1", [key, except], |row| row.get(0))
-            .optional()?)
+        Ok(self.db.lock().query_row(r#"SELECT name FROM "keys" WHERE "key" = ?1 AND name <> ?2 AND proven = 1 LIMIT 1"#, params![key, except], |row| row.get(0))?)
     }
 
     /// The names whose holder has shown it holds `key`.
     pub fn names_proven_with(&self, key: &str) -> anyhow::Result<Vec<String>> {
-        let db = self.db();
-        let mut statement = db.prepare("SELECT name FROM keys WHERE key = ?1 AND proven = 1")?;
-        let names = statement.query_map([key], |row| row.get(0))?.collect::<Result<_, _>>()?;
-        Ok(names)
+        Ok(self.db.lock().query(r#"SELECT name FROM "keys" WHERE "key" = ?1 AND proven = 1"#, params![key], |row| row.get(0))?)
     }
 
     /// The names with `key` in any version of their document.
     pub fn names_with_key(&self, key: &str) -> anyhow::Result<Vec<String>> {
-        let db = self.db();
-        let mut statement = db.prepare("SELECT name FROM keys WHERE key = ?1")?;
-        let names = statement.query_map([key], |row| row.get(0))?.collect::<Result<_, _>>()?;
-        Ok(names)
+        Ok(self.db.lock().query(r#"SELECT name FROM "keys" WHERE "key" = ?1"#, params![key], |row| row.get(0))?)
     }
 
     /// `name`'s holder has authenticated with `key`.
     pub fn prove(&self, name: &str, key: &str) -> anyhow::Result<()> {
-        self.db().execute("UPDATE keys SET proven = 1 WHERE key = ?1 AND name = ?2", [key, name])?;
+        self.db.lock().execute(r#"UPDATE "keys" SET proven = 1 WHERE "key" = ?1 AND name = ?2"#, params![key, name])?;
         Ok(())
     }
 
@@ -205,49 +211,48 @@ impl Store {
         keys: &[String],
         now: i64,
     ) -> anyhow::Result<()> {
-        let mut db = self.db();
-        let tx = db.transaction()?;
-        Self::ensure(&tx, name)?;
-        tx.execute(
-            "UPDATE names SET published = ?2, did = ?3, version_id = ?4, log = ?5, web_document = ?6, holder_keys = ?7,
-                    hold_keys = '[]', hold_expires = 0, heard_at = ?8, asked_at = NULL
-             WHERE name = ?1",
-            params![name, published.as_str(), did, version_id, log, web_document, serde_json::to_string(holder_keys)?, now],
-        )?;
-        for key in keys {
-            tx.execute("INSERT OR IGNORE INTO keys (key, name) VALUES (?1, ?2)", [key.as_str(), name])?;
-        }
-        tx.commit()?;
-        Ok(())
+        let holder_keys = serde_json::to_string(holder_keys)?;
+        self.db.lock().transaction(|tx| {
+            tx.execute(Self::ENSURE, params![name])?;
+            tx.execute(
+                "UPDATE names SET published = ?2, did = ?3, version_id = ?4, log = ?5, web_document = ?6, holder_keys = ?7,
+                        hold_keys = '[]', hold_expires = 0, heard_at = ?8, asked_at = NULL
+                 WHERE name = ?1",
+                params![name, published.as_str(), did, version_id, log, web_document, holder_keys, now],
+            )?;
+            for key in keys {
+                tx.execute(r#"INSERT OR IGNORE INTO "keys" ("key", name) VALUES (?1, ?2)"#, params![key, name])?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
     }
 
     /// Sets or removes a DID's whois, with the `did:web` document that says so.
     pub fn set_whois(&self, name: &str, whois: Option<&[u8]>, web_document: &str) -> anyhow::Result<()> {
-        self.db().execute("UPDATE names SET whois = ?2, web_document = ?3 WHERE name = ?1", params![name, whois, web_document])?;
+        self.db.lock().execute("UPDATE names SET whois = ?2, web_document = ?3 WHERE name = ?1", params![name, whois, web_document])?;
         Ok(())
     }
 
     /// An admin's word on who may claim a name: `Some(did)`, or nobody.
     pub fn assign(&self, name: &str, holder: Option<&str>) -> anyhow::Result<()> {
-        let db = self.db();
-        Self::ensure(&db, name)?;
+        let mut db = self.db.lock();
+        db.execute(Self::ENSURE, params![name])?;
         db.execute("UPDATE names SET reserved = 1, assigned = ?2, hold_keys = '[]', hold_expires = 0 WHERE name = ?1", params![name, holder])?;
         Ok(())
     }
 
     /// Ends whatever is published under `name`, and forgets who it was for.
     pub fn free(&self, name: &str) -> anyhow::Result<()> {
-        let mut db = self.db();
-        let tx = db.transaction()?;
-        tx.execute("DELETE FROM keys WHERE name = ?1", [name])?;
-        tx.execute("DELETE FROM names WHERE name = ?1", [name])?;
-        tx.commit()?;
-        Ok(())
+        self.db.lock().transaction(|tx| {
+            tx.execute(r#"DELETE FROM "keys" WHERE name = ?1"#, params![name])?;
+            tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
+            Ok::<_, anyhow::Error>(())
+        })
     }
 
     /// The holder of `name` was heard from: it is not stale, and has answered.
     pub fn heard(&self, name: &str, now: i64) -> anyhow::Result<()> {
-        self.db().execute(
+        self.db.lock().execute(
             "UPDATE names SET heard_at = ?2, asked_at = NULL, published = CASE published WHEN 'stale' THEN 'yes' ELSE published END WHERE name = ?1",
             params![name, now],
         )?;
@@ -255,12 +260,12 @@ impl Store {
     }
 
     pub fn asked(&self, name: &str, now: i64) -> anyhow::Result<()> {
-        self.db().execute("UPDATE names SET asked_at = ?2 WHERE name = ?1", params![name, now])?;
+        self.db.lock().execute("UPDATE names SET asked_at = ?2 WHERE name = ?1", params![name, now])?;
         Ok(())
     }
 
     pub fn mark_stale(&self, name: &str) -> anyhow::Result<()> {
-        self.db().execute("UPDATE names SET published = 'stale' WHERE name = ?1 AND published = 'yes'", [name])?;
+        self.db.lock().execute("UPDATE names SET published = 'stale' WHERE name = ?1 AND published = 'yes'", params![name])?;
         Ok(())
     }
 }

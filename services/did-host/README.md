@@ -57,7 +57,9 @@ docker compose up -d did-host
   place. With `DID_HOST_DID_METHOD=web` the host itself is `did:web:id.example`.
 - The `did-host-data` volume holds the host's own keys and every log it hosts:
   keep it, and back it up. A hosted DID whose log is lost cannot be put back by
-  anyone but its holder.
+  anyone but its holder. With `DID_HOST_DATABASE_URL` set, all but the keys is
+  in that MySQL database instead
+  ([where a service keeps its data](../../README.md#where-a-service-keeps-its-data)).
 
 ## What is served
 

@@ -65,7 +65,9 @@ by the old one, and they stay who they were: nobody needs letting in again.
 ## What it keeps
 
 The `community-data` volume holds the server's own keys, the list of members,
-every channel and everything said in them. **Posts are kept as they were sent:**
+every channel and everything said in them (with `COMMUNITY_DATABASE_URL` set, all
+but the keys is in that MySQL database instead:
+[where a service keeps its data](../../README.md#where-a-service-keeps-its-data)). **Posts are kept as they were sent:**
 the server can read them. A channel here is not end-to-end encrypted between its
 members; each member's messages are encrypted to the server, and the server's to
 each member.

@@ -1,0 +1,28 @@
+# What to add to the Caddy this machine already runs: each service's domain,
+# passed to where docker-compose.yml has it listening. Caddy gets each domain's
+# certificate by itself once its DNS points here.
+#
+# For a Caddy that itself runs in Docker, 127.0.0.1 is the Caddy container and
+# not this machine: put it on this stack's network (wyvrn-services_default) and
+# name the services instead (did-host:8080, stickers:8080, ...).
+
+id.example {
+	encode gzip
+	# Everything: the DIDs it hosts are paths of their own, and holders write to /.
+	reverse_proxy 127.0.0.1:8181
+}
+
+stickers.example {
+	encode gzip
+	reverse_proxy 127.0.0.1:8182
+}
+
+# community.example {
+# 	encode gzip
+# 	reverse_proxy 127.0.0.1:8183
+# }
+
+# updates.example {
+# 	encode gzip
+# 	reverse_proxy 127.0.0.1:8184
+# }

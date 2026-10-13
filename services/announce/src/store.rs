@@ -1,9 +1,7 @@
-//! What the channel keeps: every post, and who is subscribed. One SQLite file.
+//! What the channel keeps: every post, and who is subscribed.
 
-use std::path::Path;
-use std::sync::Mutex;
-
-use rusqlite::{params, Connection, OptionalExtension};
+use wyvrn_service::db::{Db, Location, Result, Row, Schema, MYSQL_DID, MYSQL_TABLE};
+use wyvrn_service::params;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -58,12 +56,10 @@ pub struct Post {
 }
 
 pub struct Store {
-    connection: Mutex<Connection>,
+    db: Db,
 }
 
-type Result<T> = rusqlite::Result<T>;
-
-fn member_from(row: &rusqlite::Row<'_>) -> Result<Member> {
+fn member_from(row: &Row) -> Result<Member> {
     let role: String = row.get(1)?;
     Ok(Member {
         did: row.get(0)?,
@@ -75,7 +71,7 @@ fn member_from(row: &rusqlite::Row<'_>) -> Result<Member> {
     })
 }
 
-fn post_from(row: &rusqlite::Row<'_>) -> Result<Post> {
+fn post_from(row: &Row) -> Result<Post> {
     Ok(Post {
         seq: row.get(0)?,
         id: row.get(1)?,
@@ -89,149 +85,150 @@ fn post_from(row: &rusqlite::Row<'_>) -> Result<Post> {
 const MEMBER_COLUMNS: &str = "did, role, subscribed, name, since, delivered_seq";
 const POST_COLUMNS: &str = "seq, id, content, posted_at, author_did, author_name";
 
+const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
+        did TEXT PRIMARY KEY,
+        role TEXT NOT NULL,
+        subscribed INTEGER NOT NULL,
+        name TEXT,
+        since INTEGER NOT NULL,
+        delivered_seq INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS posts (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        id TEXT NOT NULL UNIQUE,
+        content TEXT NOT NULL,
+        posted_at INTEGER NOT NULL,
+        author_did TEXT NOT NULL,
+        author_name TEXT
+    );
+    -- DIDs a member has left (a verified from_prior). Nothing from one is
+    -- acted on again: a device removed from an account still has its keys.
+    CREATE TABLE IF NOT EXISTS superseded (
+        did TEXT PRIMARY KEY,
+        became TEXT NOT NULL,
+        at INTEGER NOT NULL
+    );
+    -- What each member has on each post: their whole set, as last stated.
+    -- An emptied set is kept, so an older statement can't bring it back.
+    CREATE TABLE IF NOT EXISTS reactions (
+        seq INTEGER NOT NULL,
+        did TEXT NOT NULL,
+        emoji TEXT NOT NULL,
+        at INTEGER NOT NULL,
+        PRIMARY KEY (seq, did)
+    );";
+
+fn schema() -> Schema {
+    static MYSQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let mysql = MYSQL.get_or_init(|| {
+        format!(
+            "CREATE TABLE IF NOT EXISTS members (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                role VARCHAR(16) NOT NULL,
+                subscribed BIGINT NOT NULL,
+                name TEXT,
+                since BIGINT NOT NULL,
+                delivered_seq BIGINT NOT NULL DEFAULT 0
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS posts (
+                seq BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                id VARCHAR(255) NOT NULL UNIQUE,
+                content MEDIUMTEXT NOT NULL,
+                posted_at BIGINT NOT NULL,
+                author_did {MYSQL_DID} NOT NULL,
+                author_name TEXT
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS superseded (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                became {MYSQL_DID} NOT NULL,
+                at BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS reactions (
+                seq BIGINT NOT NULL,
+                did {MYSQL_DID} NOT NULL,
+                emoji TEXT NOT NULL,
+                at BIGINT NOT NULL,
+                PRIMARY KEY (seq, did)
+            ) {MYSQL_TABLE}"
+        )
+    });
+    Schema { sqlite: SQLITE, mysql }
+}
+
 impl Store {
-    pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)?;
-        }
-        Self::with(Connection::open(path)?)
+    pub fn open(location: &Location) -> anyhow::Result<Self> {
+        Ok(Self { db: Db::open(location, &schema(), "announce")? })
     }
 
     pub fn in_memory() -> anyhow::Result<Self> {
-        Self::with(Connection::open_in_memory()?)
-    }
-
-    fn with(connection: Connection) -> anyhow::Result<Self> {
-        // The `admin` and `subscribers` commands open the same file while the server
-        // has it open.
-        connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS members (
-                did TEXT PRIMARY KEY,
-                role TEXT NOT NULL,
-                subscribed INTEGER NOT NULL,
-                name TEXT,
-                since INTEGER NOT NULL,
-                delivered_seq INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS posts (
-                seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                id TEXT NOT NULL UNIQUE,
-                content TEXT NOT NULL,
-                posted_at INTEGER NOT NULL,
-                author_did TEXT NOT NULL,
-                author_name TEXT
-            );
-            -- DIDs a member has left (a verified from_prior). Nothing from one is
-            -- acted on again: a device removed from an account still has its keys.
-            CREATE TABLE IF NOT EXISTS superseded (
-                did TEXT PRIMARY KEY,
-                became TEXT NOT NULL,
-                at INTEGER NOT NULL
-            );
-            -- What each member has on each post: their whole set, as last stated.
-            -- An emptied set is kept, so an older statement can't bring it back.
-            CREATE TABLE IF NOT EXISTS reactions (
-                seq INTEGER NOT NULL,
-                did TEXT NOT NULL,
-                emoji TEXT NOT NULL,
-                at INTEGER NOT NULL,
-                PRIMARY KEY (seq, did)
-            );",
-        )?;
-        Ok(Self { connection: Mutex::new(connection) })
-    }
-
-    fn connection(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.connection.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        Ok(Self { db: Db::scratch(&schema())? })
     }
 
     pub fn member(&self, did: &str) -> Result<Option<Member>> {
-        self.connection()
-            .query_row(&format!("SELECT {MEMBER_COLUMNS} FROM members WHERE did = ?1"), [did], member_from)
-            .optional()
+        self.db.lock().query_row(&format!("SELECT {MEMBER_COLUMNS} FROM members WHERE did = ?1"), params![did], member_from)
     }
 
     /// Everyone posts are sent to, oldest subscription first.
     pub fn subscribers(&self) -> Result<Vec<Member>> {
-        let connection = self.connection();
-        let mut statement = connection.prepare(&format!(
-            "SELECT {MEMBER_COLUMNS} FROM members WHERE subscribed = 1 ORDER BY since, did"
-        ))?;
-        let members = statement.query_map([], member_from)?.collect();
-        members
+        self.db.lock().query(&format!("SELECT {MEMBER_COLUMNS} FROM members WHERE subscribed = 1 ORDER BY since, did"), params![], member_from)
     }
 
     /// Every member, subscribed or not.
     pub fn members(&self) -> Result<Vec<Member>> {
-        let connection = self.connection();
-        let mut statement =
-            connection.prepare(&format!("SELECT {MEMBER_COLUMNS} FROM members ORDER BY since, did"))?;
-        let members = statement.query_map([], member_from)?.collect();
-        members
+        self.db.lock().query(&format!("SELECT {MEMBER_COLUMNS} FROM members ORDER BY since, did"), params![], member_from)
     }
 
     pub fn subscriber_count(&self) -> Result<i64> {
-        self.connection().query_row("SELECT COUNT(*) FROM members WHERE subscribed = 1", [], |row| row.get(0))
+        self.db.lock().query_value("SELECT COUNT(*) FROM members WHERE subscribed = 1", params![])
     }
 
     /// Subscribes `did`, keeping the role it has if the channel already knows it. A
     /// new subscriber starts at the latest post: the log is theirs to ask for, not
     /// sent at them.
     pub fn subscribe(&self, did: &str, now: i64) -> Result<Member> {
-        let latest = self.latest_seq()?;
-        self.connection().execute(
-            "INSERT INTO members (did, role, subscribed, since, delivered_seq) VALUES (?1, 'subscriber', 1, ?2, ?3)
-             ON CONFLICT (did) DO UPDATE SET
-                since = CASE WHEN subscribed = 1 THEN since ELSE excluded.since END,
-                delivered_seq = CASE WHEN subscribed = 1 THEN delivered_seq ELSE excluded.delivered_seq END,
-                subscribed = 1",
-            params![did, now, latest],
-        )?;
-        Ok(self.member(did)?.expect("just written"))
+        let mut db = self.db.lock();
+        let latest: i64 = db.query_value("SELECT COALESCE(MAX(seq), 0) FROM posts", params![])?;
+        // Someone already subscribed is left as they are; a member who wasn't (an
+        // admin named ahead) starts from now; anyone else is new.
+        let known = db.execute("UPDATE members SET since = ?2, delivered_seq = ?3, subscribed = 1 WHERE did = ?1 AND subscribed = 0", params![did, now, latest])?;
+        if known == 0 {
+            db.execute("INSERT OR IGNORE INTO members (did, role, subscribed, since, delivered_seq) VALUES (?1, 'subscriber', 1, ?2, ?3)", params![did, now, latest])?;
+        }
+        db.query_row(&format!("SELECT {MEMBER_COLUMNS} FROM members WHERE did = ?1"), params![did], member_from)?
+            .ok_or_else(|| wyvrn_service::db::Error::Other("a member just written is not there".into()))
     }
 
     /// Stops sending to `did`. An admin stays one, for when they come back.
     pub fn unsubscribe(&self, did: &str) -> Result<()> {
-        let connection = self.connection();
-        connection.execute("UPDATE members SET subscribed = 0 WHERE did = ?1 AND role = 'admin'", [did])?;
-        connection.execute("DELETE FROM members WHERE did = ?1 AND role <> 'admin'", [did])?;
+        let mut db = self.db.lock();
+        db.execute("UPDATE members SET subscribed = 0 WHERE did = ?1 AND role = 'admin'", params![did])?;
+        db.execute("DELETE FROM members WHERE did = ?1 AND role <> 'admin'", params![did])?;
         Ok(())
     }
 
     /// Gives `did` a role, whether or not it has subscribed: an admin can be named
     /// first. Making a member who never subscribed an ordinary one again forgets them.
     pub fn set_role(&self, did: &str, role: Role, now: i64) -> Result<()> {
-        let connection = self.connection();
-        connection.execute(
-            "INSERT INTO members (did, role, subscribed, since) VALUES (?1, ?2, 0, ?3)
-             ON CONFLICT (did) DO UPDATE SET role = excluded.role",
-            params![did, role.as_str(), now],
-        )?;
-        connection.execute("DELETE FROM members WHERE did = ?1 AND role = 'subscriber' AND subscribed = 0", [did])?;
+        let mut db = self.db.lock();
+        if db.execute("UPDATE members SET role = ?2 WHERE did = ?1", params![did, role.as_str()])? == 0 {
+            db.execute("INSERT INTO members (did, role, subscribed, since) VALUES (?1, ?2, 0, ?3)", params![did, role.as_str(), now])?;
+        }
+        db.execute("DELETE FROM members WHERE did = ?1 AND role = 'subscriber' AND subscribed = 0", params![did])?;
         Ok(())
     }
 
     pub fn set_name(&self, did: &str, name: Option<&str>) -> Result<()> {
-        self.connection().execute("UPDATE members SET name = ?2 WHERE did = ?1", params![did, name])?;
+        self.db.lock().execute("UPDATE members SET name = ?2 WHERE did = ?1", params![did, name])?;
         Ok(())
     }
 
     pub fn set_delivered(&self, did: &str, seq: i64) -> Result<()> {
-        self.connection().execute(
-            "UPDATE members SET delivered_seq = ?2 WHERE did = ?1 AND delivered_seq < ?2",
-            params![did, seq],
-        )?;
+        self.db.lock().execute("UPDATE members SET delivered_seq = ?2 WHERE did = ?1 AND delivered_seq < ?2", params![did, seq])?;
         Ok(())
     }
 
     pub fn is_superseded(&self, did: &str) -> Result<bool> {
-        self.connection()
-            .query_row("SELECT 1 FROM superseded WHERE did = ?1", [did], |_| Ok(()))
-            .optional()
-            .map(|found| found.is_some())
+        Ok(self.db.lock().query_row("SELECT 1 FROM superseded WHERE did = ?1", params![did], |_| Ok(()))?.is_some())
     }
 
     /// A member has changed DID: everything the channel holds for `prior` is `new`'s
@@ -240,120 +237,95 @@ impl Store {
     /// came from), it keeps the higher role of the two and stays subscribed if either
     /// was.
     pub fn rotate(&self, prior: &str, new: &str, now: i64) -> Result<bool> {
-        let mut connection = self.connection();
-        let transaction = connection.transaction()?;
-        let old = transaction
-            .query_row(&format!("SELECT {MEMBER_COLUMNS} FROM members WHERE did = ?1"), [prior], member_from)
-            .optional()?;
-        if let Some(old) = &old {
-            let existing = transaction
-                .query_row(&format!("SELECT {MEMBER_COLUMNS} FROM members WHERE did = ?1"), [new], member_from)
-                .optional()?;
-            transaction.execute("DELETE FROM members WHERE did = ?1", [prior])?;
-            match existing {
-                None => {
-                    transaction.execute(
-                        "INSERT INTO members (did, role, subscribed, name, since, delivered_seq)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        params![new, old.role.as_str(), old.subscribed, old.name, old.since, old.delivered_seq],
-                    )?;
-                }
-                Some(existing) => {
-                    let role = if old.role == Role::Admin { Role::Admin } else { existing.role };
-                    transaction.execute(
-                        "UPDATE members SET role = ?2, subscribed = ?3, name = COALESCE(name, ?4),
-                            since = MIN(since, ?5), delivered_seq = MAX(delivered_seq, ?6)
-                         WHERE did = ?1",
-                        params![
-                            new,
-                            role.as_str(),
-                            old.subscribed || existing.subscribed,
-                            old.name,
-                            old.since,
-                            old.delivered_seq
-                        ],
-                    )?;
+        self.db.lock().transaction(|tx| {
+            let old = tx.query_row(&format!("SELECT {MEMBER_COLUMNS} FROM members WHERE did = ?1"), params![prior], member_from)?;
+            if let Some(old) = &old {
+                let existing = tx.query_row(&format!("SELECT {MEMBER_COLUMNS} FROM members WHERE did = ?1"), params![new], member_from)?;
+                tx.execute("DELETE FROM members WHERE did = ?1", params![prior])?;
+                match existing {
+                    None => {
+                        tx.execute(
+                            "INSERT INTO members (did, role, subscribed, name, since, delivered_seq)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            params![new, old.role.as_str(), old.subscribed, old.name, old.since, old.delivered_seq],
+                        )?;
+                    }
+                    Some(existing) => {
+                        let role = if old.role == Role::Admin { Role::Admin } else { existing.role };
+                        tx.execute(
+                            "UPDATE members SET role = ?2, subscribed = ?3, name = ?4, since = ?5, delivered_seq = ?6 WHERE did = ?1",
+                            params![
+                                new,
+                                role.as_str(),
+                                old.subscribed || existing.subscribed,
+                                existing.name.as_ref().or(old.name.as_ref()),
+                                existing.since.min(old.since),
+                                existing.delivered_seq.max(old.delivered_seq)
+                            ],
+                        )?;
+                    }
                 }
             }
-        }
-        // Their reactions go with them. Where they had reacted to a post as both,
-        // what the new DID said stands.
-        transaction.execute("UPDATE OR IGNORE reactions SET did = ?2 WHERE did = ?1", params![prior, new])?;
-        transaction.execute("DELETE FROM reactions WHERE did = ?1", [prior])?;
-        transaction.execute(
-            "INSERT OR REPLACE INTO superseded (did, became, at) VALUES (?1, ?2, ?3)",
-            params![prior, new, now],
-        )?;
-        transaction.commit()?;
-        Ok(old.is_some())
+            // Their reactions go with them. Where they had reacted to a post as both,
+            // what the new DID said stands.
+            tx.execute("UPDATE OR IGNORE reactions SET did = ?2 WHERE did = ?1", params![prior, new])?;
+            tx.execute("DELETE FROM reactions WHERE did = ?1", params![prior])?;
+            tx.execute("INSERT OR REPLACE INTO superseded (did, became, at) VALUES (?1, ?2, ?3)", params![prior, new, now])?;
+            Ok(old.is_some())
+        })
     }
 
     pub fn add_post(&self, id: &str, content: &str, author: &Member, now: i64) -> Result<Post> {
-        let connection = self.connection();
-        connection.execute(
+        let mut db = self.db.lock();
+        let seq = db.insert(
             "INSERT INTO posts (id, content, posted_at, author_did, author_name) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![id, content, now, author.did, author.name],
         )?;
-        let seq = connection.last_insert_rowid();
-        connection.query_row(&format!("SELECT {POST_COLUMNS} FROM posts WHERE seq = ?1"), [seq], post_from)
+        db.query_row(&format!("SELECT {POST_COLUMNS} FROM posts WHERE seq = ?1"), params![seq], post_from)?
+            .ok_or_else(|| wyvrn_service::db::Error::Other("a post just written is not there".into()))
     }
 
     pub fn post(&self, seq: i64) -> Result<Option<Post>> {
-        self.connection()
-            .query_row(&format!("SELECT {POST_COLUMNS} FROM posts WHERE seq = ?1"), [seq], post_from)
-            .optional()
+        self.db.lock().query_row(&format!("SELECT {POST_COLUMNS} FROM posts WHERE seq = ?1"), params![seq], post_from)
     }
 
     /// The post sent out under `id`. Ids are compared as DIDComm compares them,
     /// without regard to case.
     pub fn post_by_id(&self, id: &str) -> Result<Option<Post>> {
-        self.connection()
-            .query_row(&format!("SELECT {POST_COLUMNS} FROM posts WHERE lower(id) = lower(?1)"), [id], post_from)
-            .optional()
+        self.db.lock().query_row(&format!("SELECT {POST_COLUMNS} FROM posts WHERE lower(id) = lower(?1)"), params![id], post_from)
     }
 
     /// Makes `emoji` the whole of what `did` has on post `seq`, as stated at `at`.
     /// Returns whether anything changed: a statement no newer than the one held is
     /// ignored, and so is one that says the same.
     pub fn set_reactions(&self, seq: i64, did: &str, emoji: &[String], at: i64) -> Result<bool> {
-        let connection = self.connection();
-        let held: Option<(String, i64)> = connection
-            .query_row("SELECT emoji, at FROM reactions WHERE seq = ?1 AND did = ?2", params![seq, did], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .optional()?;
+        let mut db = self.db.lock();
+        let held: Option<(String, i64)> =
+            db.query_row("SELECT emoji, at FROM reactions WHERE seq = ?1 AND did = ?2", params![seq, did], |row| Ok((row.get(0)?, row.get(1)?)))?;
         let stated = serde_json::to_string(emoji).unwrap_or_else(|_| "[]".into());
         if let Some((held_emoji, held_at)) = &held {
             if *held_at >= at {
                 return Ok(false);
             }
             if *held_emoji == stated {
-                connection.execute("UPDATE reactions SET at = ?3 WHERE seq = ?1 AND did = ?2", params![seq, did, at])?;
+                db.execute("UPDATE reactions SET at = ?3 WHERE seq = ?1 AND did = ?2", params![seq, did, at])?;
                 return Ok(false);
             }
         }
-        connection.execute(
-            "INSERT OR REPLACE INTO reactions (seq, did, emoji, at) VALUES (?1, ?2, ?3, ?4)",
-            params![seq, did, stated, at],
-        )?;
+        db.execute("INSERT OR REPLACE INTO reactions (seq, did, emoji, at) VALUES (?1, ?2, ?3, ?4)", params![seq, did, stated, at])?;
         Ok(held.is_some() || !emoji.is_empty())
     }
 
     /// What `did` has on post `seq`.
     pub fn reactions_of(&self, seq: i64, did: &str) -> Result<Vec<String>> {
-        let held: Option<String> = self
-            .connection()
-            .query_row("SELECT emoji FROM reactions WHERE seq = ?1 AND did = ?2", params![seq, did], |row| row.get(0))
-            .optional()?;
+        let held: Option<String> = self.db.lock().query_row("SELECT emoji FROM reactions WHERE seq = ?1 AND did = ?2", params![seq, did], |row| row.get(0))?;
         Ok(held.and_then(|emoji| serde_json::from_str(&emoji).ok()).unwrap_or_default())
     }
 
     /// Each emoji on post `seq` with how many members have it there, in the order
     /// the emoji first appeared. Never who.
     pub fn reaction_counts(&self, seq: i64) -> Result<Vec<(String, i64)>> {
-        let connection = self.connection();
-        let mut statement = connection.prepare("SELECT emoji FROM reactions WHERE seq = ?1 ORDER BY at, did")?;
-        let sets: Vec<String> = statement.query_map([seq], |row| row.get(0))?.collect::<Result<_>>()?;
+        let sets: Vec<String> = self.db.lock().query("SELECT emoji FROM reactions WHERE seq = ?1 ORDER BY at, did", params![seq], |row| row.get(0))?;
         let mut counts: Vec<(String, i64)> = Vec::new();
         for set in sets {
             for emoji in serde_json::from_str::<Vec<String>>(&set).unwrap_or_default() {
@@ -369,14 +341,13 @@ impl Store {
     /// Who has each emoji on post `seq`: a name where the member gave one, their DID
     /// where they didn't, earliest first. For an admin's eyes only.
     pub fn reactors(&self, seq: i64) -> Result<Vec<(String, Vec<String>)>> {
-        let connection = self.connection();
-        let mut statement = connection.prepare(
+        let sets: Vec<(String, String)> = self.db.lock().query(
             "SELECT reactions.emoji, COALESCE(members.name, reactions.did)
              FROM reactions LEFT JOIN members ON members.did = reactions.did
              WHERE reactions.seq = ?1 ORDER BY reactions.at, reactions.did",
+            params![seq],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let sets: Vec<(String, String)> =
-            statement.query_map([seq], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<Result<_>>()?;
         let mut reactors: Vec<(String, Vec<String>)> = Vec::new();
         for (set, who) in sets {
             for emoji in serde_json::from_str::<Vec<String>>(&set).unwrap_or_default() {
@@ -390,28 +361,18 @@ impl Store {
     }
 
     pub fn latest_seq(&self) -> Result<i64> {
-        self.connection().query_row("SELECT COALESCE(MAX(seq), 0) FROM posts", [], |row| row.get(0))
+        self.db.lock().query_value("SELECT COALESCE(MAX(seq), 0) FROM posts", params![])
     }
 
     /// Up to `limit` posts older than `before` (or the newest, without one), newest
     /// first.
     pub fn posts_before(&self, before: Option<i64>, limit: usize) -> Result<Vec<Post>> {
-        let connection = self.connection();
-        let mut statement = connection.prepare(&format!(
-            "SELECT {POST_COLUMNS} FROM posts WHERE seq < ?1 ORDER BY seq DESC LIMIT ?2"
-        ))?;
-        let posts = statement.query_map(params![before.unwrap_or(i64::MAX), limit as i64], post_from)?.collect();
-        posts
+        self.db.lock().query(&format!("SELECT {POST_COLUMNS} FROM posts WHERE seq < ?1 ORDER BY seq DESC LIMIT ?2"), params![before.unwrap_or(i64::MAX), limit as i64], post_from)
     }
 
     /// Up to `limit` posts newer than `after`, oldest first.
     pub fn posts_after(&self, after: i64, limit: usize) -> Result<Vec<Post>> {
-        let connection = self.connection();
-        let mut statement = connection.prepare(&format!(
-            "SELECT {POST_COLUMNS} FROM posts WHERE seq > ?1 ORDER BY seq LIMIT ?2"
-        ))?;
-        let posts = statement.query_map(params![after, limit as i64], post_from)?.collect();
-        posts
+        self.db.lock().query(&format!("SELECT {POST_COLUMNS} FROM posts WHERE seq > ?1 ORDER BY seq LIMIT ?2"), params![after, limit as i64], post_from)
     }
 }
 

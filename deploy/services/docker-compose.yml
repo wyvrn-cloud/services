@@ -1,0 +1,101 @@
+# Wyvrn's services on a machine that already has a web server in front (Caddy,
+# nginx, ...) and a MySQL or MariaDB server: each service listens on this
+# machine only, for that web server to pass its domain to, and keeps what it
+# keeps in a database of its own. See README.md beside this file.
+#
+#   cp .env.example .env    # and fill it in
+#   docker compose up -d                                         # the DID host and the sticker service
+#   docker compose --profile community --profile announce up -d  # and the two an app isn't built to expect
+name: wyvrn-services
+
+x-service: &service
+  restart: unless-stopped
+  # For a database on this machine itself: `host.docker.internal` in a
+  # DATABASE_URL is this machine, as a container sees it.
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+services:
+  # Public addresses (did:web:<domain>:<name>). The app is built to use
+  # did:web:id.wyvrn.app unless told otherwise (VITE_DID_HOST_DID).
+  did-host:
+    <<: *service
+    image: wyvrn-did-host
+    build:
+      context: ../..
+      dockerfile: services/did-host/Dockerfile
+    ports:
+      - "127.0.0.1:${DID_HOST_PORT:-8181}:8080"
+    environment:
+      DID_HOST_DOMAIN: "${DID_HOST_DOMAIN:?set DID_HOST_DOMAIN in .env}"
+      DID_HOST_PUBLIC_URL: "https://${DID_HOST_DOMAIN}/"
+      DID_HOST_DID_METHOD: "web"
+      DID_HOST_ADMINS: "${DID_HOST_ADMINS:-}"
+      DID_HOST_DATABASE_URL: "${DID_HOST_DATABASE_URL:?set DID_HOST_DATABASE_URL in .env}"
+    volumes:
+      # The host's own keys (identity.json), and nothing else. Back this up.
+      - did-host-data:/app/data
+
+  # Sticker and custom-emoji packs. The app is built to use
+  # did:web:stickers.wyvrn.app unless told otherwise (VITE_STICKER_SERVICE_DID).
+  stickers:
+    <<: *service
+    image: wyvrn-stickers
+    build:
+      context: ../..
+      dockerfile: services/stickers/Dockerfile
+    ports:
+      - "127.0.0.1:${STICKERS_PORT:-8182}:8080"
+    environment:
+      STICKERS_PUBLIC_URL: "https://${STICKERS_DOMAIN:?set STICKERS_DOMAIN in .env}/"
+      STICKERS_DID_METHOD: "web"
+      STICKERS_ADMINS: "${STICKERS_ADMINS:-}"
+      STICKERS_DATABASE_URL: "${STICKERS_DATABASE_URL:?set STICKERS_DATABASE_URL in .env}"
+    volumes:
+      - stickers-data:/app/data
+
+  # A community server. No app is built to expect one: people are given its DID.
+  community:
+    <<: *service
+    profiles: ["community"]
+    image: wyvrn-community
+    build:
+      context: ../..
+      dockerfile: services/community/Dockerfile
+    ports:
+      - "127.0.0.1:${COMMUNITY_PORT:-8183}:8080"
+    environment:
+      COMMUNITY_PUBLIC_URL: "https://${COMMUNITY_DOMAIN:?set COMMUNITY_DOMAIN in .env}/"
+      COMMUNITY_DID_METHOD: "web"
+      COMMUNITY_NAME: "${COMMUNITY_NAME:-A community}"
+      COMMUNITY_ADMINS: "${COMMUNITY_ADMINS:-}"
+      COMMUNITY_MEMBERS: "${COMMUNITY_MEMBERS:-}"
+      COMMUNITY_DATABASE_URL: "${COMMUNITY_DATABASE_URL:?set COMMUNITY_DATABASE_URL in .env}"
+    volumes:
+      - community-data:/app/data
+
+  # An announcement channel. Likewise: people are given its DID.
+  announce:
+    <<: *service
+    profiles: ["announce"]
+    image: wyvrn-announce
+    build:
+      context: ../..
+      dockerfile: services/announce/Dockerfile
+    ports:
+      - "127.0.0.1:${ANNOUNCE_PORT:-8184}:8080"
+    environment:
+      ANNOUNCE_PUBLIC_URL: "https://${ANNOUNCE_DOMAIN:?set ANNOUNCE_DOMAIN in .env}/"
+      ANNOUNCE_DID_METHOD: "web"
+      ANNOUNCE_NAME: "${ANNOUNCE_NAME:-Announcements}"
+      ANNOUNCE_DESCRIPTION: "${ANNOUNCE_DESCRIPTION:-A one-way announcement channel.}"
+      ANNOUNCE_ADMINS: "${ANNOUNCE_ADMINS:-}"
+      ANNOUNCE_DATABASE_URL: "${ANNOUNCE_DATABASE_URL:?set ANNOUNCE_DATABASE_URL in .env}"
+    volumes:
+      - announce-data:/app/data
+
+volumes:
+  did-host-data:
+  stickers-data:
+  community-data:
+  announce-data:

@@ -49,7 +49,10 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn open_store(config: &Config) -> anyhow::Result<Store> {
-    Store::open(&config.store.path).with_context(|| format!("store {}", config.store.path.display()))
+    // In the file the configuration names, unless the environment names a
+    // database (DID_HOST_DATABASE_URL or DATABASE_URL: mysql://user:password@host/database).
+    let location = wyvrn_service::db::Location::from_env("DID_HOST", &config.store.path)?;
+    Store::open(&location).with_context(|| format!("store {location}"))
 }
 
 fn host(config: &Config) -> anyhow::Result<Host> {

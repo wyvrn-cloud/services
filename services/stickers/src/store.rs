@@ -1,11 +1,9 @@
 //! What the service keeps: packs, the stickers in them, and the workflows that
 //! are under way -- each with the stickers it has gathered so far.
 
-use std::path::Path;
-use std::sync::Mutex;
-
-use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
+use wyvrn_service::db::{self, Db, Location, Row, Schema, MYSQL_DID, MYSQL_TABLE};
+use wyvrn_service::params;
 
 use crate::images::Image;
 
@@ -67,6 +65,7 @@ pub struct Sticker {
 }
 
 impl Sticker {
+    /// A picture's bytes and type, by the file name it is served under.
     pub fn file(&self) -> String {
         format!("{}.{}", self.id, self.extension)
     }
@@ -87,7 +86,7 @@ pub struct Instance {
 }
 
 pub struct Store {
-    db: Mutex<Connection>,
+    db: Db,
 }
 
 /// Where a sticker belongs: a published pack, or a workflow's gathering of them.
@@ -98,113 +97,121 @@ pub fn draft_scope(instance: &str) -> String {
     format!("draft:{instance}")
 }
 
+const PACK_COLUMNS: &str = "name, kind, title, owner, reuse, icon, version, created, updated, removed";
+const INSTANCE_COLUMNS: &str = "id, template, owner, state, status, context, updated";
+
+/// `key` is a word of MySQL's own, so it is always written quoted.
+const SQLITE: &str = r#"CREATE TABLE IF NOT EXISTS packs (
+        name TEXT PRIMARY KEY, kind TEXT NOT NULL, title TEXT NOT NULL, owner TEXT NOT NULL,
+        reuse INTEGER NOT NULL, icon TEXT, version INTEGER NOT NULL, created INTEGER NOT NULL,
+        updated INTEGER NOT NULL, removed INTEGER NOT NULL DEFAULT 0);
+     CREATE INDEX IF NOT EXISTS packs_owner ON packs (owner);
+     CREATE TABLE IF NOT EXISTS stickers (
+        scope TEXT NOT NULL, position INTEGER NOT NULL, id TEXT NOT NULL, media_type TEXT NOT NULL,
+        extension TEXT NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL, sha256 TEXT NOT NULL,
+        animated INTEGER NOT NULL, emoji TEXT NOT NULL, shortcode TEXT, bytes BLOB NOT NULL,
+        PRIMARY KEY (scope, id));
+     CREATE TABLE IF NOT EXISTS instances (
+        id TEXT PRIMARY KEY, template TEXT NOT NULL, owner TEXT NOT NULL, state TEXT NOT NULL,
+        status TEXT NOT NULL, context TEXT NOT NULL, updated INTEGER NOT NULL);
+     CREATE INDEX IF NOT EXISTS instances_owner ON instances (owner);
+     CREATE TABLE IF NOT EXISTS advances (
+        instance TEXT NOT NULL, "key" TEXT NOT NULL, PRIMARY KEY (instance, "key"));"#;
+
+fn schema() -> Schema {
+    static MYSQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let mysql = MYSQL.get_or_init(|| {
+        format!(
+            r#"CREATE TABLE IF NOT EXISTS packs (
+                name VARCHAR(255) NOT NULL PRIMARY KEY, kind VARCHAR(16) NOT NULL, title TEXT NOT NULL, owner {MYSQL_DID} NOT NULL,
+                reuse BIGINT NOT NULL, icon VARCHAR(255), version BIGINT NOT NULL, created BIGINT NOT NULL,
+                updated BIGINT NOT NULL, removed BIGINT NOT NULL DEFAULT 0,
+                INDEX packs_owner (owner)) {MYSQL_TABLE};
+             CREATE TABLE IF NOT EXISTS stickers (
+                scope VARCHAR(300) NOT NULL, position BIGINT NOT NULL, id VARCHAR(255) NOT NULL, media_type VARCHAR(255) NOT NULL,
+                extension VARCHAR(32) NOT NULL, width BIGINT NOT NULL, height BIGINT NOT NULL, sha256 VARCHAR(128) NOT NULL,
+                animated BIGINT NOT NULL, emoji TEXT NOT NULL, shortcode VARCHAR(255), bytes LONGBLOB NOT NULL,
+                PRIMARY KEY (scope, id)) {MYSQL_TABLE};
+             CREATE TABLE IF NOT EXISTS instances (
+                id VARCHAR(255) NOT NULL PRIMARY KEY, template VARCHAR(255) NOT NULL, owner {MYSQL_DID} NOT NULL, state VARCHAR(255) NOT NULL,
+                status VARCHAR(32) NOT NULL, context LONGTEXT NOT NULL, updated BIGINT NOT NULL,
+                INDEX instances_owner (owner)) {MYSQL_TABLE};
+             CREATE TABLE IF NOT EXISTS advances (
+                instance VARCHAR(255) NOT NULL, "key" VARCHAR(255) NOT NULL, PRIMARY KEY (instance, "key")) {MYSQL_TABLE}"#
+        )
+    });
+    Schema { sqlite: SQLITE, mysql }
+}
+
 impl Store {
-    pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        if let Some(parent) = path.as_ref().parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)?;
-        }
-        Self::with(Connection::open(path)?)
+    pub fn open(location: &Location) -> anyhow::Result<Self> {
+        Ok(Self { db: Db::open(location, &schema(), "stickers")? })
     }
 
     pub fn in_memory() -> anyhow::Result<Self> {
-        Self::with(Connection::open_in_memory()?)
-    }
-
-    fn with(db: Connection) -> anyhow::Result<Self> {
-        db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS packs (
-                name TEXT PRIMARY KEY, kind TEXT NOT NULL, title TEXT NOT NULL, owner TEXT NOT NULL,
-                reuse INTEGER NOT NULL, icon TEXT, version INTEGER NOT NULL, created INTEGER NOT NULL,
-                updated INTEGER NOT NULL, removed INTEGER NOT NULL DEFAULT 0);
-             CREATE INDEX IF NOT EXISTS packs_owner ON packs (owner);
-             CREATE TABLE IF NOT EXISTS stickers (
-                scope TEXT NOT NULL, position INTEGER NOT NULL, id TEXT NOT NULL, media_type TEXT NOT NULL,
-                extension TEXT NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL, sha256 TEXT NOT NULL,
-                animated INTEGER NOT NULL, emoji TEXT NOT NULL, shortcode TEXT, bytes BLOB NOT NULL,
-                PRIMARY KEY (scope, id));
-             CREATE TABLE IF NOT EXISTS instances (
-                id TEXT PRIMARY KEY, template TEXT NOT NULL, owner TEXT NOT NULL, state TEXT NOT NULL,
-                status TEXT NOT NULL, context TEXT NOT NULL, updated INTEGER NOT NULL);
-             CREATE INDEX IF NOT EXISTS instances_owner ON instances (owner);
-             CREATE TABLE IF NOT EXISTS advances (
-                instance TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY (instance, key));",
-        )?;
-        Ok(Self { db: Mutex::new(db) })
-    }
-
-    fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.db.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        Ok(Self { db: Db::scratch(&schema())? })
     }
 
     // --- packs
 
     pub fn pack(&self, name: &str) -> anyhow::Result<Option<Pack>> {
-        Ok(self
-            .db()
-            .query_row("SELECT name, kind, title, owner, reuse, icon, version, created, updated, removed FROM packs WHERE name = ?1", [name], pack_row)
-            .optional()?)
+        Ok(self.db.lock().query_row(&format!("SELECT {PACK_COLUMNS} FROM packs WHERE name = ?1"), params![name], pack_row)?)
     }
 
     /// Every pack, or every pack of one maker's, oldest first.
     pub fn packs(&self, owner: Option<&str>) -> anyhow::Result<Vec<Pack>> {
-        let db = self.db();
-        let mut statement = db.prepare(
-            "SELECT name, kind, title, owner, reuse, icon, version, created, updated, removed FROM packs
-             WHERE ?1 IS NULL OR owner = ?1 ORDER BY created, name",
-        )?;
-        let rows = statement.query_map([owner], pack_row)?.collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        let mut db = self.db.lock();
+        Ok(match owner {
+            Some(owner) => db.query(&format!("SELECT {PACK_COLUMNS} FROM packs WHERE owner = ?1 ORDER BY created, name"), params![owner], pack_row)?,
+            None => db.query(&format!("SELECT {PACK_COLUMNS} FROM packs ORDER BY created, name"), params![], pack_row)?,
+        })
     }
 
     /// Publishes a pack under `pack.name`, taking the stickers gathered under
     /// `from` as its own. `false` if the name was taken first.
     pub fn publish(&self, pack: &Pack, from: &str) -> anyhow::Result<bool> {
-        let mut db = self.db();
-        let tx = db.transaction()?;
-        let made = tx.execute(
-            "INSERT OR IGNORE INTO packs (name, kind, title, owner, reuse, icon, version, created, updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7)",
-            params![pack.name, pack.kind.as_str(), pack.title, pack.owner, pack.reuse, pack.icon, pack.created],
-        )?;
-        if made == 0 {
-            return Ok(false);
-        }
-        tx.execute("UPDATE stickers SET scope = ?1 WHERE scope = ?2", params![pack_scope(&pack.name), from])?;
-        tx.commit()?;
-        Ok(true)
+        self.db.lock().transaction(|tx| {
+            let made = tx.execute(
+                "INSERT OR IGNORE INTO packs (name, kind, title, owner, reuse, icon, version, created, updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7)",
+                params![pack.name, pack.kind.as_str(), pack.title, pack.owner, pack.reuse, pack.icon, pack.created],
+            )?;
+            if made == 0 {
+                return Ok(false);
+            }
+            tx.execute("UPDATE stickers SET scope = ?1 WHERE scope = ?2", params![pack_scope(&pack.name), from])?;
+            Ok::<_, anyhow::Error>(true)
+        })
     }
 
     /// Changes a pack's own details, and counts the change.
     pub fn update_pack(&self, name: &str, title: &str, reuse: bool, icon: Option<&str>, now: i64) -> anyhow::Result<()> {
-        self.db().execute("UPDATE packs SET title = ?2, reuse = ?3, icon = ?4, version = version + 1, updated = ?5 WHERE name = ?1", params![name, title, reuse, icon, now])?;
+        self.db.lock().execute("UPDATE packs SET title = ?2, reuse = ?3, icon = ?4, version = version + 1, updated = ?5 WHERE name = ?1", params![name, title, reuse, icon, now])?;
         Ok(())
     }
 
     /// Counts a change to a pack's stickers.
     pub fn touch_pack(&self, name: &str, now: i64) -> anyhow::Result<()> {
-        self.db().execute("UPDATE packs SET version = version + 1, updated = ?2 WHERE name = ?1", params![name, now])?;
+        self.db.lock().execute("UPDATE packs SET version = version + 1, updated = ?2 WHERE name = ?1", params![name, now])?;
         Ok(())
     }
 
     /// Takes a pack down: nothing of it is served again, and its pictures are
     /// deleted. The name stays taken, so nobody else can pass for it.
     pub fn remove_pack(&self, name: &str, now: i64) -> anyhow::Result<bool> {
-        let mut db = self.db();
-        let tx = db.transaction()?;
-        let removed = tx.execute("UPDATE packs SET removed = 1, version = version + 1, updated = ?2 WHERE name = ?1 AND removed = 0", params![name, now])?;
-        tx.execute("DELETE FROM stickers WHERE scope = ?1", [pack_scope(name)])?;
-        tx.commit()?;
-        Ok(removed > 0)
+        self.db.lock().transaction(|tx| {
+            let removed = tx.execute("UPDATE packs SET removed = 1, version = version + 1, updated = ?2 WHERE name = ?1 AND removed = 0", params![name, now])?;
+            tx.execute("DELETE FROM stickers WHERE scope = ?1", params![pack_scope(name)])?;
+            Ok::<_, anyhow::Error>(removed > 0)
+        })
     }
 
     // --- stickers
 
     pub fn stickers(&self, scope: &str) -> anyhow::Result<Vec<Sticker>> {
-        let db = self.db();
-        let mut statement = db.prepare(
+        Ok(self.db.lock().query(
             "SELECT id, media_type, extension, width, height, sha256, animated, length(bytes), emoji, shortcode FROM stickers WHERE scope = ?1 ORDER BY position",
-        )?;
-        let rows = statement
-            .query_map([scope], |row| {
+            params![scope],
+            |row| {
                 Ok(Sticker {
                     id: row.get(0)?,
                     media_type: row.get(1)?,
@@ -213,102 +220,106 @@ impl Store {
                     height: row.get(4)?,
                     sha256: row.get(5)?,
                     animated: row.get(6)?,
-                    bytes: row.get::<_, i64>(7)? as usize,
+                    bytes: row.get::<i64>(7)? as usize,
                     emoji: row.get(8)?,
                     shortcode: row.get(9)?,
                 })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+            },
+        )?)
     }
 
     /// Adds a picture to the end of `scope`. `false` if that picture is in it already.
     pub fn add_sticker(&self, scope: &str, image: &Image, bytes: &[u8], emoji: &str, shortcode: Option<&str>) -> anyhow::Result<bool> {
-        let db = self.db();
+        let mut db = self.db.lock();
+        // Asked first: MySQL won't read a table in the values of an insert into it.
+        let position: i64 = db.query_value("SELECT COALESCE(MAX(position), 0) + 1 FROM stickers WHERE scope = ?1", params![scope])?;
         let added = db.execute(
             "INSERT OR IGNORE INTO stickers (scope, position, id, media_type, extension, width, height, sha256, animated, emoji, shortcode, bytes)
-             VALUES (?1, (SELECT COALESCE(MAX(position), 0) + 1 FROM stickers WHERE scope = ?1), ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![scope, image.id(), image.media_type, image.extension, image.width, image.height, image.sha256, image.animated, emoji, shortcode, bytes],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![scope, position, image.id(), image.media_type, image.extension, image.width, image.height, image.sha256, image.animated, emoji, shortcode, bytes],
         )?;
         Ok(added > 0)
     }
 
     pub fn remove_sticker(&self, scope: &str, id: &str) -> anyhow::Result<bool> {
-        Ok(self.db().execute("DELETE FROM stickers WHERE scope = ?1 AND id = ?2", params![scope, id])? > 0)
+        Ok(self.db.lock().execute("DELETE FROM stickers WHERE scope = ?1 AND id = ?2", params![scope, id])? > 0)
     }
 
     /// A picture's bytes and type, by the file name it is served under.
     pub fn file(&self, scope: &str, file: &str) -> anyhow::Result<Option<(Vec<u8>, String)>> {
         let Some((id, extension)) = file.rsplit_once('.') else { return Ok(None) };
         Ok(self
-            .db()
-            .query_row("SELECT bytes, media_type FROM stickers WHERE scope = ?1 AND id = ?2 AND extension = ?3", params![scope, id, extension], |row| Ok((row.get(0)?, row.get(1)?)))
-            .optional()?)
+            .db
+            .lock()
+            .query_row("SELECT bytes, media_type FROM stickers WHERE scope = ?1 AND id = ?2 AND extension = ?3", params![scope, id, extension], |row| Ok((row.get(0)?, row.get(1)?)))?)
     }
 
     // --- workflows
 
     pub fn instance(&self, id: &str) -> anyhow::Result<Option<Instance>> {
-        Ok(self.db().query_row("SELECT id, template, owner, state, status, context, updated FROM instances WHERE id = ?1", [id], instance_row).optional()?)
+        Ok(self.db.lock().query_row(&format!("SELECT {INSTANCE_COLUMNS} FROM instances WHERE id = ?1"), params![id], instance_row)?)
     }
 
     /// The workflow of `template` that `owner` has under way, if there is one.
     pub fn active_instance(&self, owner: &str, template: &str) -> anyhow::Result<Option<Instance>> {
-        Ok(self
-            .db()
-            .query_row(
-                "SELECT id, template, owner, state, status, context, updated FROM instances WHERE owner = ?1 AND template = ?2 AND status IN ('active', 'paused') ORDER BY updated DESC LIMIT 1",
-                params![owner, template],
-                instance_row,
-            )
-            .optional()?)
+        Ok(self.db.lock().query_row(
+            &format!("SELECT {INSTANCE_COLUMNS} FROM instances WHERE owner = ?1 AND template = ?2 AND status IN ('active', 'paused') ORDER BY updated DESC LIMIT 1"),
+            params![owner, template],
+            instance_row,
+        )?)
     }
 
     pub fn save_instance(&self, instance: &Instance) -> anyhow::Result<()> {
-        self.db().execute(
-            "INSERT INTO instances (id, template, owner, state, status, context, updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT (id) DO UPDATE SET state = ?4, status = ?5, context = ?6, updated = ?7",
-            params![instance.id, instance.template, instance.owner, instance.state, instance.status, instance.context.to_string(), instance.updated],
+        let mut db = self.db.lock();
+        let context = instance.context.to_string();
+        let known = db.execute(
+            "UPDATE instances SET state = ?2, status = ?3, context = ?4, updated = ?5 WHERE id = ?1",
+            params![instance.id, instance.state, instance.status, context, instance.updated],
         )?;
+        if known == 0 {
+            db.execute(
+                "INSERT INTO instances (id, template, owner, state, status, context, updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![instance.id, instance.template, instance.owner, instance.state, instance.status, context, instance.updated],
+            )?;
+        }
         Ok(())
     }
 
     /// Notes that `key` advanced `instance`. `false` if it already had: the same
     /// press of a button, arriving twice.
     pub fn first_advance(&self, instance: &str, key: &str) -> anyhow::Result<bool> {
-        Ok(self.db().execute("INSERT OR IGNORE INTO advances (instance, key) VALUES (?1, ?2)", params![instance, key])? > 0)
+        Ok(self.db.lock().execute(r#"INSERT OR IGNORE INTO advances (instance, "key") VALUES (?1, ?2)"#, params![instance, key])? > 0)
     }
 
     /// Deletes what a workflow gathered and never published.
     pub fn drop_draft(&self, instance: &str) -> anyhow::Result<()> {
-        self.db().execute("DELETE FROM stickers WHERE scope = ?1", [draft_scope(instance)])?;
+        self.db.lock().execute("DELETE FROM stickers WHERE scope = ?1", params![draft_scope(instance)])?;
         Ok(())
     }
 
     /// Forgets workflows nobody has touched since `before`, and what they gathered.
     pub fn prune(&self, before: i64) -> anyhow::Result<usize> {
-        let mut db = self.db();
-        let tx = db.transaction()?;
-        tx.execute("DELETE FROM stickers WHERE scope IN (SELECT 'draft:' || id FROM instances WHERE updated < ?1)", [before])?;
-        tx.execute("DELETE FROM advances WHERE instance IN (SELECT id FROM instances WHERE updated < ?1)", [before])?;
-        let gone = tx.execute("DELETE FROM instances WHERE updated < ?1", [before])?;
-        tx.commit()?;
-        Ok(gone)
+        self.db.lock().transaction(|tx| {
+            tx.execute("DELETE FROM stickers WHERE scope IN (SELECT 'draft:' || id FROM instances WHERE updated < ?1)", params![before])?;
+            tx.execute("DELETE FROM advances WHERE instance IN (SELECT id FROM instances WHERE updated < ?1)", params![before])?;
+            let gone = tx.execute("DELETE FROM instances WHERE updated < ?1", params![before])?;
+            Ok::<_, anyhow::Error>(gone)
+        })
     }
 
     /// A maker changed DID (a verified `from_prior`): what was `prior`'s is `new`'s.
     pub fn rotate(&self, prior: &str, new: &str) -> anyhow::Result<bool> {
-        let db = self.db();
+        let mut db = self.db.lock();
         let packs = db.execute("UPDATE packs SET owner = ?2 WHERE owner = ?1", params![prior, new])?;
         let instances = db.execute("UPDATE instances SET owner = ?2 WHERE owner = ?1", params![prior, new])?;
         Ok(packs + instances > 0)
     }
 }
 
-fn pack_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pack> {
+fn pack_row(row: &Row) -> db::Result<Pack> {
     Ok(Pack {
         name: row.get(0)?,
-        kind: Kind::parse(&row.get::<_, String>(1)?),
+        kind: Kind::parse(&row.get::<String>(1)?),
         title: row.get(2)?,
         owner: row.get(3)?,
         reuse: row.get(4)?,
@@ -320,14 +331,14 @@ fn pack_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pack> {
     })
 }
 
-fn instance_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Instance> {
+fn instance_row(row: &Row) -> db::Result<Instance> {
     Ok(Instance {
         id: row.get(0)?,
         template: row.get(1)?,
         owner: row.get(2)?,
         state: row.get(3)?,
         status: row.get(4)?,
-        context: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or(Value::Null),
+        context: serde_json::from_str(&row.get::<String>(5)?).unwrap_or(Value::Null),
         updated: row.get(6)?,
     })
 }
