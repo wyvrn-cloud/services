@@ -1,0 +1,29 @@
+[package]
+name = "wyvrn-cards"
+description = "Link cards: what a link to a public address or a contact invite looks like where it is posted, as OpenGraph tags and a drawn picture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+wyvrn-service = { workspace = true }
+wyvrn-hosted-did = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+# Drawing: a card is written as SVG and rendered to a PNG.
+resvg = "0.48"
+# Measuring text, to fit it to the card.
+ttf-parser = "0.25"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+didcomm-agent = { workspace = true }

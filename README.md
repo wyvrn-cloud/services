@@ -8,6 +8,7 @@ that they share crates instead of each carrying its own copy of the same plumbin
 | [`services/announce`](services/announce) | A one-way announcement channel: people subscribe, admins post, everyone subscribed receives it, and a web page shows every post. |
 | [`services/community`](services/community) | A community server: channels that the people let in, and nobody else, read and post in. A post can ask a question, answered as a form. |
 | [`services/did-host`](services/did-host) | Hosts short, stable `did:webvh` DIDs, and their parallel `did:web`, for agents that write and sign them themselves. |
+| [`services/cards`](services/cards) | Link cards: what a link to a public address or a contact invite looks like where it is posted, as OpenGraph tags and a drawn picture. Not a DIDComm service: it has no identity and keeps nothing. |
 | [`services/stickers`](services/stickers) | Hosts sticker and custom-emoji packs. They are made by talking to it, as `workflow/1.0` workflows, and fetched from it over HTTPS. |
 | [`crates/wyvrn-service`](crates/wyvrn-service) | What every DIDComm service does, whatever it is for. |
 | [`crates/wyvrn-hosted-did`](crates/wyvrn-hosted-did) | A hosted DID from both ends: the holder writing and signing its log, and anyone reading it -- from a `did:web` to the `did:webvh` behind it, verified, and its whois profile. Works on what was fetched; the fetching is the caller's. |
@@ -33,23 +34,28 @@ its own: [`deploy/did-host`](deploy/did-host).
 
 ## Who a service says it is
 
-A service that is a `did:web` publishes a profile: a name, a description and a
-picture, signed with its own key (`/whois.vp`, named in its DID document as
+A service that is a `did:web` publishes a profile: a name, a description, a
+picture, and if it likes a banner and a background, signed with its own key (`/whois.vp`, named in its DID document as
 did:webvh's `#whois`). An app that looks the DID up before adding it shows that
 profile, and nothing has to be registered anywhere.
 
 ```sh
 ANNOUNCE_PROFILE_NAME="Wyvrn updates"
 ANNOUNCE_PROFILE_DESCRIPTION="News about Wyvrn."
-ANNOUNCE_PROFILE_PICTURE=/app/profile.png    # PNG, JPEG, WebP or GIF, at most 200 KB
+ANNOUNCE_PROFILE_PICTURE=/app/profile.png        # PNG, JPEG, WebP or GIF, at most 200 KB
+ANNOUNCE_PROFILE_BANNER=/app/banner.jpg          # across the top: wide, about 3 to 1
+ANNOUNCE_PROFILE_BACKGROUND=/app/background.jpg  # behind the rest
 ```
 
-`<SERVICE>_PROFILE_NAME`, `_PROFILE_DESCRIPTION` and `_PROFILE_PICTURE`, or a
-`[profile]` section in the configuration file (`name`, `description`,
-`picture`). Left out, the name and description are what the service is called
+`<SERVICE>_PROFILE_NAME`, `_PROFILE_DESCRIPTION`, `_PROFILE_PICTURE`,
+`_PROFILE_BANNER` and `_PROFILE_BACKGROUND`, or a `[profile]` section in the
+configuration file (`name`, `description`, `picture`, `banner`, `background`).
+Each picture is a file of the same kinds and limit, and all of them travel inside
+the profile: keep the three together well under the 512 KB an app will read. Left out, the name and description are what the service is called
 anyway (`ANNOUNCE_NAME`, `COMMUNITY_NAME`; "Stickers"; "Public addresses"), and
-the announcement channel's picture is its `channel.picture`. In Docker the
-picture is a file mounted into the container.
+the announcement channel's picture is its `channel.picture`. In Docker each
+picture is a file mounted into the container. They are read when the service
+starts: changing one is replacing the file, or the setting, and restarting it.
 
 Whether an app marks the service **Official** is the app's to say, not the
 service's: Wyvrn marks the `did:web` of each domain it was built to take as the

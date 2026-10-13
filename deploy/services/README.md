@@ -108,15 +108,29 @@ and it listens on 8080.
 ```
 
 Optional, for any of them: who it says it is when someone looks its DID up
-(`<SERVICE>_PROFILE_NAME`, `_PROFILE_DESCRIPTION`, and `_PROFILE_PICTURE` for a
-picture mounted into the container), as
+(`<SERVICE>_PROFILE_NAME`, `_PROFILE_DESCRIPTION`, and `_PROFILE_PICTURE`,
+`_PROFILE_BANNER` and `_PROFILE_BACKGROUND` for pictures mounted into the
+container), as
 [the root README](../../README.md#who-a-service-says-it-is) has it:
 
 ```yaml
     environment:
       ANNOUNCE_PROFILE_PICTURE: "/app/profile.png"
+      ANNOUNCE_PROFILE_BANNER: "/app/banner.jpg"
     volumes:
       - ./updates.png:/app/profile.png:ro
+      - ./updates-banner.jpg:/app/banner.jpg:ro
+```
+
+Link cards (below) are one more, with no database:
+
+```yaml
+  cards:
+    image: wyvrn-cards
+    restart: unless-stopped
+    environment:
+      CARDS_DID_HOST: "id.example"
+      CARDS_OFFICIAL_DOMAINS: "id.example,stickers.example,updates.example"
 ```
 
 `docker-compose.yml` here has the same for `community` and `announce`. With
@@ -126,7 +140,7 @@ did-host:8080`) and they need no `ports`.
 ## 4. Your web server
 
 [`Caddyfile.example`](Caddyfile.example) has what to add to Caddy: each domain,
-passed to `127.0.0.1` at the port its service listens on (8181 to 8184, or
+passed to `127.0.0.1` at the port its service listens on (8181 to 8185, or
 what `.env` says). Reload Caddy, then:
 
 ```sh
@@ -162,6 +176,28 @@ minute; past that it answers `429` with a `Retry-After`. Those numbers are a
 starting point, not measured: one person making a pack sends a few messages a
 minute, and opening a pack reads one picture per sticker. The counts are kept
 in that Caddy's memory, so they are per Caddy and start again when it does.
+
+### Link cards
+
+A link the app hands out (`https://chat.example/dl/did:web:id.example:alice`, or
+one carrying a contact invite) opens a page of the web app. Somewhere a link is
+posted -- a chat, a social network -- doesn't run that page: it fetches the link
+once and reads its OpenGraph tags. [`services/cards`](../../services/cards)
+answers that fetch with who the link is to, and a picture of it: their name,
+address, picture, banner and background.
+
+```sh
+docker compose --profile cards up -d    # listens on 127.0.0.1:8185
+```
+
+It goes in front of the **web app's** domain, not a domain of its own:
+`Caddyfile.example` has the lines. What fetches links to show them is told from
+a person's browser by its `User-Agent`, and only those are passed to it; the
+pictures (`/card/…`) always are. To see what one gets:
+
+```sh
+curl -A Discordbot https://chat.example/dl/did:web:id.example:alice
+```
 
 ## 5. Keep it
 

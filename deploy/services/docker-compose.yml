@@ -97,3 +97,22 @@ services:
       # Who it says it is, to someone looking its DID up (../../README.md).
       ANNOUNCE_PROFILE_NAME: "${ANNOUNCE_PROFILE_NAME:-}"
       ANNOUNCE_PROFILE_DESCRIPTION: "${ANNOUNCE_PROFILE_DESCRIPTION:-}"
+
+  # Link cards: what a link to an address or an invite looks like where it is
+  # posted. In front of the web app's own /dl pages, for what fetches a link to
+  # show it (Caddyfile.example). It keeps nothing and needs no database.
+  cards:
+    <<: *service
+    profiles: ["cards"]
+    image: wyvrn-cards
+    build:
+      context: ../..
+      dockerfile: services/cards/Dockerfile
+    ports:
+      - "127.0.0.1:${CARDS_PORT:-8185}:8080"
+    environment:
+      # The DID host whose "official:" names are marked official, and the domains
+      # whose own did:web is: what the app is built with (VITE_OFFICIAL_DOMAINS).
+      CARDS_DID_HOST: "${DID_HOST_DOMAIN:-id.wyvrn.app}"
+      CARDS_OFFICIAL_DOMAINS: "${CARDS_OFFICIAL_DOMAINS:-}"
+      CARDS_SITE_NAME: "${CARDS_SITE_NAME:-Wyvrn}"

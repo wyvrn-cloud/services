@@ -61,3 +61,24 @@ stickers.example {
 # 	encode gzip
 # 	reverse_proxy 127.0.0.1:8184
 # }
+
+# Link cards, in front of the web app (README.md, "Link cards"): add these to the
+# block the web app's domain already has, above what serves the app itself.
+#
+# chat.example {
+# 	# What fetches a link to show it, not to open it: it gets who the link is to.
+# 	@link-fetcher {
+# 		path /dl /dl/*
+# 		header_regexp User-Agent (?i)(bot|crawl|spider|preview|embed|facebookexternalhit|slack|discord|telegram|whatsapp|twitter|mastodon|pleroma|akkoma|misskey|signal|skype|iframely|linkedin|pinterest|wyvrn)
+# 	}
+# 	handle @link-fetcher {
+# 		reverse_proxy 127.0.0.1:8185
+# 	}
+# 	# The pictures those pages name.
+# 	handle /card/* {
+# 		reverse_proxy 127.0.0.1:8185
+# 	}
+# 	handle {
+# 		# ... the web app, as it is served now ...
+# 	}
+# }
