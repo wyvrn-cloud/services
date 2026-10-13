@@ -186,6 +186,14 @@ async fn an_admin_named_by_a_public_address_is_one_when_they_write_from_their_ow
     assert_eq!(ada.next_of(channel::SUBSCRIPTION).await["body"]["role"], "admin");
     ada.send(&channel.did, channel::POST, json!({"content": "From the address's holder."})).await;
     assert_eq!(someone.next_of(channel::ANNOUNCEMENT).await["body"]["content"], "From the address's holder.");
+
+    // She is in the list once, as the DID she writes from: the address isn't a
+    // second subscriber.
+    ada.send(&channel.did, channel::SUBSCRIBERS_REQUEST, json!({})).await;
+    let listed = ada.next_of(channel::SUBSCRIBERS).await;
+    let dids: Vec<&str> = listed["body"]["subscribers"].as_array().unwrap().iter().filter_map(|member| member["did"].as_str()).collect();
+    assert_eq!(dids.len(), 2, "{dids:?}");
+    assert!(dids.contains(&ada.did().as_str()) && !dids.contains(&ADDRESS), "{dids:?}");
 }
 
 #[tokio::test]

@@ -442,8 +442,17 @@ impl Channel {
 
     /// Makes the DIDs the configuration names admins, unless they are DIDs a member
     /// has since left.
+    ///
+    /// Someone named by a public address is not made a member here: nobody writes
+    /// from one, so that member would be a second entry for whoever it names, who
+    /// becomes an admin under the DID they do write from (`wyvrn_service::named`).
     pub fn name_admins(&self, dids: &[String], now: i64) -> anyhow::Result<()> {
         for did in dids {
+            if wyvrn_service::named::is_hosted(did) {
+                // (One made here before this was so, and never subscribed as itself.)
+                self.store.forget_unsubscribed(did)?;
+                continue;
+            }
             if self.store.is_superseded(did)? {
                 tracing::warn!(%did, "a configured admin DID has been replaced by another, and is left alone");
                 continue;

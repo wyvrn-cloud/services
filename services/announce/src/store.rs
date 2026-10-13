@@ -217,6 +217,12 @@ impl Store {
         Ok(())
     }
 
+    /// Forgets a member who was only ever named, and never subscribed.
+    pub fn forget_unsubscribed(&self, did: &str) -> Result<()> {
+        self.db.lock().execute("DELETE FROM members WHERE did = ?1 AND subscribed = 0", params![did])?;
+        Ok(())
+    }
+
     pub fn set_name(&self, did: &str, name: Option<&str>) -> Result<()> {
         self.db.lock().execute("UPDATE members SET name = ?2 WHERE did = ?1", params![did, name])?;
         Ok(())

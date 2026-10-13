@@ -296,6 +296,12 @@ impl Store {
         Ok(self.db.lock().execute("DELETE FROM members WHERE did = ?1", params![did])? > 0)
     }
 
+    /// Forgets a member who was only ever named, and whose app never joined.
+    pub fn forget_never_joined(&self, did: &str) -> Result<()> {
+        self.db.lock().execute("DELETE FROM members WHERE did = ?1 AND joined = 0", params![did])?;
+        Ok(())
+    }
+
     pub fn set_joined(&self, did: &str, joined: bool) -> Result<()> {
         self.db.lock().execute("UPDATE members SET joined = ?2 WHERE did = ?1", params![did, joined])?;
         Ok(())
