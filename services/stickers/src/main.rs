@@ -87,6 +87,17 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     tracing::info!(did = %agent.did(), url = %config.server.public_url, packs = processor.store.packs(None)?.len(), "sticker service ready");
 
     let state = Arc::new(AppState { agent, processor, did_document, resolver: didcomm_quickstart::default_resolver() });
+    // A public address at a DID host, if it is set to hold one (STICKERS_PUBLIC_ADDRESS):
+    // taken up once the service is serving, and kept up to date from then on.
+    if let (Some(address), Some(document)) = (wyvrn_service::hosted_address::Address::from_env("STICKERS")?, state.did_document.clone()) {
+        let asking = state.clone();
+        let ask: wyvrn_service::hosted_address::Ask = Box::new(move |to, message| {
+            let asking = asking.clone();
+            Box::pin(async move { Ok(asking.agent.request(&to, &message).await?.message) })
+        });
+        let kept = wyvrn_service::hosted_address::Kept::open(&location, "stickers")?;
+        tokio::spawn(wyvrn_service::hosted_address::Holding::new(address, kept, document, ask)?.run());
+    }
     tokio::spawn(server::run_pruning(state.clone()));
     if let Some(mediator) = &config.mediator {
         let service = Arc::new(server::StickerService(state.clone()));

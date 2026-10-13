@@ -59,10 +59,12 @@ async fn resolve_webvh(did: &str, fetch: &impl Fetch) -> Result<Resolved, String
 
 /// Resolves a `did:web` or `did:webvh` to the party it names.
 ///
-/// A `did:web` that names a `did:webvh` in its own place is followed to it: the
-/// log is verified, and the pair accepted only if the `did:webvh` names the
-/// `did:web` back. Then the party is known by the `did:webvh`. Otherwise the
-/// `did:web` stands alone, on its host's word.
+/// A `did:web` that names a `did:webvh` is followed to it -- the one in its own
+/// place, or failing that one hosted elsewhere, which is how a service at its own
+/// domain holds an address at a DID host. The log is verified, and the pair
+/// accepted only if the `did:webvh` names the `did:web` back. Then the party is
+/// known by the `did:webvh`. Otherwise the `did:web` stands alone, on its host's
+/// word.
 pub async fn resolve(did: &str, fetch: &impl Fetch) -> Result<Resolved, String> {
     if did.starts_with("did:webvh:") {
         return resolve_webvh(did, fetch).await;

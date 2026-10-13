@@ -126,6 +126,17 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         reacted: Default::default(),
         react: Notify::new(),
     });
+    // A public address at a DID host, if it is set to hold one (ANNOUNCE_PUBLIC_ADDRESS):
+    // taken up once the service is serving, and kept up to date from then on.
+    if let (Some(address), Some(document)) = (wyvrn_service::hosted_address::Address::from_env("ANNOUNCE")?, state.did_document.clone()) {
+        let asking = state.clone();
+        let ask: wyvrn_service::hosted_address::Ask = Box::new(move |to, message| {
+            let asking = asking.clone();
+            Box::pin(async move { Ok(asking.agent.request(&to, &message).await?.message) })
+        });
+        let kept = wyvrn_service::hosted_address::Kept::open(&location, "announce")?;
+        tokio::spawn(wyvrn_service::hosted_address::Holding::new(address, kept, document, ask)?.run());
+    }
     tokio::spawn(server::run_deliveries(state.clone()));
     tokio::spawn(server::run_reaction_notices(state.clone()));
     if let Some(mediator) = &config.mediator {

@@ -670,15 +670,15 @@ async fn a_host_cannot_pass_off_another_history_under_the_short_name() {
     assert_eq!(wyvrn_hosted_did::resolve(web, &missing).await.unwrap().standing, Standing::HostsWord);
 
     // Mallory's own, perfectly valid did:webvh, which the host's did:web for
-    // "alice" is made to point at. It is in another place, so it isn't followed;
-    // and one in the right place that doesn't name the did:web back isn't accepted.
+    // "alice" is made to point at. It is looked at, as a did:webvh named from
+    // anywhere is, and not accepted: it doesn't name this did:web back, as no
+    // did:webvh that isn't this one's holder's will.
     let mut mallory = Holder::new(&host, "mallory");
     mallory.register().await;
     let pointing_away = real_web.replace(&alice.did(), &mallory.did());
     let elsewhere = FromHost::new(&host).with("https://id.example/alice/did.json", Some(&pointing_away));
     let resolved = wyvrn_hosted_did::resolve(web, &elsewhere).await.unwrap();
     assert_eq!((resolved.did.as_str(), resolved.standing), (web, Standing::HostsWord));
-    assert!(!elsewhere.asked.lock().unwrap().iter().any(|url| url.contains("mallory")));
 
     // A document served for the name that is some other DID's is not taken at all.
     let not_its_own = FromHost::new(&host).with("https://id.example/alice/did.json", Some(&real_web.replace(web, "did:web:id.example:alicia")));
@@ -1021,4 +1021,80 @@ async fn an_app_registers_and_is_read_back_with_the_functions_it_will_use() {
 fn rand_seed() -> [u8; 32] {
     let key = Secret::generate_ed25519(None, None);
     key.get_private_bytes()[..32].try_into().unwrap()
+}
+
+#[tokio::test]
+async fn a_service_holds_an_address_and_is_found_by_it_from_its_own_domain() {
+    use wyvrn_service::address::{build_agent, DidMethod, ProfileConfig};
+    use wyvrn_service::hosted_address::{Address, Holding, Kept};
+
+    let admin = Agent::new(Identity::generate().unwrap()).unwrap();
+    let host = start_host(&[admin.did()]).await;
+
+    // A service that is did:web:news.example, saying who it is. Here it writes to
+    // the host from a did:peer:4 of the same keys, which the host can look up
+    // without news.example being anywhere.
+    let identity = Identity::generate().unwrap();
+    let asking = Arc::new(Agent::new(Identity::from_json(&identity.to_json().unwrap()).unwrap()).unwrap());
+    let (_, published) = build_agent(identity, "https://news.example/", DidMethod::Web).unwrap();
+    let profile = ProfileConfig { name: Some("Wyvrn News".into()), description: Some("What is new.".into()), ..Default::default() };
+    let published = published.unwrap().with_profile(&profile).unwrap();
+
+    let address = Address::parse(&format!("did:web:{DOMAIN}:official:news")).unwrap();
+    let ask = {
+        let (asking, host_did) = (asking.clone(), host.did.clone());
+        Box::new(move |_to: String, mut message: Value| {
+            let (asking, host_did) = (asking.clone(), host_did.clone());
+            Box::pin(async move {
+                message["return_route"] = json!("all");
+                // (The host under test is a did:peer:4 at a local port, not the did:web the address names.)
+                Ok(asking.send(&host_did, &message).await?.ok_or_else(|| anyhow::anyhow!("no answer"))?.message)
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Value>> + Send>>
+        })
+    };
+    let holding = Holding::new(address, Kept::scratch().unwrap(), published.clone(), ask).unwrap();
+
+    // The namespace is reserved: not the service's until an admin says so.
+    let refused = holding.hold(1_800_000_000).await.unwrap_err();
+    assert!(format!("{refused:#}").contains("set aside"), "{refused:#}");
+    assert_eq!(published.document_now()["alsoKnownAs"], Value::Null);
+    let assign = json!({ "type": format!("{P}assign"), "body": { "name": "official:news", "holder": asking.did() }, "return_route": "all" });
+    admin.send(&host.did, &assign).await.unwrap().expect("an answer");
+
+    let did = holding.hold(1_800_000_000).await.unwrap();
+    assert!(did.starts_with("did:webvh:") && did.ends_with(&format!(":{DOMAIN}:official:news")), "{did}");
+    // Its own document names the address from then on, and its website's link covers both.
+    assert_eq!(published.document_now()["alsoKnownAs"], json!([did]));
+    let linked = published.did_configuration(1_800_000_000).await.unwrap();
+    assert_eq!(linked["linked_dids"].as_array().unwrap().len(), 2);
+
+    // Looked up by its own domain, it is the party the address names: its history
+    // verified, and its profile the one published at the host, signed as the address.
+    let web_document = published.document_now().to_string();
+    let files = || FromHost::new(&host).with("https://news.example/.well-known/did.json", Some(&web_document));
+    let found = wyvrn_hosted_did::resolve("did:web:news.example", &files()).await.unwrap();
+    assert_eq!((found.did.as_str(), found.standing, found.did_web.as_deref()), (did.as_str(), Standing::Verified, Some("did:web:news.example")));
+    assert_eq!(found.document["service"][0]["serviceEndpoint"]["uri"], published.document["service"][0]["serviceEndpoint"]["uri"]);
+    let who = wyvrn_hosted_did::whois_of(&found, &files()).await.unwrap().unwrap();
+    assert_eq!((who.name.as_deref(), who.description.as_deref()), (Some("Wyvrn News"), Some("What is new.")));
+    // ...as it is looked up by the address itself.
+    let by_address = wyvrn_hosted_did::resolve(&format!("did:web:{DOMAIN}:official:news"), &files()).await.unwrap();
+    assert_eq!((by_address.did.as_str(), by_address.standing), (did.as_str(), Standing::Verified));
+
+    // A did:web that only claims the address is not it: the address doesn't name it back.
+    let claiming = json!({ "id": "did:web:impostor.example", "alsoKnownAs": [did] }).to_string();
+    let impostor = FromHost::new(&host).with("https://impostor.example/.well-known/did.json", Some(&claiming));
+    let alone = wyvrn_hosted_did::resolve("did:web:impostor.example", &impostor).await.unwrap();
+    assert_eq!((alone.did.as_str(), alone.standing), ("did:web:impostor.example", Standing::HostsWord));
+
+    // Held again, nothing is written: the log already says what the document says.
+    let before = fetch(&host, "official/news/did.jsonl").await.text().await.unwrap();
+    assert_eq!(holding.hold(1_800_000_100).await.unwrap(), did);
+    assert_eq!(fetch(&host, "official/news/did.jsonl").await.text().await.unwrap(), before);
+
+    // An admin changes what the service is called: the address says so too.
+    published.changed(&wyvrn_service::profile::Changed { name: Some("Wyvrn Updates".into()), ..Default::default() });
+    holding.publish_whois(&did, 1_800_000_200).await.unwrap();
+    let who = wyvrn_hosted_did::whois_of(&found, &files()).await.unwrap().unwrap();
+    assert_eq!(who.name.as_deref(), Some("Wyvrn Updates"));
 }

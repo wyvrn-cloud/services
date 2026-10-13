@@ -33,13 +33,19 @@ pub fn also_known_as(document: &Value) -> Vec<&str> {
     document["alsoKnownAs"].as_array().into_iter().flatten().filter_map(Value::as_str).collect()
 }
 
-/// The `did:webvh` a `did:web` document says it is the shadow of: one it names
-/// that is at its own host and path. One somewhere else is another DID's business.
+/// The `did:webvh` a `did:web` document says it is another name of. One at its
+/// own host and path, if it names one: that is the `did:webvh` it is the shadow
+/// of. Failing that, one anywhere: a `did:web` that stands at its own domain (a
+/// service) and holds an address at a DID host says so this way. Either is only
+/// the `did:web`'s word until the `did:webvh` [names it back](names_back).
 pub fn webvh_behind<'a>(did_web: &str, web_document: &'a Value) -> Option<&'a str> {
     let here = Location::of(did_web)?;
-    also_known_as(web_document)
+    let named: Vec<(&str, Location)> = also_known_as(web_document)
         .into_iter()
-        .find(|did| did.starts_with("did:webvh:") && Location::of(did).is_some_and(|there| there.same_place(&here)))
+        .filter(|did| did.starts_with("did:webvh:"))
+        .filter_map(|did| Location::of(did).map(|there| (did, there)))
+        .collect();
+    named.iter().find(|(_, there)| there.same_place(&here)).or(named.first()).map(|(did, _)| *did)
 }
 
 /// Whether a `did:webvh` document names `did_web` back: without that, anyone's
@@ -84,10 +90,12 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn a_did_web_points_only_at_a_did_webvh_in_its_own_place() {
+    fn a_did_web_points_at_the_did_webvh_in_its_own_place_before_one_elsewhere() {
         let document = json!({ "alsoKnownAs": ["did:peer:4zQm", "did:webvh:QmOther:elsewhere.example:alice", "did:webvh:QmScid:id.example:alice"] });
         assert_eq!(webvh_behind("did:web:id.example:alice", &document), Some("did:webvh:QmScid:id.example:alice"));
-        assert_eq!(webvh_behind("did:web:id.example:bob", &document), None);
+        // Named from somewhere else, it is still the one named: a service at its own
+        // domain, holding an address here. (Whether that is so is the did:webvh's to say.)
+        assert_eq!(webvh_behind("did:web:news.example", &document), Some("did:webvh:QmOther:elsewhere.example:alice"));
         assert_eq!(webvh_behind("did:web:id.example:alice", &json!({})), None);
     }
 

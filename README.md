@@ -57,9 +57,44 @@ the announcement channel's picture is its `channel.picture`. In Docker each
 picture is a file mounted into the container. They are read when the service
 starts: changing one is replacing the file, or the setting, and restarting it.
 
+An admin of an announcement channel or a community can change its name,
+description and picture from the app (their `set-profile`). What was changed is
+kept in the service's database and laid over these settings; emptying a field
+puts the setting back. The banner and background are only ever the settings'.
+
 Whether an app marks the service **Official** is the app's to say, not the
-service's: Wyvrn marks the `did:web` of each domain it was built to take as the
-project's own (`VITE_OFFICIAL_DOMAINS`).
+service's. Wyvrn marks two things: the `did:web` of each domain it was built to
+take as the project's own (`VITE_OFFICIAL_DOMAINS`), and any name under
+`official:` at its DID host, which is the better of the two:
+
+### A public address for a service
+
+A service is the `did:web` of its own domain: whatever that domain serves today.
+Set to, it also holds an address at a DID host, as a person's app does, and is
+known by that: a `did:webvh` with a history the host can't rewrite.
+
+```sh
+ANNOUNCE_PUBLIC_ADDRESS=did:web:id.example:official:update-news
+```
+
+(`COMMUNITY_PUBLIC_ADDRESS`, `STICKERS_PUBLIC_ADDRESS`. A name is 3 to 32 of
+a-z, 0-9 and hyphens to a label.) A name under `official:` is reserved, so one of
+the host's admins sets it aside for the service first, by the service's own DID:
+
+```sh
+docker compose exec did-host wyvrn-did-host assign official:update-news did:web:updates.example
+```
+
+The service then claims the name by itself once it is serving (it tries again
+until it can), publishes its profile there, and names the address in its own DID
+document. Looked up by either DID it is one party: **Official**, by the name its
+host reserved for it, and **History verified** where a bare `did:web` is "on its
+host's word". Nothing needs listing in any app's build. People go on writing to
+it at its own domain.
+
+The address's log is kept in the service's database with its keys. Only the
+service can continue it: lose both and the name can only be freed by the host's
+admin and claimed afresh, as a new DID.
 
 ## Who the settings name
 

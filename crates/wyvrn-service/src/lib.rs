@@ -13,6 +13,8 @@
 //! - [`db`]: where a service keeps what it keeps -- a SQLite file, or a MySQL
 //!   database it is given the address of.
 //! - [`identity`]: the service's own keys, in a file or in that database.
+//! - [`hosted_address`]: holding a public address at a DID host, so that the
+//!   service is known by a name with a history and not only by its domain.
 //! - [`profile`]: a service's name, description and picture, changed by an admin
 //!   while it runs.
 //! - [`named`]: someone the settings name by a public address, recognised by the
@@ -24,6 +26,7 @@
 
 pub mod address;
 pub mod db;
+pub mod hosted_address;
 pub mod http;
 pub mod identity;
 pub mod logging;

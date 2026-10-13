@@ -53,6 +53,11 @@ pub struct Published {
     /// ...and as it is now, with what an admin has changed since
     /// ([`Published::changed`]). Shared by every copy of this.
     profile: std::sync::Arc<std::sync::RwLock<Option<wyvrn_hosted_did::write::ProfileFields>>>,
+    /// Rung when it changes.
+    profile_changed: std::sync::Arc<tokio::sync::Notify>,
+    /// The `did:webvh` of the public address the service holds, if it holds one
+    /// ([`crate::hosted_address`]). Shared likewise.
+    also: std::sync::Arc<std::sync::RwLock<Option<String>>>,
 }
 
 /// Who a service says it is, to someone looking its DID up before writing to it:
@@ -142,10 +147,15 @@ impl Published {
     /// so that a service left running never serves one that has run out.
     pub async fn did_configuration(&self, now: i64) -> anyhow::Result<Value> {
         let issued = now - now.rem_euclid(DAY);
-        let credential = wyvrn_hosted_did::linkage::credential(&self.did, &self.origin, &self.signing_jwk, &format!("{}#key-1", self.did), &rfc3339(issued), &rfc3339(issued + 366 * DAY))
-            .await
-            .map_err(|why| anyhow::anyhow!(why))?;
-        Ok(wyvrn_hosted_did::linkage::configuration(vec![credential]))
+        // As each DID it is: its own, and the public address it holds if it holds one.
+        let mut credentials = Vec::new();
+        for did in std::iter::once(self.did.clone()).chain(self.also()) {
+            let credential = wyvrn_hosted_did::linkage::credential(&did, &self.origin, &self.signing_jwk, &format!("{did}#key-1"), &rfc3339(issued), &rfc3339(issued + 366 * DAY))
+                .await
+                .map_err(|why| anyhow::anyhow!(why))?;
+            credentials.push(credential);
+        }
+        Ok(wyvrn_hosted_did::linkage::configuration(credentials))
     }
 
     /// Has the service say who it is: its document names a whois (did:webvh's
@@ -182,6 +192,46 @@ impl Published {
             fields.image = Some(serde_json::json!({ "contentUrl": picture.data_url(), "encodingFormat": picture.media_type }));
         }
         *self.profile.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(fields);
+        self.profile_changed.notify_one();
+    }
+
+    /// Waits for the next change to who the service says it is.
+    pub async fn profile_changed(&self) {
+        self.profile_changed.notified().await
+    }
+
+    /// Who the service says it is now, if it says.
+    pub fn profile_now(&self) -> Option<wyvrn_hosted_did::write::ProfileFields> {
+        self.profile.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+
+    pub fn did(&self) -> &str {
+        &self.did
+    }
+
+    /// The key the service signs as, secret and all: a JWK.
+    pub fn signing_jwk(&self) -> &str {
+        &self.signing_jwk
+    }
+
+    /// Says (or stops saying) that the service is also the `did:webvh` of a public
+    /// address it holds: its document names it, and its website's link covers it.
+    pub fn known_also_as(&self, did: Option<String>) {
+        *self.also.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = did;
+    }
+
+    fn also(&self) -> Option<String> {
+        self.also.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+
+    /// The service's DID document as it is served now: [`document`](Self::document),
+    /// naming the public address it holds if it holds one.
+    pub fn document_now(&self) -> Value {
+        let mut document = self.document.clone();
+        if let Some(also) = self.also() {
+            document["alsoKnownAs"] = serde_json::json!([also]);
+        }
+        document
     }
 
     /// The service's whois: its profile, as a presentation it signs. Dated from the
@@ -218,9 +268,9 @@ pub fn build_agent(identity: Identity, public_url: &str, method: DidMethod) -> a
                     if let Some(services) = document["service"].as_array_mut() {
                         services.push(serde_json::json!({ "id": format!("{did}#linked-domains"), "type": "LinkedDomains", "serviceEndpoint": origin }));
                     }
-                    Published { document, did: did.clone(), origin, public_url: with_slash(public_url), signing_jwk, settings: None, profile: Default::default() }
+                    Published { document, did: did.clone(), origin, public_url: with_slash(public_url), signing_jwk, settings: None, profile: Default::default(), profile_changed: Default::default(), also: Default::default() }
                 }
-                None => Published { document, did: did.clone(), origin: String::new(), public_url: with_slash(public_url), signing_jwk, settings: None, profile: Default::default() },
+                None => Published { document, did: did.clone(), origin: String::new(), public_url: with_slash(public_url), signing_jwk, settings: None, profile: Default::default(), profile_changed: Default::default(), also: Default::default() },
             };
             (Agent::with_did(identity, &did), Some(published))
         }
@@ -253,13 +303,13 @@ pub fn did_web_for(url: &str) -> anyhow::Result<String> {
 /// `/.well-known/did-configuration.json` and its `/whois.vp` (who it says it is).
 /// A service that isn't a `did:web` has none of them, and says so.
 pub fn routes<S: Clone + Send + Sync + 'static>(did: String, published: Option<Published>) -> Router<S> {
-    let document = published.as_ref().map(|published| published.document.clone());
+    let documented = published.clone();
     let whois_of = published.clone();
     let serve_document = move || {
-        let document = document.clone();
+        let published = documented.clone();
         async move {
-            match document {
-                Some(document) => Json(document).into_response(),
+            match published {
+                Some(published) => Json(published.document_now()).into_response(),
                 None => not_a_did_web(),
             }
         }
