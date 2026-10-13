@@ -157,6 +157,12 @@ impl Service for CommunityService {
         for (did, notice) in outcome.notices {
             send_later(state, did, notice);
         }
+        // Who it says it is to someone looking its DID up changes with it.
+        if outcome.profile_changed {
+            if let Some(document) = &state.did_document {
+                document.changed(&state.community.changed());
+            }
+        }
         if outcome.channels_changed {
             // Everyone else who has joined: whoever asked has it as their answer.
             for (did, notice) in state.community.community_notices()? {

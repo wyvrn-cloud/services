@@ -5,6 +5,7 @@
 use serde_json::{json, Value};
 
 use crate::store::{Member, Post, Role, Store};
+use wyvrn_service::profile::{Change, Changed, Kept};
 
 pub const PIURI: &str = "https://wyvrn.app/announcements/1.0";
 pub const SUBSCRIBE: &str = "https://wyvrn.app/announcements/1.0/subscribe";
@@ -17,6 +18,7 @@ pub const HISTORY: &str = "https://wyvrn.app/announcements/1.0/history";
 pub const SUBSCRIBERS_REQUEST: &str = "https://wyvrn.app/announcements/1.0/subscribers-request";
 pub const SUBSCRIBERS: &str = "https://wyvrn.app/announcements/1.0/subscribers";
 pub const SET_ROLE: &str = "https://wyvrn.app/announcements/1.0/set-role";
+pub const SET_PROFILE: &str = "https://wyvrn.app/announcements/1.0/set-profile";
 /// What the channel tells subscribers of a post's reactions: how many of each, and
 /// each subscriber's own. Never who.
 pub const REACTIONS: &str = "https://wyvrn.app/announcements/1.0/reactions";
@@ -63,7 +65,11 @@ pub struct ChannelInfo {
 
 pub struct Channel {
     pub store: Store,
+    /// What the settings say of it.
     pub info: ChannelInfo,
+    /// What an admin has changed of that since (`set-profile`), and where it is kept.
+    changed: std::sync::RwLock<Changed>,
+    kept: Option<Kept>,
 }
 
 /// What handling a message came to.
@@ -77,6 +83,8 @@ pub struct Outcome {
     pub posted: bool,
     /// The post whose reactions changed, which subscribers are to be told of.
     pub reacted: Option<i64>,
+    /// Whether the channel's name, description or picture changed.
+    pub profile_changed: bool,
 }
 
 impl Outcome {
@@ -125,15 +133,48 @@ pub fn problem(message: &Value, code: &str, comment: &str) -> Value {
 }
 
 impl Channel {
+    /// A channel as its settings have it, with what an admin changed last time laid
+    /// over them. `kept` is where a change is written; without it, one lasts until
+    /// the channel stops.
+    pub fn new(store: Store, info: ChannelInfo, kept: Option<Kept>) -> anyhow::Result<Self> {
+        let changed = match &kept {
+            Some(kept) => kept.load()?,
+            None => Changed::default(),
+        };
+        Ok(Self { store, info, changed: std::sync::RwLock::new(changed), kept })
+    }
+
+    /// What an admin has changed of the channel's name, description and picture.
+    pub fn changed(&self) -> Changed {
+        self.changed.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+
+    /// What the channel says of itself now: its settings, with what was changed.
+    pub fn shown(&self) -> ChannelInfo {
+        let changed = self.changed();
+        let mut info = self.info.clone();
+        if let Some(name) = changed.name {
+            info.name = name;
+        }
+        if let Some(description) = changed.description {
+            info.description = description;
+        }
+        if let Some(picture) = changed.picture {
+            info.picture = Some((picture.media_type, picture.base64));
+        }
+        info
+    }
+
     /// The channel's `subscription` for `member` (or for someone who isn't one).
     pub fn subscription(&self, member: Option<&Member>) -> anyhow::Result<Value> {
+        let info = self.shown();
         Ok(json!({
             "subscribed": member.is_some_and(|m| m.subscribed),
             "role": member.map_or(Role::Subscriber, |m| m.role).as_str(),
             "channel": {
-                "name": self.info.name,
-                "description": self.info.description,
-                "url": self.info.url,
+                "name": info.name,
+                "description": info.description,
+                "url": info.url,
             },
             "latest_seq": self.store.latest_seq()?,
         }))
@@ -196,9 +237,10 @@ impl Channel {
 
     /// The channel's user-profile/1.0 `profile`, in answer to `message`.
     fn profile(&self, message: &Value) -> Value {
-        let mut profile = json!({"displayName": self.info.name, "description": self.info.description});
+        let info = self.shown();
+        let mut profile = json!({"displayName": info.name, "description": info.description});
         let mut reply = reply_to(message, PROFILE, json!({}));
-        if let Some((media_type, base64)) = &self.info.picture {
+        if let Some((media_type, base64)) = &info.picture {
             profile["displayPicture"] = json!("#picture");
             reply["attachments"] = json!([{"id": "picture", "media_type": media_type, "data": {"base64": base64}}]);
         }
@@ -367,6 +409,36 @@ impl Channel {
                 }
                 Ok(Outcome::reply(reply_to(message, SUBSCRIBERS, self.subscribers_body(message)?)))
             }
+            SET_PROFILE => {
+                if !is_admin {
+                    return Ok(not_admin());
+                }
+                let change = match Change::read(message) {
+                    Ok(change) => change,
+                    Err(refused) => return Ok(Outcome::reply(problem(message, refused.code, &refused.comment))),
+                };
+                let changed = {
+                    let mut changed = self.changed.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    changed.apply(change);
+                    changed.clone()
+                };
+                if let Some(kept) = &self.kept {
+                    kept.save(&changed)?;
+                }
+                let member = self.store.member(sender)?;
+                let mut outcome = Outcome::reply(reply_to(message, SUBSCRIPTION, self.subscription(member.as_ref())?));
+                outcome.profile_changed = true;
+                // Every subscriber is told who the channel is now, as a contact
+                // tells of a changed profile: all of it, a picture that is gone
+                // said to be gone.
+                let info = self.shown();
+                let picture = info.picture.map(|(media_type, base64)| wyvrn_service::profile::Picture { media_type, base64 });
+                let told = Changed::profile_message(&info.name, &info.description, picture.as_ref());
+                for subscriber in self.store.subscribers()? {
+                    outcome.notices.push((subscriber.did, told.clone()));
+                }
+                Ok(outcome)
+            }
             SET_ROLE => {
                 if !is_admin {
                     return Ok(not_admin());
@@ -468,9 +540,9 @@ mod tests {
     use super::*;
 
     fn channel() -> Channel {
-        Channel {
-            store: Store::in_memory().unwrap(),
-            info: ChannelInfo {
+        Channel::new(
+            Store::in_memory().unwrap(),
+            ChannelInfo {
                 name: "Wyvrn Updates".into(),
                 description: "Release notes".into(),
                 url: "https://updates.example/".into(),
@@ -478,7 +550,44 @@ mod tests {
                 show_authors: false,
                 max_post_length: 100,
             },
-        }
+            Some(Kept::scratch().unwrap()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_admin_changes_what_the_channel_is_called_and_every_subscriber_is_told() {
+        let channel = channel();
+        with_admin(&channel, "did:a");
+        channel.handle("did:a", &message(SUBSCRIBE, json!({})), 10).unwrap();
+        channel.handle("did:s", &message(SUBSCRIBE, json!({})), 10).unwrap();
+
+        // Not a subscriber's to change.
+        let refused = channel.handle("did:s", &message(SET_PROFILE, json!({"profile": {"displayName": "Mine now"}})), 11).unwrap();
+        assert_eq!(code(&refused), "e.p.trust.not-authorized");
+        assert_eq!(channel.shown().name, "Wyvrn Updates");
+
+        let mut change = message(SET_PROFILE, json!({"profile": {"displayName": "Wyvrn News", "displayPicture": "#p"}}));
+        change["attachments"] = json!([{"id": "p", "media_type": "image/png", "data": {"base64": "aGk="}}]);
+        let outcome = channel.handle("did:a", &change, 12).unwrap();
+        let answer = outcome.reply.as_ref().unwrap();
+        assert_eq!((answer["type"].as_str(), answer["body"]["channel"]["name"].as_str()), (Some(SUBSCRIPTION), Some("Wyvrn News")));
+        assert!(outcome.profile_changed);
+        // What wasn't mentioned is as it was.
+        assert_eq!(channel.shown().description, "Release notes");
+        // Both subscribers are sent its profile, picture and all.
+        assert_eq!(outcome.notices.len(), 2);
+        let (to, told) = &outcome.notices[1];
+        assert_eq!((to.as_str(), told["type"].as_str()), ("did:s", Some(PROFILE)));
+        assert_eq!(told["body"]["profile"], json!({"displayName": "Wyvrn News", "description": "Release notes", "displayPicture": "#picture"}));
+        assert_eq!(told["attachments"][0]["data"]["base64"], "aGk=");
+
+        // A field emptied is what the settings say again; a picture gone is said to be.
+        let outcome = channel.handle("did:a", &message(SET_PROFILE, json!({"profile": {"displayName": "", "displayPicture": null}})), 13).unwrap();
+        assert_eq!(channel.shown().name, "Wyvrn Updates");
+        assert_eq!(outcome.notices[0].1["body"]["profile"]["displayPicture"], Value::Null);
+        // And something that is no profile changes nothing.
+        assert_eq!(code(&channel.handle("did:a", &message(SET_PROFILE, json!({"profile": {}})), 14).unwrap()), "e.p.msg.invalid-profile");
     }
 
     fn message(message_type: &str, body: Value) -> Value {

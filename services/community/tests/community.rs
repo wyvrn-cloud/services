@@ -111,7 +111,7 @@ async fn start_server(settings: &str) -> Running {
     .unwrap();
     let (agent, did_document) = server::build_agent(&config, Identity::generate().unwrap()).unwrap();
     let did = agent.did();
-    let community = Community { store: Store::in_memory().unwrap(), config: config.community.clone() };
+    let community = Community::new(Store::in_memory().unwrap(), config.community.clone(), Some(wyvrn_service::profile::Kept::scratch().unwrap())).unwrap();
     let state = Arc::new(AppState { agent, community, did_document, resolver: didcomm_quickstart::default_resolver(), deliver: Notify::new() });
     tokio::spawn(server::run_deliveries(state.clone()));
     let app = server::router(state.clone());
@@ -152,6 +152,29 @@ async fn someone_not_let_in_is_told_so_and_nothing_else() {
         assert!(!answer.to_string().contains("general") && !answer.to_string().contains("Workshop"));
     }
     assert_eq!(server.state.community.store.channel(&channel).unwrap().unwrap().latest_seq, 0);
+}
+
+#[tokio::test]
+async fn an_admin_changes_what_the_community_is_called_and_everyone_who_joined_is_told() {
+    let server = start_server("").await;
+    let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member]);
+    member.community("join", json!({})).await;
+
+    // Not a member's to change.
+    let refused = member.community("set-profile", json!({ "profile": { "displayName": "Mine now" } })).await;
+    assert_eq!(refused["body"]["code"], "e.p.trust.not-authorized");
+
+    let changed = admin.community("set-profile", json!({ "profile": { "displayName": "The Workshop, Reopened", "description": "Tools and talk." } })).await;
+    assert_eq!(kind(&changed), "community");
+    assert_eq!((changed["body"]["name"].as_str(), changed["body"]["description"].as_str()), (Some("The Workshop, Reopened"), Some("Tools and talk.")));
+    let told = member.next_of(&format!("{C}community")).await;
+    assert_eq!(told["body"]["name"], "The Workshop, Reopened");
+
+    // A name emptied is what the settings say again; the description is as it was.
+    let back = admin.community("set-profile", json!({ "profile": { "displayName": null } })).await;
+    assert_eq!((back["body"]["name"].as_str(), back["body"]["description"].as_str()), (Some("The Workshop"), Some("Tools and talk.")));
+    assert_eq!(admin.community("set-profile", json!({ "profile": {} })).await["body"]["code"], "e.p.msg.invalid-profile");
 }
 
 #[tokio::test]

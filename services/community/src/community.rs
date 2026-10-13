@@ -8,6 +8,7 @@ use serde_json::{json, Map, Value};
 
 use crate::config::CommunityConfig;
 use crate::store::{Channel, Member, Post, Role, Store};
+use wyvrn_service::profile::{Change, Changed, Kept};
 
 pub const PIURI: &str = "https://wyvrn.app/community/1.0";
 pub const JOIN: &str = "https://wyvrn.app/community/1.0/join";
@@ -23,6 +24,7 @@ pub const HISTORY: &str = "https://wyvrn.app/community/1.0/history";
 pub const MEMBERS_REQUEST: &str = "https://wyvrn.app/community/1.0/members-request";
 pub const MEMBERS: &str = "https://wyvrn.app/community/1.0/members";
 pub const SET_MEMBER: &str = "https://wyvrn.app/community/1.0/set-member";
+pub const SET_PROFILE: &str = "https://wyvrn.app/community/1.0/set-profile";
 
 pub const USER_PROFILE: &str = "https://didcomm.org/user-profile/1.0";
 pub const PROFILE: &str = "https://didcomm.org/user-profile/1.0/profile";
@@ -45,6 +47,10 @@ const MAX_DESCRIPTION: usize = 400;
 pub struct Community {
     pub store: Store,
     pub config: CommunityConfig,
+    /// What an admin has changed of its name, description and picture
+    /// (`set-profile`), and where that is kept.
+    changed: std::sync::RwLock<Changed>,
+    kept: Option<Kept>,
 }
 
 /// What handling a message came to.
@@ -58,6 +64,8 @@ pub struct Outcome {
     pub posted: bool,
     /// Whether the channels changed: everyone who has joined is told.
     pub channels_changed: bool,
+    /// Whether the community's name, description or picture changed.
+    pub profile_changed: bool,
 }
 
 impl Outcome {
@@ -172,12 +180,29 @@ impl Community {
         json!({ "id": channel.id, "name": channel.name, "topic": channel.topic, "closed": channel.closed, "latest_seq": channel.latest_seq })
     }
 
+    /// A community as its settings have it, with what an admin changed last time
+    /// laid over them. `kept` is where a change is written; without it, one lasts
+    /// until the server stops.
+    pub fn new(store: Store, config: CommunityConfig, kept: Option<Kept>) -> anyhow::Result<Self> {
+        let changed = match &kept {
+            Some(kept) => kept.load()?,
+            None => Changed::default(),
+        };
+        Ok(Self { store, config, changed: std::sync::RwLock::new(changed), kept })
+    }
+
+    /// What an admin has changed of the community's name, description and picture.
+    pub fn changed(&self) -> Changed {
+        self.changed.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+
     /// The community as `member` is told of it.
     pub fn community(&self, member: &Member) -> anyhow::Result<Value> {
         let channels: Vec<Value> = self.store.channels()?.iter().map(Self::channel_body).collect();
+        let changed = self.changed();
         Ok(json!({
-            "name": self.config.name,
-            "description": self.config.description,
+            "name": changed.name.unwrap_or_else(|| self.config.name.clone()),
+            "description": changed.description.unwrap_or_else(|| self.config.description.clone()),
             "role": member.role.as_str(),
             "joined": member.joined,
             "members_may_create_channels": self.config.members_may_create_channels,
@@ -411,6 +436,30 @@ impl Community {
             }
 
             MEMBERS_REQUEST => Ok(Outcome::reply(reply_to(message, MEMBERS, self.members_body()?))),
+
+            SET_PROFILE => {
+                if member.role != Role::Admin {
+                    return refuse(message, "e.p.trust.not-authorized", "Only an admin changes what the community is called.");
+                }
+                let change = match Change::read(message) {
+                    Ok(change) => change,
+                    Err(refused) => return refuse(message, refused.code, &refused.comment),
+                };
+                let changed = {
+                    let mut changed = self.changed.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    changed.apply(change);
+                    changed.clone()
+                };
+                if let Some(kept) = &self.kept {
+                    kept.save(&changed)?;
+                }
+                let mut outcome = Outcome::reply(reply_to(message, COMMUNITY, self.community(&member)?));
+                // Everyone joined is told what it is called now, as they are of a
+                // change to its channels.
+                outcome.channels_changed = true;
+                outcome.profile_changed = true;
+                Ok(outcome)
+            }
 
             SET_MEMBER => {
                 if member.role != Role::Admin {

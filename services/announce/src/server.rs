@@ -157,12 +157,13 @@ async fn feed(State(state): State<Arc<AppState>>) -> Response {
 
 async fn api_channel(State(state): State<Arc<AppState>>) -> Response {
     let store = &state.channel.store;
+    let info = state.channel.shown();
     match (store.latest_seq(), store.subscriber_count()) {
         (Ok(latest_seq), Ok(subscribers)) => Json(json!({
             "did": state.agent.did(),
-            "name": state.channel.info.name,
-            "description": state.channel.info.description,
-            "url": state.channel.info.url,
+            "name": info.name,
+            "description": info.description,
+            "url": info.url,
             "latest_seq": latest_seq,
             "subscribers": subscribers,
         }))
@@ -260,6 +261,12 @@ async fn answer(state: &Arc<AppState>, received: &Received, sender_kid: Option<&
     }
     if outcome.posted {
         state.deliver.notify_one();
+    }
+    // Who it says it is to someone looking its DID up changes with it.
+    if outcome.profile_changed {
+        if let Some(document) = &state.did_document {
+            document.changed(&state.channel.changed());
+        }
     }
     if let Some(seq) = outcome.reacted {
         state.reacted.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(seq);

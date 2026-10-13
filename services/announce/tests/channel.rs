@@ -127,9 +127,9 @@ async fn start_channel_resolving(admins: &[String], resolver: Box<dyn didcomm_co
     ))
     .unwrap();
     let (agent, did_document) = server::build_agent(&config, Identity::generate().unwrap()).unwrap();
-    let channel = Channel {
-        store: Store::in_memory().unwrap(),
-        info: ChannelInfo {
+    let channel = Channel::new(
+        Store::in_memory().unwrap(),
+        ChannelInfo {
             name: "Wyvrn Updates".into(),
             description: "Release notes".into(),
             url: url.clone(),
@@ -137,7 +137,9 @@ async fn start_channel_resolving(admins: &[String], resolver: Box<dyn didcomm_co
             show_authors: false,
             max_post_length: 16_000,
         },
-    };
+        Some(wyvrn_service::profile::Kept::scratch().unwrap()),
+    )
+    .unwrap();
     channel.name_admins(admins, server::now()).unwrap();
     let did = agent.did();
     let state = Arc::new(AppState {

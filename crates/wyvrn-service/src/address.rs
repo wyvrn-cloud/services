@@ -47,8 +47,12 @@ pub struct Published {
     public_url: String,
     /// The key the document signs and asserts as, to sign the website's half with.
     signing_jwk: String,
-    /// Who the service says it is, if it says ([`Published::with_profile`]).
-    profile: Option<wyvrn_hosted_did::write::ProfileFields>,
+    /// Who the service says it is, if it says ([`Published::with_profile`]): as its
+    /// settings have it...
+    settings: Option<wyvrn_hosted_did::write::ProfileFields>,
+    /// ...and as it is now, with what an admin has changed since
+    /// ([`Published::changed`]). Shared by every copy of this.
+    profile: std::sync::Arc<std::sync::RwLock<Option<wyvrn_hosted_did::write::ProfileFields>>>,
 }
 
 /// Who a service says it is, to someone looking its DID up before writing to it:
@@ -153,7 +157,9 @@ impl Published {
         if self.origin.is_empty() || (profile.name.is_none() && profile.description.is_none() && profile.picture.is_none()) {
             return Ok(self);
         }
-        self.profile = Some(profile.fields()?);
+        let fields = profile.fields()?;
+        self.profile = std::sync::Arc::new(std::sync::RwLock::new(Some(fields.clone())));
+        self.settings = Some(fields);
         let endpoint = format!("{}whois.vp", self.public_url);
         if let Some(services) = self.document["service"].as_array_mut() {
             services.push(serde_json::json!({ "id": format!("{}#whois", self.did), "type": "LinkedVerifiablePresentation", "serviceEndpoint": endpoint }));
@@ -161,10 +167,28 @@ impl Published {
         Ok(self)
     }
 
+    /// Lays what an admin has changed over what the settings say: the whois says
+    /// so from the next time it is asked for. A service with no profile to begin
+    /// with (one that isn't a `did:web` over HTTPS) has none to change.
+    pub fn changed(&self, changed: &crate::profile::Changed) {
+        let Some(mut fields) = self.settings.clone() else { return };
+        if let Some(name) = &changed.name {
+            fields.name = Some(name.clone());
+        }
+        if let Some(description) = &changed.description {
+            fields.description = Some(description.clone());
+        }
+        if let Some(picture) = &changed.picture {
+            fields.image = Some(serde_json::json!({ "contentUrl": picture.data_url(), "encodingFormat": picture.media_type }));
+        }
+        *self.profile.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(fields);
+    }
+
     /// The service's whois: its profile, as a presentation it signs. Dated from the
     /// start of the day, as its website's link is.
     pub async fn whois(&self, now: i64) -> anyhow::Result<Option<Value>> {
-        let Some(profile) = &self.profile else { return Ok(None) };
+        let Some(profile) = self.profile.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() else { return Ok(None) };
+        let profile = &profile;
         let issued = now - now.rem_euclid(DAY);
         let whois = wyvrn_hosted_did::write::whois(&self.did, profile, &self.signing_jwk, &format!("{}#key-1", self.did), &rfc3339(issued)).await.map_err(|why| anyhow::anyhow!(why))?;
         Ok(Some(whois))
@@ -194,9 +218,9 @@ pub fn build_agent(identity: Identity, public_url: &str, method: DidMethod) -> a
                     if let Some(services) = document["service"].as_array_mut() {
                         services.push(serde_json::json!({ "id": format!("{did}#linked-domains"), "type": "LinkedDomains", "serviceEndpoint": origin }));
                     }
-                    Published { document, did: did.clone(), origin, public_url: with_slash(public_url), signing_jwk, profile: None }
+                    Published { document, did: did.clone(), origin, public_url: with_slash(public_url), signing_jwk, settings: None, profile: Default::default() }
                 }
-                None => Published { document, did: did.clone(), origin: String::new(), public_url: with_slash(public_url), signing_jwk, profile: None },
+                None => Published { document, did: did.clone(), origin: String::new(), public_url: with_slash(public_url), signing_jwk, settings: None, profile: Default::default() },
             };
             (Agent::with_did(identity, &did), Some(published))
         }

@@ -148,7 +148,8 @@ Add this channel as a contact, by its DID. New posts then arrive in the app as t
 
 /// The log: `posts` newest first, with a way on to older and back to newer ones.
 pub fn index_page(channel: &Channel, did: &str, posts: &[Post], older: Option<i64>, newer: bool) -> String {
-    let mut body = header(&channel.info, did, false);
+    let info = channel.shown();
+    let mut body = header(&info, did, false);
     if posts.is_empty() {
         body.push_str("<p class=\"empty\">Nothing has been posted yet.</p>");
     }
@@ -163,29 +164,31 @@ pub fn index_page(channel: &Channel, did: &str, posts: &[Post], older: Option<i6
         }
         body.push_str("</nav>");
     }
-    page(&channel.info, &channel.info.name, &body)
+    page(&info, &info.name, &body)
 }
 
 pub fn post_page(channel: &Channel, did: &str, post: &Post) -> String {
-    let body = format!("{}{}", header(&channel.info, did, true), article(channel, post));
-    page(&channel.info, &format!("{} · {}", title_of(&post.content), channel.info.name), &body)
+    let info = channel.shown();
+    let body = format!("{}{}", header(&info, did, true), article(channel, post));
+    page(&info, &format!("{} · {}", title_of(&post.content), info.name), &body)
 }
 
 /// The newest posts as an Atom feed.
 pub fn feed(channel: &Channel, did: &str, posts: &[Post]) -> String {
-    let base = channel.info.url.trim_end_matches('/');
+    let info = channel.shown();
+    let base = info.url.trim_end_matches('/');
     let updated = posts.first().map(|post| rfc3339(post.posted_at)).unwrap_or_else(|| rfc3339(0));
     let mut feed = format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<feed xmlns=\"http://www.w3.org/2005/Atom\">\
 <title>{name}</title><subtitle>{description}</subtitle><id>{id}</id>\
 <link href=\"{base}/\"/><link rel=\"self\" href=\"{base}/feed.xml\"/><updated>{updated}</updated>",
-        name = escape(&channel.info.name),
-        description = escape(&channel.info.description),
+        name = escape(&info.name),
+        description = escape(&info.description),
         id = escape(did),
         base = escape(base),
     );
     for post in posts {
-        let author = channel.author_of(post).unwrap_or(&channel.info.name);
+        let author = channel.author_of(post).unwrap_or(&info.name);
         feed.push_str(&format!(
             "<entry><title>{title}</title><id>urn:uuid:{id}</id><link href=\"{base}/posts/{seq}\"/>\
 <updated>{at}</updated><author><name>{author}</name></author><content type=\"html\">{content}</content></entry>",
@@ -210,16 +213,18 @@ mod tests {
     fn channel() -> Channel {
         let store = Store::in_memory().unwrap();
         store.set_role("did:a", Role::Admin, 1).unwrap();
-        Channel {
+        Channel::new(
             store,
-            info: ChannelInfo {
+            ChannelInfo {
                 name: "Wyvrn <Updates>".into(),
                 description: "Release notes & more".into(),
                 url: "https://updates.example/".into(),
                 max_post_length: 1000,
                 ..ChannelInfo::default()
             },
-        }
+            None,
+        )
+        .unwrap()
     }
 
     fn post(channel: &Channel, content: &str) -> Post {

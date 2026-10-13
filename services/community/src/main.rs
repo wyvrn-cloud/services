@@ -96,7 +96,13 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     if let Some(mediator) = &config.mediator {
         wyvrn_service::mediator::register(&agent, mediator).await?;
     }
-    let community = Community { store: open_store(&config)?, config: config.community.clone() };
+    // What an admin has changed of its name, description and picture is kept with
+    // the rest, and laid over the settings.
+    let kept = wyvrn_service::profile::Kept::open(&location, "community")?;
+    let community = Community::new(open_store(&config)?, config.community.clone(), Some(kept))?;
+    if let Some(document) = &did_document {
+        document.changed(&community.changed());
+    }
     community.admit_configured(now())?;
     let members = community.store.members()?;
     tracing::info!(did = %agent.did(), url = %config.server.public_url, name = %config.community.name, members = members.len(), channels = community.store.channels()?.len(), "community server ready");

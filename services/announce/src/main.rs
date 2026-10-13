@@ -91,13 +91,18 @@ fn set_role(config: &Config, did: &str, role: Role) -> anyhow::Result<()> {
 async fn serve(config: Config) -> anyhow::Result<()> {
     wyvrn_service::logging::init();
 
-    let channel = Channel { store: open_store(&config)?, info: server::channel_info(&config)? };
-    channel.name_admins(&config.channel.admins, server::now())?;
-
     // Kept with the store: in the database, for a service that has one.
     let location = wyvrn_service::db::Location::from_env("ANNOUNCE", &config.store.path)?;
+    // What an admin has changed of its name, description and picture is kept too.
+    let kept = wyvrn_service::profile::Kept::open(&location, "announce")?;
+    let channel = Channel::new(open_store(&config)?, server::channel_info(&config)?, Some(kept))?;
+    channel.name_admins(&config.channel.admins, server::now())?;
+
     let identity = wyvrn_service::identity::load_or_generate(&location, &config.identity.path, "announce")?;
     let (agent, did_document) = server::build_agent(&config, identity)?;
+    if let Some(document) = &did_document {
+        document.changed(&channel.changed());
+    }
     // Behind a mediator, the channel's DID is the one that names it as the way in.
     if let Some(mediator) = &config.mediator {
         wyvrn_service::mediator::register(&agent, mediator).await?;
@@ -105,7 +110,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     tracing::info!(
         did = %agent.did(),
         url = %config.server.public_url,
-        name = %channel.info.name,
+        name = %channel.shown().name,
         posts = channel.store.latest_seq()?,
         subscribers = channel.store.subscriber_count()?,
         "channel ready"
