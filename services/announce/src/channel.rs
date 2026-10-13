@@ -239,7 +239,12 @@ impl Channel {
     fn profile(&self, message: &Value) -> Value {
         let info = self.shown();
         let mut profile = json!({"displayName": info.name, "description": info.description});
-        let mut reply = reply_to(message, PROFILE, json!({}));
+        // (user-profile/1.0 has a profile sent in answer name what asked for it as
+        // its parent thread, not its own.)
+        let mut reply = json!({"type": PROFILE, "body": {}});
+        if let Some(id) = message["id"].as_str() {
+            reply["pthid"] = json!(id);
+        }
         if let Some((media_type, base64)) = &info.picture {
             profile["displayPicture"] = json!("#picture");
             reply["attachments"] = json!([{"id": "picture", "media_type": media_type, "data": {"base64": base64}}]);
