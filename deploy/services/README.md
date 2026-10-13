@@ -68,6 +68,51 @@ docker compose --profile community --profile announce up -d   # the other two as
 
 The first start builds from source, which takes several minutes.
 
+### With a compose file of your own
+
+Build the images where the source is, and carry them over:
+
+```sh
+docker compose -f deploy/services/docker-compose.yml build did-host stickers
+docker save wyvrn-did-host wyvrn-stickers | gzip | ssh you@server 'gunzip | docker load'
+```
+
+(`build` reads no `.env`. The images are for the processor they were built on:
+for a server of another kind, `docker buildx build --platform linux/arm64 -f
+services/did-host/Dockerfile -t wyvrn-did-host .` from the repository root.)
+
+Then a service in your compose file is its image, its settings and a volume
+for its keys. Everything it needs is in the image; it listens on 8080.
+
+```yaml
+  did-host:
+    image: wyvrn-did-host
+    restart: unless-stopped
+    environment:
+      DID_HOST_DOMAIN: "id.example"
+      DID_HOST_PUBLIC_URL: "https://id.example/"
+      DID_HOST_DID_METHOD: "web"
+      DID_HOST_ADMINS: ""
+      DID_HOST_DATABASE_URL: "mysql://wyvrn:password@mysql:3306/wyvrn_did_host"
+    volumes:
+      - did-host-data:/app/data
+
+  stickers:
+    image: wyvrn-stickers
+    restart: unless-stopped
+    environment:
+      STICKERS_PUBLIC_URL: "https://stickers.example/"
+      STICKERS_DID_METHOD: "web"
+      STICKERS_ADMINS: ""
+      STICKERS_DATABASE_URL: "mysql://wyvrn:password@mysql:3306/wyvrn_stickers"
+    volumes:
+      - stickers-data:/app/data
+```
+
+`docker-compose.yml` here has the same for `community` and `announce`. With
+Caddy in the same compose file, it reaches them by name (`reverse_proxy
+did-host:8080`) and they need no `ports`.
+
 ## 4. Your web server
 
 [`Caddyfile.example`](Caddyfile.example) has what to add to Caddy: each domain,
