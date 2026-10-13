@@ -38,7 +38,9 @@ fn new_pack(id: &str, emoji_pack: bool) -> Value {
     let known_by = if emoji_pack {
         json!({ "type": "text-input", "form-id": "shortcode", "label": "Shortcode", "placeholder": "party_cat", "required": true })
     } else {
-        json!({ "type": "text-input", "form-id": "emoji", "label": "Emoji", "placeholder": "😺", "required": true })
+        // (`format` is a hint for an app that has an emoji picker to offer: one that
+        // doesn't know it draws the text box this is.)
+        json!({ "type": "text-input", "form-id": "emoji", "format": "emoji", "label": "Emoji", "placeholder": "😺", "required": true })
     };
     let asking = if emoji_pack {
         "Send me a picture: a PNG, WebP or GIF, up to {{ artifacts.max_px }} by {{ artifacts.max_px }} pixels. Then give it a shortcode, which is what people type between colons to use it."
