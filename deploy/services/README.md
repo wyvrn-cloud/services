@@ -204,6 +204,18 @@ service takes the scheme and host from the proxy (`X-Forwarded-Proto`, `Host`),
 and where TLS ends before that proxy it is told `http`, and nothing shows a
 picture. Set `CARDS_PUBLIC_URL=https://chat.example` in `.env` then.
 
+Some of what fetches links reads the domain's `robots.txt` first and fetches
+nothing it is turned away by (Twitter's does; Discord's doesn't). A site that
+turns everything away has to let these two paths through, in a group of its
+own for each such fetcher or in the one for `*`:
+
+```
+User-agent: Twitterbot
+Allow: /dl
+Allow: /card/
+Disallow: /
+```
+
 ## 5. Keep it
 
 - **The databases** hold everything a service was told: back them up as you do
