@@ -199,6 +199,11 @@ pictures (`/card/…`) always are. To see what one gets:
 curl -A Discordbot https://chat.example/dl/did:web:id.example:alice
 ```
 
+Look at `og:image` in what comes back: it has to start with `https://`. The
+service takes the scheme and host from the proxy (`X-Forwarded-Proto`, `Host`),
+and where TLS ends before that proxy it is told `http`, and nothing shows a
+picture. Set `CARDS_PUBLIC_URL=https://chat.example` in `.env` then.
+
 ## 5. Keep it
 
 - **The databases** hold everything a service was told: back them up as you do

@@ -119,3 +119,6 @@ services:
       CARDS_DID_HOST: "${DID_HOST_DOMAIN:-id.wyvrn.app}"
       CARDS_OFFICIAL_DOMAINS: "${CARDS_OFFICIAL_DOMAINS:-}"
       CARDS_SITE_NAME: "${CARDS_SITE_NAME:-Wyvrn}"
+      # Where the links point, if the proxy in front doesn't say rightly
+      # (X-Forwarded-Proto, Host): a page naming its picture at http:// gets none.
+      CARDS_PUBLIC_URL: "${CARDS_PUBLIC_URL:-}"
