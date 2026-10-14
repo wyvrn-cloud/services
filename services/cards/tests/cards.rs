@@ -107,7 +107,7 @@ async fn an_address_that_cannot_be_read_is_still_a_link_and_has_no_card() {
     let (status, _, body) = get(&state, "/dl/did:web:id.example:nobody").await;
     let html = String::from_utf8(body).unwrap();
     assert_eq!(status, StatusCode::OK);
-    assert!(html.contains(r#"<meta property="og:title" content="nobody at id.example">"#), "{html}");
+    assert!(html.contains(r#"<meta property="og:title" content="nobody via id.example">"#), "{html}");
     assert!(!html.contains("og:image"));
     assert_eq!(get(&state, "/card/a/did:web:id.example:nobody.png").await.0, StatusCode::NOT_FOUND);
     // And what isn't an address is nothing at all.

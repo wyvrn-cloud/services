@@ -270,7 +270,7 @@ mod tests {
     fn someone() -> Who {
         Who {
             did: "did:web:id.example:alice".into(),
-            label: "alice at id.example".into(),
+            label: "alice via id.example".into(),
             name: Some("Alice <&> \"Friends\"".into()),
             description: Some("Writes about wyverns, dragons and other things with wings, at more length than fits on one line of a card by a good way, and then some more besides to be sure of it.".into()),
             picture: None,

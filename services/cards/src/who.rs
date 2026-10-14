@@ -29,7 +29,7 @@ pub enum Mark {
 pub struct Who {
     /// The DID the link names.
     pub did: String,
-    /// What it is, in words that can't be made up: `alice at id.example` for an
+    /// What it is, in words that can't be made up: `alice via id.example` for an
     /// address, `Contact invite` for an invite.
     pub label: String,
     /// The rest is its own word.
@@ -83,10 +83,10 @@ pub fn is_address(did: &str) -> bool {
     did.len() <= 300 && did.chars().all(ok) && Location::of(did).is_some_and(|place| !place.host.contains('%'))
 }
 
-/// `alice at id.example`: an address as it is written for a person.
+/// `alice via id.example`: an address as it is written for a person.
 pub fn written(did: &str) -> String {
     match Location::of(did) {
-        Some(place) if !place.path.is_empty() => format!("{} at {}", place.path.join(" / "), place.host),
+        Some(place) if !place.path.is_empty() => format!("{} via {}", place.path.join(" / "), place.host),
         Some(place) => place.host,
         None => did.to_string(),
     }
@@ -298,9 +298,9 @@ mod tests {
     }
 
     #[test]
-    fn an_address_is_written_as_a_name_at_a_host() {
-        assert_eq!(written("did:web:id.wyvrn.app:frostyfrog"), "frostyfrog at id.wyvrn.app");
-        assert_eq!(written("did:webvh:Qm:id.wyvrn.app:official:news"), "official / news at id.wyvrn.app");
+    fn an_address_is_written_as_a_name_via_a_host() {
+        assert_eq!(written("did:web:id.wyvrn.app:frostyfrog"), "frostyfrog via id.wyvrn.app");
+        assert_eq!(written("did:webvh:Qm:id.wyvrn.app:official:news"), "official / news via id.wyvrn.app");
         assert_eq!(written("did:web:announce.wyvrn.app"), "announce.wyvrn.app");
     }
 

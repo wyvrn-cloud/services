@@ -27,7 +27,7 @@ An address is looked up the way an app looks one up before adding it
 verified where it has one, and its profile checked against it. The card then
 shows what the app's own card does:
 
-- the profile's name, and under it `alice at id.example`: the name is the
+- the profile's name, and under it `alice via id.example`: the name is the
   holder's own word, where it is hosted is not;
 - **History verified** for a `did:webvh` whose log checked out, **On its host's
   word** for a bare `did:web`;
