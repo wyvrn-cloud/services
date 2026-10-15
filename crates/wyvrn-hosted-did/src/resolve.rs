@@ -62,7 +62,8 @@ async fn resolve_webvh(did: &str, fetch: &impl Fetch) -> Result<Resolved, String
 /// A `did:web` that names a `did:webvh` is followed to it -- the one in its own
 /// place, or failing that one hosted elsewhere, which is how a service at its own
 /// domain holds an address at a DID host. The log is verified, and the pair
-/// accepted only if the `did:webvh` names the `did:web` back. Then the party is
+/// accepted only if the `did:webvh` names the `did:web` back and the two hold the
+/// same keys ([`verify::same_keys`]). Then the party is
 /// known by the `did:webvh`. Otherwise the `did:web` stands alone, on its host's
 /// word.
 pub async fn resolve(did: &str, fetch: &impl Fetch) -> Result<Resolved, String> {
@@ -76,12 +77,12 @@ pub async fn resolve(did: &str, fetch: &impl Fetch) -> Result<Resolved, String> 
     }
     if let Some(behind) = verify::webvh_behind(did, &web_document) {
         match resolve_webvh(behind, fetch).await {
-            Ok(mut resolved) if verify::names_back(&resolved.document, did) => {
+            Ok(mut resolved) if verify::names_back(&resolved.document, did) && verify::same_keys(&web_document, &resolved.document) => {
                 resolved.did_web = Some(did.to_string());
                 return Ok(resolved);
             }
-            // A did:webvh that doesn't verify, or doesn't own up to this did:web,
-            // adds nothing: the did:web is on its own.
+            // A did:webvh that doesn't verify, doesn't own up to this did:web, or
+            // holds other keys than it, adds nothing: the did:web is on its own.
             Ok(_) | Err(_) => {}
         }
     }

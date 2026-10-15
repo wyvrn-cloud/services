@@ -54,6 +54,15 @@ pub fn names_back(webvh_document: &Value, did_web: &str) -> bool {
     also_known_as(webvh_document).contains(&did_web)
 }
 
+/// Whether a `did:web` document holds the same keys as the `did:webvh` it is the
+/// short name of. Naming each other isn't enough: the `did:web` is served by its
+/// host alone, and is what someone writing to it reads. A host that swapped its
+/// keys could otherwise stand behind a verified history it doesn't match.
+pub fn same_keys(web_document: &Value, webvh_document: &Value) -> bool {
+    let web = keys::all_keys(web_document);
+    !web.is_empty() && web == keys::all_keys(webvh_document)
+}
+
 /// Whether a `did:peer:4` (by its own document, which it carries) is the party a
 /// hosted DID belongs to: it names the hosted DID's `did:web`, and shares a
 /// key-agreement key with the hosted document. The first is its word; the second
@@ -97,6 +106,22 @@ mod tests {
         // domain, holding an address here. (Whether that is so is the did:webvh's to say.)
         assert_eq!(webvh_behind("did:web:news.example", &document), Some("did:webvh:QmOther:elsewhere.example:alice"));
         assert_eq!(webvh_behind("did:web:id.example:alice", &json!({})), None);
+    }
+
+    #[test]
+    fn a_did_web_is_paired_only_with_a_did_webvh_holding_the_same_keys() {
+        let method = |did: &str, key: &str| json!({ "id": format!("{did}#key-1"), "publicKeyMultibase": key });
+        let web = json!({ "id": "did:web:id.example:alice", "verificationMethod": [method("did:web:id.example:alice", "z6Mkalice")], "authentication": ["#key-1"] });
+        let webvh = json!({ "id": "did:webvh:Qm:id.example:alice", "verificationMethod": [method("did:webvh:Qm:id.example:alice", "z6Mkalice")], "authentication": ["#key-1"] });
+        assert!(same_keys(&web, &webvh));
+        // The host serving the did:web swapped in a key of its own.
+        let swapped = json!({ "id": "did:web:id.example:alice", "verificationMethod": [method("did:web:id.example:alice", "z6Mkhost")], "authentication": ["#key-1"] });
+        assert!(!same_keys(&swapped, &webvh));
+        // ...or added one beside the holder's.
+        let added = json!({ "id": "did:web:id.example:alice", "verificationMethod": [method("did:web:id.example:alice", "z6Mkalice"), { "id": "#key-2", "publicKeyMultibase": "z6Mkhost" }] });
+        assert!(!same_keys(&added, &webvh));
+        // Two documents with no keys at all prove nothing.
+        assert!(!same_keys(&json!({}), &json!({})));
     }
 
     #[test]
