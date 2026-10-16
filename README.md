@@ -203,7 +203,10 @@ compiles what all the services have in common (the dependencies of
 in each, Docker builds it once and every other service's build reuses it, however
 the images are built (`docker build -f services/<name>/Dockerfile .` one after
 another, or compose). It is made again only when a `Cargo.toml` or `Cargo.lock`
-changes. Each service then compiles only what it needs beyond it, and its own code.
+changes. Each service then compiles what it needs beyond it as a layer of its own
+(also made again only when a manifest or the lock file changes), and its code on
+top: a change to the code alone compiles the workspace's own crates, and nothing
+else.
 
 `scripts/check-dockerfiles.sh` says whether the shared bases still match; the
 build secrets they take are handled by `deploy/docker/cargo-secrets.sh`.

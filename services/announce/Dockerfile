@@ -48,14 +48,24 @@ RUN --mount=type=secret,id=github_token,required=false \
     cargo-secrets cargo chef cook --release --locked -j 2 -p wyvrn-service --recipe-path recipe.json
 # --------------------------- end of the shared base ---------------------------
 
-FROM base AS builder
+# This service's own dependencies, beyond the shared base: an image layer of its
+# own, made again only when a manifest or the lock file changes, so that a change
+# to the code compiles the code alone.
+FROM base AS deps
+RUN --mount=type=secret,id=github_token,required=false \
+    --mount=type=secret,id=ca_bundle,required=false \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo-secrets cargo chef cook --release --locked -j 2 -p wyvrn-announce --recipe-path recipe.json
+
+FROM deps AS builder
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo .cargo
 # The whole workspace: cargo needs every member's manifest to read the lock file,
 # and this service's own crates are among them.
 COPY crates crates
 COPY services services
-# On top of the shared base: only what this service needs beyond it, and its code.
+# Its code, on top of everything it depends on.
 RUN --mount=type=secret,id=github_token,required=false \
     --mount=type=secret,id=ca_bundle,required=false \
     --mount=type=cache,target=/usr/local/cargo/registry \
