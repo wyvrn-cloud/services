@@ -144,6 +144,7 @@ async fn start_channel_resolving(admins: &[String], resolver: Box<dyn didcomm_co
     let did = agent.did();
     let state = Arc::new(AppState {
         agent,
+        voice: Default::default(),
         channel,
         did_document,
         resolver,
@@ -413,4 +414,34 @@ async fn a_subscribers_reaction_is_counted_for_every_subscriber_and_on_the_web_p
     assert_eq!(admin.next_of(channel::REACTIONS).await["body"]["counts"], json!({}));
     let page = reqwest::get(format!("{}posts/1", channel.url)).await.unwrap().text().await.unwrap();
     assert!(!page.contains("class=\"reactions\""), "{page}");
+}
+
+#[tokio::test]
+async fn a_channel_holding_an_address_is_read_there_and_speaks_as_it_and_subscribers_follow() {
+    let admin = Peer::start().await;
+    let reader = Peer::start().await;
+    let channel = start_channel(&[admin.did()]).await;
+    reader.send(&channel.did, channel::SUBSCRIBE, json!({})).await;
+    reader.next_of(channel::SUBSCRIPTION).await;
+
+    // The address: the channel's own keys at a DID of another name. A real one is a
+    // did:webvh at a DID host; here a did:peer naming the channel's own address
+    // under another spelling, which needs no host to be looked up.
+    let address = channel.state.agent.identity().did(&format!("{}?held", channel.url)).unwrap();
+    assert_ne!(address, channel.did);
+    channel.state.voice.take_up(&channel.state.agent, &address, &address, server::now()).await.unwrap();
+
+    // A post goes out from the address, saying it moved there from the channel's own DID.
+    admin.send(&channel.did, channel::POST, json!({"content": "now at our address"})).await;
+    let post = reader.next_of(channel::ANNOUNCEMENT).await;
+    assert_eq!(post["from"], address);
+    let resolver = didcomm_quickstart::default_resolver();
+    let moved = didcomm_core::rotation::verify_from_prior(&AskarCryptoService, resolver.as_ref(), post["from_prior"].as_str().expect("a from_prior")).await.unwrap();
+    assert_eq!(moved, (channel.did.clone(), address.clone()));
+
+    // Written to at the address, it reads it, and answers from there.
+    reader.send(&address, channel::UNSUBSCRIBE, json!({})).await;
+    let answer = reader.next_of(channel::SUBSCRIPTION).await;
+    assert_eq!(answer["body"]["subscribed"], false);
+    assert_eq!(answer["from"], address);
 }

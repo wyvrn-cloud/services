@@ -89,8 +89,15 @@ The service then claims the name by itself once it is serving (it tries again
 until it can), publishes its profile there, and names the address in its own DID
 document. Looked up by either DID it is one party: **Official**, by the name its
 host reserved for it, and **History verified** where a bare `did:web` is "on its
-host's word". Nothing needs listing in any app's build. People go on writing to
-it at its own domain.
+host's word". Nothing needs listing in any app's build.
+
+From then on the address is the DID the service is known by
+(`crates/wyvrn-service`'s `voice`): what is sent to it is read (the service's key
+is filed under the address's key ids too), what the service sends unasked comes
+from it, with a `from_prior` signed by its `did:web` so that whoever knew it by
+that follows it there, and an answer comes from whichever DID it was written to.
+What it asks of its DID host it asks as its `did:web`, the DID the name was set
+aside for. Writing to its own domain goes on working.
 
 The address's log is kept in the service's database with its keys. Only the
 service can continue it: lose both and the name can only be freed by the host's
@@ -170,7 +177,8 @@ protocol, its pages.
 2. Implement `wyvrn_service::Service`, and build its router from
    `wyvrn_service::address::routes` and `wyvrn_service::http::receive`.
 3. A `Dockerfile` in its directory, built from the repository root (the workspace),
-   and an entry in `docker-compose.yml`.
+   and an entry in `docker-compose.yml`. Copy another service's: it begins with
+   the shared base (below), which has to stay word for word the same.
 4. A row in the table above.
 
 Something a second service turns out to need that the first already has belongs in
@@ -185,6 +193,20 @@ cargo test -p wyvrn-announce  # one member
 
 The DIDComm crates come from [wyvrn-cloud/didcomm](https://github.com/wyvrn-cloud/didcomm)
 by git; `Cargo.lock` pins the commit.
+
+### Building the images
+
+Every service's `Dockerfile` begins with the same **shared base**: a stage that
+compiles what all the services have in common (the dependencies of
+`crates/wyvrn-service`, wyvrn-didcomm among them) as an image layer, with
+[cargo-chef](https://github.com/LukeMathWalker/cargo-chef). Because it is the same
+in each, Docker builds it once and every other service's build reuses it, however
+the images are built (`docker build -f services/<name>/Dockerfile .` one after
+another, or compose). It is made again only when a `Cargo.toml` or `Cargo.lock`
+changes. Each service then compiles only what it needs beyond it, and its own code.
+
+`scripts/check-dockerfiles.sh` says whether the shared bases still match; the
+build secrets they take are handled by `deploy/docker/cargo-secrets.sh`.
 
 ## Licence
 

@@ -34,6 +34,8 @@ const ANSWERING_KEPT_FOR: i64 = 24 * 60 * 60;
 
 pub struct AppState {
     pub agent: Agent,
+    /// Which DID it speaks as: its address's, once it holds one (wyvrn_service::voice).
+    pub voice: wyvrn_service::Voice,
     pub community: Community,
     /// Published at `/.well-known/did.json` when the server is a `did:web`.
     pub did_document: Option<address::Published>,
@@ -80,7 +82,7 @@ async fn rotation(state: &AppState, received: &Received, sender: &str) -> Option
 fn send_later(state: &Arc<AppState>, did: String, message: Value) {
     let state = state.clone();
     tokio::spawn(async move {
-        if let Err(error) = state.agent.send(&did, &message).await {
+        if let Err(error) = state.voice.send(&state.agent, &did, &message).await {
             tracing::warn!(%did, %error, "couldn't send a notice");
         }
     });
@@ -210,7 +212,7 @@ pub async fn deliver_pending(state: &Arc<AppState>) -> anyhow::Result<()> {
                 Err(error) => return tracing::error!(%error, "couldn't read posts to deliver"),
             };
             for post in posts {
-                if let Err(error) = state.agent.send(&member.did, &state.community.message(&post)).await {
+                if let Err(error) = state.voice.send(&state.agent, &member.did, &state.community.message(&post)).await {
                     tracing::warn!(did = %member.did, serial = post.serial, %error, "couldn't deliver a post; will try again");
                     return;
                 }

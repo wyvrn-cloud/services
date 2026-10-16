@@ -496,7 +496,7 @@ impl Processor {
                 if !is_name(&name) {
                     return Err(mistake("A short name is 3 to 32 lowercase letters, digits and hyphens, with no hyphen first, last or doubled."));
                 }
-                if self.config.reserved_names.iter().any(|reserved| *reserved == name) {
+                if self.config.reserved_names.contains(&name) {
                     return Err(mistake("That name is set aside. Please choose another."));
                 }
                 let mine = self.store.packs(Some(&instance.owner)).map_err(failed)?.iter().filter(|pack| !pack.removed).count();

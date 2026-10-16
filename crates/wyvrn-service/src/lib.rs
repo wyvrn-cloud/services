@@ -33,6 +33,9 @@ pub mod logging;
 pub mod mediator;
 pub mod named;
 pub mod profile;
+pub mod voice;
+
+pub use voice::Voice;
 
 use std::future::Future;
 use std::time::{SystemTime, UNIX_EPOCH};

@@ -4988,6 +4988,7 @@ dependencies = [
  "chrono",
  "didcomm-agent",
  "didcomm-core",
+ "didcomm-crypto-askar",
  "mysql",
  "reqwest",
  "rusqlite",

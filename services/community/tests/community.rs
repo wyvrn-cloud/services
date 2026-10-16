@@ -112,7 +112,7 @@ async fn start_server(settings: &str) -> Running {
     let (agent, did_document) = server::build_agent(&config, Identity::generate().unwrap()).unwrap();
     let did = agent.did();
     let community = Community::new(Store::in_memory().unwrap(), config.community.clone(), Some(wyvrn_service::profile::Kept::scratch().unwrap())).unwrap();
-    let state = Arc::new(AppState { agent, community, did_document, resolver: didcomm_quickstart::default_resolver(), deliver: Notify::new() });
+    let state = Arc::new(AppState { agent, voice: Default::default(), community, did_document, resolver: didcomm_quickstart::default_resolver(), deliver: Notify::new() });
     tokio::spawn(server::run_deliveries(state.clone()));
     let app = server::router(state.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

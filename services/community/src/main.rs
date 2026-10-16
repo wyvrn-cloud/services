@@ -110,17 +110,24 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         tracing::warn!("nobody is let in yet: set COMMUNITY_ADMINS, or run `wyvrn-community add <did> admin`");
     }
 
-    let state = Arc::new(AppState { agent, community, did_document, resolver: didcomm_quickstart::default_resolver(), deliver: Notify::new() });
+    let state = Arc::new(AppState { agent, voice: Default::default(), community, did_document, resolver: didcomm_quickstart::default_resolver(), deliver: Notify::new() });
     // A public address at a DID host, if it is set to hold one (COMMUNITY_PUBLIC_ADDRESS):
     // taken up once the service is serving, and kept up to date from then on.
     if let (Some(address), Some(document)) = (wyvrn_service::hosted_address::Address::from_env("COMMUNITY")?, state.did_document.clone()) {
         let asking = state.clone();
         let ask: wyvrn_service::hosted_address::Ask = Box::new(move |to, message| {
             let asking = asking.clone();
-            Box::pin(async move { Ok(asking.agent.request(&to, &message).await?.message) })
+            // As its did:web, which the host set the name aside for, whatever
+            // DID the service speaks as to everyone else.
+            Box::pin(async move { Ok(asking.agent.request_as(asking.agent.base_did(), &to, &message).await?.message) })
         });
         let kept = wyvrn_service::hosted_address::Kept::open(&location, "community")?;
-        tokio::spawn(wyvrn_service::hosted_address::Holding::new(address, kept, document, ask)?.run());
+        let speaking = state.clone();
+        let held: wyvrn_service::hosted_address::Held = Box::new(move |did, address| {
+            let speaking = speaking.clone();
+            Box::pin(async move { speaking.voice.take_up(&speaking.agent, &did, &address, wyvrn_service::now()).await })
+        });
+        tokio::spawn(wyvrn_service::hosted_address::Holding::new(address, kept, document, ask)?.when_held(held).run());
     }
     tokio::spawn(server::run_deliveries(state.clone()));
     tokio::spawn(server::run_pruning(state.clone()));

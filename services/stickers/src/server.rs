@@ -35,6 +35,8 @@ const PRUNE_EVERY: Duration = Duration::from_secs(60 * 60);
 
 pub struct AppState {
     pub agent: Agent,
+    /// Which DID it speaks as: its address's, once it holds one (wyvrn_service::voice).
+    pub voice: wyvrn_service::Voice,
     pub processor: Processor,
     /// Published at `/.well-known/did.json` when the service itself is a `did:web`.
     pub did_document: Option<address::Published>,

@@ -1052,17 +1052,28 @@ async fn a_service_holds_an_address_and_is_found_by_it_from_its_own_domain() {
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Value>> + Send>>
         })
     };
-    let holding = Holding::new(address, Kept::scratch().unwrap(), published.clone(), ask).unwrap();
+    // Told once it holds the address, to speak as it (wyvrn_service::Voice).
+    let told = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+    let held = {
+        let told = told.clone();
+        Box::new(move |did: String, address: String| {
+            told.lock().unwrap().push((did, address));
+            Box::pin(async { Ok(()) }) as std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>
+        })
+    };
+    let holding = Holding::new(address, Kept::scratch().unwrap(), published.clone(), ask).unwrap().when_held(held);
 
     // The namespace is reserved: not the service's until an admin says so.
     let refused = holding.hold(1_800_000_000).await.unwrap_err();
     assert!(format!("{refused:#}").contains("set aside"), "{refused:#}");
+    assert!(told.lock().unwrap().is_empty());
     assert_eq!(published.document_now()["alsoKnownAs"], Value::Null);
     let assign = json!({ "type": format!("{P}assign"), "body": { "name": "official:news", "holder": asking.did() }, "return_route": "all" });
     admin.send(&host.did, &assign).await.unwrap().expect("an answer");
 
     let did = holding.hold(1_800_000_000).await.unwrap();
     assert!(did.starts_with("did:webvh:") && did.ends_with(&format!(":{DOMAIN}:official:news")), "{did}");
+    assert_eq!(told.lock().unwrap().as_slice(), [(did.clone(), format!("did:web:{DOMAIN}:official:news"))]);
     // Its own document names the address from then on, and its website's link covers both.
     assert_eq!(published.document_now()["alsoKnownAs"], json!([did]));
     let linked = published.did_configuration(1_800_000_000).await.unwrap();

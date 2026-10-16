@@ -8,8 +8,10 @@
 //! known by the address. That is what lets an app mark a service by the name its
 //! DID host reserved for it, and not by a list of domains the app was built with.
 //!
-//! The service goes on being written to, and writing, as its `did:web`. The
-//! address carries the same keys and the same way in.
+//! The address carries the same keys and the same way in. Once the service holds
+//! it, it is the DID the service speaks as ([`crate::voice`]), told by
+//! [`Holding::when_held`]: what is sent to it is read, and what the service sends
+//! unasked comes from it.
 //!
 //! The name has to be free, or set aside for this service by one of the host's
 //! admins (`wyvrn-did-host assign official:news did:web:news.example`).
@@ -33,6 +35,10 @@ const DID_HOSTING: &str = "https://wyvrn.app/did-hosting/1.0";
 /// Asking a DID something as the service, and having its answer: the service's
 /// agent, by whatever route it reaches people.
 pub type Ask = Box<dyn Fn(String, Value) -> Pin<Box<dyn Future<Output = anyhow::Result<Value>> + Send>> + Send + Sync>;
+
+/// Told that the service holds its address: the address's `did:webvh`, and its own
+/// `did:web`. For [`crate::Voice::take_up`].
+pub type Held = Box<dyn Fn(String, String) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync>;
 
 /// The address a service is set to hold, taken apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +155,7 @@ pub struct Holding {
     kept: Kept,
     published: Published,
     ask: Ask,
+    held: Option<Held>,
 }
 
 impl Holding {
@@ -158,7 +165,22 @@ impl Holding {
         if let Some(log) = kept.load(&address)? {
             published.known_also_as(Some(log.did));
         }
-        Ok(Self { address, kept, published, ask })
+        Ok(Self { address, kept, published, ask, held: None })
+    }
+
+    /// What to do once the address is held: at start, for an address held before
+    /// (so the service speaks as it even while its host can't be reached), and
+    /// whenever it is taken up or brought up to date.
+    pub fn when_held(mut self, held: Held) -> Self {
+        self.held = Some(held);
+        self
+    }
+
+    async fn tell_held(&self, did: &str) {
+        let Some(held) = &self.held else { return };
+        if let Err(error) = held(did.to_string(), self.address.did_web.clone()).await {
+            tracing::warn!(%did, error = %format!("{error:#}"), "couldn't speak as this service's public address");
+        }
     }
 
     async fn ask_host(&self, kind: &str, body: Value, attachments: Option<Value>) -> anyhow::Result<Value> {
@@ -212,6 +234,7 @@ impl Holding {
             }
         };
         self.published.known_also_as(Some(did.clone()));
+        self.tell_held(&did).await;
         self.publish_whois(&did, now).await?;
         Ok(did)
     }
@@ -231,6 +254,9 @@ impl Holding {
     /// not before the service is serving), and its whois published again whenever
     /// an admin changes who the service says it is.
     pub async fn run(self) {
+        if let Ok(Some(log)) = self.kept.load(&self.address) {
+            self.tell_held(&log.did).await;
+        }
         let mut wait = Duration::from_secs(2);
         let did = loop {
             tokio::time::sleep(wait).await;

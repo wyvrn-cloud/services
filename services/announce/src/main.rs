@@ -118,6 +118,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 
     let state = Arc::new(AppState {
         agent,
+        voice: Default::default(),
         channel,
         did_document,
         resolver: didcomm_quickstart::default_resolver(),
@@ -132,10 +133,17 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         let asking = state.clone();
         let ask: wyvrn_service::hosted_address::Ask = Box::new(move |to, message| {
             let asking = asking.clone();
-            Box::pin(async move { Ok(asking.agent.request(&to, &message).await?.message) })
+            // As its did:web, which the host set the name aside for, whatever
+            // DID the service speaks as to everyone else.
+            Box::pin(async move { Ok(asking.agent.request_as(asking.agent.base_did(), &to, &message).await?.message) })
         });
         let kept = wyvrn_service::hosted_address::Kept::open(&location, "announce")?;
-        tokio::spawn(wyvrn_service::hosted_address::Holding::new(address, kept, document, ask)?.run());
+        let speaking = state.clone();
+        let held: wyvrn_service::hosted_address::Held = Box::new(move |did, address| {
+            let speaking = speaking.clone();
+            Box::pin(async move { speaking.voice.take_up(&speaking.agent, &did, &address, wyvrn_service::now()).await })
+        });
+        tokio::spawn(wyvrn_service::hosted_address::Holding::new(address, kept, document, ask)?.when_held(held).run());
     }
     tokio::spawn(server::run_deliveries(state.clone()));
     tokio::spawn(server::run_reaction_notices(state.clone()));

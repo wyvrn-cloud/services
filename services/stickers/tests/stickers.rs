@@ -29,7 +29,7 @@ async fn start_service(extra: &str) -> Running {
     let (agent, did_document) = server::build_agent(&config, Identity::generate().unwrap()).unwrap();
     let did = agent.did();
     let processor = Processor::new(Store::in_memory().unwrap(), config.service.clone(), &url);
-    let state = Arc::new(AppState { agent, processor, did_document, resolver: didcomm_quickstart::default_resolver() });
+    let state = Arc::new(AppState { agent, voice: Default::default(), processor, did_document, resolver: didcomm_quickstart::default_resolver() });
     let app = server::router(state.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     Running { did, url, state }

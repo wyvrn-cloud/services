@@ -417,7 +417,7 @@ impl Host {
                 if bytes.len() > self.config.max_whois_bytes {
                     return Ok(Err(Refusal::new("e.p.msg.too-large", "The whois is over this host's limit of {1} bytes.").with(self.config.max_whois_bytes.to_string())));
                 }
-                let document: Value = record.log.as_deref().and_then(|log| last_document(log)).unwrap_or_default();
+                let document: Value = record.log.as_deref().and_then(last_document).unwrap_or_default();
                 if let Err(why) = whois::check(&bytes, &did, &document) {
                     return Ok(Err(Refusal::new("e.p.msg.whois-invalid", why)));
                 }

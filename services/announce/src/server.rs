@@ -42,6 +42,8 @@ const FEED_SIZE: usize = 30;
 
 pub struct AppState {
     pub agent: Agent,
+    /// Which DID it speaks as: its address's, once it holds one (wyvrn_service::voice).
+    pub voice: wyvrn_service::Voice,
     pub channel: Channel,
     /// Published at `/.well-known/did.json` and `/did.json` when the channel is a
     /// `did:web`.
@@ -279,7 +281,7 @@ async fn answer(state: &Arc<AppState>, received: &Received, sender_kid: Option<&
 fn send_later(state: &Arc<AppState>, did: String, message: Value) {
     let state = state.clone();
     tokio::spawn(async move {
-        if let Err(error) = state.agent.send(&did, &message).await {
+        if let Err(error) = state.voice.send(&state.agent, &did, &message).await {
             tracing::warn!(%did, %error, "couldn't send a notice");
         }
     });
@@ -302,7 +304,7 @@ pub async fn deliver_pending(state: &Arc<AppState>) -> anyhow::Result<()> {
                 Err(error) => return tracing::error!(%error, "couldn't read posts to deliver"),
             };
             for post in posts {
-                if let Err(error) = state.agent.send(&member.did, &state.channel.announcement(&post)).await {
+                if let Err(error) = state.voice.send(&state.agent, &member.did, &state.channel.announcement(&post)).await {
                     tracing::warn!(did = %member.did, seq = post.seq, %error, "couldn't deliver a post; will try again");
                     return;
                 }
@@ -338,7 +340,7 @@ pub async fn tell_reactions(state: &Arc<AppState>, seqs: Vec<i64>) -> anyhow::Re
                     Ok(None) => continue,
                     Err(error) => return tracing::error!(%error, "couldn't read a post's reactions"),
                 };
-                if let Err(error) = state.agent.send(&member.did, &notice).await {
+                if let Err(error) = state.voice.send(&state.agent, &member.did, &notice).await {
                     return tracing::debug!(did = %member.did, seq, %error, "couldn't tell a subscriber of reactions");
                 }
             }

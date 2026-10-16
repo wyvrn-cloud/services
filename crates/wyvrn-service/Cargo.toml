@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 didcomm-agent = { workspace = true }
 didcomm-core = { workspace = true }
+didcomm-crypto-askar = { workspace = true }
 wyvrn-hosted-did = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
