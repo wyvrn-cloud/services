@@ -273,10 +273,20 @@ async fn a_post_is_answered_reacted_to_changed_pinned_and_taken_back_and_everyon
     assert_eq!(admin.ask("https://wyvrn.app/message-pins/1.0/unpin", json!({ "to": { "id": "p1" } })).await["body"].get("pinned"), None);
 
     // Taken back, its place is kept and what it said is gone.
-    assert_eq!(admin.ask("https://wyvrn.app/message-edits/1.0/delete", json!({ "to": { "id": "p2" } })).await["body"]["code"], "e.p.trust.not-authorized");
     let gone = member.ask("https://wyvrn.app/message-edits/1.0/delete", json!({ "to": { "id": "p2" } })).await;
     assert_eq!((gone["body"]["deleted"].as_bool(), gone["body"]["content"].as_str(), gone["body"]["seq"].as_i64()), (Some(true), Some(""), Some(2)));
+    assert_eq!(gone["body"].get("removed_by"), None);
     assert_eq!(member.ask("https://wyvrn.app/message-edits/1.0/edit", json!({ "to": { "id": "p2" }, "content": "again" })).await["body"]["code"], "e.p.msg.deleted");
+
+    // Someone else's is removed by an admin, or whoever opened the channel, and
+    // says who by; by nobody else.
+    member.community("post", json!({ "channel": channel, "id": "p3", "content": "Buy my thing" })).await;
+    assert_eq!(member.ask("https://wyvrn.app/message-edits/1.0/delete", json!({ "to": { "id": "p1" } })).await["body"]["code"], "e.p.trust.not-authorized");
+    let removed = admin.ask("https://wyvrn.app/message-edits/1.0/delete", json!({ "to": { "id": "p3" } })).await;
+    assert_eq!((removed["body"]["deleted"].as_bool(), removed["body"]["content"].as_str()), (Some(true), Some("")));
+    assert_eq!(removed["body"]["removed_by"], admin.did());
+    // ...and an edit is still its author's alone.
+    assert_eq!(admin.ask("https://wyvrn.app/message-edits/1.0/edit", json!({ "to": { "id": "p1" }, "content": "Mine" })).await["body"]["content"], "Mine");
 
     // Someone who was away asks what changed since what they hold, and is given
     // each post once, as it now stands.
@@ -286,9 +296,10 @@ async fn a_post_is_answered_reacted_to_changed_pinned_and_taken_back_and_everyon
     let missed = away.community("changes-request", json!({ "after_rev": 0 })).await;
     assert_eq!(kind(&missed), "changes");
     let posts = missed["body"]["messages"].as_array().unwrap();
-    assert_eq!(posts.iter().map(|post| post["id"].as_str().unwrap()).collect::<Vec<_>>(), ["p1", "p2"]);
-    assert_eq!(by(&posts[0]), both);
-    assert_eq!(posts[1]["deleted"], true);
+    assert_eq!(posts.iter().map(|post| post["id"].as_str().unwrap()).collect::<Vec<_>>(), ["p2", "p3", "p1"]);
+    assert_eq!(by(&posts[2]), both);
+    assert_eq!(posts[0]["deleted"], true);
+    assert_eq!(posts[1]["removed_by"], admin.did());
     assert_eq!((missed["body"]["rev"].as_i64(), missed["body"]["more"].as_bool()), (Some(latest), Some(false)));
     assert_eq!(away.community("changes-request", json!({ "after_rev": latest })).await["body"]["messages"], json!([]));
 }

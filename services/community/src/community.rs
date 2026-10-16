@@ -312,6 +312,9 @@ impl Community {
         if post.deleted {
             body["deleted"] = json!(true);
         }
+        if let Some(removed_by) = &post.removed_by {
+            body["removed_by"] = json!(removed_by);
+        }
         if post.pinned {
             body["pinned"] = json!(true);
         }
@@ -591,15 +594,20 @@ impl Community {
                 let Some(post) = self.named_post(body)? else {
                     return refuse(message, "e.p.msg.unknown-post", "There is no such post.");
                 };
-                // A post is its author's to change, and nobody else's.
-                if post.author_did != sender {
-                    return refuse(message, "e.p.trust.not-authorized", "Only whoever wrote a post changes it or takes it back.");
+                // A post is its author's to change, and nobody else's. Someone
+                // else's is removed by whoever may change the channel.
+                let removal = post.author_did != sender;
+                if removal && message_type == EDIT {
+                    return refuse(message, "e.p.trust.not-authorized", "Only whoever wrote a post changes it.");
+                }
+                if removal && member.role != Role::Admin && !self.store.channel(&post.channel)?.is_some_and(|channel| channel.created_by == sender) {
+                    return refuse(message, "e.p.trust.not-authorized", "Only whoever wrote a post takes it back; an admin, or whoever opened the channel, removes it.");
                 }
                 if post.deleted {
                     return refuse(message, "e.p.msg.deleted", "That post was taken back.");
                 }
                 if message_type == DELETE {
-                    self.store.delete_post(&post.id)?;
+                    self.store.delete_post(&post.id, removal.then_some(sender))?;
                 } else {
                     let content = body["content"].as_str().unwrap_or_default().trim();
                     if content.is_empty() {

@@ -83,8 +83,10 @@ pub struct Post {
     /// Who it calls on, and what it writes each as.
     pub mentions: Vec<Mention>,
     pub edited_at: Option<i64>,
-    /// Taken back by its author. What it said is gone; its place is kept.
+    /// Taken back, or removed. What it said is gone; its place is kept.
     pub deleted: bool,
+    /// Who removed it, when it wasn't its author: an admin, or whoever opened the channel.
+    pub removed_by: Option<String>,
     pub pinned: bool,
     /// Each emoji on it, and who put it there, in the order they were first put.
     pub reactions: Vec<(String, Vec<String>)>,
@@ -146,7 +148,8 @@ const POST_COLUMNS: &str = "serial, channel, seq, id, content, posted_at, author
     (SELECT deleted FROM post_state WHERE post_state.post = posts.id), \
     (SELECT pinned FROM post_state WHERE post_state.post = posts.id), \
     (SELECT reply_author FROM post_state WHERE post_state.post = posts.id), \
-    (SELECT reply_snippet FROM post_state WHERE post_state.post = posts.id)";
+    (SELECT reply_snippet FROM post_state WHERE post_state.post = posts.id), \
+    (SELECT removed_by FROM post_removals WHERE post_removals.post = posts.id)";
 const CHANNEL_COLUMNS: &str =
     "id, name, topic, closed, created_at, created_by, (SELECT COALESCE(MAX(seq), 0) FROM posts WHERE posts.channel = channels.id)";
 
@@ -181,6 +184,7 @@ fn post_from(row: &Row) -> Result<Post> {
         pinned: row.get::<Option<bool>>(17)?.unwrap_or(false),
         reply_author: row.get(18)?,
         reply_snippet: row.get(19)?,
+        removed_by: row.get(20)?,
         // Read after, each by a query of its own (`Store::filled`).
         reactions: Vec::new(),
         grew: None,
@@ -266,6 +270,12 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         at INTEGER NOT NULL,
         PRIMARY KEY (post, did, emoji)
     );
+    -- Who removed a post that wasn't theirs. A table of its own for the reason
+    -- post_state is one.
+    CREATE TABLE IF NOT EXISTS post_removals (
+        post TEXT PRIMARY KEY,
+        removed_by TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS threads (
         id TEXT PRIMARY KEY,
         channel TEXT NOT NULL,
@@ -347,6 +357,10 @@ fn schema() -> Schema {
                 name TEXT,
                 created_by {MYSQL_DID} NOT NULL,
                 created_at BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS post_removals (
+                post VARCHAR(255) NOT NULL PRIMARY KEY,
+                removed_by {MYSQL_DID} NOT NULL
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS answering (
                 id VARCHAR(255) NOT NULL PRIMARY KEY,
@@ -581,8 +595,12 @@ impl Store {
     }
 
     /// Takes a post back: what it said and asked is gone, and so is what was put on it.
-    pub fn delete_post(&self, id: &str) -> Result<()> {
+    /// `removed_by` is who did, when it wasn't its author.
+    pub fn delete_post(&self, id: &str, removed_by: Option<&str>) -> Result<()> {
         let mut db = self.db.lock();
+        if let Some(removed_by) = removed_by {
+            db.execute("INSERT INTO post_removals (post, removed_by) VALUES (?1, ?2)", params![id, removed_by])?;
+        }
         db.execute("UPDATE posts SET content = '', question = NULL, answer = NULL WHERE id = ?1", params![id])?;
         db.execute("DELETE FROM reactions WHERE post = ?1", params![id])?;
         Self::touch(&mut db, id)?;
