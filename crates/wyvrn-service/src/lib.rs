@@ -19,12 +19,14 @@
 //!   while it runs.
 //! - [`named`]: someone the settings name by a public address, recognised by the
 //!   key they write with.
+//! - [`admin`]: a service's admin pages, as workflows only its admins are let into.
 //! - [`logging`], [`now`]: the same start-up and the same clock for all of them.
 //!
 //! A service keeps what is its own: its configuration file, its store, its
 //! protocol, its pages.
 
 pub mod address;
+pub mod admin;
 pub mod db;
 pub mod hosted_address;
 pub mod http;
