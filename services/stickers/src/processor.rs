@@ -565,8 +565,21 @@ impl Processor {
         if let Some(icon) = pack.icon.as_deref().filter(|icon| stickers.iter().any(|sticker| sticker.id == *icon)) {
             manifest["icon"] = json!(icon);
         }
+        // A pack kept to its maker says who that is, to whoever already knows: the
+        // maker's app tells its own pack from someone else's by it.
+        if !pack.reuse {
+            manifest["maker"] = json!(maker_check(&self.link(&pack.name), &pack.owner));
+        }
         Ok(manifest)
     }
+}
+
+/// What a pack kept to its maker names its maker by (stickers/1.0's `maker`): the
+/// SHA-256 of its address and the maker's DID, so that only someone who has the DID
+/// can tell whose it is, and two packs of one maker aren't seen to be by it.
+pub fn maker_check(address: &str, maker: &str) -> String {
+    use sha2::{Digest, Sha256};
+    images::hex(&Sha256::digest(format!("{address}\n{maker}").as_bytes()))
 }
 
 fn failed(error: anyhow::Error) -> Refusal {

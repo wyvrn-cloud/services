@@ -345,6 +345,11 @@ async fn a_pack_has_a_name_nobody_else_has_and_as_many_stickers_as_allowed() {
     assert_eq!(kind(&bob.advance("b-1", "set_name", json!({ "name": "more-cats", "private": true })).await), "complete");
     let pack: Value = fetch(&service, "more-cats/pack.json").await.json().await.unwrap();
     assert_eq!((pack["reuse"].as_bool(), pack["stickers"].as_array().unwrap().len()), (Some(false), 2));
+    // Kept to himself, it names its maker in a way only someone with his DID can check.
+    let link = pack["url"].as_str().unwrap();
+    assert_eq!(pack["maker"].as_str(), Some(wyvrn_stickers::processor::maker_check(link, &bob.agent.did()).as_str()));
+    assert_ne!(pack["maker"].as_str(), Some(wyvrn_stickers::processor::maker_check(link, &alice.agent.did()).as_str()));
+    assert!(fetch(&service, "cats/pack.json").await.json::<Value>().await.unwrap().get("maker").is_none());
     // With no icon chosen, the pack names none: the first sticker stands for it.
     assert!(pack.get("icon").is_none());
 
