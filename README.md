@@ -10,6 +10,7 @@ that they share crates instead of each carrying its own copy of the same plumbin
 | [`services/did-host`](services/did-host) | Hosts short, stable `did:webvh` DIDs, and their parallel `did:web`, for agents that write and sign them themselves. |
 | [`services/cards`](services/cards) | Link cards: what a link to a public address or a contact invite looks like where it is posted, as OpenGraph tags and a drawn picture. Not a DIDComm service: it has no identity and keeps nothing. |
 | [`services/stickers`](services/stickers) | Hosts sticker and custom-emoji packs. They are made by talking to it, as `workflow/1.0` workflows, and fetched from it over HTTPS. |
+| [`services/files`](services/files) | A files service: files too big for a message, put there in resumable chunks by the agents it allows (`files/1.0`) and served to anyone with the link. |
 | [`crates/wyvrn-service`](crates/wyvrn-service) | What every DIDComm service does, whatever it is for. |
 | [`crates/wyvrn-hosted-did`](crates/wyvrn-hosted-did) | A hosted DID from both ends: the holder writing and signing its log, and anyone reading it -- from a `did:web` to the `did:webvh` behind it, verified, and its whois profile. Works on what was fetched; the fetching is the caller's. |
 | [`crates/wyvrn-hosted-did-wasm`](crates/wyvrn-hosted-did-wasm) | The same for a web app, as a WebAssembly module. |

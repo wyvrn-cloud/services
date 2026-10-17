@@ -94,6 +94,31 @@ services:
       CARDS_SITE_NAME: "${CARDS_SITE_NAME:-Wyvrn}"
     restart: unless-stopped
 
+  # A files service (services/files): files too big for a message, put there by
+  # the agents FILES_UPLOADERS names and fetched from it by anyone with the link.
+  # A file's address starts with FILES_PUBLIC_URL, so a real one needs its real
+  # address there, over HTTPS (see services/files/README.md).
+  files:
+    build:
+      context: .
+      dockerfile: services/files/Dockerfile
+    ports:
+      - "${FILES_PORT:-8086}:8080"
+    environment:
+      FILES_PUBLIC_URL: "${FILES_PUBLIC_URL:-http://localhost:8086/}"
+      FILES_DID_METHOD: "${FILES_DID_METHOD:-peer}"
+      # FILES_PUBLIC_URL: "https://files.example/"
+      # FILES_DID_METHOD: "web"
+      # Who may put files here, separated by commas: nobody until someone is named.
+      FILES_UPLOADERS: "${FILES_UPLOADERS:-}"
+      # Its records in MySQL or MariaDB instead of the volume, its keys too:
+      # mysql://user:password@host/database, a database of this service's own (README.md).
+      # The bytes stay in the volume either way.
+      FILES_DATABASE_URL: "${FILES_DATABASE_URL:-}"
+    volumes:
+      - files-data:/app/data
+    restart: unless-stopped
+
   # A community server (services/community): channels that the people let in, and
   # nobody else, read and post in. Nobody is let in until COMMUNITY_ADMINS names
   # someone (the ID their app shows for them), or one is added from here:
@@ -121,6 +146,7 @@ services:
     restart: unless-stopped
 
 volumes:
+  files-data:
   community-data:
   stickers-data:
   did-host-data:

@@ -101,6 +101,31 @@ services:
       ANNOUNCE_PROFILE_NAME: "${ANNOUNCE_PROFILE_NAME:-}"
       ANNOUNCE_PROFILE_DESCRIPTION: "${ANNOUNCE_PROFILE_DESCRIPTION:-}"
 
+  # Files too big for a message, for the agents FILES_UPLOADERS names. No app is
+  # built to expect one: an uploader is given its DID. The bytes live in a
+  # volume on this machine (files-data); its records are in its database.
+  files:
+    <<: *service
+    profiles: ["files"]
+    image: wyvrn-files
+    build:
+      context: ../..
+      dockerfile: services/files/Dockerfile
+    ports:
+      - "127.0.0.1:${FILES_PORT:-8186}:8080"
+    environment:
+      FILES_PUBLIC_URL: "https://${FILES_DOMAIN:?set FILES_DOMAIN in .env}/"
+      FILES_DID_METHOD: "web"
+      FILES_UPLOADERS: "${FILES_UPLOADERS:-}"
+      FILES_QUOTA_BYTES: "${FILES_QUOTA_BYTES:-10737418240}"
+      FILES_DATABASE_URL: "${FILES_DATABASE_URL:?set FILES_DATABASE_URL in .env}"
+      # Who it says it is, to someone looking its DID up (../../README.md).
+      FILES_PUBLIC_ADDRESS: "${FILES_PUBLIC_ADDRESS:-}"
+      FILES_PROFILE_NAME: "${FILES_PROFILE_NAME:-}"
+      FILES_PROFILE_DESCRIPTION: "${FILES_PROFILE_DESCRIPTION:-}"
+    volumes:
+      - files-data:/app/data
+
   # Link cards: what a link to an address or an invite looks like where it is
   # posted. In front of the web app's own /dl pages, for what fetches a link to
   # show it (Caddyfile.example). It keeps nothing and needs no database.
@@ -122,3 +147,8 @@ services:
       # Where the links point, if the proxy in front doesn't say rightly
       # (X-Forwarded-Proto, Host): a page naming its picture at http:// gets none.
       CARDS_PUBLIC_URL: "${CARDS_PUBLIC_URL:-}"
+
+volumes:
+  # Every file the files service holds. The only thing this stack keeps outside
+  # the databases: `docker volume inspect wyvrn-services_files-data` says where.
+  files-data:

@@ -13,6 +13,7 @@ With no web server yet, [`deploy/did-host`](../did-host) brings its own Caddy.
 | `stickers` | `did:web:stickers.wyvrn.app`, unless built with `VITE_STICKER_SERVICE_DID` | Yes: making and sending sticker packs |
 | `community` | Nothing: people are given its DID | No |
 | `announce` | Nothing: people are given its DID | No |
+| `files` | Nothing: an uploader is given its DID | No |
 
 ## 1. Domains
 
@@ -31,6 +32,7 @@ CREATE DATABASE wyvrn_did_host;
 CREATE DATABASE wyvrn_stickers;
 -- CREATE DATABASE wyvrn_community;
 -- CREATE DATABASE wyvrn_announce;
+-- CREATE DATABASE wyvrn_files;
 CREATE USER 'wyvrn'@'%' IDENTIFIED BY 'a long password';
 GRANT ALL ON wyvrn_did_host.* TO 'wyvrn'@'%';
 GRANT ALL ON wyvrn_stickers.* TO 'wyvrn'@'%';
@@ -64,9 +66,38 @@ cd deploy/services
 cp .env.example .env     # the domains, the database URLs, the admins
 docker compose up -d                                          # did-host and stickers
 docker compose --profile community --profile announce up -d   # the other two as well
+docker compose --profile files up -d                          # the files service
 ```
 
 The first start builds from source, which takes several minutes.
+
+### The files service, step by step
+
+It is the one service that keeps something outside its database: the bytes,
+in a Docker volume on this machine. Adding it to a machine that already runs
+the others:
+
+1. DNS for `files.example` (its domain is part of every file's address, so
+   choose it once), and in `.env`: `FILES_DOMAIN`, `FILES_DATABASE_URL` and
+   `FILES_UPLOADERS` (the DIDs allowed to put files there; a public address at
+   the DID host works, matched by its holder's key).
+2. `CREATE DATABASE wyvrn_files;` and the grant, as above.
+3. The Caddy block from `Caddyfile.example` (`files.example`): no `encode`, a
+   `request_body` that lets a 64 MiB chunk through, and longer proxy timeouts.
+   Reload Caddy.
+4. `docker compose --profile files up -d`, then
+   `curl https://files.example/did` → `did:web:files.example`.
+5. For it to be known by an address at the DID host, set the name aside and
+   tell it: `docker compose exec did-host wyvrn-did-host assign official:files did:web:files.example`,
+   `FILES_PUBLIC_ADDRESS=did:web:id.example:official:files` in `.env`, and
+   `docker compose --profile files up -d` again.
+6. Give an uploader its DID. The first `upload` from an allowed DID is the
+   test: `docker compose logs files` says "upload granted".
+
+The volume is `wyvrn-services_files-data` (`docker volume inspect` says
+where on disk). Files expire (14 days unless an uploader asks for longer),
+so it doesn't need backing up; the quota (`FILES_QUOTA_BYTES`, per uploader)
+bounds how much it can hold.
 
 ### With a compose file of your own
 
@@ -234,6 +265,7 @@ Run inside its container, on the same database:
 docker compose exec did-host wyvrn-did-host names
 docker compose exec stickers wyvrn-stickers packs
 docker compose exec community wyvrn-community add <did> admin
+docker compose exec files wyvrn-files files
 ```
 
 Each service's README lists its commands.
