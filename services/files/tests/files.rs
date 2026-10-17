@@ -230,3 +230,45 @@ async fn sign_up_is_open_until_locked_down_and_anonymous_uploads_can_be_refused(
     state.host.store.put_uploader(&blocked).unwrap();
     assert_eq!(dave.upload("e.txt", b"again").await["body"]["code"], "e.p.msg.not-allowed");
 }
+
+async fn workflow(agent: &Agent, service: &str, kind: &str, body: Value) -> Value {
+    let message = json!({ "type": format!("https://didcomm.org/workflow/1.0/{kind}"), "body": body, "return_route": "all" });
+    agent.send(service, &message).await.expect("sent").expect("an answer").message
+}
+
+#[tokio::test]
+async fn admins_alone_see_the_admin_pages_and_what_they_save_holds() {
+    let admin = Agent::new(Identity::generate().unwrap()).unwrap();
+    let alice = Agent::new(Identity::generate().unwrap()).unwrap();
+    let (service, state) = start_with(&alice.did(), &format!("admins = [\"{}\"]\n", admin.did())).await;
+    let listed = |answer: &Value| answer["body"]["workflows"].as_array().unwrap().len();
+    assert_eq!(listed(&workflow(&alice, &service.did, "discover", json!({})).await), 0);
+    assert_eq!(listed(&workflow(&admin, &service.did, "discover", json!({})).await), 4);
+    let refused = workflow(&alice, &service.did, "start", json!({ "template_id": "admin-files-settings", "instance_id": "a1" })).await;
+    assert_eq!(refused["body"]["code"], "not_authorized");
+
+    // The settings page shows the rules as they are, and saving it changes them.
+    let page = workflow(&admin, &service.did, "start", json!({ "template_id": "admin-files-settings", "instance_id": "s1" })).await;
+    let mut input = serde_json::Map::new();
+    for item in page["body"]["ui"][1]["children"].as_array().unwrap() {
+        if let Some(id) = item["form-id"].as_str() {
+            input.insert(id.to_string(), item["value"].clone());
+        }
+    }
+    assert_eq!(input["everyone_quota"], "300 bytes");
+    input.insert("locked".into(), json!(true));
+    input.insert("everyone_max_file".into(), json!("50 bytes"));
+    let saved = workflow(&admin, &service.did, "advance", json!({ "instance_id": "s1", "event": "save", "input": input })).await;
+    assert_eq!(saved["body"]["ui"][1]["text"], "Saved.");
+    let policy = state.policy().unwrap();
+    assert!(policy.locked && policy.everyone.max_file_bytes == 50 && policy.everyone.quota_bytes == 300);
+
+    // Every file, and one removed.
+    let alice = Uploader::new(alice, &service);
+    let granted = alice.upload("big.txt", b"a file to remove").await;
+    let page = workflow(&admin, &service.did, "start", json!({ "template_id": "admin-files-files", "instance_id": "f1" })).await;
+    assert!(page["body"]["ui"][2]["children"][0]["text"].as_str().unwrap().starts_with("big.txt"));
+    let removed = workflow(&admin, &service.did, "advance", json!({ "instance_id": "f1", "event": "remove", "input": { "file": granted["body"]["file"] } })).await;
+    assert_eq!(removed["body"]["ui"][1]["text"], "Removed big.txt.");
+    assert_eq!(state.host.store.file_count().unwrap(), 0);
+}

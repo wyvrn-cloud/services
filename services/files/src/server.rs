@@ -47,11 +47,13 @@ pub struct AppState {
     /// One chunk at a time per upload: two at once would both see the same
     /// offset and both append.
     uploads: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// The admin pages open now (crate::admin).
+    pub admin: wyvrn_service::admin::Admin,
 }
 
 impl AppState {
     pub fn new(agent: Agent, host: Host, did_document: Option<address::Published>) -> Self {
-        Self { agent, voice: Default::default(), host, did_document, resolver: didcomm_quickstart::default_resolver(), uploads: Default::default() }
+        Self { agent, voice: Default::default(), host, did_document, resolver: didcomm_quickstart::default_resolver(), uploads: Default::default(), admin: Default::default() }
     }
 
     fn upload_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -66,7 +68,8 @@ pub fn build_agent(config: &Config, identity: Identity) -> anyhow::Result<(Agent
     let (agent, document) = address::build_agent(identity, &config.server.public_url, config.server.did_method)?;
     let profile = config.profile.or("FILES", "Files", "Keeps files too big for a message, for the agents it allows, and serves them to anyone with the link.");
     let document = document.map(|document| document.with_profile(&profile)).transpose()?;
-    let features = Features::standard().with_protocol(PIURI, &["host"]);
+    // Its admin pages are workflows, listed to its admins alone (crate::admin).
+    let features = Features::standard().with_protocol(PIURI, &["host"]).with_protocol(wyvrn_service::admin::PIURI, &["processor"]);
     Ok((agent.with_features(features), document))
 }
 
@@ -194,6 +197,13 @@ impl Service for FilesService {
         if received.message_type() == PROFILE {
             take_profile(&self.0, received, sender, kid, now()).await?;
             return Ok(None);
+        }
+        if received.message_type().starts_with(wyvrn_service::admin::PIURI) {
+            let is_admin = self.0.is_admin(sender, kid).await;
+            return Ok(self.0.admin.handle(self.0.as_ref(), is_admin, sender, &received.message, now()).map(|answer| match answer {
+                Ok((kind, body)) => received.reply(&kind, body),
+                Err(refusal) => received.reply(&format!("{}/problem-report", wyvrn_service::admin::PIURI), refusal.body()),
+            }));
         }
         if !received.message_type().starts_with(PIURI) {
             return Ok(None);

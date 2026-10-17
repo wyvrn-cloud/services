@@ -2,6 +2,7 @@
 //! here over HTTPS, in chunks that resume, and hand them to anyone as a DIDComm
 //! attachment by reference. It keeps bytes; it doesn't look at them.
 
+pub mod admin;
 pub mod config;
 pub mod hash;
 pub mod host;
