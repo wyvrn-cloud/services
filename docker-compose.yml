@@ -111,6 +111,9 @@ services:
       # FILES_DID_METHOD: "web"
       # Who may put files here, separated by commas: nobody until someone is named.
       FILES_UPLOADERS: "${FILES_UPLOADERS:-}"
+      # Who runs it (its admin pages are theirs), and whether anyone may sign up.
+      FILES_ADMINS: "${FILES_ADMINS:-}"
+      FILES_OPEN_SIGNUP: "${FILES_OPEN_SIGNUP:-false}"
       # Its records in MySQL or MariaDB instead of the volume, its keys too:
       # mysql://user:password@host/database, a database of this service's own (README.md).
       # The bytes stay in the volume either way.

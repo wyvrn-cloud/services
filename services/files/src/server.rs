@@ -27,6 +27,10 @@ use wyvrn_service::{
 
 use crate::config::Config;
 use crate::host::{Fetch, Host, Put, Refusal, PIURI};
+use crate::policy::{Limits, Policy, Uploader};
+
+const PROFILE: &str = "https://didcomm.org/user-profile/1.0/profile";
+const REQUEST_PROFILE: &str = "https://didcomm.org/user-profile/1.0/request-profile";
 
 /// How often what is past its time is removed.
 const PRUNE_EVERY: Duration = Duration::from_secs(10 * 60);
@@ -79,11 +83,85 @@ async fn rotation(state: &AppState, received: &Received, sender: &str) -> Option
     }
 }
 
-/// Whether `sender` (writing with `kid`) is one of the uploaders the settings
-/// name: by DID, or by the key of a public address's holder.
-async fn is_uploader(state: &AppState, sender: &str, kid: Option<&str>) -> bool {
-    let named = &state.host.config.uploaders;
+/// Whether `sender` (writing with `kid`) is among `named`: by DID, or by the key
+/// of a public address's holder.
+async fn among(state: &AppState, named: &[String], sender: &str, kid: Option<&str>) -> bool {
     named.iter().any(|did| did == sender) || named::holder_among(state.resolver.as_ref(), named, sender, kid).await.is_some()
+}
+
+impl AppState {
+    /// The rules as they stand: an admin's, or the settings' until one has changed them.
+    pub fn policy(&self) -> anyhow::Result<Policy> {
+        Ok(self.host.store.policy()?.unwrap_or_else(|| Policy::from_config(&self.host.config)))
+    }
+
+    pub async fn is_admin(&self, sender: &str, kid: Option<&str>) -> bool {
+        among(self, &self.host.config.admins, sender, kid).await
+    }
+}
+
+/// What may come of a message from someone, before what it asks is looked at.
+enum Access {
+    /// An uploader, with what they may do.
+    Uploader(Limits),
+    Refused(Refusal),
+    /// Would be let in, but the service has no profile for them and wants one.
+    Anonymous,
+}
+
+/// Whether `sender` may put files here, as the rules stand at `now`: an admin; an
+/// uploader the settings name or the service knows and hasn't blocked; or, with
+/// sign-up open and not locked down, anyone, who becomes an uploader by asking.
+async fn access(state: &AppState, sender: &str, kid: Option<&str>, now: i64) -> anyhow::Result<Access> {
+    let policy = state.policy()?;
+    let admin = state.is_admin(sender, kid).await;
+    let known = state.host.store.uploader(sender)?;
+    if known.as_ref().is_some_and(|uploader| uploader.blocked) && !admin {
+        return Ok(Access::Refused(Refusal::not_allowed()));
+    }
+    let in_settings = among(state, &state.host.config.uploaders, sender, kid).await;
+    if !admin && known.is_none() && !in_settings {
+        if policy.locked && policy.open {
+            return Ok(Access::Refused(Refusal::closed()));
+        }
+        if !policy.open || policy.locked {
+            return Ok(Access::Refused(Refusal::not_allowed()));
+        }
+    }
+    if policy.require_profile && !admin && known.as_ref().and_then(|uploader| uploader.name.as_ref()).is_none() {
+        return Ok(Access::Anonymous);
+    }
+    if known.is_none() {
+        let source = if admin { "admin" } else if in_settings { "settings" } else { "signup" };
+        state.host.store.put_uploader(&Uploader { did: sender.to_string(), source: source.to_string(), name: None, limits: None, blocked: false, added: now })?;
+        tracing::info!(uploader = %sender, source, "a new uploader");
+    }
+    Ok(Access::Uploader(policy.limits_for(admin, known.and_then(|uploader| uploader.limits))))
+}
+
+/// Keeps the name a profile gives, for an uploader, or for someone who could
+/// become one: what tells an anonymous uploader from one with a name.
+async fn take_profile(state: &AppState, received: &Received, sender: &str, kid: Option<&str>, now: i64) -> anyhow::Result<()> {
+    let profile = &received.message["body"]["profile"];
+    let Some(name) = profile["displayName"].as_str().map(str::trim).filter(|name| !name.is_empty()) else {
+        return Ok(());
+    };
+    let name: String = name.chars().take(wyvrn_service::profile::MAX_NAME_CHARS).collect();
+    let store = &state.host.store;
+    let uploader = match store.uploader(sender)? {
+        Some(known) => Uploader { name: Some(name), ..known },
+        None => {
+            let policy = state.policy()?;
+            let admin = state.is_admin(sender, kid).await;
+            let in_settings = among(state, &state.host.config.uploaders, sender, kid).await;
+            if !admin && !in_settings && (!policy.open || policy.locked) {
+                return Ok(());
+            }
+            let source = if admin { "admin" } else if in_settings { "settings" } else { "signup" };
+            Uploader { did: sender.to_string(), source: source.to_string(), name: Some(name), limits: None, blocked: false, added: now }
+        }
+    };
+    store.put_uploader(&uploader)
 }
 
 /// The service as the shared plumbing sees it: its agent, and what it answers.
@@ -112,13 +190,26 @@ impl Service for FilesService {
         if let Some(reply) = self.0.agent.auto_reply(received) {
             return Ok(Some(reply));
         }
+        let kid = incoming.sender_kid.as_deref();
+        if received.message_type() == PROFILE {
+            take_profile(&self.0, received, sender, kid, now()).await?;
+            return Ok(None);
+        }
         if !received.message_type().starts_with(PIURI) {
             return Ok(None);
         }
-        let answer = if is_uploader(&self.0, sender, incoming.sender_kid.as_deref()).await {
-            self.0.host.handle(sender, &received.message, now())
-        } else {
-            Some(Err(Refusal::not_allowed()))
+        let answer = match access(&self.0, sender, kid, now()).await? {
+            Access::Uploader(limits) => self.0.host.handle(sender, &limits, &self.0.policy()?, &received.message, now()),
+            Access::Refused(refusal) => Some(Err(refusal)),
+            Access::Anonymous => {
+                // Asked for, apart from this answer: an app that has user-profile/1.0
+                // sends one, and its next try goes through. One that hasn't is refused.
+                let ask = json!({ "type": REQUEST_PROFILE, "body": { "query": ["displayName"] } });
+                if let Err(error) = self.0.voice.send(&self.0.agent, sender, &ask).await {
+                    tracing::debug!(%sender, %error, "couldn't ask an uploader for their profile");
+                }
+                Some(Err(Refusal::anonymous()))
+            }
         };
         Ok(match answer {
             Some(Ok((kind, body))) => Some(received.reply(&format!("{PIURI}/{kind}"), body)),

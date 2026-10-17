@@ -20,20 +20,25 @@ struct Running {
 /// The service, with `uploader` allowed and small limits: 8-byte chunks, 100
 /// bytes a file, 300 bytes in all.
 async fn start_service(uploader: &str) -> Running {
+    start_with(uploader, "").await.0
+}
+
+/// The same, with more `[service]` settings, and the state to change its rules by.
+async fn start_with(uploader: &str, more: &str) -> (Running, Arc<AppState>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let config: wyvrn_files::config::Config = toml::from_str(&format!(
         "[server]\nbind = \"unused\"\npublic_url = \"{url}\"\n[identity]\npath = \"unused\"\n[store]\npath = \"unused\"\ndir = \"unused\"\n\
-         [service]\nuploaders = [\"{uploader}\"]\nchunk_bytes = 8\nmax_file_bytes = 100\nquota_bytes = 300\n"
+         [service]\nuploaders = [\"{uploader}\"]\nchunk_bytes = 8\nmax_file_bytes = 100\nquota_bytes = 300\n{more}"
     ))
     .unwrap();
     let (agent, did_document) = server::build_agent(&config, Identity::generate().unwrap()).unwrap();
     let did = agent.did();
     let host = Host::new(Store::scratch().unwrap(), config.service.clone(), &url);
     let state = Arc::new(AppState::new(agent, host, did_document));
-    let app = server::router(state);
+    let app = server::router(state.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    Running { did, url }
+    (Running { did, url }, state)
 }
 
 struct Uploader {
@@ -183,4 +188,45 @@ async fn only_an_uploader_is_served_and_only_what_was_promised_is_kept() {
     // What nobody was granted is nowhere.
     assert_eq!(reqwest::Client::new().head(format!("{}u/{}", service.url, "A".repeat(27))).send().await.unwrap().status(), 404);
     assert_eq!(reqwest::get(format!("{}f/not-an-id", service.url)).await.unwrap().status(), 404);
+}
+
+#[tokio::test]
+async fn sign_up_is_open_until_locked_down_and_anonymous_uploads_can_be_refused() {
+    let admin = Agent::new(Identity::generate().unwrap()).unwrap();
+    let (service, state) = start_with("did:example:nobody", &format!("admins = [\"{}\"]\nopen_signup = true\n", admin.did())).await;
+    let stranger = || Uploader::new(Agent::new(Identity::generate().unwrap()).unwrap(), &service);
+
+    // Open: anyone who authenticates is an uploader by asking.
+    let carol = stranger();
+    assert_eq!(kind(&carol.upload("a.txt", b"hello").await), "upload-granted");
+    assert_eq!(state.host.store.uploader(&carol.agent.did()).unwrap().unwrap().source, "signup");
+
+    // Locked down: nobody new, and those already in carry on.
+    let mut policy = state.policy().unwrap();
+    policy.locked = true;
+    state.host.store.set_policy(&policy).unwrap();
+    let dave = stranger();
+    let refused = dave.upload("b.txt", b"hi").await;
+    assert_eq!(refused["body"]["comment"], "This service isn't taking new uploaders right now.");
+    assert_eq!(kind(&carol.upload("c.txt", b"more").await), "upload-granted");
+    // An admin always may.
+    assert_eq!(kind(&Uploader::new(admin, &service).upload("d.txt", b"mine").await), "upload-granted");
+
+    // No profile, no files: asked for one, and let in once it has come.
+    policy.locked = false;
+    policy.require_profile = true;
+    state.host.store.set_policy(&policy).unwrap();
+    let refused = dave.upload("b.txt", b"hi").await;
+    assert_eq!(refused["body"]["code"], "e.p.msg.not-allowed");
+    assert!(refused["body"]["comment"].as_str().unwrap().contains("profile"));
+    let profile = json!({ "type": "https://didcomm.org/user-profile/1.0/profile", "body": { "profile": { "displayName": "Dave" } } });
+    dave.agent.send(&service.did, &profile).await.unwrap();
+    assert_eq!(kind(&dave.upload("b.txt", b"hi").await), "upload-granted");
+    assert_eq!(state.host.store.uploader(&dave.agent.did()).unwrap().unwrap().name.as_deref(), Some("Dave"));
+
+    // Blocked: out, whatever else.
+    let mut blocked = state.host.store.uploader(&dave.agent.did()).unwrap().unwrap();
+    blocked.blocked = true;
+    state.host.store.put_uploader(&blocked).unwrap();
+    assert_eq!(dave.upload("e.txt", b"again").await["body"]["code"], "e.p.msg.not-allowed");
 }

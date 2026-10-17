@@ -5,5 +5,6 @@
 pub mod config;
 pub mod hash;
 pub mod host;
+pub mod policy;
 pub mod server;
 pub mod store;

@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use wyvrn_service::db::{self, Db, Location, Row, Schema, MYSQL_DID, MYSQL_TABLE};
 use wyvrn_service::params;
 
+use crate::policy::{Limits, Policy, Uploader};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Uploading,
@@ -75,7 +77,11 @@ const SQLITE: &str = r#"CREATE TABLE IF NOT EXISTS files (
         id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL, media_type TEXT NOT NULL,
         byte_count INTEGER NOT NULL, hash TEXT NOT NULL, state TEXT NOT NULL, created INTEGER NOT NULL,
         upload_expires INTEGER NOT NULL, expires INTEGER NOT NULL);
-     CREATE INDEX IF NOT EXISTS files_owner ON files (owner);"#;
+     CREATE INDEX IF NOT EXISTS files_owner ON files (owner);
+     CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
+     CREATE TABLE IF NOT EXISTS uploaders (
+        did TEXT PRIMARY KEY, source TEXT NOT NULL, name TEXT, limits TEXT,
+        blocked INTEGER NOT NULL DEFAULT 0, added INTEGER NOT NULL);"#;
 
 fn schema() -> Schema {
     static MYSQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -85,7 +91,11 @@ fn schema() -> Schema {
                 id VARCHAR(64) NOT NULL PRIMARY KEY, owner {MYSQL_DID} NOT NULL, name VARCHAR(255) NOT NULL, media_type VARCHAR(255) NOT NULL,
                 byte_count BIGINT NOT NULL, hash VARCHAR(128) NOT NULL, state VARCHAR(16) NOT NULL, created BIGINT NOT NULL,
                 upload_expires BIGINT NOT NULL, expires BIGINT NOT NULL,
-                INDEX files_owner (owner)) {MYSQL_TABLE}"#
+                INDEX files_owner (owner)) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS settings (name VARCHAR(64) NOT NULL PRIMARY KEY, value TEXT NOT NULL) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS uploaders (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY, source VARCHAR(16) NOT NULL, name VARCHAR(255), limits TEXT,
+                blocked INT NOT NULL DEFAULT 0, added BIGINT NOT NULL) {MYSQL_TABLE}"#
         )
     });
     Schema { sqlite: SQLITE, mysql }
@@ -242,10 +252,90 @@ impl Store {
         Ok(gone.len())
     }
 
-    /// An uploader's change of DID: their files go with them.
+    /// An uploader's change of DID: their files go with them, and so does what
+    /// the service knows of them, unless it already knows the new DID.
     pub fn rotate(&self, prior: &str, new: &str) -> anyhow::Result<bool> {
-        Ok(self.db.lock().execute("UPDATE files SET owner = ?2 WHERE owner = ?1", params![prior, new])? > 0)
+        let mut db = self.db.lock();
+        let moved = db.execute("UPDATE files SET owner = ?2 WHERE owner = ?1", params![prior, new])? > 0;
+        let known: i64 = db.query_value("SELECT COUNT(*) FROM uploaders WHERE did = ?1", params![new])?;
+        let carried = known == 0 && db.execute("UPDATE uploaders SET did = ?2 WHERE did = ?1", params![prior, new])? > 0;
+        Ok(moved || carried)
     }
+
+    /// Everything held, by everyone, in bytes.
+    pub fn used_total(&self) -> anyhow::Result<u64> {
+        let used: Option<i64> = self.db.lock().query_value("SELECT SUM(byte_count) FROM files", params![])?;
+        Ok(used.unwrap_or(0).max(0) as u64)
+    }
+
+    /// Every file, the largest first: what an admin looks through.
+    pub fn largest(&self, limit: usize) -> anyhow::Result<Vec<FileRecord>> {
+        Ok(self.db.lock().query(&format!("SELECT {COLUMNS} FROM files ORDER BY byte_count DESC, id LIMIT {limit}"), params![], file_row)?)
+    }
+
+    pub fn file_count(&self) -> anyhow::Result<u64> {
+        let count: i64 = self.db.lock().query_value("SELECT COUNT(*) FROM files", params![])?;
+        Ok(count.max(0) as u64)
+    }
+
+    // --- The rules, and who is an uploader.
+
+    /// The rules an admin has set, if one has.
+    pub fn policy(&self) -> anyhow::Result<Option<Policy>> {
+        let text: Option<String> = self.db.lock().query_row("SELECT value FROM settings WHERE name = 'policy'", params![], |row| row.get(0))?;
+        text.map(|text| serde_json::from_str(&text).map_err(Into::into)).transpose()
+    }
+
+    pub fn set_policy(&self, policy: &Policy) -> anyhow::Result<()> {
+        let text = serde_json::to_string(policy)?;
+        self.db.lock().transaction(|db| -> anyhow::Result<()> {
+            db.execute("DELETE FROM settings WHERE name = 'policy'", params![])?;
+            db.execute("INSERT INTO settings (name, value) VALUES ('policy', ?1)", params![text])?;
+            Ok(())
+        })
+    }
+
+    pub fn uploader(&self, did: &str) -> anyhow::Result<Option<Uploader>> {
+        Ok(self.db.lock().query_row(&format!("SELECT {UPLOADER_COLUMNS} FROM uploaders WHERE did = ?1"), params![did], uploader_row)?)
+    }
+
+    /// Everyone the service knows as an uploader, the most recent first.
+    pub fn uploaders(&self) -> anyhow::Result<Vec<Uploader>> {
+        Ok(self.db.lock().query(&format!("SELECT {UPLOADER_COLUMNS} FROM uploaders ORDER BY added DESC, did"), params![], uploader_row)?)
+    }
+
+    /// Writes what is known of an uploader, in place of what was.
+    pub fn put_uploader(&self, uploader: &Uploader) -> anyhow::Result<()> {
+        let limits = uploader.limits.map(|limits| serde_json::to_string(&limits)).transpose()?;
+        self.db.lock().transaction(|db| -> anyhow::Result<()> {
+            db.execute("DELETE FROM uploaders WHERE did = ?1", params![uploader.did])?;
+            db.execute(
+                &format!("INSERT INTO uploaders ({UPLOADER_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"),
+                params![uploader.did, uploader.source, uploader.name, limits, i64::from(uploader.blocked), uploader.added],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Forgets an uploader. Their files stay until they expire or are removed.
+    pub fn remove_uploader(&self, did: &str) -> anyhow::Result<bool> {
+        Ok(self.db.lock().execute("DELETE FROM uploaders WHERE did = ?1", params![did])? > 0)
+    }
+}
+
+const UPLOADER_COLUMNS: &str = "did, source, name, limits, blocked, added";
+
+fn uploader_row(row: &Row) -> db::Result<Uploader> {
+    let limits: Option<String> = row.get(3)?;
+    Ok(Uploader {
+        did: row.get(0)?,
+        source: row.get(1)?,
+        name: row.get(2)?,
+        // Limits that can't be read are as if none were set: the tier's apply.
+        limits: limits.and_then(|text| serde_json::from_str::<Limits>(&text).ok()),
+        blocked: row.get::<i64>(4)? != 0,
+        added: row.get(5)?,
+    })
 }
 
 fn file_row(row: &Row) -> db::Result<FileRecord> {
@@ -311,5 +401,28 @@ mod tests {
         assert!(store.rotate("did:example:alice", "did:example:alice2").unwrap());
         assert_eq!(store.files_of("did:example:alice2").unwrap().len(), 1);
         assert!(!store.rotate("did:example:nobody", "did:example:x").unwrap());
+    }
+
+    #[test]
+    fn the_rules_and_the_uploaders_are_kept() {
+        let store = Store::scratch().unwrap();
+        assert_eq!(store.policy().unwrap(), None);
+        let mut policy = Policy::from_config(&crate::config::ServiceConfig::default());
+        policy.locked = true;
+        store.set_policy(&policy).unwrap();
+        store.set_policy(&policy).unwrap();
+        assert_eq!(store.policy().unwrap(), Some(policy.clone()));
+
+        let alice = Uploader { did: "did:example:alice".into(), source: "signup".into(), name: None, limits: None, blocked: false, added: 5 };
+        store.put_uploader(&alice).unwrap();
+        let named = Uploader { name: Some("Alice".into()), limits: Some(Limits { quota_bytes: 7, ..policy.everyone }), ..alice.clone() };
+        store.put_uploader(&named).unwrap();
+        assert_eq!(store.uploader("did:example:alice").unwrap(), Some(named.clone()));
+        assert_eq!(store.uploaders().unwrap().len(), 1);
+        // A change of DID carries them over.
+        store.rotate("did:example:alice", "did:example:alice2").unwrap();
+        assert_eq!(store.uploader("did:example:alice2").unwrap().unwrap().name.as_deref(), Some("Alice"));
+        assert!(store.remove_uploader("did:example:alice2").unwrap());
+        assert_eq!(store.uploader("did:example:alice2").unwrap(), None);
     }
 }

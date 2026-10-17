@@ -117,6 +117,9 @@ services:
       FILES_PUBLIC_URL: "https://${FILES_DOMAIN:?set FILES_DOMAIN in .env}/"
       FILES_DID_METHOD: "web"
       FILES_UPLOADERS: "${FILES_UPLOADERS:-}"
+      # Who runs it (its admin pages are theirs), and whether anyone may sign up.
+      FILES_ADMINS: "${FILES_ADMINS:-}"
+      FILES_OPEN_SIGNUP: "${FILES_OPEN_SIGNUP:-false}"
       FILES_QUOTA_BYTES: "${FILES_QUOTA_BYTES:-10737418240}"
       FILES_DATABASE_URL: "${FILES_DATABASE_URL:?set FILES_DATABASE_URL in .env}"
       # Who it says it is, to someone looking its DID up (../../README.md).

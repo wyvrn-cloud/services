@@ -48,12 +48,24 @@ that passes the domain to it ([`deploy/services`](../../deploy/services)).
 | `FILES_PUBLIC_URL` | Where it is reached: its DIDComm endpoint, and the start of every file's address. Part of every link it hands out, so it can't change afterwards. |
 | `FILES_DID_METHOD` | `peer` or `web`. |
 | `FILES_UPLOADERS` | Who may put files here, separated by commas: the DID an agent writes from, or a public address at a DID host (`did:web:id.example:frosty:claude`), matched by the key its holder writes with. Nobody, until someone is named. |
+| `FILES_ADMINS` | Who runs it, separated by commas: DIDs, or public addresses as for uploaders. They may always upload (under the admins' limits), and they alone see its admin pages. |
+| `FILES_OPEN_SIGNUP` | `true`: anyone who authenticates becomes an uploader at their first upload. Off unless set. |
+| `FILES_TOTAL_BYTES` | The most it holds of everyone's. 0 (the default): no limit but the disk. |
 | `FILES_QUOTA_BYTES` | How much each uploader may keep in all. 10 GiB. |
 | `FILES_MAX_FILE_BYTES` | The largest file. 4 GiB. |
 | `FILES_DIR` | Where the bytes are. `data/files`. |
 | `FILES_DATABASE_URL` | Its records (and its keys) in MySQL or MariaDB instead of SQLite: `mysql://user:password@host/database`, a database of its own ([the root README](../../README.md)). The bytes are on disk either way. |
 | `FILES_PUBLIC_ADDRESS` | An address for it at the DID host (`did:web:id.example:official:files`), to be known by. The name is set aside for it first: `wyvrn-did-host assign official:files did:web:files.example`. |
 | `FILES_PROFILE_NAME`, `_DESCRIPTION`, `_PICTURE` | Who it says it is to someone looking its DID up. |
+
+Whether sign-up is open, the total, and the limits (quota, largest file, longest
+keep, uploads at once) are where the service starts. An admin changes them while
+it runs, from its admin pages in the app; what an admin sets is kept in the
+database and wins from then on. There they can also lock sign-up down (nobody
+new, everyone in carries on), refuse uploaders it has no profile for (they are
+asked for one, through user-profile/1.0), give admins limits of their own, set an
+uploader's limits in place of their tier's, block or remove an uploader, and
+look through every file, the largest first.
 
 The chunk size (64 MiB), how long a file is kept by default and at most, how
 long an unfinished upload is kept (a day) and how many an uploader may have
