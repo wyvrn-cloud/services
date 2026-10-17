@@ -13,7 +13,7 @@ nothing: it fetches the address once and reads the page's
 | --- | --- |
 | `/dl/<did>` | A page of tags saying who a public address is: its name, where it is hosted, its description, and the card below. |
 | `/dl?_oob=…` | The same for a contact invite, from what the invite carries. |
-| `/card/a/<did>.png` | An address's card: 1200 by 630, with its picture, name, address, description, banner and background. |
+| `/card/a/<did>.png?v=…` | An address's card: 1200 by 630, with its picture, name, address, description, banner and background. The page names it with `v`, a mark of what it shows, so that a link preview that keeps pictures by their address fetches a changed card again; the card itself ignores it. |
 | `/card/i/<id>.png` | An invite's card, for an hour after its page was asked for. |
 | `/healthz` | `ok`. |
 

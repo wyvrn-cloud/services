@@ -4,7 +4,7 @@
 //! | --- | --- |
 //! | `/dl/<did>` | A page saying who a public address is, in OpenGraph tags. |
 //! | `/dl?_oob=…` | The same for a contact invite. |
-//! | `/card/a/<did>.png` | An address's card. |
+//! | `/card/a/<did>.png?v=…` | An address's card. `v` is what it shows (`Who::version`), and is otherwise ignored. |
 //! | `/card/i/<id>.png` | An invite's card, for as long as it is remembered. |
 //!
 //! The `/dl` paths are the web app's own: a person's browser is to get the app
@@ -209,7 +209,10 @@ async fn address_page(State(state): State<Arc<AppState>>, uri: Uri, headers: Hea
                 (None, Some(description)) => description.clone(),
                 (None, None) => format!("A public address on {}", state.config.site_name),
             };
-            page(&state, &link, who.title(), &description, Some(&format!("{site}/card/a/{did}.png")))
+            // The picture's address changes with what it shows: whatever showed the
+            // link keeps the picture by its address, and a page fetched again for a
+            // changed profile went on showing the old one.
+            page(&state, &link, who.title(), &description, Some(&format!("{site}/card/a/{did}.png?v={}", who.version())))
         }
         // Still a link to somewhere: said plainly, with no picture of anyone.
         Err(_) => page(&state, &link, &who::written(&did), &format!("A public address on {}", state.config.site_name), None),

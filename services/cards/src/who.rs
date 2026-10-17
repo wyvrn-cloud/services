@@ -47,6 +47,21 @@ impl Who {
     pub fn title(&self) -> &str {
         self.name.as_deref().unwrap_or(&self.label)
     }
+
+    /// A short mark of everything its card shows: the same while the card would be
+    /// drawn the same, and another once anything on it changes.
+    pub fn version(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        for part in [Some(&self.did), Some(&self.label), self.name.as_ref(), self.description.as_ref(), self.picture.as_ref(), self.banner.as_ref(), self.background.as_ref()] {
+            // Each part's length first, so that no two lists of parts run together the same.
+            let part = part.map(String::as_str).unwrap_or_default();
+            hash.update((part.len() as u64).to_be_bytes());
+            hash.update(part.as_bytes());
+        }
+        hash.update(format!("{:?}", self.marks).as_bytes());
+        hash.finalize().iter().take(6).map(|byte| format!("{byte:02x}")).collect()
+    }
 }
 
 /// A `data:` URL that is a bitmap and nothing else: what may be put in a card.
@@ -284,6 +299,18 @@ impl Fetch for Https {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_card_s_version_follows_what_it_shows() {
+        let who = Who { did: "did:web:id.example:alice".into(), label: "alice via id.example".into(), name: Some("Alice".into()), description: None, picture: None, banner: None, background: None, marks: vec![] };
+        assert_eq!(who.version(), who.clone().version());
+        assert_eq!(who.version().len(), 12);
+        let with_banner = Who { banner: Some("data:image/png;base64,AAAA".into()), ..who.clone() };
+        assert_ne!(who.version(), with_banner.version());
+        // Parts don't run into one another: a name moved into the description is a change.
+        let moved = Who { name: None, description: Some("Alice".into()), ..who.clone() };
+        assert_ne!(who.version(), moved.version());
+    }
     use super::*;
     use serde_json::json;
 

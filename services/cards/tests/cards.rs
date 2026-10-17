@@ -84,10 +84,14 @@ async fn a_link_to_an_address_says_who_it_is_and_names_its_card() {
     // What the profile says is text, wherever it is put.
     assert!(html.contains(r#"<meta property="og:description" content="updates.example · Release notes &amp; news, &lt;as&gt; they happen.">"#), "{html}");
     assert!(html.contains(r#"<meta property="og:url" content="https://chat.example/dl/did:web:updates.example">"#), "{html}");
-    assert!(html.contains(r#"<meta property="og:image" content="https://chat.example/card/a/did:web:updates.example.png">"#), "{html}");
+    // The picture's address carries a mark of what it shows, so that whatever
+    // keeps pictures by their address fetches it again once the profile changes.
+    let image = html.split(r#"<meta property="og:image" content=""#).nth(1).and_then(|rest| rest.split('"').next()).expect("an og:image");
+    let version = image.strip_prefix("https://chat.example/card/a/did:web:updates.example.png?v=").expect(image);
+    assert!(version.len() == 12 && version.bytes().all(|b| b.is_ascii_hexdigit()), "{image}");
     assert!(html.contains(r#"<meta name="twitter:card" content="summary_large_image">"#));
 
-    let (status, kind, png) = get(&state, "/card/a/did:web:updates.example.png").await;
+    let (status, kind, png) = get(&state, &format!("/card/a/did:web:updates.example.png?v={version}")).await;
     assert_eq!((status, kind.as_str()), (StatusCode::OK, "image/png"));
     assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
     if let Ok(to) = std::env::var("CARDS_TEST_OUT") {
