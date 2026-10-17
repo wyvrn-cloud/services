@@ -1,0 +1,43 @@
+# wyvrn-files: what `cargo run` and the Docker image start with. The environment
+# overrides the settings a deployment most often changes (see README.md).
+
+[server]
+bind = "0.0.0.0:8080"
+# Where the service is reached: its DIDComm endpoint, and the start of every
+# file's address (<public_url>f/<id>), so it is part of every link handed out.
+public_url = "http://localhost:8080/"
+# "peer" needs nothing published; "web" makes the service did:web:<its own domain>.
+did_method = "peer"
+
+[identity]
+path = "data/identity.json"
+
+[store]
+# Its records: the files it holds, whose they are, when they go.
+path = "data/files.sqlite"
+# The bytes themselves, one file per id.
+dir = "data/files"
+
+[service]
+# Who may put files here: DIDs (the one an app writes from, or a public address
+# at a DID host, matched by the key its holder writes with). Nobody, until
+# someone is named.
+uploaders = []
+# How much each uploader may keep here, in all. 10 GiB.
+quota_bytes = 10737418240
+# The largest file. 4 GiB.
+max_file_bytes = 4294967296
+# The most bytes one PUT may carry. 64 MiB.
+chunk_bytes = 67108864
+# How long a file is kept once complete, unless the uploader asks otherwise,
+# and the most it may ask for. 14 and 90 days.
+default_keep_seconds = 1209600
+max_keep_seconds = 7776000
+# An upload that isn't completed within this is dropped. A day.
+upload_deadline_seconds = 86400
+# How many uploads one uploader may have going at once.
+max_uploads_in_progress = 16
+
+# To have messages to the service arrive through a mediator instead of at public_url:
+# [mediator]
+# did = "did:web:mediator.wyvrn.app"

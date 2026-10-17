@@ -62,6 +62,25 @@ stickers.example {
 # 	reverse_proxy 127.0.0.1:8184
 # }
 
+# A files service: uploads come in 64 MiB chunks, and what it serves is already
+# compressed or not worth compressing, so no `encode`; `request_body` lets a
+# chunk through (the service refuses anything longer itself).
+# files.example {
+# 	route {
+# 		import wyvrn-limits
+# 		request_body {
+# 			max_size 65MB
+# 		}
+# 		reverse_proxy 127.0.0.1:8186 {
+# 			# A chunk, or a file, can take a while.
+# 			transport http {
+# 				read_timeout 10m
+# 				write_timeout 10m
+# 			}
+# 		}
+# 	}
+# }
+
 # Link cards, in front of the web app (README.md, "Link cards"): add these to the
 # block the web app's domain already has, above what serves the app itself.
 #
