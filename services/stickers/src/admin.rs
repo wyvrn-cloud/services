@@ -85,7 +85,7 @@ impl Pages for AppState {
                     return Err(format!("{bad} is longer than any pack's name could be."));
                 }
                 store.set_reserved_names(Some(&names)).map_err(failed)?;
-                Ok(Some(format!("Saved: {} names.", names.len())))
+                Ok(Some(format!("Saved: {} name{}.", names.len(), if names.len() == 1 { "" } else { "s" })))
             }
             (NAMES, "reset") => {
                 store.set_reserved_names(None).map_err(failed)?;
