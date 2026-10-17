@@ -119,7 +119,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         "host ready"
     );
 
-    let state = Arc::new(AppState { agent, host, did_document });
+    let state = Arc::new(AppState { agent, host, did_document, admin: Default::default() });
     tokio::spawn(server::run_staleness_checks(state.clone()));
     if let Some(mediator) = &config.mediator {
         let service = Arc::new(server::HostService(state.clone()));

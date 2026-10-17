@@ -93,7 +93,9 @@ and from there the DID is the holder's. An admin cannot change it, only free the
 name, which ends its hosting.
 
 Admins are the DIDs in `DID_HOST_ADMINS` (`host.admins`), and send `assign` and
-`free` as DIDComm messages. Whoever is at the machine can do the same:
+`free` as DIDComm messages. In the app they have an admin page for it (a
+workflow only admins are shown): every name and how it stands, with setting one
+aside and freeing it. Whoever is at the machine can do the same:
 
 ```sh
 docker compose exec did-host wyvrn-did-host names

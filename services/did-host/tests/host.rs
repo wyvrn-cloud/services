@@ -39,7 +39,7 @@ async fn start_host(admins: &[String]) -> Running {
     let (agent, did_document) = server::build_agent(&config, Identity::generate().unwrap()).unwrap();
     let did = agent.did();
     let host = Host::new(Store::in_memory().unwrap(), config.host.clone(), didcomm_quickstart::default_resolver());
-    let state = Arc::new(AppState { agent, host, did_document });
+    let state = Arc::new(AppState { agent, host, did_document, admin: Default::default() });
     let app = server::router(state.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     Running { did, url, state }
@@ -1108,4 +1108,29 @@ async fn a_service_holds_an_address_and_is_found_by_it_from_its_own_domain() {
     holding.publish_whois(&did, 1_800_000_200).await.unwrap();
     let who = wyvrn_hosted_did::whois_of(&found, &files()).await.unwrap().unwrap();
     assert_eq!(who.name.as_deref(), Some("Wyvrn Updates"));
+}
+
+async fn workflow(agent: &Agent, host: &str, kind: &str, body: Value) -> Value {
+    let message = json!({ "type": format!("https://didcomm.org/workflow/1.0/{kind}"), "body": body, "return_route": "all" });
+    agent.send(host, &message).await.expect("sent").expect("an answer").message
+}
+
+#[tokio::test]
+async fn an_admin_sets_names_aside_and_frees_them_from_the_admin_page() {
+    let admin = Agent::new(Identity::generate().unwrap()).unwrap();
+    let stranger = Agent::new(Identity::generate().unwrap()).unwrap();
+    let host = start_host(&[admin.did()]).await;
+    assert_eq!(workflow(&stranger, &host.did, "discover", json!({})).await["body"]["workflows"], json!([]));
+    assert_eq!(workflow(&admin, &host.did, "discover", json!({})).await["body"]["workflows"][0]["template_id"], "admin-did-host-names");
+    assert_eq!(workflow(&stranger, &host.did, "start", json!({ "template_id": "admin-did-host-names", "instance_id": "x" })).await["body"]["code"], "not_authorized");
+
+    workflow(&admin, &host.did, "start", json!({ "template_id": "admin-did-host-names", "instance_id": "n1" })).await;
+    let set = workflow(&admin, &host.did, "advance", json!({ "instance_id": "n1", "event": "assign", "input": { "name": "news", "holder": "" } })).await;
+    assert_eq!(set["body"]["ui"][1]["text"], "news is set aside for nobody.");
+    assert!(set["body"]["ui"].as_array().unwrap().iter().any(|item| item["children"][0]["text"] == "news · reserved"));
+    assert!(host.state.host.store.get("news").unwrap().unwrap().reserved);
+    let freed = workflow(&admin, &host.did, "advance", json!({ "instance_id": "n1", "event": "free", "input": { "name": "news" } })).await;
+    assert_eq!(freed["body"]["ui"][1]["text"], "news is free.");
+    let wrong = workflow(&admin, &host.did, "advance", json!({ "instance_id": "n1", "event": "assign", "input": { "name": "Not A Name!", "holder": "" } })).await;
+    assert_eq!(wrong["body"]["ui"][1]["type"], "error");
 }

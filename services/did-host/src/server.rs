@@ -35,6 +35,8 @@ pub struct AppState {
     pub host: Host,
     /// Published at `/.well-known/did.json` when the host itself is a `did:web`.
     pub did_document: Option<address::Published>,
+    /// The admin pages open now (crate::admin).
+    pub admin: wyvrn_service::admin::Admin,
 }
 
 /// The agent for `config`: the host's own DID, which holders write to.
@@ -43,7 +45,7 @@ pub fn build_agent(config: &Config, identity: Identity) -> anyhow::Result<(Agent
     // Who it is, for whoever looks its DID up before writing to it.
     let profile = config.profile.or("DID_HOST", "Public addresses", "Hosts public addresses: short names that people and services are found by.");
     let document = document.map(|document| document.with_profile(&profile)).transpose()?;
-    Ok((agent.with_features(Features::standard().with_protocol(PIURI, &["host"])), document))
+    Ok((agent.with_features(Features::standard().with_protocol(PIURI, &["host"]).with_protocol(wyvrn_service::admin::PIURI, &["processor"])), document))
 }
 
 /// The host as the shared plumbing sees it: its agent, and what it answers.
@@ -71,6 +73,16 @@ impl Service for HostService {
         self.0.host.note_sender(received, kid, now()).await?;
         if let Some(reply) = self.0.agent.auto_reply(received) {
             return Ok(Some(reply));
+        }
+        if received.message_type().starts_with(wyvrn_service::admin::PIURI) {
+            let Some(sender) = received.sender.as_deref() else {
+                return Ok(None);
+            };
+            let is_admin = self.0.host.is_admin_by(sender, kid).await;
+            return Ok(self.0.admin.handle(self.0.as_ref(), is_admin, sender, &received.message, now()).map(|answer| match answer {
+                Ok((kind, body)) => received.reply(&kind, body),
+                Err(refusal) => received.reply(&format!("{}/problem-report", wyvrn_service::admin::PIURI), refusal.body()),
+            }));
         }
         self.0.host.handle(received, kid, now()).await
     }

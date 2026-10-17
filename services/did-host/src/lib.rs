@@ -8,6 +8,7 @@
 //! - [`host`]: the protocol -- what each message does.
 //! - [`server`]: the HTTP side: the endpoint messages come to, and serving what is hosted.
 
+pub mod admin;
 pub mod config;
 pub mod host;
 pub mod log;

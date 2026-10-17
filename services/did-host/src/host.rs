@@ -133,6 +133,15 @@ impl Host {
         Some(Sender { did: did.to_string(), key: key.to_string() })
     }
 
+    /// Whether a message from `did`, authenticated with `kid`, is an admin's:
+    /// what lets them into the host's admin pages (crate::admin).
+    pub async fn is_admin_by(&self, did: &str, kid: &str) -> bool {
+        match self.sender(did, kid).await {
+            Some(sender) => self.is_admin(&sender).await,
+            None => false,
+        }
+    }
+
     async fn is_admin(&self, sender: &Sender) -> bool {
         for admin in &self.config.admins {
             if *admin == sender.did || sender.holds(&self.keys_of(admin).await) {
