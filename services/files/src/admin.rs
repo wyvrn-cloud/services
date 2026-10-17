@@ -36,7 +36,7 @@ fn when(time: i64, now: i64) -> String {
 /// of, so that saving a form unchanged changes nothing.
 fn exact(n: u64) -> String {
     for (unit, name) in [(1u64 << 40, "TB"), (1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "KB")] {
-        if n >= unit && n % unit == 0 {
+        if n >= unit && n.is_multiple_of(unit) {
             return format!("{} {name}", n / unit);
         }
     }
