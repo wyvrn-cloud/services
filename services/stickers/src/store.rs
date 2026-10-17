@@ -116,7 +116,8 @@ const SQLITE: &str = r#"CREATE TABLE IF NOT EXISTS packs (
         status TEXT NOT NULL, context TEXT NOT NULL, updated INTEGER NOT NULL);
      CREATE INDEX IF NOT EXISTS instances_owner ON instances (owner);
      CREATE TABLE IF NOT EXISTS advances (
-        instance TEXT NOT NULL, "key" TEXT NOT NULL, PRIMARY KEY (instance, "key"));"#;
+        instance TEXT NOT NULL, "key" TEXT NOT NULL, PRIMARY KEY (instance, "key"));
+     CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);"#;
 
 fn schema() -> Schema {
     static MYSQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -137,7 +138,8 @@ fn schema() -> Schema {
                 status VARCHAR(32) NOT NULL, context LONGTEXT NOT NULL, updated BIGINT NOT NULL,
                 INDEX instances_owner (owner)) {MYSQL_TABLE};
              CREATE TABLE IF NOT EXISTS advances (
-                instance VARCHAR(255) NOT NULL, "key" VARCHAR(255) NOT NULL, PRIMARY KEY (instance, "key")) {MYSQL_TABLE}"#
+                instance VARCHAR(255) NOT NULL, "key" VARCHAR(255) NOT NULL, PRIMARY KEY (instance, "key")) {MYSQL_TABLE};
+             CREATE TABLE IF NOT EXISTS settings (name VARCHAR(64) NOT NULL PRIMARY KEY, value TEXT NOT NULL) {MYSQL_TABLE}"#
         )
     });
     Schema { sqlite: SQLITE, mysql }
@@ -150,6 +152,26 @@ impl Store {
 
     pub fn in_memory() -> anyhow::Result<Self> {
         Ok(Self { db: Db::scratch(&schema())? })
+    }
+
+    // --- what an admin has set
+
+    /// The names set aside by an admin, in place of the settings', if one has.
+    pub fn reserved_names(&self) -> anyhow::Result<Option<Vec<String>>> {
+        let text: Option<String> = self.db.lock().query_row("SELECT value FROM settings WHERE name = 'reserved_names'", params![], |row| row.get(0))?;
+        text.map(|text| serde_json::from_str(&text).map_err(Into::into)).transpose()
+    }
+
+    /// Sets them, or with `None` goes back to the settings'.
+    pub fn set_reserved_names(&self, names: Option<&[String]>) -> anyhow::Result<()> {
+        let text = names.map(serde_json::to_string).transpose()?;
+        self.db.lock().transaction(|db| -> anyhow::Result<()> {
+            db.execute("DELETE FROM settings WHERE name = 'reserved_names'", params![])?;
+            if let Some(text) = text {
+                db.execute("INSERT INTO settings (name, value) VALUES ('reserved_names', ?1)", params![text])?;
+            }
+            Ok(())
+        })
     }
 
     // --- packs

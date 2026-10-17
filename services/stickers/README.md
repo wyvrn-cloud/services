@@ -133,6 +133,14 @@ environment overrides `STICKERS_BIND`, `STICKERS_PUBLIC_URL`,
 to the service arrive through a mediator instead of at `public_url`; packs are
 fetched over HTTPS regardless.
 
+## Admin pages
+
+`STICKERS_ADMINS` (DIDs, or public addresses matched by their holder's key) see
+two admin pages in the app, as workflows nobody else is shown: every pack and
+who made it, to take one down (as `wyvrn-stickers remove` does), and the names
+no pack may take. Names an admin sets are kept in the database in place of
+`reserved_names`, until they go back to the settings' list.
+
 ## Development
 
 ```sh

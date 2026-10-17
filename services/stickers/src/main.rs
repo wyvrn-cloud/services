@@ -86,7 +86,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let processor = Processor::new(open_store(&config)?, config.service.clone(), &config.server.public_url);
     tracing::info!(did = %agent.did(), url = %config.server.public_url, packs = processor.store.packs(None)?.len(), "sticker service ready");
 
-    let state = Arc::new(AppState { agent, voice: Default::default(), processor, did_document, resolver: didcomm_quickstart::default_resolver() });
+    let state = Arc::new(AppState { agent, voice: Default::default(), processor, did_document, resolver: didcomm_quickstart::default_resolver(), admin: Default::default() });
     // A public address at a DID host, if it is set to hold one (STICKERS_PUBLIC_ADDRESS):
     // taken up once the service is serving, and kept up to date from then on.
     if let (Some(address), Some(document)) = (wyvrn_service::hosted_address::Address::from_env("STICKERS")?, state.did_document.clone()) {

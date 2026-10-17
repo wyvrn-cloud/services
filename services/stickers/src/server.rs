@@ -20,7 +20,7 @@ use tower_http::cors::CorsLayer;
 use wyvrn_service::{
     address,
     http::{internal, receive},
-    now, Incoming, Service,
+    named, now, Incoming, Service,
 };
 
 use crate::config::Config;
@@ -42,6 +42,17 @@ pub struct AppState {
     pub did_document: Option<address::Published>,
     /// Resolves the DID a `from_prior` names, to check who signed it.
     pub resolver: Box<dyn DIDResolver>,
+    /// The admin pages open now (crate::admin).
+    pub admin: wyvrn_service::admin::Admin,
+}
+
+impl AppState {
+    /// Whether `sender` (writing with `kid`) is one of `STICKERS_ADMINS`: by DID,
+    /// or by the key of a public address's holder.
+    pub async fn is_admin(&self, sender: &str, kid: Option<&str>) -> bool {
+        let admins = &self.processor.config.admins;
+        admins.iter().any(|did| did == sender) || named::holder_among(self.resolver.as_ref(), admins, sender, kid).await.is_some()
+    }
 }
 
 /// The agent for `config`: the service's own DID, which makers write to.
@@ -95,6 +106,27 @@ impl Service for StickerService {
         }
         if let Some(reply) = self.0.agent.auto_reply(received) {
             return Ok(Some(reply));
+        }
+        // Admin pages are workflows too: discover lists them beside the service's
+        // own (to an admin), and a message about one goes to them.
+        if received.message_type().starts_with(PIURI) {
+            let admin = &self.0.admin;
+            let is_admin = self.0.is_admin(sender, incoming.sender_kid.as_deref()).await;
+            if received.message_type().ends_with("/discover") {
+                if let Some(Ok((kind, mut body))) = self.0.processor.handle(sender, &received.message, now()) {
+                    let listed = admin.listed(self.0.as_ref(), is_admin, &received.message["body"]);
+                    if let Some(workflows) = body["workflows"].as_array_mut() {
+                        workflows.extend(listed);
+                        body["paging"]["total"] = json!(workflows.len());
+                    }
+                    return Ok(Some(received.reply(&kind, body)));
+                }
+            } else if admin.concerns(&received.message) {
+                return Ok(admin.handle(self.0.as_ref(), is_admin, sender, &received.message, now()).map(|answer| match answer {
+                    Ok((kind, body)) => received.reply(&kind, body),
+                    Err(refusal) => received.reply(&format!("{PIURI}/problem-report"), refusal.body()),
+                }));
+            }
         }
         Ok(match self.0.processor.handle(sender, &received.message, now()) {
             Some(Ok((message_type, body))) => Some(received.reply(&message_type, body)),

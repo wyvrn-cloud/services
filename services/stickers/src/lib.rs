@@ -13,6 +13,7 @@
 // The templates are written out as JSON, several levels deep.
 #![recursion_limit = "512"]
 
+pub mod admin;
 pub mod config;
 pub mod images;
 pub mod processor;

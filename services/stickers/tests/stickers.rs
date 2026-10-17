@@ -29,7 +29,7 @@ async fn start_service(extra: &str) -> Running {
     let (agent, did_document) = server::build_agent(&config, Identity::generate().unwrap()).unwrap();
     let did = agent.did();
     let processor = Processor::new(Store::in_memory().unwrap(), config.service.clone(), &url);
-    let state = Arc::new(AppState { agent, voice: Default::default(), processor, did_document, resolver: didcomm_quickstart::default_resolver() });
+    let state = Arc::new(AppState { agent, voice: Default::default(), processor, did_document, resolver: didcomm_quickstart::default_resolver(), admin: Default::default() });
     let app = server::router(state.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     Running { did, url, state }
@@ -523,4 +523,39 @@ async fn a_maker_whose_did_changes_keeps_their_packs_and_what_they_were_doing() 
     assert_eq!(mine["body"]["artifacts"]["packs"][0]["name"], "cats");
     refused_with(&before.ask("status", json!({ "instance_id": "a-2" })).await, "instance_not_found");
     assert_eq!(before.start("edit-pack", "b-1").await["body"]["artifacts"]["packs"], json!([]));
+}
+
+#[tokio::test]
+async fn an_admin_takes_a_pack_down_and_sets_names_aside() {
+    let admin_agent = Agent::new(Identity::generate().unwrap()).unwrap();
+    let service = start_service(&format!("admins = [\"{}\"]", admin_agent.did())).await;
+    let admin = Maker { agent: admin_agent, service: service.did.clone(), keys: std::cell::Cell::new(0) };
+    let alice = Maker::new(&service);
+    let titles = |answer: &Value| answer["body"]["workflows"].as_array().unwrap().iter().map(|w| w["template_id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    // Only an admin is shown the admin pages, beside the service's own workflows.
+    assert!(!titles(&alice.ask("discover", json!({})).await).iter().any(|id| id.starts_with("admin-")));
+    let listed = titles(&admin.ask("discover", json!({})).await);
+    assert!(listed.contains(&"new-sticker-pack".to_string()) && listed.contains(&"admin-stickers-packs".to_string()));
+    assert_eq!(alice.start("admin-stickers-packs", "x").await["body"]["code"], "not_authorized");
+
+    alice.publish_pack("p1", "cats", 1).await;
+    let page = admin.start("admin-stickers-packs", "a1").await;
+    assert!(page["body"]["ui"][1]["children"][0]["text"].as_str().unwrap().starts_with("Cats (cats)"));
+    let down = admin.advance("a1", "take-down", json!({ "pack": "cats" })).await;
+    assert_eq!(down["body"]["ui"][1]["text"], "Took cats down. Its name stays taken.");
+    assert!(service.state.processor.store.pack("cats").unwrap().unwrap().removed);
+
+    // A name set aside by an admin can't be taken.
+    admin.start("admin-stickers-names", "a2").await;
+    admin.advance("a2", "save", json!({ "names": "dogs\nadmin" })).await;
+    assert_eq!(service.state.processor.reserved_names(), ["admin", "dogs"]);
+    assert_eq!(kind(&alice.start("new-sticker-pack", "p2").await), "status");
+    alice.advance("p2", "set_title", json!({ "title": "Dogs" })).await;
+    alice.advance("p2", "add_sticker", json!({ "image": data_url(&png(512, 512, 9)), "emoji": "🐶" })).await;
+    alice.advance("p2", "publish", json!({})).await;
+    alice.advance("p2", "skip_icon", json!({})).await;
+    let refused = alice.advance("p2", "set_name", json!({ "name": "dogs" })).await;
+    assert!(refused["body"]["comment"].as_str().unwrap().contains("set aside"), "{refused}");
+    admin.advance("a2", "reset", json!({})).await;
+    assert!(service.state.processor.reserved_names().contains(&"healthz".to_string()));
 }

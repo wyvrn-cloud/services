@@ -77,6 +77,18 @@ impl Processor {
         Self { store, config, base }
     }
 
+    /// The names no pack may take: an admin's list, or the settings' until one has set one.
+    pub fn reserved_names(&self) -> Vec<String> {
+        match self.store.reserved_names() {
+            Ok(Some(names)) => names,
+            Ok(None) => self.config.reserved_names.clone(),
+            Err(error) => {
+                tracing::error!(%error, "couldn't read the names set aside; using the settings'");
+                self.config.reserved_names.clone()
+            }
+        }
+    }
+
     pub fn link(&self, name: &str) -> String {
         format!("{}{name}", self.base)
     }
@@ -496,7 +508,7 @@ impl Processor {
                 if !is_name(&name) {
                     return Err(mistake("A short name is 3 to 32 lowercase letters, digits and hyphens, with no hyphen first, last or doubled."));
                 }
-                if self.config.reserved_names.contains(&name) {
+                if self.reserved_names().contains(&name) {
                     return Err(mistake("That name is set aside. Please choose another."));
                 }
                 let mine = self.store.packs(Some(&instance.owner)).map_err(failed)?.iter().filter(|pack| !pack.removed).count();
