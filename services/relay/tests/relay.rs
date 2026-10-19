@@ -122,7 +122,7 @@ async fn a_granted_client_posts_through_the_relay_and_opens_a_socket_through_it(
 }
 
 #[tokio::test]
-async fn a_relay_that_carries_sends_hands_back_no_answer_and_opens_nothing() {
+async fn a_relay_that_carries_sends_hands_back_answers_and_opens_nothing() {
     let endpoint = start_endpoint().await;
     let relay = start_relay(Carries::Sends).await;
     let bob = client();
@@ -133,7 +133,8 @@ async fn a_relay_that_carries_sends_hands_back_no_answer_and_opens_nothing() {
     send["attachments"] = json!([{ "id": "message", "data": { "base64": STANDARD.encode("hello") } }]);
     let sent = socket.request(&send).await.unwrap();
     assert_eq!(sent.message["body"]["status"], 200);
-    assert!(sent.message.get("attachments").is_none());
+    // A service may answer on the same connection, so the answer comes back.
+    assert_eq!(attachment_text(&sent.message), "pong:hello");
 
     match socket.request(&message("open", json!({ "endpoint": format!("ws://{endpoint}/ws") }))).await {
         Err(AgentError::Problem { code, .. }) => assert_eq!(code, "e.p.req.not-carried"),

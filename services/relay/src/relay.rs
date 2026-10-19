@@ -179,8 +179,9 @@ impl Relay {
         let answer_type = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_string);
         let answer = response.bytes().await.map_err(|e| Refusal::unreachable(format!("{endpoint}: {e}")))?;
         let mut body = json!({ "status": status });
-        // A relay that carries sends says whether it was taken, and nothing of the answer.
-        let answer = (self.config.carries == Carries::All && !answer.is_empty()).then(|| answer.to_vec());
+        // Handed back whatever the relay carries: a service may answer on the same
+        // connection (return_route), and the request fails without its answer.
+        let answer = (!answer.is_empty()).then(|| answer.to_vec());
         if let (Some(answer_type), Some(_)) = (answer_type, &answer) {
             body["content_type"] = json!(answer_type);
         }

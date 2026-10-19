@@ -13,11 +13,10 @@ running the relay.
 
 `RELAY_CARRIES` (`relay.carries`):
 
-- `sends`: a client's messages to others. The relay posts each one and says what
-  status it was answered with, and nothing more.
-- `all` (the default): that, and what a client says to its own mediator. The
-  answer to a post is handed back (collecting messages needs it), and a client
-  may open a WebSocket through the relay (live delivery).
+- `sends`: a client's messages to others. The relay posts each one and hands
+  back the answer. Clients speak to their own mediator directly.
+- `all` (the default): that, and what a client says to its own mediator:
+  collecting, and a WebSocket opened through the relay for live delivery.
 
 Clients find out by discover-features, which discloses
 `app.wyvrn.relay.sends` or `app.wyvrn.relay.all` as a goal code, and the grant

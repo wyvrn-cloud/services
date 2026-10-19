@@ -18,9 +18,9 @@ path = "data/identity.json"
 path = "data/relay.sqlite"
 
 [relay]
-# What it carries: "sends" (a client's messages to others: the relay posts them
-# and says whether they were taken) or "all" (that, and what a client says to its
-# own mediator: answers handed back, and a WebSocket for live delivery).
+# What it carries: "sends" (a client's messages to others, answers handed back)
+# or "all" (that, and what a client says to its own mediator: collecting, and a
+# WebSocket for live delivery).
 carries = "all"
 # Whether anyone may register. Otherwise only the DIDs in `clients`.
 open = true
