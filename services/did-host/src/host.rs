@@ -67,6 +67,26 @@ impl Refusal {
 
 type Answer = Result<(&'static str, Value), Refusal>;
 
+/// Whether `did` discloses `kind`'s protocol in `kind`'s role, asked as
+/// discover-features/2.0 asks. Only an agent that answers at once can say: a
+/// service, posted to with `return_route`. One that can't be asked is not taken
+/// for that kind.
+async fn is_of_kind(agent: &didcomm_agent::Agent, did: &str, kind: &crate::config::Kind) -> bool {
+    let queries = json!({
+        "type": "https://didcomm.org/discover-features/2.0/queries",
+        "body": { "queries": [{ "feature-type": "protocol", "match": kind.protocol }] },
+    });
+    match agent.request(did, &queries).await {
+        Ok(answer) => answer.message["body"]["disclosures"].as_array().into_iter().flatten().any(|disclosure| {
+            disclosure["id"] == kind.protocol.as_str() && disclosure["roles"].as_array().is_some_and(|roles| roles.iter().any(|role| role == kind.role.as_str()))
+        }),
+        Err(error) => {
+            tracing::debug!(%did, %error, "couldn't ask what an agent is");
+            false
+        }
+    }
+}
+
 pub struct Host {
     pub store: Store,
     pub config: HostConfig,
@@ -213,6 +233,24 @@ impl Host {
         }
     }
 
+    /// Whether a free name may be claimed by `did`: in a namespace new names may be
+    /// claimed in, and of the kind that namespace is held for, if it is held for
+    /// one. A name an admin assigned isn't asked about: that is the admin's choice.
+    async fn claimable_by(&self, name: &Name, did: &str, agent: &didcomm_agent::Agent) -> Result<(), Refusal> {
+        let open = &self.config.open_namespaces;
+        let namespace = (name.labels().len() > 1).then(|| name.labels()[0].as_str());
+        if !open.is_empty() && !namespace.is_some_and(|namespace| open.iter().any(|label| label == namespace)) {
+            let named = open.iter().map(|label| format!("{label}:")).collect::<Vec<_>>().join(", ");
+            return Err(Refusal::new("e.p.msg.name-invalid", format!("New names here are in a namespace: {named}.")));
+        }
+        let Some(kind) = namespace.and_then(|namespace| self.config.kinds.get(namespace)) else { return Ok(()) };
+        if is_of_kind(agent, did, kind).await {
+            Ok(())
+        } else {
+            Err(Refusal::new("e.p.msg.wrong-kind", format!("Names in {}: are for agents that disclose {} as {}.", name.labels()[0], kind.protocol, kind.role)))
+        }
+    }
+
     fn name(&self, body: &Value) -> Result<Name, Refusal> {
         let text = body["name"].as_str().unwrap_or_default();
         Name::parse(text, self.config.max_labels).ok_or_else(|| {
@@ -229,7 +267,10 @@ impl Host {
     /// Acts on one message, authenticated by its sender with the key `kid` names.
     /// `None` for a message that isn't this protocol's, or whose sender's DID
     /// can't be read to see what that key is.
-    pub async fn handle(&self, received: &Received, kid: &str, now: i64) -> anyhow::Result<Option<Value>> {
+    ///
+    /// `agent` is the host's own, which asks a sender what it is when a namespace
+    /// is held for one kind of agent.
+    pub async fn handle(&self, received: &Received, kid: &str, now: i64, agent: &didcomm_agent::Agent) -> anyhow::Result<Option<Value>> {
         let Some(did) = received.sender.as_deref() else {
             return Ok(None);
         };
@@ -239,7 +280,7 @@ impl Host {
         let sender = &sender;
         let body = &received.message["body"];
         let answer = match received.message_type() {
-            RESERVE => self.reserve(sender, body, now).await?,
+            RESERVE => self.reserve(sender, body, now, agent).await?,
             PUBLISH => self.publish(sender, &received.message, now).await?,
             PUBLISH_WHOIS => self.publish_whois(sender, &received.message, now)?,
             STATUS_REQUEST => self.status(sender, body, now).await?,
@@ -257,7 +298,7 @@ impl Host {
         }))
     }
 
-    async fn reserve(&self, sender: &Sender, body: &Value, now: i64) -> anyhow::Result<Answer> {
+    async fn reserve(&self, sender: &Sender, body: &Value, now: i64, agent: &didcomm_agent::Agent) -> anyhow::Result<Answer> {
         let name = match self.name(body) {
             Ok(name) => name,
             Err(refusal) => return Ok(Err(refusal)),
@@ -265,7 +306,11 @@ impl Host {
         let key = name.as_did_path();
         let record = self.store.get(&key)?;
         match self.state_of(&name, record.as_ref(), now) {
-            State::Free => {}
+            State::Free => {
+                if let Err(refusal) = self.claimable_by(&name, &sender.did, agent).await {
+                    return Ok(Err(refusal));
+                }
+            }
             State::Held => {
                 if !record.as_ref().is_some_and(|r| sender.holds(&r.hold_keys)) {
                     return Ok(Err(Refusal::new("e.p.msg.name-taken", "Someone else is claiming that name right now.")));

@@ -81,6 +81,15 @@ is at `/official/news/did.jsonl`.
 
 First come, first served, one to a holder, except for names that are **reserved**.
 
+New names go in a namespace by kind of holder (`open_namespaces`, or
+`DID_HOST_OPEN_NAMESPACES`): `user:alice` for a person's app, `community:makers`
+for a community server. A name outside them is refused. A `community:` name is
+held only for an agent that answers the host's discover-features query with
+`https://wyvrn.app/community/1.0` as `server` (`[host.kinds]` says which
+namespace wants what), so it has to be a service the host can post to. Names held
+before the namespaces are left where they are. `open_namespaces = []` lets a name
+be anything, as before.
+
 - `reserved_names` in the configuration: by default the host's own routes and the
   names that would pass for the host itself (`admin`, `support`, `official`, ...).
 - `reserved_namespaces`: leading labels under which every name is reserved. By

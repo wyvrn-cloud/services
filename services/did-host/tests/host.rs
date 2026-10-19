@@ -28,12 +28,17 @@ struct Running {
 }
 
 async fn start_host(admins: &[String]) -> Running {
+    start_host_with(admins, "").await
+}
+
+/// The same, with more `[host]` settings.
+async fn start_host_with(admins: &[String], more: &str) -> Running {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let admins = admins.iter().map(|did| format!("{did:?}")).collect::<Vec<_>>().join(", ");
     let config: wyvrn_did_host::config::Config = toml::from_str(&format!(
         "[server]\nbind = \"unused\"\npublic_url = \"{url}\"\n[identity]\npath = \"unused\"\n[store]\npath = \"unused\"\n\
-         [host]\ndomain = \"{DOMAIN}\"\nadmins = [{admins}]\nreserved_names = [\"admin\"]\nreserved_namespaces = [\"official\"]\n"
+         [host]\ndomain = \"{DOMAIN}\"\nadmins = [{admins}]\nreserved_names = [\"admin\"]\nreserved_namespaces = [\"official\"]\n{more}"
     ))
     .unwrap();
     let (agent, did_document) = server::build_agent(&config, Identity::generate().unwrap()).unwrap();
@@ -1133,4 +1138,50 @@ async fn an_admin_sets_names_aside_and_frees_them_from_the_admin_page() {
     assert_eq!(freed["body"]["ui"][1]["text"], "news is free.");
     let wrong = workflow(&admin, &host.did, "advance", json!({ "instance_id": "n1", "event": "assign", "input": { "name": "Not A Name!", "holder": "" } })).await;
     assert_eq!(wrong["body"]["ui"][1]["type"], "error");
+}
+
+/// An agent at an address of its own, answering discover-features as `features`
+/// say: a service, as far as the host can tell.
+async fn start_service(features: didcomm_agent::Features) -> Agent {
+    struct Answers(Agent);
+    impl wyvrn_service::Service for Answers {
+        fn agent(&self) -> &Agent {
+            &self.0
+        }
+        async fn answer(&self, incoming: &wyvrn_service::Incoming<'_>) -> anyhow::Result<Option<Value>> {
+            Ok(self.0.auto_reply(incoming.received))
+        }
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let identity = Identity::generate().unwrap();
+    let serving = Arc::new(Answers(Agent::with_endpoint(Identity::from_json(&identity.to_json().unwrap()).unwrap(), &url).unwrap().with_features(features.clone())));
+    let app = axum::Router::new().route("/", axum::routing::post(move |body: axum::body::Bytes| wyvrn_service::http::receive(serving.clone(), body)));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    Agent::with_endpoint(identity, &url).unwrap().with_features(features)
+}
+
+#[tokio::test]
+async fn new_names_go_in_a_namespace_and_community_names_are_for_community_servers() {
+    let host = start_host_with(&[], "open_namespaces = [\"user\", \"community\"]\n").await;
+
+    // Outside the namespaces new names are claimed in, a name is refused...
+    let refusal = Holder::new(&host, "alice").reserve().await;
+    refused_with(&refusal, "e.p.msg.name-invalid");
+    assert!(refusal["body"]["comment"].as_str().unwrap().contains("user:"), "{refusal}");
+    refused_with(&Holder::new(&host, "other:alice").reserve().await, "e.p.msg.name-invalid");
+    // ...and a person's app claims under user:.
+    Holder::new(&host, "user:alice").register().await;
+    assert_eq!(fetch(&host, "user/alice/did.jsonl").await.status(), 200);
+
+    // An app isn't a community server, and can't be asked at once besides.
+    refused_with(&Holder::new(&host, "community:makers").reserve().await, "e.p.msg.wrong-kind");
+    // A service that discloses community/1.0 as server is one.
+    let mut makers = Holder::new(&host, "community:makers");
+    makers.agent = start_service(didcomm_agent::Features::standard().with_protocol("https://wyvrn.app/community/1.0", &["server"])).await;
+    makers.register().await;
+    // One that discloses it in another role is not.
+    let mut member = Holder::new(&host, "community:members");
+    member.agent = start_service(didcomm_agent::Features::standard().with_protocol("https://wyvrn.app/community/1.0", &["member"])).await;
+    refused_with(&member.reserve().await, "e.p.msg.wrong-kind");
 }

@@ -84,7 +84,7 @@ impl Service for HostService {
                 Err(refusal) => received.reply(&format!("{}/problem-report", wyvrn_service::admin::PIURI), refusal.body()),
             }));
         }
-        self.0.host.handle(received, kid, now()).await
+        self.0.host.handle(received, kid, now(), &self.0.agent).await
     }
 }
 

@@ -63,12 +63,32 @@ pub struct HostConfig {
     /// Leading labels under which every name is reserved.
     #[serde(default = "default_reserved_namespaces")]
     pub reserved_namespaces: Vec<String>,
+    /// The namespaces new names may be claimed in (did-hosting/1.0, "Namespaces by
+    /// kind"): `user` for people's apps, `community` for community servers. Empty,
+    /// a name may be anything. Names already held are left where they are.
+    #[serde(default)]
+    pub open_namespaces: Vec<String>,
+    /// Namespaces held for one kind of agent: the protocol it must disclose, and
+    /// in what role, before a name there is held for it.
+    #[serde(default = "default_kinds")]
+    pub kinds: std::collections::BTreeMap<String, Kind>,
     /// How long without hearing from a holder before it is asked whether it is
     /// still there, and how long it then has to answer.
     #[serde(default = "default_ask_after_days")]
     pub ask_after_days: i64,
     #[serde(default = "default_answer_within_days")]
     pub answer_within_days: i64,
+}
+
+/// What an agent must disclose (discover-features/2.0) to claim a name in a namespace.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct Kind {
+    pub protocol: String,
+    pub role: String,
+}
+
+fn default_kinds() -> std::collections::BTreeMap<String, Kind> {
+    [("community".to_string(), Kind { protocol: "https://wyvrn.app/community/1.0".to_string(), role: "server".to_string() })].into()
 }
 
 fn default_hold_seconds() -> i64 {
@@ -105,8 +125,9 @@ fn default_reserved_namespaces() -> Vec<String> {
 impl Config {
     /// Reads `path`, then lets the environment override what a deployment most
     /// often needs to: `DID_HOST_BIND`, `DID_HOST_PUBLIC_URL`,
-    /// `DID_HOST_DID_METHOD`, `DID_HOST_DOMAIN`, and `DID_HOST_ADMINS` (DIDs
-    /// separated by commas or whitespace).
+    /// `DID_HOST_DID_METHOD`, `DID_HOST_DOMAIN`, `DID_HOST_ADMINS` (DIDs
+    /// separated by commas or whitespace) and `DID_HOST_OPEN_NAMESPACES` (labels,
+    /// likewise; `*` for any name).
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading config {}: {e}", path.display()))?;
@@ -123,6 +144,9 @@ impl Config {
         }
         if let Some(domain) = env("DID_HOST_DOMAIN") {
             config.host.domain = domain;
+        }
+        if let Some(open) = env("DID_HOST_OPEN_NAMESPACES") {
+            config.host.open_namespaces = open.split(|c: char| c == ',' || c.is_whitespace()).filter(|label| !label.is_empty() && *label != "*").map(str::to_string).collect();
         }
         if let Some(admins) = env("DID_HOST_ADMINS") {
             config.host.admins = admins.split(|c: char| c == ',' || c.is_whitespace()).filter(|did| !did.is_empty()).map(str::to_string).collect();

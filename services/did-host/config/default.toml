@@ -23,6 +23,11 @@ admins = []
 # Reserved for nobody until an admin assigns them. `reserved_names` defaults to the
 # host's own routes and the names that would pass for the host itself.
 reserved_namespaces = ["official"]
+# New names are claimed in these namespaces: user:<name> for a person's app,
+# community:<name> for a community server, which has to disclose community/1.0
+# as `server` to claim one. Names held before are left where they are. Empty
+# (or DID_HOST_OPEN_NAMESPACES="*"), a name may be anything.
+open_namespaces = ["user", "community"]
 
 # To have messages to the host arrive through a mediator instead of at public_url:
 # [mediator]
