@@ -1,0 +1,34 @@
+# wyvrn-relay: what `cargo run` and the Docker image start with. The environment
+# overrides the settings a deployment most often changes (see README.md).
+
+[server]
+bind = "0.0.0.0:8080"
+# Where the relay is reached. Clients connect a WebSocket here (http -> ws,
+# https -> wss).
+public_url = "http://localhost:8080/"
+# "peer" needs nothing published; "web" makes the relay did:web:<its own domain>,
+# whose document lists the WebSocket address too.
+did_method = "peer"
+
+[identity]
+path = "data/identity.json"
+
+[store]
+# Who has been granted the relay.
+path = "data/relay.sqlite"
+
+[relay]
+# What it carries: "sends" (a client's messages to others: the relay posts them
+# and says whether they were taken) or "all" (that, and what a client says to its
+# own mediator: answers handed back, and a WebSocket for live delivery).
+carries = "all"
+# Whether anyone may register. Otherwise only the DIDs in `clients`.
+open = true
+clients = []
+# Hosts or IP addresses it may reach although they are on a private network or
+# this machine: a mediator running beside it, say. Nothing private otherwise.
+allow = []
+# The largest message a client may send through it, and the largest frame.
+max_bytes = 16777216
+# How long a post may take, start to finish, in seconds.
+timeout_seconds = 30

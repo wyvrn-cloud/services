@@ -1,0 +1,30 @@
+[package]
+name = "wyvrn-relay"
+description = "An outbound relay (outbound-relay/1.0): agents registered with it send what they would post to others' endpoints through it, over one WebSocket, and, where it is set to, what they say to their own mediator too"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+wyvrn-service = { workspace = true }
+didcomm-agent = { workspace = true }
+anyhow = { workspace = true }
+# `ws`: the socket each client holds open to the relay.
+axum = { workspace = true, features = ["ws"] }
+base64 = { workspace = true }
+futures-util = "0.3"
+reqwest = { workspace = true }
+# A WebSocket to a client's mediator, made with the same client (and so the same
+# address checks) as every post.
+reqwest-websocket = "0.6"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+didcomm-quickstart = { workspace = true }

@@ -148,9 +148,37 @@ services:
       - community-data:/app/data
     restart: unless-stopped
 
+  # An outbound relay (services/relay): agents registered with it send through it,
+  # over a WebSocket, so that where their messages go sees the relay and not them.
+  # RELAY_CARRIES is "sends" (their messages to others) or "all" (their own
+  # mediator's traffic too). It reaches nothing on a private network unless
+  # RELAY_ALLOW names it: a mediator beside it, say.
+  relay:
+    build:
+      context: .
+      dockerfile: services/relay/Dockerfile
+    ports:
+      - "${RELAY_PORT:-8087}:8080"
+    environment:
+      RELAY_PUBLIC_URL: "${RELAY_PUBLIC_URL:-http://localhost:8087/}"
+      RELAY_DID_METHOD: "${RELAY_DID_METHOD:-peer}"
+      # RELAY_PUBLIC_URL: "https://relay.example/"
+      # RELAY_DID_METHOD: "web"
+      RELAY_CARRIES: "${RELAY_CARRIES:-all}"
+      # Whether anyone may register, or only the DIDs in RELAY_CLIENTS (commas).
+      RELAY_OPEN: "${RELAY_OPEN:-true}"
+      RELAY_CLIENTS: "${RELAY_CLIENTS:-}"
+      # Hosts it may reach although they are private, separated by commas.
+      RELAY_ALLOW: "${RELAY_ALLOW:-}"
+      RELAY_DATABASE_URL: "${RELAY_DATABASE_URL:-}"
+    volumes:
+      - relay-data:/app/data
+    restart: unless-stopped
+
 volumes:
   files-data:
   community-data:
   stickers-data:
   did-host-data:
   announce-data:
+  relay-data:
