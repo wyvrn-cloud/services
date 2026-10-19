@@ -128,6 +128,7 @@ fn addressed(received: &Received) -> String {
 /// One client's socket, until it closes. Every connection opened through it
 /// closes with it.
 async fn connection(state: Arc<AppState>, socket: WebSocket) {
+    tracing::debug!("a client connected");
     let (mut sink, mut stream) = socket.split();
     let (out, mut outgoing) = mpsc::channel::<Vec<u8>>(256);
     let writing = tokio::spawn(async move {
@@ -155,9 +156,19 @@ async fn connection(state: Arc<AppState>, socket: WebSocket) {
         if bytes.len() > largest {
             continue;
         }
-        let Ok(received) = state.agent.receive(&bytes).await else { continue };
+        let received = match state.agent.receive(&bytes).await {
+            Ok(received) => received,
+            Err(error) => {
+                tracing::debug!(%error, "a frame that didn't open");
+                continue;
+            }
+        };
         let Ok(unpacked) = state.agent.messaging().unpack_verified(&bytes).await else { continue };
-        let (Some(sender), Some(sender_kid)) = (received.sender.clone(), unpacked.sender_kid) else { continue };
+        let (Some(sender), Some(sender_kid)) = (received.sender.clone(), unpacked.sender_kid) else {
+            tracing::debug!("a frame nobody authenticated");
+            continue;
+        };
+        tracing::debug!(%sender, message_type = received.message_type(), "heard");
         let reply = match received.message_type() {
             OPEN => Some(open(&state, &received, &sender, &mut tunnels, out.clone()).await.unwrap_or_else(|refusal| refused(&received, &refusal))),
             FRAME => frame_out(&state, &received, &sender, &mut tunnels).await,
@@ -175,6 +186,7 @@ async fn connection(state: Arc<AppState>, socket: WebSocket) {
             }),
         };
         if let Some(reply) = reply {
+            tracing::debug!(message_type = reply["type"].as_str().unwrap_or_default(), "answering");
             match state.agent.pack_reply(&received, &reply).await {
                 Ok(packed) => {
                     if out.send(packed).await.is_err() {
