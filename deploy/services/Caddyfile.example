@@ -62,6 +62,15 @@ stickers.example {
 # 	reverse_proxy 127.0.0.1:8184
 # }
 
+# An outbound relay: one WebSocket per app, held open, which `reverse_proxy`
+# passes through by itself.
+# relay.example {
+# 	route {
+# 		import wyvrn-limits
+# 		reverse_proxy 127.0.0.1:8187
+# 	}
+# }
+
 # A files service: uploads come in 64 MiB chunks, and what it serves is already
 # compressed or not worth compressing, so no `encode`; `request_body` lets a
 # chunk through (the service refuses anything longer itself).

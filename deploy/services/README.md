@@ -14,6 +14,7 @@ With no web server yet, [`deploy/did-host`](../did-host) brings its own Caddy.
 | `community` | Nothing: people are given its DID | No |
 | `announce` | Nothing: people are given its DID | No |
 | `files` | Nothing: an uploader is given its DID | No |
+| `relay` | Nothing: people are given its DID (Settings, Developer, in the app) | No |
 
 ## 1. Domains
 
@@ -33,6 +34,7 @@ CREATE DATABASE wyvrn_stickers;
 -- CREATE DATABASE wyvrn_community;
 -- CREATE DATABASE wyvrn_announce;
 -- CREATE DATABASE wyvrn_files;
+-- CREATE DATABASE wyvrn_relay;
 CREATE USER 'wyvrn'@'%' IDENTIFIED BY 'a long password';
 GRANT ALL ON wyvrn_did_host.* TO 'wyvrn'@'%';
 GRANT ALL ON wyvrn_stickers.* TO 'wyvrn'@'%';

@@ -7,6 +7,7 @@
 #   cp .env.example .env    # and fill it in
 #   docker compose up -d                                         # the DID host and the sticker service
 #   docker compose --profile community --profile announce up -d  # and the two an app isn't built to expect
+#   docker compose --profile relay up -d                         # an outbound relay
 name: wyvrn-services
 
 x-service: &service
@@ -150,6 +151,33 @@ services:
       # Where the links point, if the proxy in front doesn't say rightly
       # (X-Forwarded-Proto, Host): a page naming its picture at http:// gets none.
       CARDS_PUBLIC_URL: "${CARDS_PUBLIC_URL:-}"
+
+  # An outbound relay: an app that chooses it (Settings, Developer) sends through
+  # it, so where its messages go sees this machine's address and not the app's
+  # (services/relay/README.md). No app is built to expect one: people are given
+  # its DID. Its proxy must pass WebSocket upgrades on / (Caddy does by itself).
+  relay:
+    <<: *service
+    profiles: ["relay"]
+    image: wyvrn-relay
+    build:
+      context: ../..
+      dockerfile: services/relay/Dockerfile
+    ports:
+      - "127.0.0.1:${RELAY_PORT:-8187}:8080"
+    environment:
+      RELAY_PUBLIC_URL: "https://${RELAY_DOMAIN:?set RELAY_DOMAIN in .env}/"
+      RELAY_DID_METHOD: "web"
+      # "all" (sends, collecting and live delivery) or "sends" (messages to
+      # others only).
+      RELAY_CARRIES: "${RELAY_CARRIES:-all}"
+      # Anyone may register, or only the DIDs in RELAY_CLIENTS.
+      RELAY_OPEN: "${RELAY_OPEN:-true}"
+      RELAY_CLIENTS: "${RELAY_CLIENTS:-}"
+      # Hosts it may reach although they are on this machine or a private
+      # network. Nothing private otherwise.
+      RELAY_ALLOW: "${RELAY_ALLOW:-}"
+      RELAY_DATABASE_URL: "${RELAY_DATABASE_URL:?set RELAY_DATABASE_URL in .env}"
 
 volumes:
   # Every file the files service holds. The only thing this stack keeps outside
