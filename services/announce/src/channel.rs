@@ -456,15 +456,19 @@ impl Channel {
                         "A role is \"admin\" or \"subscriber\".",
                     )));
                 };
-                let Some(before) = self.store.member(target)? else {
+                // An admin can be named before they subscribe (announcements/1.0,
+                // `set-role`); an ordinary subscriber only from those the channel knows.
+                let before = self.store.member(target)?;
+                if before.is_none() && role == Role::Subscriber {
                     return Ok(Outcome::reply(problem(
                         message,
                         "e.p.msg.unknown-subscriber",
                         "Nobody with that DID is subscribed to this channel.",
                     )));
-                };
+                }
+                let before_role = before.as_ref().map(|m| m.role);
                 let admins = self.store.members()?.iter().filter(|m| m.role == Role::Admin).count();
-                if before.role == Role::Admin && role == Role::Subscriber && admins <= 1 {
+                if before_role == Some(Role::Admin) && role == Role::Subscriber && admins <= 1 {
                     return Ok(Outcome::reply(problem(
                         message,
                         "e.p.msg.last-admin",
@@ -474,7 +478,7 @@ impl Channel {
                 self.store.set_role(target, role, now)?;
                 let mut outcome = Outcome::reply(reply_to(message, SUBSCRIBERS, self.subscribers_body(message)?));
                 // The one whose standing changed is told, wherever it is subscribed.
-                if let Some(after) = self.store.member(target)?.filter(|m| m.subscribed && m.role != before.role) {
+                if let Some(after) = self.store.member(target)?.filter(|m| m.subscribed && Some(m.role) != before_role) {
                     outcome.notices.push((after.did.clone(), json!({"type": SUBSCRIPTION, "body": self.subscription(Some(&after))?})));
                 }
                 Ok(outcome)
@@ -769,11 +773,22 @@ mod tests {
     }
 
     #[test]
-    fn a_role_is_only_given_to_someone_the_channel_knows() {
+    fn an_admin_can_be_named_before_subscribing_and_an_ordinary_subscriber_cannot() {
         let channel = channel();
         with_admin(&channel, "did:a");
+        // Named by DID, never subscribed: an admin, listed as not subscribed.
+        let outcome = channel.handle("did:a", &message(SET_ROLE, json!({"did": "did:editor", "role": "admin"})), 12).unwrap();
+        let listed = outcome.reply.as_ref().unwrap()["body"]["subscribers"].as_array().unwrap().clone();
+        let editor = listed.iter().find(|m| m["did"] == "did:editor").expect("listed");
+        assert_eq!((editor["role"].as_str(), editor["subscribed"].as_bool()), (Some("admin"), Some(false)));
+        // ...who may post.
+        assert!(channel.store.member("did:editor").unwrap().is_some_and(|m| m.role == Role::Admin));
+        // Made ordinary again, never having subscribed: forgotten.
+        channel.handle("did:a", &message(SET_ROLE, json!({"did": "did:editor", "role": "subscriber"})), 13).unwrap();
+        assert!(channel.store.member("did:editor").unwrap().is_none());
+        // An ordinary subscriber the channel doesn't know: refused.
         assert_eq!(
-            code(&channel.handle("did:a", &message(SET_ROLE, json!({"did": "did:nobody", "role": "admin"})), 12).unwrap()),
+            code(&channel.handle("did:a", &message(SET_ROLE, json!({"did": "did:nobody", "role": "subscriber"})), 14).unwrap()),
             "e.p.msg.unknown-subscriber"
         );
         assert_eq!(
