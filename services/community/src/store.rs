@@ -39,6 +39,8 @@ pub struct Member {
     pub since: i64,
     /// The last post sent to them, by its serial.
     pub delivered: i64,
+    /// When they left, having joined, while they stay away.
+    pub left_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,7 +137,7 @@ pub struct Store {
     db: Db,
 }
 
-const MEMBER_COLUMNS: &str = "did, role, name, joined, since, delivered";
+const MEMBER_COLUMNS: &str = "did, role, name, joined, since, delivered, (SELECT at FROM member_left WHERE member_left.did = members.did)";
 // A post's author is called what they are called now, where they are still a
 // member; what they were called when they wrote it, otherwise.
 const POST_COLUMNS: &str = "serial, channel, seq, id, content, posted_at, author_did, \
@@ -155,7 +157,15 @@ const CHANNEL_COLUMNS: &str =
 
 fn member_from(row: &Row) -> Result<Member> {
     let role: String = row.get(1)?;
-    Ok(Member { did: row.get(0)?, role: Role::parse(&role).unwrap_or(Role::Member), name: row.get(2)?, joined: row.get(3)?, since: row.get(4)?, delivered: row.get(5)? })
+    Ok(Member {
+        did: row.get(0)?,
+        role: Role::parse(&role).unwrap_or(Role::Member),
+        name: row.get(2)?,
+        joined: row.get(3)?,
+        since: row.get(4)?,
+        delivered: row.get(5)?,
+        left_at: row.get(6)?,
+    })
 }
 
 fn json_from(text: Option<String>) -> Option<Value> {
@@ -348,6 +358,12 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         created_by TEXT NOT NULL,
         revoked INTEGER NOT NULL DEFAULT 0
     );
+    -- When a member who had joined left. A table of its own for the reason
+    -- post_state is one.
+    CREATE TABLE IF NOT EXISTS member_left (
+        did TEXT PRIMARY KEY,
+        at INTEGER NOT NULL
+    );
     -- What an admin has set that the configuration otherwise says (admission).
     CREATE TABLE IF NOT EXISTS settings (
         name TEXT PRIMARY KEY,
@@ -447,6 +463,10 @@ fn schema() -> Schema {
                 created_by {MYSQL_DID} NOT NULL,
                 revoked BIGINT NOT NULL DEFAULT 0
             ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS member_left (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                at BIGINT NOT NULL
+            ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS settings (
                 name VARCHAR(64) NOT NULL PRIMARY KEY,
                 value TEXT NOT NULL
@@ -503,7 +523,9 @@ impl Store {
     }
 
     pub fn remove_member(&self, did: &str) -> Result<bool> {
-        Ok(self.db.lock().execute("DELETE FROM members WHERE did = ?1", params![did])? > 0)
+        let mut db = self.db.lock();
+        db.execute("DELETE FROM member_left WHERE did = ?1", params![did])?;
+        Ok(db.execute("DELETE FROM members WHERE did = ?1", params![did])? > 0)
     }
 
     /// Forgets a member who was only ever named, and whose app never joined.
@@ -513,7 +535,17 @@ impl Store {
     }
 
     pub fn set_joined(&self, did: &str, joined: bool) -> Result<()> {
-        self.db.lock().execute("UPDATE members SET joined = ?2 WHERE did = ?1", params![did, joined])?;
+        let mut db = self.db.lock();
+        db.execute("UPDATE members SET joined = ?2 WHERE did = ?1", params![did, joined])?;
+        if joined {
+            db.execute("DELETE FROM member_left WHERE did = ?1", params![did])?;
+        }
+        Ok(())
+    }
+
+    /// A member who had joined has left, at `now`.
+    pub fn note_left(&self, did: &str, now: i64) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO member_left (did, at) VALUES (?1, ?2)", params![did, now])?;
         Ok(())
     }
 
@@ -562,6 +594,10 @@ impl Store {
                         )?;
                     }
                 }
+                // When they left goes with them, unless the new DID is joined.
+                tx.execute("DELETE FROM member_left WHERE did = ?1 AND EXISTS (SELECT 1 FROM members WHERE did = ?2 AND joined = 1)", params![prior, new])?;
+                tx.execute("UPDATE OR IGNORE member_left SET did = ?2 WHERE did = ?1", params![prior, new])?;
+                tx.execute("DELETE FROM member_left WHERE did = ?1", params![prior])?;
                 // What they wrote, and what they were answering, is theirs under the new DID.
                 tx.execute("UPDATE posts SET author_did = ?2 WHERE author_did = ?1", params![prior, new])?;
                 tx.execute("UPDATE posts SET answered_by = ?2 WHERE answered_by = ?1", params![prior, new])?;

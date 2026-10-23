@@ -551,6 +551,9 @@ impl Community {
                 if let Some(name) = &member.name {
                     listed["name"] = json!(name);
                 }
+                if let Some(left_at) = member.left_at.filter(|_| !member.joined) {
+                    listed["left_at"] = json!(left_at);
+                }
                 listed
             })
             .collect();
@@ -649,6 +652,10 @@ impl Community {
 
         match message_type {
             JOIN | LEAVE => {
+                // Someone who had joined and leaves stays a member, sent nothing more.
+                if message_type == LEAVE && member.joined {
+                    self.store.note_left(sender, now)?;
+                }
                 self.store.set_joined(sender, message_type == JOIN)?;
                 let member = Member { joined: message_type == JOIN, ..member };
                 Ok(Outcome::reply(reply_to(message, COMMUNITY, self.community(&member)?)))

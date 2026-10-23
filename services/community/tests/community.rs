@@ -626,3 +626,30 @@ async fn members_make_invites_only_when_an_admin_allows_and_revoke_only_their_ow
     assert_eq!(admin.community("revoke-invite", json!({ "code": code })).await["body"]["invites"].as_array().unwrap().len(), 1);
     assert_eq!(member.community("revoke-invite", json!({ "code": code })).await["body"]["code"], "e.p.msg.unknown-invite");
 }
+
+#[tokio::test]
+async fn a_member_who_leaves_is_sent_nothing_and_listed_as_left_until_they_come_back() {
+    let server = start_server("").await;
+    let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member]);
+    member.community("join", json!({})).await;
+    let channel = open_channel(&admin, "general").await;
+    member.next_of(&format!("{C}community")).await;
+
+    let left = member.community("leave", json!({})).await;
+    assert_eq!((kind(&left), left["body"]["joined"].as_bool()), ("community", Some(false)));
+    admin.community("post", json!({ "channel": channel, "content": "while you were out" })).await;
+    member.nothing_more().await;
+    let listed = admin.community("members-request", json!({})).await;
+    let entry = listed["body"]["members"].as_array().unwrap().iter().find(|m| m["did"] == member.did()).unwrap().clone();
+    assert!(entry["left_at"].as_i64().is_some(), "{entry}");
+
+    // Back at once, under any admission, and no longer listed as left.
+    admin.community("set-admission", json!({ "admission": "admin" })).await;
+    let back = member.community("join", json!({})).await;
+    assert_eq!(back["body"]["joined"], true);
+    let listed = admin.community("members-request", json!({})).await;
+    let entry = listed["body"]["members"].as_array().unwrap().iter().find(|m| m["did"] == member.did()).unwrap().clone();
+    assert!(entry.get("left_at").is_none(), "{entry}");
+}
+
