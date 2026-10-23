@@ -493,8 +493,12 @@ impl Community {
             Admission::Admin => false,
         };
         if let_in {
+            let named = self.store.waiting_one(sender)?.and_then(|waiting| waiting.name);
             self.store.remove_waiting(sender)?;
             self.store.set_member(sender, Role::Member, now)?;
+            if named.is_some() {
+                self.store.set_name(sender, named.as_deref())?;
+            }
             self.store.set_joined(sender, true)?;
             let member = self.store.member(sender)?.expect("just let in");
             return Ok(Outcome::reply(reply_to(message, COMMUNITY, self.community(&member)?)));
@@ -996,7 +1000,8 @@ impl Community {
                     return refuse(message, "e.p.msg.invalid-member", "That isn't a DID.");
                 };
                 let existing = self.store.member(did)?;
-                let was_waiting = existing.is_none() && self.store.waiting_one(did)?.is_some();
+                let waiting = if existing.is_none() { self.store.waiting_one(did)? } else { None };
+                let was_waiting = waiting.is_some();
                 let last_admin = existing.as_ref().is_some_and(|m| m.role == Role::Admin) && self.store.admin_count()? <= 1;
                 match body["role"].as_str() {
                     Some(role) => {
@@ -1012,9 +1017,13 @@ impl Community {
                         self.store.set_member(did, role, now)?;
                         // Someone let in from the waiting list asked to be sent posts:
                         // they are joined, and told what the community is.
-                        if was_waiting {
+                        if let Some(waiting) = &waiting {
                             self.store.remove_waiting(did)?;
                             self.store.set_joined(did, true)?;
+                            // What they said they are called while waiting.
+                            if waiting.name.is_some() {
+                                self.store.set_name(did, waiting.name.as_deref())?;
+                            }
                             let admitted = self.store.member(did)?.expect("just let in");
                             let mut outcome = Outcome::reply(reply_to(message, MEMBERS, self.members_for(&member)?));
                             outcome.notices.push((did.to_string(), json!({ "type": COMMUNITY, "body": self.community(&admitted)? })));

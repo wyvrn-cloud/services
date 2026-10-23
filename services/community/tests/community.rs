@@ -544,7 +544,10 @@ async fn whoever_asks_waits_for_an_admin_who_lets_them_in_or_turns_them_away() {
     assert_eq!(answer["body"]["waiting"].as_array().unwrap().len(), 1);
     let told = alice.next_of(&format!("{C}community")).await;
     assert_eq!((told["body"]["name"].as_str(), told["body"]["joined"].as_bool()), (Some("The Workshop"), Some(true)));
-    assert!(server.state.community.store.member(&alice.did()).unwrap().unwrap().joined);
+    let let_in = server.state.community.store.member(&alice.did()).unwrap().unwrap();
+    // ...under the name she gave while waiting.
+    assert!(let_in.joined);
+    assert_eq!(let_in.name.as_deref(), Some("Alice"));
 
     // Turned away: off the list, not let in, and told nothing.
     let answer = admin.community("set-member", json!({ "did": bob.did(), "role": null })).await;
