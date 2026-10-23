@@ -138,8 +138,12 @@ async fn someone_not_let_in_is_told_so_and_nothing_else() {
     server.admit(&[&admin]);
     let channel = open_channel(&admin, "general").await;
 
+    // Asking to join puts them on the waiting list, and says nothing of the community.
+    let waiting = stranger.community("join", json!({})).await;
+    assert_eq!(kind(&waiting), "waiting", "{waiting}");
+    assert_eq!(waiting["body"], json!({}));
+
     for (message_type, body) in [
-        (format!("{C}join"), json!({})),
         (format!("{C}post"), json!({ "channel": channel, "content": "let me in" })),
         (format!("{C}history-request"), json!({ "channel": channel })),
         (format!("{C}members-request"), json!({})),
@@ -403,16 +407,19 @@ async fn an_admin_decides_who_is_let_in() {
     let (admin, member, newcomer) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
     server.admit(&[&admin, &member]);
 
-    assert_eq!(newcomer.community("join", json!({})).await["type"], PROBLEM);
+    // Asking puts them on the waiting list; only an admin lets them in.
+    assert_eq!(kind(&newcomer.community("join", json!({})).await), "waiting");
     assert_eq!(member.community("set-member", json!({ "did": newcomer.did(), "role": "member" })).await["body"]["code"], "e.p.trust.not-authorized");
     let listed = admin.community("set-member", json!({ "did": newcomer.did(), "role": "member" })).await;
     assert_eq!(kind(&listed), "members");
     assert_eq!(listed["body"]["members"].as_array().unwrap().len(), 3);
     assert_eq!(kind(&newcomer.community("join", json!({})).await), "community");
 
-    // Taken out again, they are refused again.
+    // Taken out again, they are refused again, and asking to join puts them back
+    // on the waiting list.
     admin.community("set-member", json!({ "did": newcomer.did(), "role": null })).await;
-    assert_eq!(newcomer.community("join", json!({})).await["type"], PROBLEM);
+    assert_eq!(newcomer.community("members-request", json!({})).await["type"], PROBLEM);
+    assert_eq!(kind(&newcomer.community("join", json!({})).await), "waiting");
 
     // A community keeps an admin: the only one can't step down or be removed.
     assert_eq!(admin.community("set-member", json!({ "did": admin.did(), "role": "member" })).await["body"]["code"], "e.p.msg.last-admin");
@@ -503,4 +510,116 @@ async fn a_question_that_makes_no_sense_is_not_posted() {
         assert_eq!(refused["body"]["code"], "e.p.msg.invalid-question", "{refused}");
     }
     assert_eq!(server.state.community.store.channel(&channel).unwrap().unwrap().latest_seq, 0);
+}
+
+
+#[tokio::test]
+async fn whoever_asks_waits_for_an_admin_who_lets_them_in_or_turns_them_away() {
+    let server = start_server("").await;
+    let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    let (alice, bob) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member]);
+
+    assert_eq!(kind(&alice.community("join", json!({})).await), "waiting");
+    // What they call themselves, for the admins who decide.
+    alice.agent.send(&alice.server, &json!({ "type": "https://didcomm.org/user-profile/1.0/profile", "body": { "profile": { "displayName": "Alice" } } })).await.unwrap();
+    assert_eq!(kind(&bob.community("join", json!({})).await), "waiting");
+
+    // An admin is told who is waiting, oldest first; a member isn't.
+    let listed = admin.community("members-request", json!({})).await;
+    let waiting = listed["body"]["waiting"].as_array().unwrap();
+    // (Both asked in the same second here, so which is first is by DID.)
+    let mut dids: Vec<String> = waiting.iter().map(|w| w["did"].as_str().unwrap().to_string()).collect();
+    dids.sort();
+    let mut expected = vec![alice.did(), bob.did()];
+    expected.sort();
+    assert_eq!(dids, expected);
+    assert!(waiting.windows(2).all(|pair| pair[0]["asked_at"].as_i64() <= pair[1]["asked_at"].as_i64()));
+    let alice_listed = waiting.iter().find(|w| w["did"] == alice.did()).unwrap();
+    assert_eq!(alice_listed["name"], "Alice");
+    assert!(member.community("members-request", json!({})).await["body"].get("waiting").is_none());
+
+    // Let in from the list: joined, and told what the community is.
+    let answer = admin.community("set-member", json!({ "did": alice.did(), "role": "member" })).await;
+    assert_eq!(answer["body"]["waiting"].as_array().unwrap().len(), 1);
+    let told = alice.next_of(&format!("{C}community")).await;
+    assert_eq!((told["body"]["name"].as_str(), told["body"]["joined"].as_bool()), (Some("The Workshop"), Some(true)));
+    assert!(server.state.community.store.member(&alice.did()).unwrap().unwrap().joined);
+
+    // Turned away: off the list, not let in, and told nothing.
+    let answer = admin.community("set-member", json!({ "did": bob.did(), "role": null })).await;
+    assert_eq!(answer["body"]["waiting"], json!([]));
+    assert!(server.state.community.store.member(&bob.did()).unwrap().is_none());
+    bob.nothing_more().await;
+
+    // Asking and taking it back.
+    assert_eq!(kind(&bob.community("join", json!({})).await), "waiting");
+    bob.agent.send(&bob.server, &json!({ "type": format!("{C}leave"), "body": {} })).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(server.state.community.store.waiting().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn an_invite_lets_in_while_it_lasts_when_admission_is_by_invite() {
+    let server = start_server("").await;
+    let admin = Peer::start(&server).await;
+    let (alice, bob, carol) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin]);
+
+    // By default an admin lets people in: a code is noted beside them, not used.
+    let made = admin.community("create-invite", json!({ "uses": 1, "note": "for Alice" })).await;
+    assert_eq!(kind(&made), "invites", "{made}");
+    let code = made["body"]["created"].as_str().unwrap().to_string();
+    assert_eq!(made["body"]["invites"][0]["note"], "for Alice");
+    assert_eq!(kind(&alice.community("join", json!({ "invite": code })).await), "waiting");
+    let waiting = admin.community("members-request", json!({})).await["body"]["waiting"][0].clone();
+    assert_eq!((waiting["invite"]["code"].as_str(), waiting["invite"]["created_by"]["did"].as_str()), (Some(code.as_str()), Some(admin.did().as_str())));
+    assert_eq!(server.state.community.store.invite(&code).unwrap().unwrap().uses_left, Some(1));
+
+    // By invite: the code lets in once, and everyone is told how admission stands.
+    let set = admin.community("set-admission", json!({ "admission": "invite" })).await;
+    assert_eq!(set["body"]["admission"], "invite");
+    let joined = alice.community("join", json!({ "invite": code })).await;
+    assert_eq!((kind(&joined), joined["body"]["joined"].as_bool()), ("community", Some(true)));
+    assert!(server.state.community.store.waiting().unwrap().is_empty());
+    assert_eq!(kind(&bob.community("join", json!({ "invite": code })).await), "waiting");
+    assert_eq!(kind(&carol.community("join", json!({})).await), "waiting");
+    // Used up, it is no longer listed.
+    assert_eq!(admin.community("invites-request", json!({})).await["body"]["invites"], json!([]));
+
+    // One that has expired lets nobody in, and can't be made.
+    let past = admin.community("create-invite", json!({ "expires_at": 1 })).await;
+    assert_eq!(past["body"]["code"], "e.p.msg.invalid-invite");
+    assert_eq!(admin.community("create-invite", json!({ "uses": 0 })).await["body"]["code"], "e.p.msg.invalid-invite");
+
+    // Open: everyone, invite or not.
+    admin.community("set-admission", json!({ "admission": "open" })).await;
+    assert_eq!(kind(&carol.community("join", json!({})).await), "community");
+    assert_eq!(admin.community("set-admission", json!({ "admission": "everyone" })).await["body"]["code"], "e.p.msg.invalid-admission");
+    assert_eq!(admin.community("set-admission", json!({})).await["body"]["code"], "e.p.msg.invalid-admission");
+}
+
+#[tokio::test]
+async fn members_make_invites_only_when_an_admin_allows_and_revoke_only_their_own() {
+    let server = start_server("").await;
+    let (admin, member, other) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member, &other]);
+
+    assert_eq!(member.community("create-invite", json!({})).await["body"]["code"], "e.p.trust.not-authorized");
+    assert_eq!(member.community("set-admission", json!({ "members_may_invite": true })).await["body"]["code"], "e.p.trust.not-authorized");
+    let set = admin.community("set-admission", json!({ "members_may_invite": true })).await;
+    assert_eq!(set["body"]["members_may_invite"], true);
+
+    let admins = admin.community("create-invite", json!({})).await["body"]["created"].as_str().unwrap().to_string();
+    let theirs = member.community("create-invite", json!({ "uses": 3 })).await;
+    let code = theirs["body"]["created"].as_str().unwrap().to_string();
+    // A member is told of their own invites; an admin of everyone's.
+    assert_eq!(theirs["body"]["invites"].as_array().unwrap().len(), 1);
+    assert_eq!(admin.community("invites-request", json!({})).await["body"]["invites"].as_array().unwrap().len(), 2);
+    assert_eq!(other.community("invites-request", json!({})).await["body"]["invites"], json!([]));
+
+    assert_eq!(member.community("revoke-invite", json!({ "code": admins })).await["body"]["code"], "e.p.trust.not-authorized");
+    assert_eq!(other.community("revoke-invite", json!({ "code": code })).await["body"]["code"], "e.p.trust.not-authorized");
+    assert_eq!(admin.community("revoke-invite", json!({ "code": code })).await["body"]["invites"].as_array().unwrap().len(), 1);
+    assert_eq!(member.community("revoke-invite", json!({ "code": code })).await["body"]["code"], "e.p.msg.unknown-invite");
 }

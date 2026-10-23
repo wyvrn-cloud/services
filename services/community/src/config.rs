@@ -46,6 +46,14 @@ pub struct CommunityConfig {
     pub max_post_length: usize,
     /// How many channels there may be that aren't closed.
     pub max_channels: usize,
+    /// Who a `join` from someone who isn't a member lets in, until an admin says
+    /// otherwise (`set-admission`): `admin` (nobody), `invite` or `open`.
+    pub admission: String,
+    /// Whether a member who isn't an admin may make invites, until an admin says
+    /// otherwise.
+    pub members_may_invite: bool,
+    /// As many as may wait to be let in at once.
+    pub max_waiting: usize,
 }
 
 impl Default for CommunityConfig {
@@ -58,6 +66,9 @@ impl Default for CommunityConfig {
             members_may_create_channels: false,
             max_post_length: 16_000,
             max_channels: 200,
+            admission: "admin".to_string(),
+            members_may_invite: false,
+            max_waiting: 500,
         }
     }
 }

@@ -59,6 +59,14 @@ docker compose exec community wyvrn-community remove "did:peer:4zQm..."
 docker compose exec community wyvrn-community channels
 ```
 
+Whoever adds the community as a contact asks to join. By default they wait on a
+list that admins see in the app, where an admin lets them in or turns them away.
+An admin can instead have the server let in everyone with an invite (an invite
+has optional uses and expiry, and admins make them in the app), or everyone who
+asks. That setting can also let members make invites. The configuration's
+`admission` and `members_may_invite` are where it starts; what an admin sets in
+the app wins after that.
+
 Someone whose devices change gets a new DID. Their app tells the server, signed
 by the old one, and they stay who they were: nobody needs letting in again.
 
@@ -84,3 +92,5 @@ those answers (`/ask*` lets several be chosen).
 - Editing or deleting a post, reactions, and replies.
 - Limits on how fast anyone posts.
 - Removing someone does not tell their app; it is told the next time it asks.
+- Turning away someone waiting does not tell them either.
+- Admins aren't notified when someone asks to join; they see it when they look.

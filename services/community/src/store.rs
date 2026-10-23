@@ -211,6 +211,46 @@ fn answering_from(row: &Row) -> Result<Answering> {
 
 const ANSWERING_COLUMNS: &str = "id, owner, post, at, answers, status, updated";
 
+/// Someone who asked to join and hasn't been let in.
+#[derive(Debug, Clone)]
+pub struct Waiting {
+    pub did: String,
+    pub name: Option<String>,
+    pub asked_at: i64,
+    /// The code of the valid invite they came with, if any.
+    pub invite: Option<String>,
+}
+
+/// An invite: a code that lets in whoever brings it, while it lasts.
+#[derive(Debug, Clone)]
+pub struct Invite {
+    pub code: String,
+    /// How many more it may let in; `None` for as many as use it.
+    pub uses_left: Option<i64>,
+    pub expires_at: Option<i64>,
+    pub note: Option<String>,
+    pub created_at: i64,
+    pub created_by: String,
+}
+
+impl Invite {
+    /// Whether it would let someone in at `now`.
+    pub fn valid(&self, now: i64) -> bool {
+        self.uses_left.is_none_or(|left| left > 0) && self.expires_at.is_none_or(|at| at > now)
+    }
+}
+
+const WAITING_COLUMNS: &str = "did, name, asked_at, invite";
+const INVITE_COLUMNS: &str = "code, uses_left, expires_at, note, created_at, created_by";
+
+fn waiting_from(row: &Row) -> Result<Waiting> {
+    Ok(Waiting { did: row.get(0)?, name: row.get(1)?, asked_at: row.get(2)?, invite: row.get(3)? })
+}
+
+fn invite_from(row: &Row) -> Result<Invite> {
+    Ok(Invite { code: row.get(0)?, uses_left: row.get(1)?, expires_at: row.get(2)?, note: row.get(3)?, created_at: row.get(4)?, created_by: row.get(5)? })
+}
+
 const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         did TEXT PRIMARY KEY,
         role TEXT NOT NULL,
@@ -291,6 +331,27 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         answers TEXT NOT NULL DEFAULT '[]',
         status TEXT NOT NULL,
         updated INTEGER NOT NULL
+    );
+    -- Who asked to join and hasn't been let in (community/1.0's waiting list).
+    CREATE TABLE IF NOT EXISTS waiting (
+        did TEXT PRIMARY KEY,
+        name TEXT,
+        asked_at INTEGER NOT NULL,
+        invite TEXT
+    );
+    CREATE TABLE IF NOT EXISTS invites (
+        code TEXT PRIMARY KEY,
+        uses_left INTEGER,
+        expires_at INTEGER,
+        note TEXT,
+        created_at INTEGER NOT NULL,
+        created_by TEXT NOT NULL,
+        revoked INTEGER NOT NULL DEFAULT 0
+    );
+    -- What an admin has set that the configuration otherwise says (admission).
+    CREATE TABLE IF NOT EXISTS settings (
+        name TEXT PRIMARY KEY,
+        value TEXT NOT NULL
     );";
 
 fn schema() -> Schema {
@@ -370,6 +431,25 @@ fn schema() -> Schema {
                 answers MEDIUMTEXT NOT NULL,
                 status VARCHAR(32) NOT NULL,
                 updated BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS waiting (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                name TEXT,
+                asked_at BIGINT NOT NULL,
+                invite VARCHAR(255)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS invites (
+                code VARCHAR(255) NOT NULL PRIMARY KEY,
+                uses_left BIGINT,
+                expires_at BIGINT,
+                note TEXT,
+                created_at BIGINT NOT NULL,
+                created_by {MYSQL_DID} NOT NULL,
+                revoked BIGINT NOT NULL DEFAULT 0
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS settings (
+                name VARCHAR(64) NOT NULL PRIMARY KEY,
+                value TEXT NOT NULL
             ) {MYSQL_TABLE}"
         )
     });
@@ -490,6 +570,81 @@ impl Store {
             tx.execute("INSERT OR REPLACE INTO superseded (did, became, at) VALUES (?1, ?2, ?3)", params![prior, new, now])?;
             Ok(old.is_some())
         })
+    }
+
+    // --- The waiting list, invites and settings ------------------------------
+
+    /// Puts `did` on the waiting list, or notes a newer valid invite of theirs.
+    pub fn add_waiting(&self, did: &str, invite: Option<&str>, now: i64) -> Result<()> {
+        let mut db = self.db.lock();
+        db.execute("INSERT OR IGNORE INTO waiting (did, asked_at, invite) VALUES (?1, ?2, ?3)", params![did, now, invite])?;
+        if invite.is_some() {
+            db.execute("UPDATE waiting SET invite = ?2 WHERE did = ?1", params![did, invite])?;
+        }
+        Ok(())
+    }
+
+    pub fn waiting_one(&self, did: &str) -> Result<Option<Waiting>> {
+        self.db.lock().query_row(&format!("SELECT {WAITING_COLUMNS} FROM waiting WHERE did = ?1"), params![did], waiting_from)
+    }
+
+    /// Everyone waiting, who asked first first.
+    pub fn waiting(&self) -> Result<Vec<Waiting>> {
+        self.db.lock().query(&format!("SELECT {WAITING_COLUMNS} FROM waiting ORDER BY asked_at, did"), params![], waiting_from)
+    }
+
+    pub fn waiting_count(&self) -> Result<i64> {
+        self.db.lock().query_value("SELECT COUNT(*) FROM waiting", params![])
+    }
+
+    pub fn remove_waiting(&self, did: &str) -> Result<bool> {
+        Ok(self.db.lock().execute("DELETE FROM waiting WHERE did = ?1", params![did])? > 0)
+    }
+
+    pub fn set_waiting_name(&self, did: &str, name: Option<&str>) -> Result<()> {
+        self.db.lock().execute("UPDATE waiting SET name = ?2 WHERE did = ?1", params![did, name])?;
+        Ok(())
+    }
+
+    pub fn add_invite(&self, invite: &Invite) -> Result<()> {
+        self.db.lock().execute(
+            "INSERT INTO invites (code, uses_left, expires_at, note, created_at, created_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![invite.code, invite.uses_left, invite.expires_at, invite.note, invite.created_at, invite.created_by],
+        )?;
+        Ok(())
+    }
+
+    /// An invite that hasn't been revoked, used up or not.
+    pub fn invite(&self, code: &str) -> Result<Option<Invite>> {
+        self.db.lock().query_row(&format!("SELECT {INVITE_COLUMNS} FROM invites WHERE code = ?1 AND revoked = 0"), params![code], invite_from)
+    }
+
+    /// Every invite still good at `now`, newest first: everyone's, or `by`'s.
+    pub fn invites(&self, by: Option<&str>, now: i64) -> Result<Vec<Invite>> {
+        let all = self.db.lock().query(&format!("SELECT {INVITE_COLUMNS} FROM invites WHERE revoked = 0 ORDER BY created_at DESC, code"), params![], invite_from)?;
+        Ok(all.into_iter().filter(|invite| invite.valid(now) && by.is_none_or(|by| invite.created_by == by)).collect())
+    }
+
+    /// Uses an invite once, if it is still good at `now`. Returns whether it was.
+    pub fn use_invite(&self, code: &str, now: i64) -> Result<bool> {
+        Ok(self.db.lock().execute(
+            "UPDATE invites SET uses_left = uses_left - 1 WHERE code = ?1 AND revoked = 0 \
+             AND (uses_left IS NULL OR uses_left > 0) AND (expires_at IS NULL OR expires_at > ?2)",
+            params![code, now],
+        )? > 0)
+    }
+
+    pub fn revoke_invite(&self, code: &str) -> Result<bool> {
+        Ok(self.db.lock().execute("UPDATE invites SET revoked = 1 WHERE code = ?1 AND revoked = 0", params![code])? > 0)
+    }
+
+    pub fn setting(&self, name: &str) -> Result<Option<String>> {
+        self.db.lock().query_row("SELECT value FROM settings WHERE name = ?1", params![name], |row| row.get(0))
+    }
+
+    pub fn set_setting(&self, name: &str, value: &str) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO settings (name, value) VALUES (?1, ?2)", params![name, value])?;
+        Ok(())
     }
 
     // --- Channels --------------------------------------------------------------

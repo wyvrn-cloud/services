@@ -24,6 +24,14 @@ admins = []
 members = []
 # Whether a member who isn't an admin may open a channel.
 members_may_create_channels = false
+# Who asking to join lets in, until an admin sets it in the app: "admin" (nobody;
+# an admin lets them in from the waiting list), "invite" (whoever brings a valid
+# invite) or "open" (everyone).
+admission = "admin"
+# Whether a member who isn't an admin may make invites, until an admin sets it.
+members_may_invite = false
+# As many as may wait to be let in at once.
+max_waiting = 500
 
 # To have messages to the server arrive through a mediator instead of at public_url
 # (a server at home, or one a phone app has to reach):

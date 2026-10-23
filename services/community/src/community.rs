@@ -7,7 +7,7 @@
 use serde_json::{json, Map, Value};
 
 use crate::config::CommunityConfig;
-use crate::store::{Channel, Member, Mention, Post, Role, Store};
+use crate::store::{Channel, Invite, Member, Mention, Post, Role, Store};
 use wyvrn_service::profile::{Change, Changed, Kept};
 
 pub const PIURI: &str = "https://wyvrn.app/community/1.0";
@@ -25,6 +25,12 @@ pub const MEMBERS_REQUEST: &str = "https://wyvrn.app/community/1.0/members-reque
 pub const MEMBERS: &str = "https://wyvrn.app/community/1.0/members";
 pub const SET_MEMBER: &str = "https://wyvrn.app/community/1.0/set-member";
 pub const SET_PROFILE: &str = "https://wyvrn.app/community/1.0/set-profile";
+pub const WAITING: &str = "https://wyvrn.app/community/1.0/waiting";
+pub const SET_ADMISSION: &str = "https://wyvrn.app/community/1.0/set-admission";
+pub const CREATE_INVITE: &str = "https://wyvrn.app/community/1.0/create-invite";
+pub const REVOKE_INVITE: &str = "https://wyvrn.app/community/1.0/revoke-invite";
+pub const INVITES_REQUEST: &str = "https://wyvrn.app/community/1.0/invites-request";
+pub const INVITES: &str = "https://wyvrn.app/community/1.0/invites";
 // A post is answered, reacted to, changed, taken back and pinned as any message
 // is, by the protocols that already say how, addressed to the server: it is the
 // server that keeps the post.
@@ -71,6 +77,42 @@ const MAX_QUESTION_TEXT: usize = 1_000;
 const MAX_HEADER: usize = 40;
 const MAX_LABEL: usize = 120;
 const MAX_DESCRIPTION: usize = 400;
+const MAX_INVITE_NOTE: usize = 200;
+
+/// Who a `join` from someone who isn't a member lets in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// Nobody: an admin lets them in.
+    Admin,
+    /// Whoever brings a valid invite.
+    Invite,
+    /// Everyone.
+    Open,
+}
+
+impl Admission {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "admin" => Some(Self::Admin),
+            "invite" => Some(Self::Invite),
+            "open" => Some(Self::Open),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::Invite => "invite",
+            Self::Open => "open",
+        }
+    }
+}
+
+/// A new invite's code: 256 bits of randomness, in hex.
+fn new_code() -> String {
+    format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
+}
 
 pub struct Community {
     pub store: Store,
@@ -255,6 +297,8 @@ impl Community {
             "role": member.role.as_str(),
             "joined": member.joined,
             "members_may_create_channels": self.config.members_may_create_channels,
+            "admission": self.admission()?.as_str(),
+            "members_may_invite": self.members_may_invite()?,
             "channels": channels,
             // Where the last change to any post stands: an app holding less asks for
             // what it missed (`changes-request`).
@@ -383,6 +427,116 @@ impl Community {
         Ok(notices)
     }
 
+    /// Who a `join` lets in: as an admin last set it, or as configured.
+    pub fn admission(&self) -> anyhow::Result<Admission> {
+        let set = self.store.setting("admission")?;
+        Ok(set.as_deref().or(Some(self.config.admission.as_str())).and_then(Admission::parse).unwrap_or(Admission::Admin))
+    }
+
+    pub fn members_may_invite(&self) -> anyhow::Result<bool> {
+        Ok(match self.store.setting("members_may_invite")?.as_deref() {
+            Some(set) => set == "true",
+            None => self.config.members_may_invite,
+        })
+    }
+
+    fn invite_body(&self, invite: &Invite) -> anyhow::Result<Value> {
+        let mut body = json!({
+            "code": invite.code,
+            "uses_left": invite.uses_left,
+            "expires_at": invite.expires_at,
+            "created_at": invite.created_at,
+            "created_by": self.who(&invite.created_by)?,
+        });
+        if let Some(note) = &invite.note {
+            body["note"] = json!(note);
+        }
+        Ok(body)
+    }
+
+    /// `{ did, name? }` for a member, as the server knows them.
+    fn who(&self, did: &str) -> anyhow::Result<Value> {
+        let mut who = json!({ "did": did });
+        if let Some(name) = self.store.member(did)?.and_then(|member| member.name) {
+            who["name"] = json!(name);
+        }
+        Ok(who)
+    }
+
+    /// The invites `member` may revoke and is told of: all of them for an admin.
+    fn invites_body(&self, member: &Member, now: i64) -> anyhow::Result<Value> {
+        let by = (member.role != Role::Admin).then_some(member.did.as_str());
+        let invites = self.store.invites(by, now)?.iter().map(|invite| self.invite_body(invite)).collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(json!({ "invites": invites }))
+    }
+
+    /// A `join` from someone who isn't a member: let in, by `admission` and the
+    /// invite they bring, or put on the waiting list.
+    fn join_from_outside(&self, sender: &str, message: &Value, now: i64) -> anyhow::Result<Outcome> {
+        let code = message["body"]["invite"].as_str().filter(|code| !code.is_empty() && code.len() <= 255);
+        let invite = match code {
+            Some(code) => self.store.invite(code)?.filter(|invite| invite.valid(now)),
+            None => None,
+        };
+        let let_in = match self.admission()? {
+            Admission::Open => {
+                // Used up if it was brought, though nothing needed it.
+                if let Some(invite) = &invite {
+                    self.store.use_invite(&invite.code, now)?;
+                }
+                true
+            }
+            Admission::Invite => match &invite {
+                Some(invite) => self.store.use_invite(&invite.code, now)?,
+                None => false,
+            },
+            Admission::Admin => false,
+        };
+        if let_in {
+            self.store.remove_waiting(sender)?;
+            self.store.set_member(sender, Role::Member, now)?;
+            self.store.set_joined(sender, true)?;
+            let member = self.store.member(sender)?.expect("just let in");
+            return Ok(Outcome::reply(reply_to(message, COMMUNITY, self.community(&member)?)));
+        }
+        if self.store.waiting_one(sender)?.is_none() && self.store.waiting_count()? >= self.config.max_waiting as i64 {
+            return refuse(message, "e.p.req.waiting-full", "As many are waiting to be let in as can.");
+        }
+        self.store.add_waiting(sender, invite.as_ref().map(|invite| invite.code.as_str()), now)?;
+        Ok(Outcome::reply(reply_to(message, WAITING, json!({}))))
+    }
+
+    /// Who is waiting, as an admin is told: `waiting` in `members`.
+    fn waiting_body(&self) -> anyhow::Result<Vec<Value>> {
+        self.store
+            .waiting()?
+            .iter()
+            .map(|waiting| {
+                let mut listed = json!({ "did": waiting.did, "asked_at": waiting.asked_at });
+                if let Some(name) = &waiting.name {
+                    listed["name"] = json!(name);
+                }
+                if let Some(code) = &waiting.invite {
+                    let created_by = match self.store.invite(code)? {
+                        Some(invite) => self.who(&invite.created_by)?,
+                        None => Value::Null,
+                    };
+                    listed["invite"] = json!({ "code": code, "created_by": created_by });
+                }
+                Ok(listed)
+            })
+            .collect()
+    }
+
+    /// `members`, as `asker` is told: with who is waiting for an admin.
+    fn members_for(&self, asker: &Member) -> anyhow::Result<Value> {
+        let mut body = self.members_body()?;
+        if asker.role == Role::Admin {
+            body["waiting"] = json!(self.waiting_body()?);
+        }
+        Ok(body)
+    }
+
     fn members_body(&self) -> anyhow::Result<Value> {
         let members: Vec<Value> = self
             .store
@@ -473,7 +627,20 @@ impl Community {
             return refuse(message, "e.p.trust.superseded", "This DID has been replaced by another.");
         }
         let Some(member) = self.store.member(sender)? else {
-            return refuse(message, "e.p.trust.not-authorized", "This community is by invitation: you are not on its list.");
+            // Someone who isn't let in may ask to be, take back having asked, and
+            // say what they are called for the admins who decide.
+            return match message_type {
+                JOIN => self.join_from_outside(sender, message, now),
+                LEAVE if self.store.remove_waiting(sender)? => Ok(Outcome::default()),
+                PROFILE if self.store.waiting_one(sender)?.is_some() => {
+                    let profile = &body["profile"];
+                    if profile.get("displayName").is_some() {
+                        self.store.set_waiting_name(sender, line(&profile["displayName"], MAX_NAME_LENGTH).as_deref())?;
+                    }
+                    Ok(Outcome::default())
+                }
+                _ => refuse(message, "e.p.trust.not-authorized", "This community is by invitation: you are not on its list."),
+            };
         };
 
         match message_type {
@@ -716,7 +883,86 @@ impl Community {
                 Ok(Outcome::reply(reply_to(message, HISTORY, history)))
             }
 
-            MEMBERS_REQUEST => Ok(Outcome::reply(reply_to(message, MEMBERS, self.members_body()?))),
+            MEMBERS_REQUEST => Ok(Outcome::reply(reply_to(message, MEMBERS, self.members_for(&member)?))),
+
+            SET_ADMISSION => {
+                if member.role != Role::Admin {
+                    return refuse(message, "e.p.trust.not-authorized", "Only an admin decides who is let in.");
+                }
+                let admission = match body.get("admission").filter(|v| !v.is_null()) {
+                    Some(value) => match value.as_str().and_then(Admission::parse) {
+                        Some(admission) => Some(admission),
+                        None => return refuse(message, "e.p.msg.invalid-admission", "Admission is admin, invite or open."),
+                    },
+                    None => None,
+                };
+                let may_invite = match body.get("members_may_invite").filter(|v| !v.is_null()) {
+                    Some(value) => match value.as_bool() {
+                        Some(may) => Some(may),
+                        None => return refuse(message, "e.p.msg.invalid-admission", "members_may_invite is true or false."),
+                    },
+                    None => None,
+                };
+                if admission.is_none() && may_invite.is_none() {
+                    return refuse(message, "e.p.msg.invalid-admission", "That changes nothing.");
+                }
+                if let Some(admission) = admission {
+                    self.store.set_setting("admission", admission.as_str())?;
+                }
+                if let Some(may) = may_invite {
+                    self.store.set_setting("members_may_invite", if may { "true" } else { "false" })?;
+                }
+                let mut outcome = Outcome::reply(reply_to(message, COMMUNITY, self.community(&member)?));
+                // Everyone joined is told, as of any change to what the community is.
+                outcome.channels_changed = true;
+                Ok(outcome)
+            }
+
+            CREATE_INVITE => {
+                if member.role != Role::Admin && !self.members_may_invite()? {
+                    return refuse(message, "e.p.trust.not-authorized", "Only an admin makes invites here.");
+                }
+                let uses = match body.get("uses").filter(|v| !v.is_null()) {
+                    Some(value) => match value.as_i64().filter(|uses| *uses >= 1) {
+                        Some(uses) => Some(uses),
+                        None => return refuse(message, "e.p.msg.invalid-invite", "An invite lets in at least one person."),
+                    },
+                    None => None,
+                };
+                let expires_at = match body.get("expires_at").filter(|v| !v.is_null()) {
+                    Some(value) => match value.as_i64().filter(|at| *at > now) {
+                        Some(at) => Some(at),
+                        None => return refuse(message, "e.p.msg.invalid-invite", "An invite can't expire before it is made."),
+                    },
+                    None => None,
+                };
+                let note = match body.get("note").filter(|v| !v.is_null()) {
+                    Some(value) => match value.as_str() {
+                        Some(note) if note.chars().count() <= MAX_INVITE_NOTE => Some(note.trim().to_string()).filter(|n| !n.is_empty()),
+                        _ => return refuse(message, "e.p.msg.invalid-invite", "An invite's note is at most 200 characters."),
+                    },
+                    None => None,
+                };
+                let invite = Invite { code: new_code(), uses_left: uses, expires_at, note, created_at: now, created_by: sender.to_string() };
+                self.store.add_invite(&invite)?;
+                let mut answer = self.invites_body(&member, now)?;
+                answer["created"] = json!(invite.code);
+                Ok(Outcome::reply(reply_to(message, INVITES, answer)))
+            }
+
+            REVOKE_INVITE => {
+                let code = body["code"].as_str().unwrap_or_default();
+                let Some(invite) = self.store.invite(code)? else {
+                    return refuse(message, "e.p.msg.unknown-invite", "There is no such invite.");
+                };
+                if member.role != Role::Admin && invite.created_by != sender {
+                    return refuse(message, "e.p.trust.not-authorized", "Only an admin, or whoever made an invite, can revoke it.");
+                }
+                self.store.revoke_invite(code)?;
+                Ok(Outcome::reply(reply_to(message, INVITES, self.invites_body(&member, now)?)))
+            }
+
+            INVITES_REQUEST => Ok(Outcome::reply(reply_to(message, INVITES, self.invites_body(&member, now)?))),
 
             SET_PROFILE => {
                 if member.role != Role::Admin {
@@ -750,6 +996,7 @@ impl Community {
                     return refuse(message, "e.p.msg.invalid-member", "That isn't a DID.");
                 };
                 let existing = self.store.member(did)?;
+                let was_waiting = existing.is_none() && self.store.waiting_one(did)?.is_some();
                 let last_admin = existing.as_ref().is_some_and(|m| m.role == Role::Admin) && self.store.admin_count()? <= 1;
                 match body["role"].as_str() {
                     Some(role) => {
@@ -763,15 +1010,27 @@ impl Community {
                             return refuse(message, "e.p.trust.superseded", "That DID has been replaced by another.");
                         }
                         self.store.set_member(did, role, now)?;
+                        // Someone let in from the waiting list asked to be sent posts:
+                        // they are joined, and told what the community is.
+                        if was_waiting {
+                            self.store.remove_waiting(did)?;
+                            self.store.set_joined(did, true)?;
+                            let admitted = self.store.member(did)?.expect("just let in");
+                            let mut outcome = Outcome::reply(reply_to(message, MEMBERS, self.members_for(&member)?));
+                            outcome.notices.push((did.to_string(), json!({ "type": COMMUNITY, "body": self.community(&admitted)? })));
+                            return Ok(outcome);
+                        }
                     }
                     None => {
                         if last_admin {
                             return refuse(message, "e.p.msg.last-admin", "A community needs an admin: make someone else one first.");
                         }
+                        // Turned away, if they were waiting; taken out, if they were in.
+                        self.store.remove_waiting(did)?;
                         self.store.remove_member(did)?;
                     }
                 }
-                Ok(Outcome::reply(reply_to(message, MEMBERS, self.members_body()?)))
+                Ok(Outcome::reply(reply_to(message, MEMBERS, self.members_for(&member)?)))
             }
 
             PROFILE => {
