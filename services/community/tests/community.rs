@@ -111,7 +111,7 @@ async fn start_server(settings: &str) -> Running {
     .unwrap();
     let (agent, did_document) = server::build_agent(&config, Identity::generate().unwrap()).unwrap();
     let did = agent.did();
-    let community = Community::new(Store::in_memory().unwrap(), config.community.clone(), Some(wyvrn_service::profile::Kept::scratch().unwrap())).unwrap();
+    let community = Community::new(Store::in_memory().unwrap(), config.community.clone(), Some(wyvrn_service::profile::Kept::scratch().unwrap())).unwrap().with_voice(config.voice.clone());
     let state = Arc::new(AppState { agent, voice: Default::default(), community, did_document, resolver: didcomm_quickstart::default_resolver(), deliver: Notify::new() });
     tokio::spawn(server::run_deliveries(state.clone()));
     let app = server::router(state.clone());
@@ -746,4 +746,48 @@ async fn a_member_reports_a_post_or_a_member_and_only_admins_are_told() {
     let done = all["body"]["reports"].as_array().unwrap().iter().find(|r| r["id"] == id).unwrap().clone();
     assert_eq!(done["resolved_by"], admin.did());
     assert_eq!(admin.community("resolve-report", json!({ "id": "nope" })).await["body"]["code"], "e.p.msg.unknown-report");
+}
+
+#[tokio::test]
+async fn an_admin_opens_voice_channels_which_take_no_posts() {
+    let server = start_server("[voice]\nrelay_url = \"https://voice.example/\"").await;
+    let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member]);
+    member.community("join", json!({})).await;
+
+    // Only an admin, and only valid settings.
+    let refused = member.community("create-channel", json!({ "name": "lounge", "kind": "voice" })).await;
+    assert_eq!(refused["body"]["code"], "e.p.trust.not-authorized");
+    let bad = admin.community("create-channel", json!({ "name": "lounge", "kind": "voice", "voice": { "speak": "nobody" } })).await;
+    assert_eq!(bad["body"]["code"], "e.p.msg.invalid-voice");
+    let made = admin.community("create-channel", json!({ "name": "lounge", "kind": "voice", "voice": { "screen": "admins", "limit": 25 } })).await;
+    assert_eq!(kind(&made), "community", "{made}");
+    let id = made["body"]["created"].as_str().unwrap().to_string();
+    let listed = made["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == id).unwrap().clone();
+    assert_eq!((listed["kind"].as_str(), listed["voice"]["screen"].as_str(), listed["voice"]["limit"].as_i64()), (Some("voice"), Some("admins"), Some(25)));
+    assert_eq!(made["body"]["voice"]["transport"], "moq");
+    member.next_of(&format!("{C}community")).await;
+
+    // It takes no posts.
+    assert_eq!(member.community("post", json!({ "channel": id, "content": "hi" })).await["body"]["code"], "e.p.msg.voice-channel");
+
+    // Its settings change a field at a time; the community's defaults by set-voice.
+    let changed = admin.community("update-channel", json!({ "channel": id, "voice": { "transport": "webrtc", "limit": null } })).await;
+    let listed = changed["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == id).unwrap().clone();
+    assert_eq!((listed["voice"]["transport"].as_str(), listed["voice"]["screen"].as_str(), listed["voice"].get("limit")), (Some("webrtc"), Some("admins"), None));
+    let text = open_channel(&admin, "general").await;
+    let set = admin.community("set-voice", json!({ "transport": "webrtc", "invites_to": text })).await;
+    assert_eq!((set["body"]["voice"]["transport"].as_str(), set["body"]["voice"]["invites_to"].as_str()), (Some("webrtc"), Some(text.as_str())));
+    assert_eq!(admin.community("set-voice", json!({ "invites_to": id })).await["body"]["code"], "e.p.msg.unknown-channel");
+    assert_eq!(member.community("set-voice", json!({ "transport": "moq" })).await["body"]["code"], "e.p.trust.not-authorized");
+}
+
+#[tokio::test]
+async fn a_server_without_voice_has_no_voice_channels() {
+    let server = start_server("").await;
+    let admin = Peer::start(&server).await;
+    server.admit(&[&admin]);
+    assert_eq!(admin.community("create-channel", json!({ "name": "lounge", "kind": "voice" })).await["body"]["code"], "e.p.msg.unsupported");
+    let community = admin.community("join", json!({})).await;
+    assert!(community["body"].get("voice").is_none(), "{community}");
 }

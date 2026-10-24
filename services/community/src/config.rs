@@ -19,6 +19,32 @@ pub struct Config {
     /// description and a picture, each optional.
     #[serde(default)]
     pub profile: wyvrn_service::address::ProfileConfig,
+    /// Voice channels (community-voice/1.0): left out, there are none.
+    #[serde(default)]
+    pub voice: Option<VoiceConfig>,
+}
+
+/// Where voice channels' media is forwarded, and how its tokens are signed.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VoiceConfig {
+    /// The transport a voice channel uses unless it or an admin says otherwise:
+    /// `moq` or `webrtc`.
+    #[serde(default = "default_transport")]
+    pub transport: String,
+    /// The moq relay's public address, which members connect to (`https://…`).
+    #[serde(default)]
+    pub relay_url: String,
+    /// The SHA-256 of a self-signed relay certificate, hex, for members to pin.
+    #[serde(default)]
+    pub relay_fingerprint: Option<String>,
+    /// The moq-auth signing key (a JWK file) tokens are signed with; the relay is
+    /// configured with its public half. Made on first start if missing.
+    #[serde(default)]
+    pub token_key: Option<PathBuf>,
+}
+
+fn default_transport() -> String {
+    "moq".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]

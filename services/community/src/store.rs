@@ -53,6 +53,8 @@ pub struct Channel {
     pub created_by: String,
     /// The number of its newest post; 0 with none.
     pub latest_seq: i64,
+    /// A voice channel's settings (community-voice/1.0); `None` for a text channel.
+    pub voice: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,8 +154,8 @@ const POST_COLUMNS: &str = "serial, channel, seq, id, content, posted_at, author
     (SELECT reply_author FROM post_state WHERE post_state.post = posts.id), \
     (SELECT reply_snippet FROM post_state WHERE post_state.post = posts.id), \
     (SELECT removed_by FROM post_removals WHERE post_removals.post = posts.id)";
-const CHANNEL_COLUMNS: &str =
-    "id, name, topic, closed, created_at, created_by, (SELECT COALESCE(MAX(seq), 0) FROM posts WHERE posts.channel = channels.id)";
+const CHANNEL_COLUMNS: &str = "id, name, topic, closed, created_at, created_by, (SELECT COALESCE(MAX(seq), 0) FROM posts WHERE posts.channel = channels.id), \
+    (SELECT settings FROM channel_voice WHERE channel_voice.channel = channels.id)";
 
 fn member_from(row: &Row) -> Result<Member> {
     let role: String = row.get(1)?;
@@ -202,7 +204,16 @@ fn post_from(row: &Row) -> Result<Post> {
 }
 
 fn channel_from(row: &Row) -> Result<Channel> {
-    Ok(Channel { id: row.get(0)?, name: row.get(1)?, topic: row.get(2)?, closed: row.get(3)?, created_at: row.get(4)?, created_by: row.get(5)?, latest_seq: row.get(6)? })
+    Ok(Channel {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        topic: row.get(2)?,
+        closed: row.get(3)?,
+        created_at: row.get(4)?,
+        created_by: row.get(5)?,
+        latest_seq: row.get(6)?,
+        voice: json_from(row.get(7)?),
+    })
 }
 
 fn answering_from(row: &Row) -> Result<Answering> {
@@ -403,6 +414,12 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         name TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
+    -- Which channels are voice channels (community-voice/1.0), and their settings
+    -- as JSON. A table of its own, as member_left is.
+    CREATE TABLE IF NOT EXISTS channel_voice (
+        channel TEXT PRIMARY KEY,
+        settings TEXT NOT NULL
+    );
     -- The latest version of the rules each has accepted, member or not yet.
     CREATE TABLE IF NOT EXISTS rules_accepted (
         did TEXT PRIMARY KEY,
@@ -523,6 +540,10 @@ fn schema() -> Schema {
             CREATE TABLE IF NOT EXISTS settings (
                 name VARCHAR(64) NOT NULL PRIMARY KEY,
                 value MEDIUMTEXT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS channel_voice (
+                channel VARCHAR(255) NOT NULL PRIMARY KEY,
+                settings TEXT NOT NULL
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS rules_accepted (
                 did {MYSQL_DID} NOT NULL PRIMARY KEY,
@@ -833,6 +854,12 @@ impl Store {
 
     pub fn add_channel(&self, id: &str, name: &str, topic: &str, by: &str, now: i64) -> Result<()> {
         self.db.lock().execute("INSERT INTO channels (id, name, topic, created_at, created_by) VALUES (?1, ?2, ?3, ?4, ?5)", params![id, name, topic, now, by])?;
+        Ok(())
+    }
+
+    /// Makes `id` a voice channel with `settings`, or changes them.
+    pub fn set_channel_voice(&self, id: &str, settings: &Value) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO channel_voice (channel, settings) VALUES (?1, ?2)", params![id, settings.to_string()])?;
         Ok(())
     }
 

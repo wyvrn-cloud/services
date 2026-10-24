@@ -99,7 +99,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     // What an admin has changed of its name, description and picture is kept with
     // the rest, and laid over the settings.
     let kept = wyvrn_service::profile::Kept::open(&location, "community")?;
-    let community = Community::new(open_store(&config)?, config.community.clone(), Some(kept))?;
+    let community = Community::new(open_store(&config)?, config.community.clone(), Some(kept))?.with_voice(config.voice.clone());
     if let Some(document) = &did_document {
         document.changed(&community.changed());
     }

@@ -6,7 +6,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::config::CommunityConfig;
+use crate::config::{CommunityConfig, VoiceConfig};
 use crate::store::{Channel, Invite, Member, Mention, Post, Report, Role, Store};
 use wyvrn_service::profile::{Change, Changed, Kept};
 
@@ -31,6 +31,7 @@ pub const CREATE_INVITE: &str = "https://wyvrn.app/community/1.0/create-invite";
 pub const REVOKE_INVITE: &str = "https://wyvrn.app/community/1.0/revoke-invite";
 pub const INVITES_REQUEST: &str = "https://wyvrn.app/community/1.0/invites-request";
 pub const INVITES: &str = "https://wyvrn.app/community/1.0/invites";
+pub const SET_VOICE: &str = "https://wyvrn.app/community/1.0/set-voice";
 pub const RULES: &str = "https://wyvrn.app/community/1.0/rules";
 pub const ACCEPT_RULES: &str = "https://wyvrn.app/community/1.0/accept-rules";
 pub const SET_RULES: &str = "https://wyvrn.app/community/1.0/set-rules";
@@ -87,6 +88,45 @@ const MAX_LABEL: usize = 120;
 const MAX_DESCRIPTION: usize = 400;
 const MAX_INVITE_NOTE: usize = 200;
 const MAX_RULES: usize = 20_000;
+/// The most a voice channel's `limit` may be.
+const MAX_VOICE_LIMIT: i64 = 500;
+
+/// A voice channel's settings as an admin gives them (community-voice/1.0, "A voice
+/// channel"), laid over what it had: checked, and with nothing in them the protocol
+/// doesn't name. `Err` says what is wrong.
+pub fn clean_voice(given: &Value, held: Option<&Value>) -> Result<Value, &'static str> {
+    let mut out = held.and_then(Value::as_object).cloned().unwrap_or_default();
+    if !given.is_object() && !given.is_null() {
+        return Err("A voice channel's settings are an object.");
+    }
+    for (field, allowed) in [("transport", &["moq", "webrtc"][..]), ("speak", &["everyone", "admins"]), ("video", &["everyone", "admins"]), ("screen", &["everyone", "admins"])] {
+        match given.get(field) {
+            None => {}
+            Some(Value::Null) => {
+                out.remove(field);
+            }
+            Some(value) => match value.as_str().filter(|v| allowed.contains(v)) {
+                Some(v) => {
+                    out.insert(field.into(), json!(v));
+                }
+                None => return Err("A voice setting has a value it doesn't take."),
+            },
+        }
+    }
+    match given.get("limit") {
+        None => {}
+        Some(Value::Null) => {
+            out.remove("limit");
+        }
+        Some(value) => match value.as_i64().filter(|n| (2..=MAX_VOICE_LIMIT).contains(n)) {
+            Some(n) => {
+                out.insert("limit".into(), json!(n));
+            }
+            None => return Err("A voice channel holds between 2 and 500."),
+        },
+    }
+    Ok(Value::Object(out))
+}
 const MAX_REPORT_NOTE: usize = 1_000;
 const REPORT_REASONS: [&str; 7] = ["spam", "harassment", "hate", "violence", "sexual", "illegal", "other"];
 
@@ -140,6 +180,8 @@ pub struct Community {
     /// (`set-profile`), and where that is kept.
     changed: std::sync::RwLock<Changed>,
     kept: Option<Kept>,
+    /// Voice channels, where the server has them (community-voice/1.0).
+    pub voice: Option<VoiceConfig>,
 }
 
 /// What handling a message came to.
@@ -287,7 +329,30 @@ pub fn answer_text(question: &Value, answers: &[Value]) -> String {
 
 impl Community {
     fn channel_body(channel: &Channel) -> Value {
-        json!({ "id": channel.id, "name": channel.name, "topic": channel.topic, "closed": channel.closed, "latest_seq": channel.latest_seq })
+        let mut body = json!({ "id": channel.id, "name": channel.name, "topic": channel.topic, "closed": channel.closed, "latest_seq": channel.latest_seq });
+        if let Some(voice) = &channel.voice {
+            body["kind"] = json!("voice");
+            body["voice"] = voice.clone();
+        }
+        body
+    }
+
+    /// The server with voice channels (community-voice/1.0).
+    pub fn with_voice(mut self, voice: Option<VoiceConfig>) -> Self {
+        self.voice = voice;
+        self
+    }
+
+    /// The community's voice defaults, as `community` says them: the transport,
+    /// and the text channel invitations are posted in.
+    pub fn voice_defaults(&self) -> anyhow::Result<Option<Value>> {
+        let Some(voice) = &self.voice else { return Ok(None) };
+        let transport = self.store.setting("voice_transport")?.unwrap_or_else(|| voice.transport.clone());
+        let mut body = json!({ "transport": transport });
+        if let Some(channel) = self.store.setting("voice_invites_to")?.filter(|c| !c.is_empty()) {
+            body["invites_to"] = json!(channel);
+        }
+        Ok(Some(body))
     }
 
     /// A community as its settings have it, with what an admin changed last time
@@ -298,7 +363,7 @@ impl Community {
             Some(kept) => kept.load()?,
             None => Changed::default(),
         };
-        Ok(Self { store, config, changed: std::sync::RwLock::new(changed), kept })
+        Ok(Self { store, config, changed: std::sync::RwLock::new(changed), kept, voice: None })
     }
 
     /// What an admin has changed of the community's name, description and picture.
@@ -331,6 +396,9 @@ impl Community {
             }
             if let Some(accepted) = self.store.rules_accepted(&member.did)? {
                 body["rules_accepted"] = json!(accepted);
+            }
+            if let Some(voice) = self.voice_defaults()? {
+                body["voice"] = voice;
             }
             Ok(body)
         })
@@ -760,6 +828,22 @@ impl Community {
                 if !self.may_manage_channels(&member) {
                     return refuse(message, "e.p.trust.not-authorized", "Only an admin can open a channel here.");
                 }
+                let voice = match body["kind"].as_str() {
+                    None | Some("text") => None,
+                    Some("voice") => {
+                        if self.voice.is_none() {
+                            return refuse(message, "e.p.msg.unsupported", "This server has no voice channels.");
+                        }
+                        if member.role != Role::Admin {
+                            return refuse(message, "e.p.trust.not-authorized", "Only an admin opens a voice channel.");
+                        }
+                        match clean_voice(&body["voice"], None) {
+                            Ok(voice) => Some(voice),
+                            Err(why) => return refuse(message, "e.p.msg.invalid-voice", why),
+                        }
+                    }
+                    Some(_) => return refuse(message, "e.p.msg.invalid-kind", "A channel is a text channel or a voice channel."),
+                };
                 let Some(name) = line(&body["name"], MAX_CHANNEL_NAME) else {
                     return refuse(message, "e.p.msg.empty", "A channel needs a name.");
                 };
@@ -771,6 +855,9 @@ impl Community {
                 }
                 let id = uuid::Uuid::new_v4().to_string();
                 self.store.add_channel(&id, &name, &line(&body["topic"], MAX_TOPIC).unwrap_or_default(), sender, now)?;
+                if let Some(voice) = &voice {
+                    self.store.set_channel_voice(&id, voice)?;
+                }
                 let mut community = self.community(&member)?;
                 community["created"] = json!(id);
                 Ok(Outcome { reply: Some(reply_to(message, COMMUNITY, community)), channels_changed: true, ..Outcome::default() })
@@ -799,6 +886,15 @@ impl Community {
                     None => channel.topic.clone(),
                 };
                 let closed = body["closed"].as_bool().unwrap_or(channel.closed);
+                if let Some(given) = body.get("voice").filter(|v| !v.is_null()) {
+                    let Some(held) = &channel.voice else {
+                        return refuse(message, "e.p.msg.invalid-voice", "That isn't a voice channel.");
+                    };
+                    match clean_voice(given, Some(held)) {
+                        Ok(voice) => self.store.set_channel_voice(&channel.id, &voice)?,
+                        Err(why) => return refuse(message, "e.p.msg.invalid-voice", why),
+                    }
+                }
                 self.store.update_channel(&channel.id, &name, &topic, closed)?;
                 Ok(Outcome { reply: Some(reply_to(message, COMMUNITY, self.community(&member)?)), channels_changed: true, ..Outcome::default() })
             }
@@ -813,6 +909,9 @@ impl Community {
                 };
                 if channel.closed {
                     return refuse(message, "e.p.msg.closed", "That channel is closed.");
+                }
+                if channel.voice.is_some() {
+                    return refuse(message, "e.p.msg.voice-channel", "A voice channel takes no posts.");
                 }
                 let content = body["content"].as_str().unwrap_or_default().trim();
                 let question = match body.get("question").filter(|question| !question.is_null()) {
@@ -1073,6 +1172,32 @@ impl Community {
             }
 
             INVITES_REQUEST => Ok(Outcome::reply(reply_to(message, INVITES, self.invites_body(&member, now)?))),
+
+            SET_VOICE => {
+                if member.role != Role::Admin {
+                    return refuse(message, "e.p.trust.not-authorized", "Only an admin sets how voice channels work.");
+                }
+                if self.voice.is_none() {
+                    return refuse(message, "e.p.msg.unsupported", "This server has no voice channels.");
+                }
+                match body.get("transport") {
+                    None => {}
+                    Some(Value::String(t)) if t == "moq" || t == "webrtc" => self.store.set_setting("voice_transport", t)?,
+                    Some(_) => return refuse(message, "e.p.msg.invalid-voice", "The transport is moq or webrtc."),
+                }
+                match body.get("invites_to") {
+                    None => {}
+                    Some(Value::Null) => self.store.set_setting("voice_invites_to", "")?,
+                    Some(Value::String(id)) => match self.store.channel(id)? {
+                        Some(channel) if channel.voice.is_none() => self.store.set_setting("voice_invites_to", id)?,
+                        _ => return refuse(message, "e.p.msg.unknown-channel", "That isn't a text channel here."),
+                    },
+                    Some(_) => return refuse(message, "e.p.msg.invalid-voice", "invites_to is a channel's id."),
+                }
+                let mut outcome = Outcome::reply(reply_to(message, COMMUNITY, self.community(&member)?));
+                outcome.channels_changed = true;
+                Ok(outcome)
+            }
 
             ACCEPT_RULES => {
                 let current = self.rules()?.map(|rules| rules.version);
