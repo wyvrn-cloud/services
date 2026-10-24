@@ -31,8 +31,10 @@ pub const MODERATE: &str = "https://wyvrn.app/community-voice/1.0/moderate";
 /// How long someone in a room may go without saying anything (`state`, or any
 /// message of this protocol) before they are taken to have gone.
 pub const SILENT_FOR: i64 = 60;
-/// How often the forwarding service asks again what a session may do.
+/// How often the forwarding service asks again what a session may do, and how
+/// long each answer lasts if it can't ask.
 pub const REVALIDATE_SECONDS: u64 = 15;
+pub const GRANT_SECONDS: i64 = 60;
 /// As many as one `invite` asks.
 const MAX_INVITEES: usize = 10;
 /// How long a ring lasts.
@@ -228,7 +230,7 @@ impl Rooms {
 
     /// The forwarding service's question (moq-auth's auth contract): what the
     /// session holding `token` may do. `None`: nothing, refuse it.
-    pub fn grant(&self, community: &Community, community_did: &str, token: &str) -> Option<Value> {
+    pub fn grant(&self, community: &Community, community_did: &str, token: &str, now: i64) -> Option<Value> {
         let inner = self.lock();
         for (channel, room) in &inner.rooms {
             let Some((did, p)) = room.participants.iter().find(|(_, p)| p.token == token) else { continue };
@@ -246,7 +248,9 @@ impl Rooms {
             if may(&channel_settings, "screen", role) {
                 publish.push(format!("{path}/{}/screen", p.id));
             }
-            return Some(json!({ "publish": publish, "subscribe": [format!("{path}/**")], "revalidate": REVALIDATE_SECONDS }));
+            // A grant that is revalidated has to say when it runs out (moq-auth):
+            // well after the next asking, so a slow answer doesn't cut anyone off.
+            return Some(json!({ "publish": publish, "subscribe": [format!("{path}/**")], "revalidate": REVALIDATE_SECONDS, "expires": now + GRANT_SECONDS }));
         }
         None
     }

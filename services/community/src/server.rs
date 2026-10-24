@@ -398,7 +398,7 @@ async fn voice_auth(State(state): State<Arc<AppState>>, Json(request): Json<Valu
     let query = request["query"].as_str().unwrap_or_default();
     let token = query.split('&').find_map(|pair| pair.strip_prefix("jwt=")).unwrap_or_default();
     let did = state.voice.speaking_as().unwrap_or_else(|| state.agent.did());
-    match state.rooms.grant(&state.community, &did, token) {
+    match state.rooms.grant(&state.community, &did, token, now()) {
         Some(grant) => Json(grant).into_response(),
         None => (StatusCode::FORBIDDEN, Json(json!({ "reason": "forbidden" }))).into_response(),
     }

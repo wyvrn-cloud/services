@@ -37,10 +37,6 @@ pub struct VoiceConfig {
     /// The SHA-256 of a self-signed relay certificate, hex, for members to pin.
     #[serde(default)]
     pub relay_fingerprint: Option<String>,
-    /// The moq-auth signing key (a JWK file) tokens are signed with; the relay is
-    /// configured with its public half. Made on first start if missing.
-    #[serde(default)]
-    pub token_key: Option<PathBuf>,
 }
 
 fn default_transport() -> String {
@@ -107,7 +103,9 @@ impl Config {
     /// Reads `path`, then lets the environment override what a deployment most
     /// often needs to: `COMMUNITY_BIND`, `COMMUNITY_PUBLIC_URL`,
     /// `COMMUNITY_DID_METHOD`, `COMMUNITY_NAME`, and `COMMUNITY_ADMINS` and
-    /// `COMMUNITY_MEMBERS` (DIDs separated by commas or whitespace).
+    /// `COMMUNITY_MEMBERS` (DIDs separated by commas or whitespace), and for voice
+    /// channels `COMMUNITY_VOICE_RELAY_URL`, `COMMUNITY_VOICE_RELAY_FINGERPRINT` and
+    /// `COMMUNITY_VOICE_TRANSPORT`.
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading config {}: {e}", path.display()))?;
@@ -130,6 +128,17 @@ impl Config {
         }
         if let Some(members) = env("COMMUNITY_MEMBERS") {
             config.community.members = dids(&members);
+        }
+        // Voice channels, turned on by naming the relay members connect to.
+        if let Some(relay_url) = env("COMMUNITY_VOICE_RELAY_URL") {
+            let voice = config.voice.get_or_insert_with(|| VoiceConfig { transport: default_transport(), relay_url: String::new(), relay_fingerprint: None });
+            voice.relay_url = relay_url;
+            if let Some(fingerprint) = env("COMMUNITY_VOICE_RELAY_FINGERPRINT") {
+                voice.relay_fingerprint = Some(fingerprint);
+            }
+            if let Some(transport) = env("COMMUNITY_VOICE_TRANSPORT") {
+                voice.transport = transport;
+            }
         }
         if !config.server.public_url.ends_with('/') {
             config.server.public_url.push('/');

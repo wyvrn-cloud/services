@@ -935,6 +935,7 @@ async fn the_relay_is_told_what_each_token_may_publish_from_who_is_in_the_room_n
     assert!(!publish.iter().any(|p| p.ends_with("/screen")), "{publish:?}");
     assert_eq!(grant["subscribe"], json!([format!("{path}/**")]));
     assert_eq!(grant["revalidate"], 15);
+    assert!(grant["expires"].as_i64().unwrap() > wyvrn_service::now() + 15, "{grant}");
 
     // Muted by an admin, the microphone isn't granted; removed, nothing is.
     let admins = voice(&admin, "join", json!({ "channel": stage })).await;

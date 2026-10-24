@@ -1,0 +1,25 @@
+# The voice relay beside a community server (moq-relay, docker-compose.yml's
+# community-voice): it forwards voice channels' media, end-to-end encrypted, and
+# asks the community server what each session may publish and subscribe to.
+
+[log]
+level = "info"
+
+[listen]
+# QUIC (WebTransport) on UDP, and the WebSocket fallback on TCP, on one port.
+bind = "[::]:4443"
+# For trying it out locally: a self-signed certificate, which members pin by its
+# SHA-256 (served at /certificate.sha256; give it to the community as
+# COMMUNITY_VOICE_RELAY_FINGERPRINT). For a real deployment, use a certificate
+# for the relay's name instead (doc.moq.dev/setup/prod):
+#   tls.cert = ["/certs/fullchain.pem"]
+#   tls.key = ["/certs/privkey.pem"]
+tls.generate = ["localhost"]
+
+[web.http]
+listen = "[::]:4443"
+
+[auth]
+# The community server answers who may do what, from who is in each room now
+# (community-voice/1.0, "Who may publish what").
+url = "http://community:8080/voice/auth"

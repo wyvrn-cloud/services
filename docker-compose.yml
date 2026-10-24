@@ -144,8 +144,31 @@ services:
       # In MySQL or MariaDB instead of the volume, its keys too: mysql://user:password@host/database,
       # a database of this service's own (README.md).
       COMMUNITY_DATABASE_URL: "${COMMUNITY_DATABASE_URL:-}"
+      # Voice channels: the relay members' apps connect to (community-voice below),
+      # and the SHA-256 of its certificate while it is self-signed. Empty: no voice.
+      COMMUNITY_VOICE_RELAY_URL: "${COMMUNITY_VOICE_RELAY_URL:-}"
+      COMMUNITY_VOICE_RELAY_FINGERPRINT: "${COMMUNITY_VOICE_RELAY_FINGERPRINT:-}"
     volumes:
       - community-data:/app/data
+    restart: unless-stopped
+
+  # The community's voice relay (moq-relay): forwards voice channels' media, which
+  # it can't read, and asks the community who may do what. Started with
+  #   docker compose --profile voice up -d
+  # Point COMMUNITY_VOICE_RELAY_URL at it (https://<host>:4443/). A community may
+  # instead use a separate one (the official community does): any moq-relay whose
+  # [auth] url is this community's <public_url>/voice/auth.
+  community-voice:
+    image: "moqdev/moq-relay:${MOQ_RELAY_TAG:-latest}"
+    profiles: ["voice"]
+    command: ["/app/relay.toml"]
+    ports:
+      - "${COMMUNITY_VOICE_PORT:-4443}:4443/udp"
+      - "${COMMUNITY_VOICE_PORT:-4443}:4443/tcp"
+    volumes:
+      - ./deploy/voice/moq-relay.toml:/app/relay.toml:ro
+    depends_on:
+      - community
     restart: unless-stopped
 
   # An outbound relay (services/relay): agents registered with it send through it,
