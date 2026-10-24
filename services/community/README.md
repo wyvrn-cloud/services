@@ -67,6 +67,17 @@ asks. That setting can also let members make invites. The configuration's
 `admission` and `members_may_invite` are where it starts; what an admin sets in
 the app wins after that.
 
+An admin can give the community rules (Markdown, set in the app), and require
+them: whoever asks to join is shown them first and is let in, or put on the
+waiting list, only once they agree. Members who were in already can still read
+but can't post until they accept the current version, which is new whenever the
+text changes.
+
+A member can report a post or another member to the admins, with a reason and a
+note. The server keeps a copy of the post as it stood, sends every admin the open
+reports at once, and an admin marks each dealt with. Only admins see reports, and
+they see who made each.
+
 Someone whose devices change gets a new DID. Their app tells the server, signed
 by the old one, and they stay who they were: nobody needs letting in again.
 

@@ -250,6 +250,40 @@ impl Invite {
     }
 }
 
+/// What a member told the admins of.
+#[derive(Debug, Clone)]
+pub struct Report {
+    pub id: String,
+    pub reported_at: i64,
+    pub by: String,
+    pub reason: String,
+    pub note: Option<String>,
+    /// The post reported, by id, and as it stood then.
+    pub post_id: Option<String>,
+    pub post: Option<Value>,
+    /// The member reported.
+    pub member: Option<String>,
+    pub resolved_at: Option<i64>,
+    pub resolved_by: Option<String>,
+}
+
+const REPORT_COLUMNS: &str = "id, reported_at, by_did, reason, note, post_id, post, member, resolved_at, resolved_by";
+
+fn report_from(row: &Row) -> Result<Report> {
+    Ok(Report {
+        id: row.get(0)?,
+        reported_at: row.get(1)?,
+        by: row.get(2)?,
+        reason: row.get(3)?,
+        note: row.get(4)?,
+        post_id: row.get(5)?,
+        post: json_from(row.get(6)?),
+        member: row.get(7)?,
+        resolved_at: row.get(8)?,
+        resolved_by: row.get(9)?,
+    })
+}
+
 const WAITING_COLUMNS: &str = "did, name, asked_at, invite";
 const INVITE_COLUMNS: &str = "code, uses_left, expires_at, note, created_at, created_by";
 
@@ -368,6 +402,25 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
     CREATE TABLE IF NOT EXISTS settings (
         name TEXT PRIMARY KEY,
         value TEXT NOT NULL
+    );
+    -- The latest version of the rules each has accepted, member or not yet.
+    CREATE TABLE IF NOT EXISTS rules_accepted (
+        did TEXT PRIMARY KEY,
+        version INTEGER NOT NULL
+    );
+    -- What members told the admins of (community/1.0's reports). `post` is the
+    -- post as it stood, as JSON.
+    CREATE TABLE IF NOT EXISTS reports (
+        id TEXT PRIMARY KEY,
+        reported_at INTEGER NOT NULL,
+        by_did TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        note TEXT,
+        post_id TEXT,
+        post TEXT,
+        member TEXT,
+        resolved_at INTEGER,
+        resolved_by TEXT
     );";
 
 fn schema() -> Schema {
@@ -469,7 +522,23 @@ fn schema() -> Schema {
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS settings (
                 name VARCHAR(64) NOT NULL PRIMARY KEY,
-                value TEXT NOT NULL
+                value MEDIUMTEXT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS rules_accepted (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                version BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS reports (
+                id VARCHAR(255) NOT NULL PRIMARY KEY,
+                reported_at BIGINT NOT NULL,
+                by_did {MYSQL_DID} NOT NULL,
+                reason VARCHAR(32) NOT NULL,
+                note TEXT,
+                post_id VARCHAR(255),
+                post MEDIUMTEXT,
+                member {MYSQL_DID},
+                resolved_at BIGINT,
+                resolved_by {MYSQL_DID}
             ) {MYSQL_TABLE}"
         )
     });
@@ -602,6 +671,15 @@ impl Store {
                 tx.execute("UPDATE posts SET author_did = ?2 WHERE author_did = ?1", params![prior, new])?;
                 tx.execute("UPDATE posts SET answered_by = ?2 WHERE answered_by = ?1", params![prior, new])?;
                 tx.execute("UPDATE answering SET owner = ?2 WHERE owner = ?1", params![prior, new])?;
+                // Reports they made, or that name them, follow them.
+                tx.execute("UPDATE reports SET by_did = ?2 WHERE by_did = ?1", params![prior, new])?;
+                tx.execute("UPDATE reports SET member = ?2 WHERE member = ?1", params![prior, new])?;
+            }
+            // The rules they accepted, whether or not they were in yet.
+            if let Some(version) = tx.query_row("SELECT version FROM rules_accepted WHERE did = ?1", params![prior], |row| row.get::<i64>(0))? {
+                let kept = tx.query_row("SELECT version FROM rules_accepted WHERE did = ?1", params![new], |row| row.get::<i64>(0))?.unwrap_or(0);
+                tx.execute("INSERT OR REPLACE INTO rules_accepted (did, version) VALUES (?1, ?2)", params![new, version.max(kept)])?;
+                tx.execute("DELETE FROM rules_accepted WHERE did = ?1", params![prior])?;
             }
             tx.execute("INSERT OR REPLACE INTO superseded (did, became, at) VALUES (?1, ?2, ?3)", params![prior, new, now])?;
             Ok(old.is_some())
@@ -681,6 +759,61 @@ impl Store {
     pub fn set_setting(&self, name: &str, value: &str) -> Result<()> {
         self.db.lock().execute("INSERT OR REPLACE INTO settings (name, value) VALUES (?1, ?2)", params![name, value])?;
         Ok(())
+    }
+
+    // --- Rules and reports ---------------------------------------------------
+
+    /// The latest version of the rules `did` has accepted, if any.
+    pub fn rules_accepted(&self, did: &str) -> Result<Option<i64>> {
+        self.db.lock().query_row("SELECT version FROM rules_accepted WHERE did = ?1", params![did], |row| row.get(0))
+    }
+
+    pub fn accept_rules(&self, did: &str, version: i64) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO rules_accepted (did, version) VALUES (?1, ?2)", params![did, version])?;
+        Ok(())
+    }
+
+    /// Files a report, in place of an open one by the same member of the same post
+    /// or member. Returns its id.
+    pub fn add_report(&self, report: &Report) -> Result<String> {
+        self.db.lock().transaction(|tx| {
+            let open = tx.query_row(
+                "SELECT id FROM reports WHERE by_did = ?1 AND resolved_at IS NULL AND (post_id = ?2 OR member = ?3)",
+                params![report.by, report.post_id, report.member],
+                |row| row.get::<String>(0),
+            )?;
+            if let Some(id) = &open {
+                tx.execute("DELETE FROM reports WHERE id = ?1", params![id])?;
+            }
+            tx.execute(
+                "INSERT INTO reports (id, reported_at, by_did, reason, note, post_id, post, member) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    report.id,
+                    report.reported_at,
+                    report.by,
+                    report.reason,
+                    report.note,
+                    report.post_id,
+                    report.post.as_ref().map(Value::to_string),
+                    report.member
+                ],
+            )?;
+            Ok(report.id.clone())
+        })
+    }
+
+    /// Reports, newest first: the open ones, or all of them.
+    pub fn reports(&self, resolved_too: bool) -> Result<Vec<Report>> {
+        let filter = if resolved_too { "" } else { "WHERE resolved_at IS NULL" };
+        self.db.lock().query(&format!("SELECT {REPORT_COLUMNS} FROM reports {filter} ORDER BY reported_at DESC, id"), params![], report_from)
+    }
+
+    pub fn report(&self, id: &str) -> Result<Option<Report>> {
+        self.db.lock().query_row(&format!("SELECT {REPORT_COLUMNS} FROM reports WHERE id = ?1"), params![id], report_from)
+    }
+
+    pub fn resolve_report(&self, id: &str, by: &str, now: i64) -> Result<bool> {
+        Ok(self.db.lock().execute("UPDATE reports SET resolved_at = ?2, resolved_by = ?3 WHERE id = ?1 AND resolved_at IS NULL", params![id, now, by])? > 0)
     }
 
     // --- Channels --------------------------------------------------------------

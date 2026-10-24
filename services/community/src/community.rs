@@ -7,7 +7,7 @@
 use serde_json::{json, Map, Value};
 
 use crate::config::CommunityConfig;
-use crate::store::{Channel, Invite, Member, Mention, Post, Role, Store};
+use crate::store::{Channel, Invite, Member, Mention, Post, Report, Role, Store};
 use wyvrn_service::profile::{Change, Changed, Kept};
 
 pub const PIURI: &str = "https://wyvrn.app/community/1.0";
@@ -31,6 +31,14 @@ pub const CREATE_INVITE: &str = "https://wyvrn.app/community/1.0/create-invite";
 pub const REVOKE_INVITE: &str = "https://wyvrn.app/community/1.0/revoke-invite";
 pub const INVITES_REQUEST: &str = "https://wyvrn.app/community/1.0/invites-request";
 pub const INVITES: &str = "https://wyvrn.app/community/1.0/invites";
+pub const RULES: &str = "https://wyvrn.app/community/1.0/rules";
+pub const ACCEPT_RULES: &str = "https://wyvrn.app/community/1.0/accept-rules";
+pub const SET_RULES: &str = "https://wyvrn.app/community/1.0/set-rules";
+pub const REPORT: &str = "https://wyvrn.app/community/1.0/report";
+pub const REPORT_RECEIVED: &str = "https://wyvrn.app/community/1.0/report-received";
+pub const REPORTS_REQUEST: &str = "https://wyvrn.app/community/1.0/reports-request";
+pub const REPORTS: &str = "https://wyvrn.app/community/1.0/reports";
+pub const RESOLVE_REPORT: &str = "https://wyvrn.app/community/1.0/resolve-report";
 // A post is answered, reacted to, changed, taken back and pinned as any message
 // is, by the protocols that already say how, addressed to the server: it is the
 // server that keeps the post.
@@ -78,6 +86,17 @@ const MAX_HEADER: usize = 40;
 const MAX_LABEL: usize = 120;
 const MAX_DESCRIPTION: usize = 400;
 const MAX_INVITE_NOTE: usize = 200;
+const MAX_RULES: usize = 20_000;
+const MAX_REPORT_NOTE: usize = 1_000;
+const REPORT_REASONS: [&str; 7] = ["spam", "harassment", "hate", "violence", "sexual", "illegal", "other"];
+
+/// The community's rules, where it has any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rules {
+    pub text: String,
+    pub version: i64,
+    pub required: bool,
+}
 
 /// Who a `join` from someone who isn't a member lets in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,6 +323,74 @@ impl Community {
             // what it missed (`changes-request`).
             "latest_rev": self.store.latest_rev()?,
         }))
+        .and_then(|mut body: Value| {
+            if let Some(rules) = self.rules()? {
+                body["rules"] = json!(rules.text);
+                body["rules_version"] = json!(rules.version);
+                body["rules_required"] = json!(rules.required);
+            }
+            if let Some(accepted) = self.store.rules_accepted(&member.did)? {
+                body["rules_accepted"] = json!(accepted);
+            }
+            Ok(body)
+        })
+    }
+
+    /// The rules as an admin last set them, if there are any.
+    pub fn rules(&self) -> anyhow::Result<Option<Rules>> {
+        let Some(text) = self.store.setting("rules")?.filter(|text| !text.is_empty()) else { return Ok(None) };
+        let version = self.store.setting("rules_version")?.and_then(|v| v.parse().ok()).unwrap_or(1);
+        let required = self.store.setting("rules_required")?.as_deref() == Some("true");
+        Ok(Some(Rules { text, version, required }))
+    }
+
+    /// The rules `did` has yet to accept, where they are required.
+    fn rules_owed(&self, did: &str) -> anyhow::Result<Option<Rules>> {
+        let Some(rules) = self.rules()?.filter(|rules| rules.required) else { return Ok(None) };
+        Ok((self.store.rules_accepted(did)?.unwrap_or(0) < rules.version).then_some(rules))
+    }
+
+    /// A `join` where rules are owed: accepted by it (`accept_rules`, the current
+    /// version), or answered with them. `Some` is the answer.
+    fn rules_before_join(&self, sender: &str, message: &Value) -> anyhow::Result<Option<Outcome>> {
+        let Some(rules) = self.rules_owed(sender)? else { return Ok(None) };
+        if message["body"]["accept_rules"].as_i64() == Some(rules.version) {
+            self.store.accept_rules(sender, rules.version)?;
+            return Ok(None);
+        }
+        let name = self.changed().name.unwrap_or_else(|| self.config.name.clone());
+        Ok(Some(Outcome::reply(reply_to(message, RULES, json!({ "name": name, "rules": rules.text, "rules_version": rules.version })))))
+    }
+
+    fn report_body(&self, report: &Report) -> anyhow::Result<Value> {
+        let mut body = json!({ "id": report.id, "reported_at": report.reported_at, "by": self.who(&report.by)?, "reason": report.reason });
+        if let Some(note) = &report.note {
+            body["note"] = json!(note);
+        }
+        if let Some(post) = &report.post {
+            let mut post = post.clone();
+            let removed = match &report.post_id {
+                Some(id) => self.store.post_by_id(id)?.is_none_or(|now| now.deleted),
+                None => false,
+            };
+            post["removed"] = json!(removed);
+            body["post"] = post;
+        }
+        if let Some(member) = &report.member {
+            body["member"] = self.who(member)?;
+        }
+        if let Some(at) = report.resolved_at {
+            body["resolved_at"] = json!(at);
+        }
+        if let Some(by) = &report.resolved_by {
+            body["resolved_by"] = json!(by);
+        }
+        Ok(body)
+    }
+
+    fn reports_body(&self, resolved_too: bool) -> anyhow::Result<Value> {
+        let reports = self.store.reports(resolved_too)?.iter().map(|report| self.report_body(report)).collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(json!({ "reports": reports }))
     }
 
     fn message_body(post: &Post) -> Value {
@@ -637,7 +724,10 @@ impl Community {
             // Someone who isn't let in may ask to be, take back having asked, and
             // say what they are called for the admins who decide.
             return match message_type {
-                JOIN => self.join_from_outside(sender, message, now),
+                JOIN => match self.rules_before_join(sender, message)? {
+                    Some(rules) => Ok(rules),
+                    None => self.join_from_outside(sender, message, now),
+                },
                 LEAVE if self.store.remove_waiting(sender)? => Ok(Outcome::default()),
                 PROFILE if self.store.waiting_one(sender)?.is_some() => {
                     let profile = &body["profile"];
@@ -652,6 +742,11 @@ impl Community {
 
         match message_type {
             JOIN | LEAVE => {
+                if message_type == JOIN {
+                    if let Some(rules) = self.rules_before_join(sender, message)? {
+                        return Ok(rules);
+                    }
+                }
                 // Someone who had joined and leaves stays a member, sent nothing more.
                 if message_type == LEAVE && member.joined {
                     self.store.note_left(sender, now)?;
@@ -706,6 +801,10 @@ impl Community {
                 let closed = body["closed"].as_bool().unwrap_or(channel.closed);
                 self.store.update_channel(&channel.id, &name, &topic, closed)?;
                 Ok(Outcome { reply: Some(reply_to(message, COMMUNITY, self.community(&member)?)), channels_changed: true, ..Outcome::default() })
+            }
+
+            POST | CREATE_THREAD if self.rules_owed(sender)?.is_some() => {
+                refuse(message, "e.p.msg.rules-not-accepted", "Accept this community's rules before posting.")
             }
 
             POST => {
@@ -974,6 +1073,141 @@ impl Community {
             }
 
             INVITES_REQUEST => Ok(Outcome::reply(reply_to(message, INVITES, self.invites_body(&member, now)?))),
+
+            ACCEPT_RULES => {
+                let current = self.rules()?.map(|rules| rules.version);
+                if current.is_none() || body["rules_version"].as_i64() != current {
+                    return refuse(message, "e.p.msg.invalid-rules", "Those aren't the rules as they stand.");
+                }
+                self.store.accept_rules(sender, current.unwrap_or_default())?;
+                Ok(Outcome::reply(reply_to(message, COMMUNITY, self.community(&member)?)))
+            }
+
+            SET_RULES => {
+                if member.role != Role::Admin {
+                    return refuse(message, "e.p.trust.not-authorized", "Only an admin sets the rules.");
+                }
+                let text = match body.get("rules").filter(|v| !v.is_null()) {
+                    Some(value) => match value.as_str() {
+                        Some(text) if text.chars().count() > MAX_RULES => return refuse(message, "e.p.msg.too-long", "Rules are at most 20,000 characters."),
+                        Some(text) => Some(text.trim().to_string()),
+                        None => return refuse(message, "e.p.msg.invalid-rules", "The rules are text."),
+                    },
+                    None => None,
+                };
+                let required = match body.get("required").filter(|v| !v.is_null()) {
+                    Some(value) => match value.as_bool() {
+                        Some(required) => Some(required),
+                        None => return refuse(message, "e.p.msg.invalid-rules", "required is true or false."),
+                    },
+                    None => None,
+                };
+                if text.is_none() && required.is_none() {
+                    return refuse(message, "e.p.msg.invalid-rules", "That changes nothing.");
+                }
+                let before = self.rules()?;
+                let after_text = text.clone().unwrap_or_else(|| before.as_ref().map(|rules| rules.text.clone()).unwrap_or_default());
+                if required == Some(true) && after_text.is_empty() {
+                    return refuse(message, "e.p.msg.invalid-rules", "There are no rules to require.");
+                }
+                if let Some(text) = &text {
+                    if before.as_ref().map(|rules| &rules.text) != Some(text) && !text.is_empty() {
+                        // A new text is a new version, counting on from the last one
+                        // there ever was.
+                        let last: i64 = self.store.setting("rules_version")?.and_then(|v| v.parse().ok()).unwrap_or(0);
+                        self.store.set_setting("rules_version", &(last + 1).to_string())?;
+                    }
+                    self.store.set_setting("rules", text)?;
+                }
+                if let Some(required) = required {
+                    self.store.set_setting("rules_required", if required { "true" } else { "false" })?;
+                }
+                if text.as_deref() == Some("") {
+                    self.store.set_setting("rules_required", "false")?;
+                }
+                // Whoever set them has read them.
+                if let Some(rules) = self.rules()? {
+                    self.store.accept_rules(sender, rules.version)?;
+                }
+                let mut outcome = Outcome::reply(reply_to(message, COMMUNITY, self.community(&member)?));
+                outcome.channels_changed = true;
+                Ok(outcome)
+            }
+
+            REPORT => {
+                let reason = body["reason"].as_str().unwrap_or_default();
+                if !REPORT_REASONS.contains(&reason) {
+                    return refuse(message, "e.p.msg.invalid-report", "A report gives one of the reasons listed.");
+                }
+                let note = match body.get("note").filter(|v| !v.is_null()) {
+                    Some(value) => match value.as_str() {
+                        Some(note) if note.chars().count() <= MAX_REPORT_NOTE => Some(note.trim().to_string()).filter(|n| !n.is_empty()),
+                        _ => return refuse(message, "e.p.msg.invalid-report", "A report's note is at most 1,000 characters."),
+                    },
+                    None => None,
+                };
+                let post_id = body["post"].as_str().filter(|id| !id.is_empty());
+                let reported_member = body["member"].as_str().filter(|did| !did.is_empty());
+                let mut report = Report {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    reported_at: now,
+                    by: sender.to_string(),
+                    reason: reason.to_string(),
+                    note,
+                    post_id: None,
+                    post: None,
+                    member: None,
+                    resolved_at: None,
+                    resolved_by: None,
+                };
+                match (post_id, reported_member) {
+                    (Some(id), None) => {
+                        let Some(post) = self.store.post_by_id(id)?.filter(|post| body["channel"].as_str().is_none_or(|channel| channel == post.channel)) else {
+                            return refuse(message, "e.p.msg.unknown-post", "There is no such post.");
+                        };
+                        if post.author_did == sender {
+                            return refuse(message, "e.p.msg.invalid-report", "A post of one's own isn't reported.");
+                        }
+                        let mut author = json!({ "did": post.author_did });
+                        if let Some(name) = &post.author_name {
+                            author["name"] = json!(name);
+                        }
+                        report.post_id = Some(post.id.clone());
+                        report.post = Some(json!({ "channel": post.channel, "id": post.id, "seq": post.seq, "content": post.content, "author": author }));
+                    }
+                    (None, Some(did)) => {
+                        if did == sender {
+                            return refuse(message, "e.p.msg.invalid-report", "Nobody reports themselves.");
+                        }
+                        if self.store.member(did)?.is_none() {
+                            return refuse(message, "e.p.msg.invalid-member", "There is no such member.");
+                        }
+                        report.member = Some(did.to_string());
+                    }
+                    _ => return refuse(message, "e.p.msg.invalid-report", "A report names a post or a member, one of them."),
+                }
+                let id = self.store.add_report(&report)?;
+                let mut outcome = Outcome::reply(reply_to(message, REPORT_RECEIVED, json!({ "id": id })));
+                let open = self.reports_body(false)?;
+                for admin in self.store.joined()?.into_iter().filter(|joined| joined.role == Role::Admin && joined.did != sender) {
+                    outcome.notices.push((admin.did, json!({ "type": REPORTS, "id": uuid::Uuid::new_v4().to_string(), "body": open.clone() })));
+                }
+                Ok(outcome)
+            }
+
+            REPORTS_REQUEST | RESOLVE_REPORT => {
+                if member.role != Role::Admin {
+                    return refuse(message, "e.p.trust.not-authorized", "Only an admin is told of reports.");
+                }
+                if message_type == RESOLVE_REPORT {
+                    let id = body["id"].as_str().unwrap_or_default();
+                    if self.store.report(id)?.is_none() {
+                        return refuse(message, "e.p.msg.unknown-report", "There is no such report.");
+                    }
+                    self.store.resolve_report(id, sender, now)?;
+                }
+                Ok(Outcome::reply(reply_to(message, REPORTS, self.reports_body(body["resolved"] == true)?)))
+            }
 
             SET_PROFILE => {
                 if member.role != Role::Admin {

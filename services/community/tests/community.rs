@@ -653,3 +653,97 @@ async fn a_member_who_leaves_is_sent_nothing_and_listed_as_left_until_they_come_
     assert!(entry.get("left_at").is_none(), "{entry}");
 }
 
+
+#[tokio::test]
+async fn rules_that_are_required_are_accepted_before_joining_and_before_posting() {
+    let server = start_server("").await;
+    let (admin, member, stranger) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member]);
+    member.community("join", json!({})).await;
+    let channel = open_channel(&admin, "general").await;
+    member.next_of(&format!("{C}community")).await;
+
+    assert_eq!(member.community("set-rules", json!({ "rules": "Be kind." })).await["body"]["code"], "e.p.trust.not-authorized");
+    assert_eq!(admin.community("set-rules", json!({ "required": true })).await["body"]["code"], "e.p.msg.invalid-rules");
+    let set = admin.community("set-rules", json!({ "rules": "Be kind.", "required": true })).await;
+    assert_eq!((set["body"]["rules"].as_str(), set["body"]["rules_version"].as_i64(), set["body"]["rules_required"].as_bool()), (Some("Be kind."), Some(1), Some(true)));
+    // Whoever set them has accepted them; everyone joined is told.
+    assert_eq!(set["body"]["rules_accepted"], 1);
+    let told = member.next_of(&format!("{C}community")).await;
+    assert_eq!((told["body"]["rules_version"].as_i64(), told["body"].get("rules_accepted")), (Some(1), None));
+
+    // A member who hasn't accepted them can't post until they do.
+    let refused = member.community("post", json!({ "channel": channel, "content": "hello" })).await;
+    assert_eq!(refused["body"]["code"], "e.p.msg.rules-not-accepted");
+    assert_eq!(member.community("accept-rules", json!({ "rules_version": 7 })).await["body"]["code"], "e.p.msg.invalid-rules");
+    let accepted = member.community("accept-rules", json!({ "rules_version": 1 })).await;
+    assert_eq!(accepted["body"]["rules_accepted"], 1);
+    assert_eq!(kind(&member.community("post", json!({ "channel": channel, "content": "hello" })).await), "posted");
+
+    // Someone outside is shown them, not put on the waiting list, until they agree.
+    admin.community("set-admission", json!({ "admission": "open" })).await;
+    let rules = stranger.community("join", json!({})).await;
+    assert_eq!(kind(&rules), "rules", "{rules}");
+    assert_eq!((rules["body"]["rules"].as_str(), rules["body"]["rules_version"].as_i64(), rules["body"]["name"].as_str()), (Some("Be kind."), Some(1), Some("The Workshop")));
+    assert!(server.state.community.store.waiting().unwrap().is_empty());
+    assert_eq!(kind(&stranger.community("join", json!({ "accept_rules": 0 })).await), "rules");
+    let joined = stranger.community("join", json!({ "accept_rules": 1 })).await;
+    assert_eq!((kind(&joined), joined["body"]["rules_accepted"].as_i64()), ("community", Some(1)));
+
+    // A new text is a new version, owed again; taking a requirement off is not.
+    let changed = admin.community("set-rules", json!({ "rules": "Be kind. No spam." })).await;
+    assert_eq!(changed["body"]["rules_version"], 2);
+    assert_eq!(member.community("post", json!({ "channel": channel, "content": "again" })).await["body"]["code"], "e.p.msg.rules-not-accepted");
+    admin.community("set-rules", json!({ "required": false })).await;
+    assert_eq!(kind(&member.community("post", json!({ "channel": channel, "content": "again" })).await), "posted");
+    // Taken away entirely, nothing is said of them.
+    let gone = admin.community("set-rules", json!({ "rules": "" })).await;
+    assert!(gone["body"].get("rules").is_none(), "{gone}");
+}
+
+#[tokio::test]
+async fn a_member_reports_a_post_or_a_member_and_only_admins_are_told() {
+    let server = start_server("").await;
+    let (admin, alice, bob) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &alice, &bob]);
+    admin.community("join", json!({})).await;
+    let channel = open_channel(&admin, "general").await;
+    let posted = bob.community("post", json!({ "channel": channel, "id": "spam-1", "content": "buy now" })).await;
+    assert_eq!(kind(&posted), "posted");
+    admin.next_message().await;
+
+    assert_eq!(alice.community("report", json!({ "post": "spam-1", "reason": "rude" })).await["body"]["code"], "e.p.msg.invalid-report");
+    assert_eq!(bob.community("report", json!({ "post": "spam-1", "reason": "spam" })).await["body"]["code"], "e.p.msg.invalid-report");
+    assert_eq!(alice.community("report", json!({ "post": "nope", "reason": "spam" })).await["body"]["code"], "e.p.msg.unknown-post");
+    assert_eq!(alice.community("report", json!({ "post": "spam-1", "member": bob.did(), "reason": "spam" })).await["body"]["code"], "e.p.msg.invalid-report");
+
+    let received = alice.community("report", json!({ "channel": channel, "post": "spam-1", "reason": "spam", "note": "third time today" })).await;
+    assert_eq!(kind(&received), "report-received", "{received}");
+    // The admin is sent the open reports, with who made each and the post as it stood.
+    let told = admin.next_of(&format!("{C}reports")).await;
+    let report = told["body"]["reports"][0].clone();
+    assert_eq!((report["reason"].as_str(), report["note"].as_str(), report["by"]["did"].as_str()), (Some("spam"), Some("third time today"), Some(alice.did().as_str())));
+    assert_eq!((report["post"]["content"].as_str(), report["post"]["author"]["did"].as_str(), report["post"]["removed"].as_bool()), (Some("buy now"), Some(bob.did().as_str()), Some(false)));
+
+    // Reporting it again replaces the first; a member is reported apart.
+    alice.community("report", json!({ "post": "spam-1", "reason": "other" })).await;
+    alice.community("report", json!({ "member": bob.did(), "reason": "harassment" })).await;
+    let open = admin.community("reports-request", json!({})).await;
+    assert_eq!(open["body"]["reports"].as_array().unwrap().len(), 2, "{open}");
+
+    // Only admins may see them. Removed since, the copy stays and says so.
+    assert_eq!(alice.community("reports-request", json!({})).await["body"]["code"], "e.p.trust.not-authorized");
+    admin.ask("https://wyvrn.app/message-edits/1.0/delete", json!({ "to": { "id": "spam-1", "author": bob.did() } })).await;
+    let after = admin.community("reports-request", json!({})).await;
+    let post_report = after["body"]["reports"].as_array().unwrap().iter().find(|r| r.get("post").is_some()).unwrap().clone();
+    assert_eq!((post_report["post"]["content"].as_str(), post_report["post"]["removed"].as_bool()), (Some("buy now"), Some(true)));
+
+    // Dealt with, it is off the open list and on the full one.
+    let id = post_report["id"].as_str().unwrap();
+    let resolved = admin.community("resolve-report", json!({ "id": id })).await;
+    assert_eq!(resolved["body"]["reports"].as_array().unwrap().len(), 1);
+    let all = admin.community("reports-request", json!({ "resolved": true })).await;
+    let done = all["body"]["reports"].as_array().unwrap().iter().find(|r| r["id"] == id).unwrap().clone();
+    assert_eq!(done["resolved_by"], admin.did());
+    assert_eq!(admin.community("resolve-report", json!({ "id": "nope" })).await["body"]["code"], "e.p.msg.unknown-report");
+}
