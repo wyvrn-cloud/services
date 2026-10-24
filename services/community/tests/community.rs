@@ -198,21 +198,35 @@ async fn an_admin_opens_channels_and_everyone_who_joined_is_told() {
     // A member can't open one here; an admin can, and the member's app hears of it.
     let refused = member.community("create-channel", json!({ "name": "mine" })).await;
     assert_eq!(refused["body"]["code"], "e.p.trust.not-authorized");
-    let channel = open_channel(&admin, "  design   review ").await;
+    // A text channel's name is one word in lowercase, as on IRC (any script).
+    for bad in ["design review", "Design", "design!", "#design"] {
+        let refused = admin.community("create-channel", json!({ "name": bad })).await;
+        assert_eq!(refused["body"]["code"], "e.p.msg.invalid-name", "{bad}");
+    }
+    let channel = open_channel(&admin, " design-review ").await;
     let told = member.next_of(&format!("{C}community")).await;
-    assert_eq!(told["body"]["channels"][0]["name"], "design review");
+    assert_eq!(told["body"]["channels"][0]["name"], "design-review");
     assert_eq!(told["body"]["channels"][0]["id"], channel);
     assert_eq!(told["body"]["role"], "member");
 
-    // No two open channels share a name, whatever its case.
-    let twice = admin.community("create-channel", json!({ "name": "Design Review" })).await;
+    // No two open channels share a name.
+    let twice = admin.community("create-channel", json!({ "name": "design-review" })).await;
     assert_eq!(twice["body"]["code"], "e.p.msg.name-taken");
+    open_channel(&admin, "にほんご").await;
+    open_channel(&admin, "v1.2_notes").await;
 
     // Renamed, given a topic, and closed: a closed channel takes no more posts.
     let changed = admin.community("update-channel", json!({ "channel": channel, "name": "design", "topic": "What we are building", "closed": true })).await;
-    assert_eq!(changed["body"]["channels"][0], json!({ "id": channel, "name": "design", "topic": "What we are building", "closed": true, "latest_seq": 0 }));
+    let held = changed["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == channel.as_str()).unwrap().clone();
+    assert_eq!(held, json!({ "id": channel, "name": "design", "topic": "What we are building", "closed": true, "latest_seq": 0 }));
     let late = admin.community("post", json!({ "channel": channel, "content": "too late" })).await;
     assert_eq!(late["body"]["code"], "e.p.msg.closed");
+    let renamed = admin.community("update-channel", json!({ "channel": channel, "name": "Design" })).await;
+    assert_eq!(renamed["body"]["code"], "e.p.msg.invalid-name");
+    // Its name taken while it was closed, it isn't opened again over the new one.
+    open_channel(&admin, "design").await;
+    let reopened = admin.community("update-channel", json!({ "channel": channel, "closed": false })).await;
+    assert_eq!(reopened["body"]["code"], "e.p.msg.name-taken");
     // ...and only an admin, or whoever opened it, changes a channel.
     let meddling = member.community("update-channel", json!({ "channel": channel, "closed": false })).await;
     assert_eq!(meddling["body"]["code"], "e.p.trust.not-authorized");
@@ -349,7 +363,7 @@ async fn members_may_open_channels_where_the_community_says_so() {
     let server = start_server("members_may_create_channels = true").await;
     let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);
     server.admit(&[&admin, &member]);
-    let channel = open_channel(&member, "a session").await;
+    let channel = open_channel(&member, "a-session").await;
     // Whoever opened it may close it.
     let closed = member.community("update-channel", json!({ "channel": channel, "closed": true })).await;
     assert_eq!(closed["body"]["channels"][0]["closed"], true);

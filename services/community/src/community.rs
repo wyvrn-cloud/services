@@ -256,6 +256,17 @@ fn refuse(message: &Value, code: &str, comment: &str) -> anyhow::Result<Outcome>
 
 /// Text someone typed for a name or a label: trimmed, on one line, and not longer
 /// than `max` characters. `None` if that leaves nothing.
+/// Whether a name is one a text channel may be given (community/1.0, "A text
+/// channel's name is one word"): lowercase letters of any script, letters of
+/// scripts without case, their marks, digits, `_`, `.` and `-`.
+fn text_channel_name(name: &str) -> bool {
+    static WORD: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"^[\p{Ll}\p{Lo}\p{Lm}\p{Mn}\p{Mc}\p{Nd}_.\-]+$").expect("a valid pattern"));
+    WORD.is_match(name)
+}
+
+const INVALID_NAME: &str = "A text channel's name is one word in lowercase: letters, digits, _, . and -, as in design-review.";
+
 fn line(value: &Value, max: usize) -> Option<String> {
     let text: String = value.as_str()?.split_whitespace().collect::<Vec<_>>().join(" ");
     let text: String = text.chars().take(max).collect();
@@ -884,6 +895,9 @@ impl Community {
                 let Some(name) = line(&body["name"], MAX_CHANNEL_NAME) else {
                     return refuse(message, "e.p.msg.empty", "A channel needs a name.");
                 };
+                if voice.is_none() && !text_channel_name(&name) {
+                    return refuse(message, "e.p.msg.invalid-name", INVALID_NAME);
+                }
                 if self.store.channel_named(&name)?.is_some() {
                     return refuse(message, "e.p.msg.name-taken", "There is a channel called that already.");
                 }
@@ -915,14 +929,20 @@ impl Community {
                     },
                     None => channel.name.clone(),
                 };
-                if !name.eq_ignore_ascii_case(&channel.name) && self.store.channel_named(&name)?.is_some() {
+                // A name from before the rule stands until the channel is renamed.
+                if name != channel.name && channel.voice.is_none() && !text_channel_name(&name) {
+                    return refuse(message, "e.p.msg.invalid-name", INVALID_NAME);
+                }
+                let closed = body["closed"].as_bool().unwrap_or(channel.closed);
+                // Renamed to, or opened again with, the name of another open channel.
+                let named = self.store.channel_named(&name)?.filter(|other| other.id != channel.id);
+                if named.is_some() && (!name.eq_ignore_ascii_case(&channel.name) || (channel.closed && !closed)) {
                     return refuse(message, "e.p.msg.name-taken", "There is a channel called that already.");
                 }
                 let topic = match body.get("topic") {
                     Some(topic) => line(topic, MAX_TOPIC).unwrap_or_default(),
                     None => channel.topic.clone(),
                 };
-                let closed = body["closed"].as_bool().unwrap_or(channel.closed);
                 if let Some(given) = body.get("voice").filter(|v| !v.is_null()) {
                     let Some(held) = &channel.voice else {
                         return refuse(message, "e.p.msg.invalid-voice", "That isn't a voice channel.");

@@ -23,6 +23,8 @@ toml = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+# Unicode categories, for what a text channel may be called (community.rs).
+regex = "1"
 sha2 = { workspace = true }
 
 [dev-dependencies]
