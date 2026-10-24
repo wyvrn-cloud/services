@@ -999,3 +999,57 @@ async fn a_voice_channel_has_a_limit_and_one_room_at_a_time() {
     let stranger = Peer::start(&server).await;
     assert_eq!(voice(&stranger, "join", json!({ "channel": small })).await["body"]["code"], "e.p.trust.not-authorized");
 }
+
+#[tokio::test]
+async fn a_member_in_a_room_from_two_devices_is_two_participants_and_can_move_to_one() {
+    let server = voice_server().await;
+    let (alice, bob) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&alice, &bob]);
+    let lounge = voice_channel(&alice, "lounge", json!({})).await;
+    let mut live = Live::open(&bob, &server).await;
+    live.send(&bob, "watch-presence", json!({})).await;
+    live.next_of(&bob, "presence").await;
+
+    // Alice's desktop, then her phone: two participants, each told of the other.
+    let desk = voice(&alice, "join", json!({ "channel": lounge, "device": "desk" })).await;
+    let phone = voice(&alice, "join", json!({ "channel": lounge, "device": "phone" })).await;
+    let (desk_id, phone_id) = (desk["body"]["participant"].as_str().unwrap().to_string(), phone["body"]["participant"].as_str().unwrap().to_string());
+    assert_ne!(desk_id, phone_id);
+    assert_ne!(desk["body"]["transport"]["token"], phone["body"]["transport"]["token"]);
+    assert_eq!(phone["body"]["participants"][0]["participant"], desk_id);
+    // The desktop asking again is the same participant, with its token.
+    let again = voice(&alice, "join", json!({ "channel": lounge, "device": "desk" })).await;
+    assert_eq!((again["body"]["participant"].as_str(), &again["body"]["transport"]["token"]), (Some(desk_id.as_str()), &desk["body"]["transport"]["token"]));
+
+    // A key from one device to the other reaches the member, saying which it is for.
+    let jwe = json!({ "protected": "e30", "ciphertext": "opaque" });
+    tell(&alice, "keys", json!({ "channel": lounge, "participant": desk_id, "keys": [{ "to": phone_id, "kid": "d1", "jwe": jwe }] })).await;
+    let key = alice.next_of(&format!("{V}keys")).await;
+    assert_eq!((key["body"]["from"].as_str(), key["body"]["to"].as_str()), (Some(desk_id.as_str()), Some(phone_id.as_str())));
+
+    // State names its participant; the other device's is left as it was.
+    tell(&alice, "state", json!({ "channel": lounge, "participant": phone_id, "muted": true, "deafened": false, "sharing": {} })).await;
+    let mut presence = live.next_of(&bob, "presence").await;
+    while presence["body"]["channels"][0]["participants"].as_array().unwrap().iter().all(|p| p["muted"] != true) {
+        presence = live.next_of(&bob, "presence").await;
+    }
+    let muted: Vec<&str> = presence["body"]["channels"][0]["participants"].as_array().unwrap().iter().filter(|p| p["muted"] == true).map(|p| p["participant"].as_str().unwrap()).collect();
+    assert_eq!(muted, vec![phone_id.as_str()]);
+
+    // Her laptop joins with replace ("move here"): the other two are out.
+    let laptop = voice(&alice, "join", json!({ "channel": lounge, "device": "laptop", "replace": true })).await;
+    assert_eq!(laptop["body"]["participants"], json!([]));
+    let mut after = live.next_of(&bob, "presence").await;
+    while after["body"]["channels"][0]["participants"].as_array().unwrap().len() != 1 {
+        after = live.next_of(&bob, "presence").await;
+    }
+    assert_eq!(after["body"]["channels"][0]["participants"][0]["participant"], laptop["body"]["participant"]);
+
+    // Leaving names the participant; one that sent none leaves with all of its.
+    voice(&alice, "join", json!({ "channel": lounge, "device": "desk" })).await;
+    tell(&alice, "leave", json!({ "channel": lounge })).await;
+    let mut empty = live.next_of(&bob, "presence").await;
+    while !empty["body"]["channels"][0]["participants"].as_array().unwrap().is_empty() {
+        empty = live.next_of(&bob, "presence").await;
+    }
+}

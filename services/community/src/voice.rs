@@ -52,6 +52,13 @@ pub struct Sharing {
 pub struct Participant {
     /// Opaque: what the forwarding service knows them by.
     pub id: String,
+    /// The member's.
+    pub did: String,
+    /// The device's own id (`join`'s `device`; empty for one that sent none). A
+    /// member's devices share its DID, and each is a participant of its own.
+    pub device: String,
+    /// The live connection it joined over, if it did: closing that takes it out.
+    pub live: Option<u64>,
     /// What their app gives the forwarding service.
     pub token: String,
     pub muted: bool,
@@ -63,8 +70,24 @@ pub struct Participant {
 
 #[derive(Debug, Default)]
 struct Room {
-    /// By DID.
+    /// By participant id.
     participants: BTreeMap<String, Participant>,
+}
+
+impl Room {
+    /// The participant of `did` that a request means: the one it names, if it is
+    /// theirs, else their only one (the first, for a member that sent none from
+    /// several devices).
+    fn of(&self, did: &str, named: Option<&str>) -> Option<String> {
+        match named {
+            Some(id) => self.participants.get(id).filter(|p| p.did == did).map(|p| p.id.clone()),
+            None => self.participants.values().find(|p| p.did == did).map(|p| p.id.clone()),
+        }
+    }
+
+    fn holds(&self, did: &str) -> bool {
+        self.participants.values().any(|p| p.did == did)
+    }
 }
 
 /// A member's live connection (community-voice/1.0's Connectivity): where
@@ -159,18 +182,19 @@ impl Rooms {
         self.lock().live.iter().filter(|(_, live)| live.did == did).map(|(id, _)| *id).collect()
     }
 
-    /// A live connection closed: its holder, if it held no other, is out of any
-    /// room it was in. Returns the presence to send.
+    /// A live connection closed: whoever joined over it is out of their room, and
+    /// so is a participant of its holder that joined otherwise, if the holder holds
+    /// no other. Returns the presence to send.
     pub fn close_live(&self, community: &Community, id: u64) -> Vec<(u64, Value)> {
         let left = {
             let mut inner = self.lock();
             let Some(live) = inner.live.remove(&id) else { return Vec::new() };
-            if inner.live.values().any(|other| other.did == live.did) {
-                return Vec::new();
-            }
+            let holds_another = inner.live.values().any(|other| other.did == live.did);
             let mut left = Vec::new();
             for (channel, room) in inner.rooms.iter_mut() {
-                if room.participants.remove(&live.did).is_some() {
+                let before = room.participants.len();
+                room.participants.retain(|_, p| p.live != Some(id) && (holds_another || p.live.is_some() || p.did != live.did));
+                if room.participants.len() != before {
                     left.push(channel.clone());
                 }
             }
@@ -183,8 +207,9 @@ impl Rooms {
     fn participants_body(&self, community: &Community, inner: &Inner, channel: &str) -> Vec<Value> {
         let Some(room) = inner.rooms.get(channel) else { return Vec::new() };
         room.participants
-            .iter()
-            .map(|(did, p)| {
+            .values()
+            .map(|p| {
+                let did = &p.did;
                 let mut entry = json!({
                     "did": did,
                     "participant": p.id,
@@ -214,11 +239,19 @@ impl Rooms {
         let gone: Vec<String> = {
             let mut inner = self.lock();
             let live_dids: Vec<String> = inner.live.values().map(|live| live.did.clone()).collect();
+            let live_ids: Vec<u64> = inner.live.keys().copied().collect();
             let mut gone = Vec::new();
             for (channel, room) in inner.rooms.iter_mut() {
                 let before = room.participants.len();
-                // Someone holding a live connection is still there, whatever they last said.
-                room.participants.retain(|did, p| now - p.seen <= SILENT_FOR || live_dids.contains(did));
+                // Someone holding a live connection is still there, whatever they last
+                // said: the one they joined over, or any of theirs if they joined otherwise.
+                room.participants.retain(|_, p| {
+                    now - p.seen <= SILENT_FOR
+                        || match p.live {
+                            Some(live) => live_ids.contains(&live),
+                            None => live_dids.contains(&p.did),
+                        }
+                });
                 if room.participants.len() != before {
                     gone.push(channel.clone());
                 }
@@ -233,7 +266,8 @@ impl Rooms {
     pub fn grant(&self, community: &Community, community_did: &str, token: &str, now: i64) -> Option<Value> {
         let inner = self.lock();
         for (channel, room) in &inner.rooms {
-            let Some((did, p)) = room.participants.iter().find(|(_, p)| p.token == token) else { continue };
+            let Some(p) = room.participants.values().find(|p| p.token == token) else { continue };
+            let did = &p.did;
             let channel_settings = community.store.channel(channel).ok().flatten()?.voice?;
             let role = community.store.member(did).ok().flatten()?.role;
             let path = room_path(community_did, channel);
@@ -264,10 +298,18 @@ impl Rooms {
         let body = &message["body"];
         let message_type = message["type"].as_str().unwrap_or_default();
         let sender = member.did.as_str();
+        // Which of the sender's participants a request means (several devices of
+        // one member; community-voice/1.0).
+        let named = body["participant"].as_str();
         // Anything said from inside a room says they are still there.
         if let Some(channel) = body["channel"].as_str() {
-            if let Some(p) = self.lock().rooms.get_mut(channel).and_then(|room| room.participants.get_mut(sender)) {
-                p.seen = now;
+            let mut inner = self.lock();
+            if let Some(room) = inner.rooms.get_mut(channel) {
+                if let Some(id) = room.of(sender, named) {
+                    if let Some(p) = room.participants.get_mut(&id) {
+                        p.seen = now;
+                    }
+                }
             }
         }
         let voice_channel = |id: &str| -> anyhow::Result<Option<(crate::store::Channel, Value)>> {
@@ -312,31 +354,61 @@ impl Rooms {
                 if transport != "moq" {
                     return refuse(message, "e.p.msg.unsupported", "This server doesn't forward that transport yet.");
                 }
+                let device = body["device"].as_str().unwrap_or_default().to_string();
                 let mut left = Vec::new();
                 let participant = {
                     let mut inner = self.lock();
                     let room = inner.rooms.entry(channel.id.clone()).or_default();
-                    let full = settings["limit"].as_i64().is_some_and(|limit| room.participants.len() as i64 >= limit && !room.participants.contains_key(sender));
+                    // "Move here": the member's other devices are taken out first.
+                    if body["replace"] == true {
+                        room.participants.retain(|_, p| p.did != sender || p.device == device);
+                    }
+                    let held = room.participants.values().find(|p| p.did == sender && p.device == device).map(|p| p.id.clone());
+                    let full = settings["limit"].as_i64().is_some_and(|limit| held.is_none() && room.participants.len() as i64 >= limit);
                     if full {
                         drop(inner);
                         return refuse(message, "e.p.req.room-full", "That voice channel is full.");
                     }
-                    let participant = room
-                        .participants
-                        .entry(sender.to_string())
-                        .and_modify(|p| p.seen = now)
-                        .or_insert_with(|| Participant { id: format!("p-{}", random_id(6)), token: random_id(24), muted: false, deafened: false, server_muted: false, sharing: Sharing::default(), seen: now })
-                        .clone();
-                    // One room per community: joining this one leaves any other.
+                    let participant = match held.and_then(|id| room.participants.get_mut(&id)) {
+                        Some(p) => {
+                            p.seen = now;
+                            if live.is_some() {
+                                p.live = live;
+                            }
+                            p.clone()
+                        }
+                        None => {
+                            let p = Participant {
+                                id: format!("p-{}", random_id(6)),
+                                did: sender.to_string(),
+                                device: device.clone(),
+                                live,
+                                token: random_id(24),
+                                muted: false,
+                                deafened: false,
+                                server_muted: false,
+                                sharing: Sharing::default(),
+                                seen: now,
+                            };
+                            room.participants.insert(p.id.clone(), p.clone());
+                            p
+                        }
+                    };
+                    // One room per community, for each device: joining this one leaves any other.
                     for (other_id, other) in inner.rooms.iter_mut() {
-                        if other_id != &channel.id && other.participants.remove(sender).is_some() {
+                        let before = other.participants.len();
+                        if other_id != &channel.id {
+                            other.participants.retain(|_, p| p.did != sender || p.device != device);
+                        }
+                        if other.participants.len() != before {
                             left.push(other_id.clone());
                         }
                     }
                     participant
                 };
                 let inner = self.lock();
-                let participants: Vec<Value> = self.participants_body(community, &inner, &channel.id).into_iter().filter(|p| p["did"] != sender).collect();
+                // Everyone else, the member's other devices included: each has a key of its own.
+                let participants: Vec<Value> = self.participants_body(community, &inner, &channel.id).into_iter().filter(|p| p["participant"] != participant.id.as_str()).collect();
                 drop(inner);
                 let role = member.role;
                 let mut transport_body = json!({ "kind": "moq", "url": voice.relay_url, "path": room_path(community_did, &channel.id), "token": participant.token });
@@ -360,7 +432,11 @@ impl Rooms {
 
             LEAVE => {
                 let channel = body["channel"].as_str().unwrap_or_default();
-                let removed = self.lock().rooms.get_mut(channel).and_then(|room| room.participants.remove(sender)).is_some();
+                let removed = self.lock().rooms.get_mut(channel).is_some_and(|room| {
+                    let before = room.participants.len();
+                    room.participants.retain(|id, p| p.did != sender || named.is_some_and(|named| named != id));
+                    room.participants.len() != before
+                });
                 let mut outcome = VoiceOutcome::default();
                 if removed {
                     outcome.live = self.presence_for_watchers(community, channel);
@@ -383,7 +459,7 @@ impl Rooms {
                 }
                 let changed = {
                     let mut inner = self.lock();
-                    let Some(p) = inner.rooms.get_mut(channel).and_then(|room| room.participants.get_mut(sender)) else {
+                    let Some(p) = inner.rooms.get_mut(channel).and_then(|room| room.of(sender, named).and_then(|id| room.participants.get_mut(&id))) else {
                         drop(inner);
                         return refuse(message, "e.p.msg.not-in-room", "You aren't in that voice channel.");
                     };
@@ -409,18 +485,20 @@ impl Rooms {
                     drop(inner);
                     return refuse(message, "e.p.msg.not-in-room", "You aren't in that voice channel.");
                 };
-                let Some(from) = room.participants.get(sender).map(|p| p.id.clone()) else {
+                let Some(from) = room.of(sender, named) else {
                     drop(inner);
                     return refuse(message, "e.p.msg.not-in-room", "You aren't in that voice channel.");
                 };
                 let mut outcome = VoiceOutcome::default();
                 for entry in body["keys"].as_array().into_iter().flatten() {
                     let Some(to) = entry["to"].as_str() else { continue };
-                    // Only to someone in the room, and passed on as it is: the server can't open it.
-                    if let Some((did, _)) = room.participants.iter().find(|(did, p)| p.id == to && did.as_str() != sender) {
+                    // Only to someone else in the room (another device of the sender's
+                    // is), and passed on as it is: the server can't open it. `to` goes
+                    // along, for a member in the room from several devices.
+                    if let Some(p) = room.participants.get(to).filter(|p| p.id != from) {
                         outcome.notices.push((
-                            did.clone(),
-                            json!({ "type": KEYS, "id": uuid::Uuid::new_v4().to_string(), "body": { "channel": channel, "from": from, "kid": entry["kid"], "jwe": entry["jwe"] } }),
+                            p.did.clone(),
+                            json!({ "type": KEYS, "id": uuid::Uuid::new_v4().to_string(), "body": { "channel": channel, "from": from, "to": to, "kid": entry["kid"], "jwe": entry["jwe"] } }),
                         ));
                     }
                 }
@@ -432,7 +510,7 @@ impl Rooms {
                 let Some((channel, _)) = voice_channel(channel_id)? else {
                     return refuse(message, "e.p.msg.unknown-channel", "There is no such voice channel.");
                 };
-                let in_room = self.lock().rooms.get(channel_id).map(|room| (room.participants.contains_key(sender), room.participants.len()));
+                let in_room = self.lock().rooms.get(channel_id).map(|room| (room.holds(sender), room.participants.len()));
                 let Some((true, count)) = in_room else {
                     return refuse(message, "e.p.trust.not-authorized", "Invite people from inside the voice channel.");
                 };
@@ -487,19 +565,15 @@ impl Rooms {
                         drop(inner);
                         return refuse(message, "e.p.msg.not-in-room", "Nobody is in that voice channel.");
                     };
-                    let did = room.participants.iter().find(|(_, p)| p.id == participant).map(|(did, _)| did.clone());
-                    match did {
-                        None => false,
-                        Some(did) => {
-                            if body["remove"] == true {
-                                room.participants.remove(&did);
-                            } else if let Some(mute) = body["mute"].as_bool() {
-                                if let Some(p) = room.participants.get_mut(&did) {
-                                    p.server_muted = mute;
-                                }
-                            }
-                            true
+                    if body["remove"] == true {
+                        room.participants.remove(participant).is_some()
+                    } else if let Some(p) = room.participants.get_mut(participant) {
+                        if let Some(mute) = body["mute"].as_bool() {
+                            p.server_muted = mute;
                         }
+                        true
+                    } else {
+                        false
                     }
                 };
                 if !found {
