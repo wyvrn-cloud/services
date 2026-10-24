@@ -7,7 +7,7 @@ use std::time::Duration;
 use axum::{body::Bytes, extract::State, routing::post, Router};
 use didcomm_agent::{Agent, Identity};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex};
 use wyvrn_community::{
     community::Community,
     server::{self, AppState},
@@ -89,6 +89,7 @@ impl Peer {
 
 struct Running {
     did: String,
+    url: String,
     state: Arc<AppState>,
 }
 
@@ -112,11 +113,11 @@ async fn start_server(settings: &str) -> Running {
     let (agent, did_document) = server::build_agent(&config, Identity::generate().unwrap()).unwrap();
     let did = agent.did();
     let community = Community::new(Store::in_memory().unwrap(), config.community.clone(), Some(wyvrn_service::profile::Kept::scratch().unwrap())).unwrap().with_voice(config.voice.clone());
-    let state = Arc::new(AppState { agent, voice: Default::default(), community, did_document, resolver: didcomm_quickstart::default_resolver(), deliver: Notify::new() });
+    let state = Arc::new(AppState::new(agent, Default::default(), community, did_document, didcomm_quickstart::default_resolver()));
     tokio::spawn(server::run_deliveries(state.clone()));
     let app = server::router(state.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    Running { did, state }
+    Running { did, url, state }
 }
 
 fn kind(message: &Value) -> &str {
@@ -790,4 +791,210 @@ async fn a_server_without_voice_has_no_voice_channels() {
     assert_eq!(admin.community("create-channel", json!({ "name": "lounge", "kind": "voice" })).await["body"]["code"], "e.p.msg.unsupported");
     let community = admin.community("join", json!({})).await;
     assert!(community["body"].get("voice").is_none(), "{community}");
+}
+
+// --- Voice channels (community-voice/1.0) ------------------------------------
+
+const V: &str = "https://wyvrn.app/community-voice/1.0/";
+
+/// A member's live connection to the server: DIDComm over a WebSocket at the
+/// server's address, packed by the member's own agent.
+struct Live {
+    socket: reqwest_websocket::WebSocket,
+}
+
+impl Live {
+    async fn open(peer: &Peer, server: &Running) -> Self {
+        let url = server.url.replacen("http://", "ws://", 1);
+        let response = reqwest_websocket::Upgrade::upgrade(reqwest::Client::new().get(&url)).send().await.unwrap();
+        let socket = response.into_websocket().await.unwrap();
+        let _ = peer;
+        Self { socket }
+    }
+
+    async fn send(&mut self, peer: &Peer, kind: &str, body: Value) {
+        use futures_util::SinkExt;
+        let message = json!({ "id": uuid::Uuid::new_v4().to_string(), "type": format!("{V}{kind}"), "body": body, "return_route": "all" });
+        let packed = peer.agent.messaging().pack(&message, &peer.server, Some(&peer.did())).await.unwrap();
+        let frame = match String::from_utf8(packed.message) {
+            Ok(text) => reqwest_websocket::Message::Text(text),
+            Err(bytes) => reqwest_websocket::Message::Binary(bytes.into_bytes().into()),
+        };
+        self.socket.send(frame).await.unwrap();
+    }
+
+    /// The next message of `kind` on the connection.
+    async fn next_of(&mut self, peer: &Peer, kind: &str) -> Value {
+        use futures_util::StreamExt;
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(10), self.socket.next()).await.unwrap_or_else(|_| panic!("a {kind} within ten seconds")).unwrap().unwrap();
+            let bytes = match frame {
+                reqwest_websocket::Message::Text(text) => text.into_bytes(),
+                reqwest_websocket::Message::Binary(bytes) => bytes.to_vec(),
+                _ => continue,
+            };
+            let received = peer.agent.receive(&bytes).await.unwrap();
+            if received.message["type"] == format!("{V}{kind}") {
+                return received.message;
+            }
+        }
+    }
+}
+
+async fn voice_server() -> Running {
+    start_server("[voice]\nrelay_url = \"https://voice.example/\"\nrelay_fingerprint = \"ab12\"").await
+}
+
+async fn voice_channel(admin: &Peer, name: &str, voice: Value) -> String {
+    let made = admin.community("create-channel", json!({ "name": name, "kind": "voice", "voice": voice })).await;
+    assert_eq!(kind(&made), "community", "{made}");
+    made["body"]["created"].as_str().unwrap().to_string()
+}
+
+async fn voice(peer: &Peer, kind: &str, body: Value) -> Value {
+    peer.ask(&format!("{V}{kind}"), body).await
+}
+
+/// Says something the server answers with nothing (state, leave, keys, invite,
+/// moderate), or with a refusal, which is returned.
+async fn tell(peer: &Peer, kind: &str, body: Value) -> Option<Value> {
+    let message = json!({ "type": format!("{V}{kind}"), "body": body, "return_route": "all" });
+    peer.agent.send(&peer.server, &message).await.expect("sent").map(|answer| answer.message)
+}
+
+#[tokio::test]
+async fn joining_a_voice_channel_gives_a_room_a_token_and_who_else_is_there_and_watchers_are_told() {
+    let server = voice_server().await;
+    let (alice, bob, carol) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&alice, &bob, &carol]);
+    let lounge = voice_channel(&alice, "lounge", json!({})).await;
+
+    // Carol watches over a live connection; asking anywhere else is refused.
+    assert_eq!(voice(&carol, "watch-presence", json!({})).await["body"]["code"], "e.p.req.live-only");
+    let mut live = Live::open(&carol, &server).await;
+    live.send(&carol, "watch-presence", json!({})).await;
+    let first = live.next_of(&carol, "presence").await;
+    assert_eq!(first["body"]["channels"], json!([{ "channel": lounge, "participants": [] }]));
+
+    // Alice joins the empty room.
+    let joined = voice(&alice, "join", json!({ "channel": lounge })).await;
+    assert_eq!(kind(&joined), "joined", "{joined}");
+    let transport = &joined["body"]["transport"];
+    assert_eq!((transport["kind"].as_str(), transport["url"].as_str(), transport["fingerprint"].as_str()), (Some("moq"), Some("https://voice.example/"), Some("ab12")));
+    let path = transport["path"].as_str().unwrap().to_string();
+    assert!(path.starts_with("c/") && path.ends_with(&lounge) && !path.contains("did:"), "{path}");
+    assert_eq!(joined["body"]["participants"], json!([]));
+    assert_eq!(joined["body"]["may"], json!({ "speak": true, "video": true, "screen": true }));
+    let alice_id = joined["body"]["participant"].as_str().unwrap().to_string();
+    let told = live.next_of(&carol, "presence").await;
+    assert_eq!(told["body"]["channels"][0]["participants"][0]["did"], alice.did());
+
+    // Bob joins and is told Alice is there; Alice's sharing reaches the watcher.
+    let bobs = voice(&bob, "join", json!({ "channel": lounge })).await;
+    assert_eq!(bobs["body"]["participants"][0]["participant"], alice_id);
+    live.next_of(&carol, "presence").await;
+    tell(&alice, "state", json!({ "channel": lounge, "muted": true, "deafened": false, "sharing": { "screen": true } })).await;
+    let sharing = live.next_of(&carol, "presence").await;
+    let entry = sharing["body"]["channels"][0]["participants"].as_array().unwrap().iter().find(|p| p["did"] == alice.did()).unwrap().clone();
+    assert_eq!((entry["muted"].as_bool(), entry["sharing"]["screen"].as_bool()), (Some(true), Some(true)));
+
+    // Leaving tells the watcher too.
+    tell(&bob, "leave", json!({ "channel": lounge })).await;
+    let after = live.next_of(&carol, "presence").await;
+    assert_eq!(after["body"]["channels"][0]["participants"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn the_relay_is_told_what_each_token_may_publish_from_who_is_in_the_room_now() {
+    let server = voice_server().await;
+    let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member]);
+    let stage = voice_channel(&admin, "stage", json!({ "screen": "admins" })).await;
+    let joined = voice(&member, "join", json!({ "channel": stage })).await;
+    assert_eq!(joined["body"]["may"]["screen"], false);
+    let token = joined["body"]["transport"]["token"].as_str().unwrap().to_string();
+    let path = joined["body"]["transport"]["path"].as_str().unwrap().to_string();
+    let id = joined["body"]["participant"].as_str().unwrap().to_string();
+
+    let ask = |token: String| {
+        let url = format!("{}voice/auth", server.url);
+        async move {
+            let response = reqwest::Client::new()
+                .post(url)
+                .json(&json!({ "id": "s1", "event": "connect", "node": "n", "transport": "quic", "path": "/", "query": format!("jwt={token}") }))
+                .send()
+                .await
+                .unwrap();
+            (response.status().as_u16(), response.json::<Value>().await.unwrap_or(Value::Null))
+        }
+    };
+    let (status, grant) = ask(token.clone()).await;
+    assert_eq!(status, 200, "{grant}");
+    let publish: Vec<String> = grant["publish"].as_array().unwrap().iter().map(|p| p.as_str().unwrap().to_string()).collect();
+    assert!(publish.contains(&format!("{path}/{id}/mic")) && publish.contains(&format!("{path}/{id}/camera")));
+    assert!(!publish.iter().any(|p| p.ends_with("/screen")), "{publish:?}");
+    assert_eq!(grant["subscribe"], json!([format!("{path}/**")]));
+    assert_eq!(grant["revalidate"], 15);
+
+    // Muted by an admin, the microphone isn't granted; removed, nothing is.
+    let admins = voice(&admin, "join", json!({ "channel": stage })).await;
+    assert_eq!(admins["body"]["may"]["screen"], true);
+    tell(&admin, "moderate", json!({ "channel": stage, "participant": id, "mute": true })).await;
+    let (_, muted) = ask(token.clone()).await;
+    assert!(!muted["publish"].as_array().unwrap().iter().any(|p| p.as_str().unwrap().ends_with("/mic")), "{muted}");
+    assert_eq!(tell(&member, "moderate", json!({ "channel": stage, "participant": id, "mute": false })).await.unwrap()["body"]["code"], "e.p.trust.not-authorized");
+    tell(&admin, "moderate", json!({ "channel": stage, "participant": id, "remove": true })).await;
+    assert_eq!(ask(token).await.0, 403);
+    assert_eq!(ask("nonsense".into()).await.0, 403);
+}
+
+#[tokio::test]
+async fn keys_are_passed_on_as_they_are_to_those_in_the_room_and_invitations_ring_or_are_posted() {
+    let server = voice_server().await;
+    let (alice, bob, carol, dave) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&alice, &bob, &carol, &dave]);
+    for peer in [&carol, &dave] {
+        peer.community("join", json!({})).await;
+    }
+    let general = open_channel(&alice, "general").await;
+    let lounge = voice_channel(&alice, "lounge", json!({})).await;
+    let a = voice(&alice, "join", json!({ "channel": lounge })).await;
+    let b = voice(&bob, "join", json!({ "channel": lounge })).await;
+    let (a_id, b_id) = (a["body"]["participant"].as_str().unwrap().to_string(), b["body"]["participant"].as_str().unwrap().to_string());
+
+    // Alice's key for Bob, opaque to the server, reaches Bob as it was; one for
+    // someone not in the room goes nowhere.
+    let jwe = json!({ "protected": "e30", "ciphertext": "opaque" });
+    tell(&alice, "keys", json!({ "channel": lounge, "keys": [{ "to": b_id, "kid": "a1", "jwe": jwe }, { "to": "p-nobody", "kid": "a1", "jwe": jwe }] })).await;
+    let key = bob.next_of(&format!("{V}keys")).await;
+    assert_eq!((key["body"]["from"].as_str(), key["body"]["kid"].as_str(), &key["body"]["jwe"]), (Some(a_id.as_str()), Some("a1"), &jwe));
+
+    // Carol lets the community ring her; Dave doesn't, and is named in a post.
+    let set = voice(&dave, "set-preferences", json!({ "ring": false })).await;
+    assert_eq!(set["body"]["ring"], false);
+    assert_eq!(tell(&carol, "invite", json!({ "channel": lounge, "to": [dave.did()] })).await.unwrap()["body"]["code"], "e.p.trust.not-authorized");
+    tell(&alice, "invite", json!({ "channel": lounge, "to": [carol.did(), dave.did()] })).await;
+    let ring = carol.next_of(&format!("{V}ring")).await;
+    assert_eq!((ring["body"]["channel"].as_str(), ring["body"]["from"]["did"].as_str(), ring["body"]["participants"].as_i64()), (Some(lounge.as_str()), Some(alice.did().as_str()), Some(2)));
+    let posted = dave.next_message().await;
+    assert_eq!((posted["channel"].as_str(), posted["voice_invite"]["channel"].as_str()), (Some(general.as_str()), Some(lounge.as_str())));
+    assert_eq!(posted["mentions"][0]["who"], dave.did());
+}
+
+#[tokio::test]
+async fn a_voice_channel_has_a_limit_and_one_room_at_a_time() {
+    let server = voice_server().await;
+    let (alice, bob, carol) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&alice, &bob, &carol]);
+    let small = voice_channel(&alice, "small", json!({ "limit": 2 })).await;
+    let other = voice_channel(&alice, "other", json!({})).await;
+    voice(&alice, "join", json!({ "channel": small })).await;
+    voice(&bob, "join", json!({ "channel": small })).await;
+    assert_eq!(voice(&carol, "join", json!({ "channel": small })).await["body"]["code"], "e.p.req.room-full");
+    // Bob moving to another room makes space.
+    let moved = voice(&bob, "join", json!({ "channel": other })).await;
+    assert_eq!(kind(&moved), "joined");
+    assert_eq!(kind(&voice(&carol, "join", json!({ "channel": small })).await), "joined");
+    let stranger = Peer::start(&server).await;
+    assert_eq!(voice(&stranger, "join", json!({ "channel": small })).await["body"]["code"], "e.p.trust.not-authorized");
 }

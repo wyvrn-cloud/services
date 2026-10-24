@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use tokio::sync::Notify;
 use wyvrn_community::{
     community::Community,
     config::Config,
@@ -110,7 +109,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         tracing::warn!("nobody is let in yet: set COMMUNITY_ADMINS, or run `wyvrn-community add <did> admin`");
     }
 
-    let state = Arc::new(AppState { agent, voice: Default::default(), community, did_document, resolver: didcomm_quickstart::default_resolver(), deliver: Notify::new() });
+    let state = Arc::new(AppState::new(agent, Default::default(), community, did_document, didcomm_quickstart::default_resolver()));
     // A public address at a DID host, if it is set to hold one (COMMUNITY_PUBLIC_ADDRESS):
     // taken up once the service is serving, and kept up to date from then on.
     if let (Some(address), Some(document)) = (wyvrn_service::hosted_address::Address::from_env("COMMUNITY")?, state.did_document.clone()) {
@@ -131,6 +130,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     }
     tokio::spawn(server::run_deliveries(state.clone()));
     tokio::spawn(server::run_pruning(state.clone()));
+    tokio::spawn(server::run_voice_sweep(state.clone()));
     if let Some(mediator) = &config.mediator {
         let service = Arc::new(server::CommunityService(state.clone()));
         tokio::spawn(wyvrn_service::mediator::run_pickups(service, mediator.poll_every()));

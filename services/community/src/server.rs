@@ -6,10 +6,20 @@ use std::time::Duration;
 
 use axum::{
     body::Bytes,
-    extract::State,
-    routing::get,
-    Router,
+    extract::{
+        ws::{rejection::WebSocketUpgradeRejection, Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
 };
+use futures_util::{SinkExt, StreamExt};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use tokio::sync::mpsc;
 use didcomm_agent::{Agent, Features, Identity, Received};
 use didcomm_core::resolver::DIDResolver;
 use didcomm_crypto_askar::AskarCryptoService;
@@ -21,6 +31,7 @@ use wyvrn_service::{address, http::receive, now, Incoming, Service};
 use crate::community::{self, Community};
 use crate::config::Config;
 use crate::questions;
+use crate::voice::{self, Rooms, VoiceOutcome};
 
 /// How many members are sent to at once.
 const DELIVERY_CONCURRENCY: usize = 8;
@@ -43,6 +54,48 @@ pub struct AppState {
     pub resolver: Box<dyn DIDResolver>,
     /// Rung when there is something new to send to members.
     pub deliver: Notify,
+    /// Voice channels' rooms (community-voice/1.0).
+    pub rooms: Rooms,
+    /// Members' live connections, by number: where to put what is sent them there.
+    pub live: Mutex<HashMap<u64, (String, mpsc::Sender<Value>)>>,
+    pub next_live: AtomicU64,
+}
+
+impl AppState {
+    /// The parts a new server starts with, beside what `main` builds.
+    pub fn new(agent: Agent, voice: wyvrn_service::Voice, community: Community, did_document: Option<address::Published>, resolver: Box<dyn DIDResolver>) -> Self {
+        Self { agent, voice, community, did_document, resolver, deliver: Notify::new(), rooms: Rooms::default(), live: Mutex::new(HashMap::new()), next_live: AtomicU64::new(1) }
+    }
+
+    fn live_sender(&self, id: u64) -> Option<mpsc::Sender<Value>> {
+        self.live.lock().unwrap_or_else(|p| p.into_inner()).get(&id).map(|(_, out)| out.clone())
+    }
+}
+
+/// Sends what a voice message came to: presence to live connections, the rest to
+/// each member over a live connection of theirs, or through DIDComm.
+fn voice_send(state: &Arc<AppState>, outcome: &VoiceOutcome) {
+    for (id, message) in &outcome.live {
+        if let Some(out) = state.live_sender(*id) {
+            let _ = out.try_send(message.clone());
+        }
+    }
+    for (did, message) in &outcome.notices {
+        let live = state.rooms.live_of(did);
+        let mut sent = false;
+        for id in live {
+            if let Some(out) = state.live_sender(id) {
+                sent |= out.try_send(message.clone()).is_ok();
+            }
+        }
+        // A ring has to reach a phone that isn't listening: through its mediator too.
+        if !sent || message["type"] == voice::RING {
+            send_later(state, did.clone(), message.clone());
+        }
+    }
+    if outcome.posted {
+        state.deliver.notify_one();
+    }
 }
 
 /// The agent for `config`: the server's own DID, which members write to.
@@ -61,7 +114,31 @@ pub fn build_agent(config: &Config, identity: Identity) -> anyhow::Result<(Agent
         .with_protocol(community::MESSAGE_REACTIONS, &["observer"])
         .with_protocol(community::MESSAGE_EDITS, &["observer"])
         .with_protocol(community::MESSAGE_PINS, &["participant"]);
+    // Voice channels, where the server has them; and the live connection they
+    // need, listed after the address messages are posted to.
+    let features = if config.voice.is_some() { features.with_protocol(voice::PIURI, &["server"]) } else { features };
+    let document = match document {
+        Some(mut published) if config.voice.is_some() => {
+            let did = published.did().to_string();
+            if let Some(services) = published.document["service"].as_array_mut() {
+                services.push(json!({ "id": format!("{did}#live"), "type": "DIDCommMessaging", "serviceEndpoint": { "uri": socket_url(&config.server.public_url), "accept": ["didcomm/v2"], "routingKeys": [] } }));
+            }
+            Some(published)
+        }
+        other => other,
+    };
     Ok((agent.with_features(features), document))
+}
+
+/// `public_url` as a WebSocket address: `https` to `wss`, `http` to `ws`.
+pub fn socket_url(public_url: &str) -> String {
+    if let Some(rest) = public_url.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = public_url.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        public_url.to_string()
+    }
 }
 
 /// A member's DID change, if `received` announces one that checks out: signed by a
@@ -159,6 +236,10 @@ impl Service for CommunityService {
             }
         }
 
+        // Voice channels: from a member, or refused as everything is from anyone else.
+        if received.message["type"].as_str().is_some_and(|message_type| message_type.starts_with(voice::PIURI)) {
+            return answer_voice(state, &sender, &received.message, None);
+        }
         let outcome = state.community.handle(&sender, &received.message, now())?;
         for (did, notice) in outcome.notices {
             send_later(state, did, notice);
@@ -192,6 +273,143 @@ impl Service for CommunityService {
             state.deliver.notify_one();
         }
         Ok(outcome.reply)
+    }
+}
+
+/// A community-voice/1.0 message from `sender`, over the live connection `live`
+/// if it came on one.
+fn answer_voice(state: &Arc<AppState>, sender: &str, message: &Value, live: Option<u64>) -> anyhow::Result<Option<Value>> {
+    let Some(member) = state.community.store.member(sender)? else {
+        return Ok(Some(community::problem(message, "e.p.trust.not-authorized", "This community is by invitation: you are not on its list.")));
+    };
+    let did = state.voice.speaking_as().unwrap_or_else(|| state.agent.did());
+    let outcome = state.rooms.handle(&state.community, &did, &member, message, live, now())?;
+    voice_send(state, &outcome);
+    Ok(outcome.reply)
+}
+
+/// A member's live connection (community-voice/1.0's Connectivity): DIDComm over a
+/// WebSocket. What they send is answered on it, and presence and keys are pushed
+/// on it. It is one member's: the first authenticated message says whose.
+async fn live_connection(state: Arc<AppState>, socket: WebSocket) {
+    let id = state.next_live.fetch_add(1, Ordering::Relaxed);
+    let (mut sink, mut stream) = socket.split();
+    let (out, mut outgoing) = mpsc::channel::<Value>(256);
+    let mut holder: Option<String> = None;
+    let writer_state = state.clone();
+    let (packed_tx, mut packed_rx) = mpsc::channel::<Vec<u8>>(256);
+    // What is pushed (presence, keys) is packed for the holder here.
+    let holder_cell = Arc::new(Mutex::new(None::<String>));
+    let pack_holder = holder_cell.clone();
+    let packing = tokio::spawn(async move {
+        while let Some(message) = outgoing.recv().await {
+            let Some(to) = pack_holder.lock().unwrap_or_else(|p| p.into_inner()).clone() else { continue };
+            let from = writer_state.voice.speaking_as().unwrap_or_else(|| writer_state.agent.did());
+            match writer_state.agent.messaging().pack_direct(&message, &to, Some(&from)).await {
+                Ok(packed) => {
+                    if packed_tx.send(packed.message).await.is_err() {
+                        break;
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "couldn't pack for a live connection"),
+            }
+        }
+    });
+    let (reply_tx, mut reply_rx) = mpsc::channel::<Vec<u8>>(64);
+    let writing = tokio::spawn(async move {
+        loop {
+            let packed = tokio::select! {
+                Some(p) = packed_rx.recv() => p,
+                Some(p) = reply_rx.recv() => p,
+                else => break,
+            };
+            let frame = match String::from_utf8(packed) {
+                Ok(text) => Message::Text(text.into()),
+                Err(bytes) => Message::Binary(bytes.into_bytes().into()),
+            };
+            if sink.send(frame).await.is_err() {
+                break;
+            }
+        }
+    });
+    let service = CommunityService(state.clone());
+    while let Some(Ok(frame)) = stream.next().await {
+        let bytes: Vec<u8> = match frame {
+            Message::Text(text) => text.as_bytes().to_vec(),
+            Message::Binary(bytes) => bytes.to_vec(),
+            Message::Close(_) => break,
+            _ => continue,
+        };
+        if bytes.len() > 4 * 1024 * 1024 {
+            continue;
+        }
+        let Ok(received) = state.agent.receive(&bytes).await else { continue };
+        let Ok(unpacked) = state.agent.messaging().unpack_verified(&bytes).await else { continue };
+        let (Some(sender), Some(sender_kid)) = (received.sender.clone(), unpacked.sender_kid) else { continue };
+        match &holder {
+            None => {
+                holder = Some(sender.clone());
+                *holder_cell.lock().unwrap_or_else(|p| p.into_inner()) = Some(sender.clone());
+                state.live.lock().unwrap_or_else(|p| p.into_inner()).insert(id, (sender.clone(), out.clone()));
+                state.rooms.open_live(id, &sender);
+            }
+            // One member's connection: anyone else's message on it is ignored.
+            Some(held) if held != &sender => continue,
+            Some(_) => {}
+        }
+        let is_voice = received.message["type"].as_str().is_some_and(|t| t.starts_with(voice::PIURI));
+        let reply = if is_voice {
+            answer_voice(&state, &sender, &received.message, Some(id)).unwrap_or_else(|error| {
+                tracing::warn!(%error, "couldn't answer a voice message");
+                None
+            })
+        } else {
+            service.answer(&Incoming { received: &received, sender_kid: Some(sender_kid) }).await.unwrap_or_else(|error| {
+                tracing::warn!(%error, "couldn't answer");
+                None
+            })
+        };
+        if let Some(reply) = reply {
+            match state.agent.pack_reply(&received, &reply).await {
+                Ok(packed) => {
+                    if reply_tx.send(packed).await.is_err() {
+                        break;
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "couldn't pack an answer"),
+            }
+        }
+    }
+    state.live.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
+    let presence = state.rooms.close_live(&state.community, id);
+    voice_send(&state, &VoiceOutcome { live: presence, ..VoiceOutcome::default() });
+    packing.abort();
+    writing.abort();
+}
+
+/// The forwarding service's question, by moq-auth's auth contract: may the session
+/// holding this token connect, and publish and subscribe to what? Answered from who
+/// is in the room now.
+async fn voice_auth(State(state): State<Arc<AppState>>, Json(request): Json<Value>) -> Response {
+    let event = request["event"].as_str().unwrap_or_default();
+    if event == "end" {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    let query = request["query"].as_str().unwrap_or_default();
+    let token = query.split('&').find_map(|pair| pair.strip_prefix("jwt=")).unwrap_or_default();
+    let did = state.voice.speaking_as().unwrap_or_else(|| state.agent.did());
+    match state.rooms.grant(&state.community, &did, token) {
+        Some(grant) => Json(grant).into_response(),
+        None => (StatusCode::FORBIDDEN, Json(json!({ "reason": "forbidden" }))).into_response(),
+    }
+}
+
+/// Takes out of their rooms those who have gone quiet, every 15 seconds.
+pub async fn run_voice_sweep(state: Arc<AppState>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        let presence = state.rooms.sweep(&state.community, now());
+        voice_send(&state, &VoiceOutcome { live: presence, ..VoiceOutcome::default() });
     }
 }
 
@@ -249,12 +467,21 @@ pub async fn run_pruning(state: Arc<AppState>) {
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/", get(index).post(|State(state): State<Arc<AppState>>, body: Bytes| receive(Arc::new(CommunityService(state)), body)))
+        .route("/", get(root).post(|State(state): State<Arc<AppState>>, body: Bytes| receive(Arc::new(CommunityService(state)), body)))
+        .route("/voice/auth", post(voice_auth))
         .route("/healthz", get(|| async { "ok" }))
         .merge(address::routes(state.agent.did(), state.did_document.clone()))
         // A browser app sends its messages from another origin.
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+/// A live connection, if the request asks for a WebSocket; otherwise what this is.
+async fn root(State(state): State<Arc<AppState>>, upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>) -> Response {
+    match upgrade {
+        Ok(upgrade) => upgrade.max_message_size(4 * 1024 * 1024).on_upgrade(move |socket| live_connection(state, socket)).into_response(),
+        Err(_) => index(State(state)).await.into_response(),
+    }
 }
 
 /// Says what this is and how to reach it. Nothing of who is in it or what is said.

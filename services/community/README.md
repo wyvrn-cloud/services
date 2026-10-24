@@ -78,6 +78,24 @@ note. The server keeps a copy of the post as it stood, sends every admin the ope
 reports at once, and an admin marks each dealt with. Only admins see reports, and
 they see who made each.
 
+**Voice channels** (community-voice/1.0) are on when the configuration has a
+`[voice]` section:
+
+```toml
+[voice]
+transport = "moq"                       # the default for new voice channels: moq or webrtc
+relay_url = "https://voice.example/"    # the moq relay members connect to
+# relay_fingerprint = "ab12..."         # SHA-256 of a self-signed relay certificate, to pin
+```
+
+The relay (moq-relay) is configured to ask this server who may do what:
+`[auth] url = "<public_url>/voice/auth"`. The server answers from who is in
+each room now, every 15 seconds, so leaving, an admin's mute or removal takes
+effect at the relay within that. The media is end-to-end encrypted: the server
+and the relay only ever pass keys and frames on. Who is in each voice channel is
+told only to members connected live (a WebSocket to the server's own address).
+Rooms are kept in memory: a restart empties them and apps join again.
+
 Someone whose devices change gets a new DID. Their app tells the server, signed
 by the old one, and they stay who they were: nobody needs letting in again.
 

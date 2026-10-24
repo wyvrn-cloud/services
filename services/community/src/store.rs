@@ -96,6 +96,8 @@ pub struct Post {
     pub reactions: Vec<(String, Vec<String>)>,
     /// The thread that grew from it, if one did.
     pub grew: Option<Thread>,
+    /// The voice channel the post invites people into (community-voice/1.0).
+    pub voice_invite: Option<String>,
 }
 
 /// Someone a post calls on: a member's DID or `everyone`, and the name the post
@@ -153,7 +155,8 @@ const POST_COLUMNS: &str = "serial, channel, seq, id, content, posted_at, author
     (SELECT pinned FROM post_state WHERE post_state.post = posts.id), \
     (SELECT reply_author FROM post_state WHERE post_state.post = posts.id), \
     (SELECT reply_snippet FROM post_state WHERE post_state.post = posts.id), \
-    (SELECT removed_by FROM post_removals WHERE post_removals.post = posts.id)";
+    (SELECT removed_by FROM post_removals WHERE post_removals.post = posts.id), \
+    (SELECT channel FROM post_voice_invites WHERE post_voice_invites.post = posts.id)";
 const CHANNEL_COLUMNS: &str = "id, name, topic, closed, created_at, created_by, (SELECT COALESCE(MAX(seq), 0) FROM posts WHERE posts.channel = channels.id), \
     (SELECT settings FROM channel_voice WHERE channel_voice.channel = channels.id)";
 
@@ -197,6 +200,7 @@ fn post_from(row: &Row) -> Result<Post> {
         reply_author: row.get(18)?,
         reply_snippet: row.get(19)?,
         removed_by: row.get(20)?,
+        voice_invite: row.get(21)?,
         // Read after, each by a query of its own (`Store::filled`).
         reactions: Vec::new(),
         grew: None,
@@ -420,6 +424,17 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         channel TEXT PRIMARY KEY,
         settings TEXT NOT NULL
     );
+    -- Whether a member lets voice invitations ring them (community-voice/1.0's
+    -- set-preferences); absent means yes.
+    CREATE TABLE IF NOT EXISTS voice_prefs (
+        did TEXT PRIMARY KEY,
+        ring INTEGER NOT NULL
+    );
+    -- A post that invites people into a voice channel, and which channel.
+    CREATE TABLE IF NOT EXISTS post_voice_invites (
+        post TEXT PRIMARY KEY,
+        channel TEXT NOT NULL
+    );
     -- The latest version of the rules each has accepted, member or not yet.
     CREATE TABLE IF NOT EXISTS rules_accepted (
         did TEXT PRIMARY KEY,
@@ -544,6 +559,14 @@ fn schema() -> Schema {
             CREATE TABLE IF NOT EXISTS channel_voice (
                 channel VARCHAR(255) NOT NULL PRIMARY KEY,
                 settings TEXT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS voice_prefs (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                ring BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS post_voice_invites (
+                post VARCHAR(255) NOT NULL PRIMARY KEY,
+                channel VARCHAR(255) NOT NULL
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS rules_accepted (
                 did {MYSQL_DID} NOT NULL PRIMARY KEY,
@@ -692,6 +715,9 @@ impl Store {
                 tx.execute("UPDATE posts SET author_did = ?2 WHERE author_did = ?1", params![prior, new])?;
                 tx.execute("UPDATE posts SET answered_by = ?2 WHERE answered_by = ?1", params![prior, new])?;
                 tx.execute("UPDATE answering SET owner = ?2 WHERE owner = ?1", params![prior, new])?;
+                // Their voice preferences follow them.
+                tx.execute("UPDATE OR IGNORE voice_prefs SET did = ?2 WHERE did = ?1", params![prior, new])?;
+                tx.execute("DELETE FROM voice_prefs WHERE did = ?1", params![prior])?;
                 // Reports they made, or that name them, follow them.
                 tx.execute("UPDATE reports SET by_did = ?2 WHERE by_did = ?1", params![prior, new])?;
                 tx.execute("UPDATE reports SET member = ?2 WHERE member = ?1", params![prior, new])?;
@@ -780,6 +806,28 @@ impl Store {
     pub fn set_setting(&self, name: &str, value: &str) -> Result<()> {
         self.db.lock().execute("INSERT OR REPLACE INTO settings (name, value) VALUES (?1, ?2)", params![name, value])?;
         Ok(())
+    }
+
+    // --- Voice ------------------------------------------------------------------
+
+    /// Whether `did` lets voice invitations ring them.
+    pub fn voice_rings(&self, did: &str) -> Result<bool> {
+        Ok(self.db.lock().query_row("SELECT ring FROM voice_prefs WHERE did = ?1", params![did], |row| row.get::<bool>(0))?.unwrap_or(true))
+    }
+
+    pub fn set_voice_rings(&self, did: &str, ring: bool) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO voice_prefs (did, ring) VALUES (?1, ?2)", params![did, ring])?;
+        Ok(())
+    }
+
+    pub fn set_post_voice_invite(&self, post: &str, channel: &str) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO post_voice_invites (post, channel) VALUES (?1, ?2)", params![post, channel])?;
+        Ok(())
+    }
+
+    /// The voice channel a post invites people into, if it is such a post.
+    pub fn post_voice_invite(&self, post: &str) -> Result<Option<String>> {
+        self.db.lock().query_row("SELECT channel FROM post_voice_invites WHERE post = ?1", params![post], |row| row.get(0))
     }
 
     // --- Rules and reports ---------------------------------------------------

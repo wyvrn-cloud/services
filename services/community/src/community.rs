@@ -412,6 +412,40 @@ impl Community {
         Ok(Some(Rules { text, version, required }))
     }
 
+    /// Whether `did` has yet to accept rules that are required.
+    pub fn rules_owed_by(&self, did: &str) -> anyhow::Result<bool> {
+        Ok(self.rules_owed(did)?.is_some())
+    }
+
+    /// The text channel voice invitations are posted in: the one an admin chose,
+    /// else the first open text channel.
+    pub fn invitations_channel(&self) -> anyhow::Result<Option<Channel>> {
+        if let Some(id) = self.store.setting("voice_invites_to")?.filter(|id| !id.is_empty()) {
+            if let Some(channel) = self.store.channel(&id)?.filter(|c| !c.closed && c.voice.is_none()) {
+                return Ok(Some(channel));
+            }
+        }
+        Ok(self.store.channels()?.into_iter().find(|c| !c.closed && c.voice.is_none()))
+    }
+
+    /// Posts, as `inviter`, an invitation into the voice channel `voice` for those
+    /// who won't be rung (community-voice/1.0's `invite`), naming them.
+    pub fn post_voice_invite(&self, text: &Channel, inviter: &Member, voice: &Channel, invitees: &[String], now: i64) -> anyhow::Result<()> {
+        let mut mentions = Vec::new();
+        let mut names = Vec::new();
+        for did in invitees {
+            let name = self.store.member(did)?.and_then(|m| m.name).unwrap_or_else(|| "someone".to_string());
+            names.push(format!("@{name}"));
+            mentions.push(Mention { who: did.clone(), name });
+        }
+        let content = format!("{} invites {} to #{}", inviter.name.as_deref().unwrap_or("Someone"), names.join(", "), voice.name);
+        let id = uuid::Uuid::new_v4().to_string();
+        let post = self.store.add_post(&text.id, &id, &content, inviter, None, None, now)?;
+        self.store.set_written_with(&post.id, None, None, &mentions)?;
+        self.store.set_post_voice_invite(&post.id, &voice.id)?;
+        Ok(())
+    }
+
     /// The rules `did` has yet to accept, where they are required.
     fn rules_owed(&self, did: &str) -> anyhow::Result<Option<Rules>> {
         let Some(rules) = self.rules()?.filter(|rules| rules.required) else { return Ok(None) };
@@ -513,6 +547,9 @@ impl Community {
         }
         if let Some(removed_by) = &post.removed_by {
             body["removed_by"] = json!(removed_by);
+        }
+        if let Some(voice) = &post.voice_invite {
+            body["voice_invite"] = json!({ "channel": voice });
         }
         if post.pinned {
             body["pinned"] = json!(true);
