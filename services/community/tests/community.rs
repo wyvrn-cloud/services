@@ -534,11 +534,24 @@ async fn whoever_asks_waits_for_an_admin_who_lets_them_in_or_turns_them_away() {
     let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);
     let (alice, bob) = (Peer::start(&server).await, Peer::start(&server).await);
     server.admit(&[&admin, &member]);
+    // The admin is sent things unasked; the member, joined too, isn't told who waits.
+    server.state.community.store.set_joined(&admin.did(), true).unwrap();
+    server.state.community.store.set_joined(&member.did(), true).unwrap();
 
     assert_eq!(kind(&alice.community("join", json!({})).await), "waiting");
+    // The admin hears of it at once, and how many wait now.
+    let asked = admin.next_of(&format!("{C}asked-to-join")).await;
+    assert_eq!(asked["body"]["did"], alice.did());
+    assert_eq!(admin.next_of(&format!("{C}community")).await["body"]["waiting"], 1);
     // What they call themselves, for the admins who decide.
     alice.agent.send(&alice.server, &json!({ "type": "https://didcomm.org/user-profile/1.0/profile", "body": { "profile": { "displayName": "Alice" } } })).await.unwrap();
     assert_eq!(kind(&bob.community("join", json!({})).await), "waiting");
+    assert_eq!(admin.next_of(&format!("{C}asked-to-join")).await["body"]["did"], bob.did());
+    assert_eq!(admin.next_of(&format!("{C}community")).await["body"]["waiting"], 2);
+    // Asking again is no news.
+    assert_eq!(kind(&bob.community("join", json!({})).await), "waiting");
+    admin.nothing_more().await;
+    member.nothing_more().await;
 
     // An admin is told who is waiting, oldest first; a member isn't.
     let listed = admin.community("members-request", json!({})).await;
@@ -559,22 +572,34 @@ async fn whoever_asks_waits_for_an_admin_who_lets_them_in_or_turns_them_away() {
     assert_eq!(answer["body"]["waiting"].as_array().unwrap().len(), 1);
     let told = alice.next_of(&format!("{C}community")).await;
     assert_eq!((told["body"]["name"].as_str(), told["body"]["joined"].as_bool()), (Some("The Workshop"), Some(true)));
+    assert!(told["body"].get("waiting").is_none(), "a member isn't told how many wait");
+    assert_eq!(admin.next_of(&format!("{C}community")).await["body"]["waiting"], 1);
     let let_in = server.state.community.store.member(&alice.did()).unwrap().unwrap();
     // ...under the name she gave while waiting.
     assert!(let_in.joined);
     assert_eq!(let_in.name.as_deref(), Some("Alice"));
 
-    // Turned away: off the list, not let in, and told nothing.
+    // Turned away: off the list, not let in, and told so, with nothing of the community.
     let answer = admin.community("set-member", json!({ "did": bob.did(), "role": null })).await;
     assert_eq!(answer["body"]["waiting"], json!([]));
     assert!(server.state.community.store.member(&bob.did()).unwrap().is_none());
+    assert_eq!(bob.next_of(&format!("{C}removed")).await["body"], json!({ "was": "waiting" }));
     bob.nothing_more().await;
+    assert_eq!(admin.next_of(&format!("{C}community")).await["body"]["waiting"], 0);
+
+    // Taken out once in: told so too.
+    admin.community("set-member", json!({ "did": alice.did(), "role": null })).await;
+    assert_eq!(alice.next_of(&format!("{C}removed")).await["body"], json!({ "was": "member" }));
 
     // Asking and taking it back.
     assert_eq!(kind(&bob.community("join", json!({})).await), "waiting");
     bob.agent.send(&bob.server, &json!({ "type": format!("{C}leave"), "body": {} })).await.unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(server.state.community.store.waiting().unwrap().len(), 0);
+    assert_eq!(admin.next_of(&format!("{C}asked-to-join")).await["body"]["did"], bob.did());
+    // (The count went to 1 and back to 0.)
+    assert_eq!(admin.next_of(&format!("{C}community")).await["body"]["waiting"], 1);
+    assert_eq!(admin.next_of(&format!("{C}community")).await["body"]["waiting"], 0);
 }
 
 #[tokio::test]

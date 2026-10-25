@@ -7,7 +7,7 @@
 use serde_json::{json, Map, Value};
 
 use crate::config::{CommunityConfig, VoiceConfig};
-use crate::store::{Channel, Invite, Member, Mention, Post, Report, Role, Store};
+use crate::store::{Channel, Invite, Member, Mention, Post, Report, Role, Store, Waiting};
 use wyvrn_service::profile::{Change, Changed, Kept};
 
 pub const PIURI: &str = "https://wyvrn.app/community/1.0";
@@ -26,6 +26,8 @@ pub const MEMBERS: &str = "https://wyvrn.app/community/1.0/members";
 pub const SET_MEMBER: &str = "https://wyvrn.app/community/1.0/set-member";
 pub const SET_PROFILE: &str = "https://wyvrn.app/community/1.0/set-profile";
 pub const WAITING: &str = "https://wyvrn.app/community/1.0/waiting";
+pub const ASKED_TO_JOIN: &str = "https://wyvrn.app/community/1.0/asked-to-join";
+pub const REMOVED: &str = "https://wyvrn.app/community/1.0/removed";
 pub const SET_ADMISSION: &str = "https://wyvrn.app/community/1.0/set-admission";
 pub const CREATE_INVITE: &str = "https://wyvrn.app/community/1.0/create-invite";
 pub const REVOKE_INVITE: &str = "https://wyvrn.app/community/1.0/revoke-invite";
@@ -411,6 +413,9 @@ impl Community {
             if let Some(voice) = self.voice_defaults()? {
                 body["voice"] = voice;
             }
+            if member.role == Role::Admin {
+                body["waiting"] = json!(self.store.waiting_count()?);
+            }
             Ok(body)
         })
     }
@@ -695,8 +700,9 @@ impl Community {
             },
             Admission::Admin => false,
         };
+        let was_waiting = self.store.waiting_one(sender)?;
         if let_in {
-            let named = self.store.waiting_one(sender)?.and_then(|waiting| waiting.name);
+            let named = was_waiting.as_ref().and_then(|waiting| waiting.name.clone());
             self.store.remove_waiting(sender)?;
             self.store.set_member(sender, Role::Member, now)?;
             if named.is_some() {
@@ -704,34 +710,58 @@ impl Community {
             }
             self.store.set_joined(sender, true)?;
             let member = self.store.member(sender)?.expect("just let in");
-            return Ok(Outcome::reply(reply_to(message, COMMUNITY, self.community(&member)?)));
+            let mut outcome = Outcome::reply(reply_to(message, COMMUNITY, self.community(&member)?));
+            if was_waiting.is_some() {
+                outcome.notices = self.admins_told()?;
+            }
+            return Ok(outcome);
         }
-        if self.store.waiting_one(sender)?.is_none() && self.store.waiting_count()? >= self.config.max_waiting as i64 {
+        if was_waiting.is_none() && self.store.waiting_count()? >= self.config.max_waiting as i64 {
             return refuse(message, "e.p.req.waiting-full", "As many are waiting to be let in as can.");
         }
         self.store.add_waiting(sender, invite.as_ref().map(|invite| invite.code.as_str()), now)?;
-        Ok(Outcome::reply(reply_to(message, WAITING, json!({}))))
+        let mut outcome = Outcome::reply(reply_to(message, WAITING, json!({})));
+        // Someone new asks: every admin hears of it, and how many wait now.
+        if was_waiting.is_none() {
+            let asked = self.store.waiting_one(sender)?.expect("just added");
+            let entry = self.waiting_entry(&asked)?;
+            for (admin, community) in self.admins_told()? {
+                outcome.notices.push((admin.clone(), json!({ "type": ASKED_TO_JOIN, "body": entry })));
+                outcome.notices.push((admin, community));
+            }
+        }
+        Ok(outcome)
     }
 
     /// Who is waiting, as an admin is told: `waiting` in `members`.
     fn waiting_body(&self) -> anyhow::Result<Vec<Value>> {
+        self.store.waiting()?.iter().map(|waiting| self.waiting_entry(waiting)).collect()
+    }
+
+    /// One who is waiting, as `waiting` in `members` and `asked-to-join` say them.
+    fn waiting_entry(&self, waiting: &Waiting) -> anyhow::Result<Value> {
+        let mut listed = json!({ "did": waiting.did, "asked_at": waiting.asked_at });
+        if let Some(name) = &waiting.name {
+            listed["name"] = json!(name);
+        }
+        if let Some(code) = &waiting.invite {
+            let created_by = match self.store.invite(code)? {
+                Some(invite) => self.who(&invite.created_by)?,
+                None => Value::Null,
+            };
+            listed["invite"] = json!({ "code": code, "created_by": created_by });
+        }
+        Ok(listed)
+    }
+
+    /// `community` for every joined admin, the waiting list having changed: its
+    /// `waiting` says how many wait now.
+    fn admins_told(&self) -> anyhow::Result<Vec<(String, Value)>> {
         self.store
-            .waiting()?
+            .members()?
             .iter()
-            .map(|waiting| {
-                let mut listed = json!({ "did": waiting.did, "asked_at": waiting.asked_at });
-                if let Some(name) = &waiting.name {
-                    listed["name"] = json!(name);
-                }
-                if let Some(code) = &waiting.invite {
-                    let created_by = match self.store.invite(code)? {
-                        Some(invite) => self.who(&invite.created_by)?,
-                        None => Value::Null,
-                    };
-                    listed["invite"] = json!({ "code": code, "created_by": created_by });
-                }
-                Ok(listed)
-            })
+            .filter(|member| member.role == Role::Admin && member.joined)
+            .map(|admin| Ok((admin.did.clone(), json!({ "type": COMMUNITY, "body": self.community(admin)? }))))
             .collect()
     }
 
@@ -844,7 +874,7 @@ impl Community {
                     Some(rules) => Ok(rules),
                     None => self.join_from_outside(sender, message, now),
                 },
-                LEAVE if self.store.remove_waiting(sender)? => Ok(Outcome::default()),
+                LEAVE if self.store.remove_waiting(sender)? => Ok(Outcome { notices: self.admins_told()?, ..Outcome::default() }),
                 PROFILE if self.store.waiting_one(sender)?.is_some() => {
                     let profile = &body["profile"];
                     if profile.get("displayName").is_some() {
@@ -1450,6 +1480,7 @@ impl Community {
                             let admitted = self.store.member(did)?.expect("just let in");
                             let mut outcome = Outcome::reply(reply_to(message, MEMBERS, self.members_for(&member)?));
                             outcome.notices.push((did.to_string(), json!({ "type": COMMUNITY, "body": self.community(&admitted)? })));
+                            outcome.notices.extend(self.admins_told()?);
                             return Ok(outcome);
                         }
                     }
@@ -1458,8 +1489,17 @@ impl Community {
                             return refuse(message, "e.p.msg.last-admin", "A community needs an admin: make someone else one first.");
                         }
                         // Turned away, if they were waiting; taken out, if they were in.
+                        // Either way they are told, and nothing more of the community.
                         self.store.remove_waiting(did)?;
                         self.store.remove_member(did)?;
+                        let mut outcome = Outcome::reply(reply_to(message, MEMBERS, self.members_for(&member)?));
+                        if was_waiting {
+                            outcome.notices.push((did.to_string(), json!({ "type": REMOVED, "body": { "was": "waiting" } })));
+                            outcome.notices.extend(self.admins_told()?);
+                        } else if existing.is_some() {
+                            outcome.notices.push((did.to_string(), json!({ "type": REMOVED, "body": { "was": "member" } })));
+                        }
+                        return Ok(outcome);
                     }
                 }
                 Ok(Outcome::reply(reply_to(message, MEMBERS, self.members_for(&member)?)))
