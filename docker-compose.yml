@@ -132,6 +132,9 @@ services:
       dockerfile: services/community/Dockerfile
     ports:
       - "${COMMUNITY_PORT:-8083}:8080"
+      # community-voice's, which shares this service's network (see there).
+      - "${COMMUNITY_VOICE_PORT:-4443}:4443/udp"
+      - "${COMMUNITY_VOICE_PORT:-4443}:4443/tcp"
     environment:
       COMMUNITY_PUBLIC_URL: "${COMMUNITY_PUBLIC_URL:-http://localhost:8083/}"
       COMMUNITY_DID_METHOD: "${COMMUNITY_DID_METHOD:-peer}"
@@ -159,12 +162,14 @@ services:
   # instead use a separate one (the official community does): any moq-relay whose
   # [auth] url is this community's <public_url>/voice/auth.
   community-voice:
-    image: "moqdev/moq-relay:${MOQ_RELAY_TAG:-latest}"
+    # A version it has been tried with: a newer one may want its config changed.
+    image: "moqdev/moq-relay:${MOQ_RELAY_TAG:-0.17.8}"
     profiles: ["voice"]
     command: ["/app/relay.toml"]
-    ports:
-      - "${COMMUNITY_VOICE_PORT:-4443}:4443/udp"
-      - "${COMMUNITY_VOICE_PORT:-4443}:4443/tcp"
+    # In the community's own network, so it asks the community over loopback:
+    # moq-relay (0.17.8 on) takes plain http:// for its auth server only there.
+    # Its port is published by the community service for that reason.
+    network_mode: "service:community"
     volumes:
       - ./deploy/voice/moq-relay.toml:/app/relay.toml:ro
     depends_on:

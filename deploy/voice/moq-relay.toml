@@ -21,5 +21,7 @@ listen = "[::]:4443"
 
 [auth]
 # The community server answers who may do what, from who is in each room now
-# (community-voice/1.0, "Who may publish what").
-url = "http://community:8080/voice/auth"
+# (community-voice/1.0, "Who may publish what"). Over loopback: the relay runs in
+# the community's network (docker-compose.yml), and moq-relay refuses plain
+# http:// to anywhere else.
+url = "http://127.0.0.1:8080/voice/auth"
