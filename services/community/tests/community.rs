@@ -208,6 +208,8 @@ async fn an_admin_opens_channels_and_everyone_who_joined_is_told() {
     assert_eq!(told["body"]["channels"][0]["name"], "design-review");
     assert_eq!(told["body"]["channels"][0]["id"], channel);
     assert_eq!(told["body"]["role"], "member");
+    // Who opened it is told to them alone (yours), and to nobody else.
+    assert_eq!(told["body"]["channels"][0].get("yours"), None);
 
     // No two open channels share a name.
     let twice = admin.community("create-channel", json!({ "name": "design-review" })).await;
@@ -218,7 +220,7 @@ async fn an_admin_opens_channels_and_everyone_who_joined_is_told() {
     // Renamed, given a topic, and closed: a closed channel takes no more posts.
     let changed = admin.community("update-channel", json!({ "channel": channel, "name": "design", "topic": "What we are building", "closed": true })).await;
     let held = changed["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == channel.as_str()).unwrap().clone();
-    assert_eq!(held, json!({ "id": channel, "name": "design", "topic": "What we are building", "closed": true, "latest_seq": 0 }));
+    assert_eq!(held, json!({ "id": channel, "name": "design", "topic": "What we are building", "closed": true, "latest_seq": 0, "yours": true }));
     let late = admin.community("post", json!({ "channel": channel, "content": "too late" })).await;
     assert_eq!(late["body"]["code"], "e.p.msg.closed");
     let renamed = admin.community("update-channel", json!({ "channel": channel, "name": "Design" })).await;

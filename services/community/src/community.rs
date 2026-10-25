@@ -341,8 +341,13 @@ pub fn answer_text(question: &Value, answers: &[Value]) -> String {
 }
 
 impl Community {
-    fn channel_body(channel: &Channel) -> Value {
+    /// A channel as `to` is told of it: `yours` only for the one who opened it,
+    /// which is what they may change it by; nobody else is told who that is.
+    fn channel_body(channel: &Channel, to: &str) -> Value {
         let mut body = json!({ "id": channel.id, "name": channel.name, "topic": channel.topic, "closed": channel.closed, "latest_seq": channel.latest_seq });
+        if channel.created_by == to {
+            body["yours"] = json!(true);
+        }
         if let Some(voice) = &channel.voice {
             body["kind"] = json!("voice");
             body["voice"] = voice.clone();
@@ -386,7 +391,7 @@ impl Community {
 
     /// The community as `member` is told of it.
     pub fn community(&self, member: &Member) -> anyhow::Result<Value> {
-        let channels: Vec<Value> = self.store.channels()?.iter().map(Self::channel_body).collect();
+        let channels: Vec<Value> = self.store.channels()?.iter().map(|channel| Self::channel_body(channel, &member.did)).collect();
         let changed = self.changed();
         Ok(json!({
             "name": changed.name.unwrap_or_else(|| self.config.name.clone()),
