@@ -245,6 +245,12 @@ impl Service for CommunityService {
                 if handled.posted {
                     state.deliver.notify_one();
                 }
+                // Roles or permissions changed: everyone joined is told what they may do now.
+                if handled.community_changed {
+                    for (did, notice) in state.community.community_notices()? {
+                        send_later(state, did, notice);
+                    }
+                }
                 return Ok(match handled.answer {
                     Some(Ok((message_type, body))) => Some(received.reply(&message_type, body)),
                     Some(Err(refusal)) => Some(received.reply(
@@ -548,10 +554,14 @@ pub async fn run_deliveries(state: Arc<AppState>) {
     }
 }
 
-/// Forgets answers that were started and left.
+/// Forgets answers, and administration workflows, that were started and left.
 pub async fn run_pruning(state: Arc<AppState>) {
     loop {
         if let Err(error) = state.community.store.prune_answering(now() - ANSWERING_KEPT_FOR) {
+            tracing::warn!(%error, "pruning failed");
+        }
+        // Administration workflows left open, as long as answers are kept.
+        if let Err(error) = state.community.store.prune_flows(now() - ANSWERING_KEPT_FOR) {
             tracing::warn!(%error, "pruning failed");
         }
         tokio::time::sleep(PRUNE_EVERY).await;

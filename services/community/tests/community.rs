@@ -225,7 +225,10 @@ async fn an_admin_opens_channels_and_everyone_who_joined_is_told() {
 
     // Renamed, given a topic, and closed: a closed channel takes no more posts.
     let changed = admin.community("update-channel", json!({ "channel": channel, "name": "design", "topic": "What we are building", "closed": true })).await;
-    let held = changed["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == channel.as_str()).unwrap().clone();
+    let mut held = changed["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == channel.as_str()).unwrap().clone();
+    // An admin may do everything a channel gives.
+    assert_eq!(held["permissions"].as_array().unwrap().len(), 11);
+    held.as_object_mut().unwrap().remove("permissions");
     assert_eq!(held, json!({ "id": channel, "name": "design", "topic": "What we are building", "closed": true, "latest_seq": 0, "yours": true }));
     let late = admin.community("post", json!({ "channel": channel, "content": "too late" })).await;
     assert_eq!(late["body"]["code"], "e.p.msg.closed");
@@ -444,11 +447,16 @@ async fn an_admin_decides_who_is_let_in() {
     assert_eq!(newcomer.community("members-request", json!({})).await["type"], PROBLEM);
     assert_eq!(kind(&newcomer.community("join", json!({})).await), "waiting");
 
-    // A community keeps an admin: the only one can't step down or be removed.
-    assert_eq!(admin.community("set-member", json!({ "did": admin.did(), "role": "member" })).await["body"]["code"], "e.p.msg.last-admin");
-    assert_eq!(admin.community("set-member", json!({ "did": admin.did(), "role": null })).await["body"]["code"], "e.p.msg.last-admin");
+    // A community keeps its owner, the first admin: nobody steps them down or takes them out.
+    assert_eq!(admin.community("set-member", json!({ "did": admin.did(), "role": "member" })).await["body"]["code"], "e.p.msg.owner");
+    assert_eq!(admin.community("set-member", json!({ "did": admin.did(), "role": null })).await["body"]["code"], "e.p.msg.owner");
     admin.community("set-member", json!({ "did": member.did(), "role": "admin" })).await;
-    assert_eq!(kind(&admin.community("set-member", json!({ "did": admin.did(), "role": "member" })).await), "members");
+    assert_eq!(member.community("set-member", json!({ "did": admin.did(), "role": null })).await["body"]["code"], "e.p.msg.owner");
+    // An admin who isn't the owner ranks no higher than another admin.
+    let listed = admin.community("set-member", json!({ "did": newcomer.did(), "role": "admin" })).await;
+    assert_eq!(kind(&listed), "members");
+    assert_eq!(member.community("set-member", json!({ "did": newcomer.did(), "role": null })).await["body"]["code"], "e.p.trust.not-authorized");
+    assert_eq!(kind(&admin.community("set-member", json!({ "did": member.did(), "role": "member" })).await), "members");
 }
 
 #[tokio::test]
@@ -1157,4 +1165,128 @@ async fn claude_answers_in_a_room_from_what_was_said_there_within_its_limits() {
     let refused = member.next_message().await;
     assert!(refused["content"].as_str().unwrap().contains("in a day"), "{refused}");
     assert_eq!(asked.lock().await.len(), 1);
+}
+
+/// Advances `instance` with `event` and `input`, and returns the answer.
+async fn advance(peer: &Peer, instance: &str, event: &str, input: Value) -> Value {
+    peer.workflow("advance", json!({ "instance_id": instance, "event": event, "input": input })).await
+}
+
+#[tokio::test]
+async fn roles_are_made_given_and_ranked_through_workflows() {
+    let server = start_server("").await;
+    let (owner, artist, other) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &artist, &other]);
+    let channel = open_channel(&owner, "gallery").await;
+    for peer in [&owner, &artist, &other] {
+        peer.community("join", json!({})).await;
+    }
+
+    // A new community has Admin, Moderator and everyone; the first admin owns it.
+    let told = owner.community("join", json!({})).await["body"].clone();
+    assert_eq!(told["owner"], owner.did());
+    let names: Vec<&str> = told["roles"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["Admin", "Moderator", "everyone"]);
+    assert_eq!(told["my_roles"], json!(["admin"]));
+    assert_eq!(told["role"], "admin");
+
+    // Only those who manage roles see the workflows, or may start them.
+    let listed = artist.workflow("discover", json!({})).await;
+    assert!(!listed["body"].to_string().contains("\"roles\""), "{listed}");
+    let refused = artist.workflow("start", json!({ "template_id": "roles", "instance_id": "r0" })).await;
+    assert_eq!(refused["body"]["code"], "not_authorized");
+    assert!(owner.workflow("discover", json!({})).await["body"].to_string().contains("member-roles"));
+
+    // The owner makes a role, Artist, that keeps order in channels.
+    let list = owner.workflow("start", json!({ "template_id": "roles", "instance_id": "r1" })).await;
+    assert_eq!(list["body"]["state"], "list", "{list}");
+    let editing = advance(&owner, "r1", "create", json!({ "name": "Artist" })).await;
+    assert_eq!(editing["body"]["state"], "edit", "{editing}");
+    assert!(editing["body"]["ui"].to_string().contains("perm-manage_messages"));
+    let taken = advance(&owner, "r1", "back", json!({})).await;
+    assert_eq!(taken["body"]["state"], "list");
+    assert_eq!(advance(&owner, "r1", "create", json!({ "name": "artist" })).await["body"]["code"], "guard_failed");
+    let roles = owner.community("join", json!({})).await["body"]["roles"].clone();
+    let artist_role = roles.as_array().unwrap().iter().find(|r| r["name"] == "Artist").unwrap()["id"].as_str().unwrap().to_string();
+    advance(&owner, "r1", "edit", json!({ "role": artist_role })).await;
+    let bad = advance(&owner, "r1", "save", json!({ "name": "Artist", "color": "blue" })).await;
+    assert_eq!(bad["body"]["code"], "guard_failed");
+    let saved = advance(&owner, "r1", "save", json!({ "name": "Artist", "color": "#9B59B6", "icon": "🎨", "mentionable": true, "perm-manage_messages": true, "perm-post": true })).await;
+    assert_eq!(saved["body"]["state"], "list", "{saved}");
+    assert!(saved["body"]["ui"].to_string().contains("Saved Artist."));
+    // Everyone is told each change; the last says it as saved.
+    let shown = loop {
+        let told = other.next_of(&format!("{C}community")).await["body"].clone();
+        let role = told["roles"].as_array().unwrap().iter().find(|r| r["id"] == artist_role.as_str()).cloned();
+        if let Some(role) = role.filter(|role| role.get("color").is_some()) {
+            break role;
+        }
+    };
+    assert_eq!(shown, json!({ "id": artist_role, "name": "Artist", "color": "#9b59b6", "icon": "🎨", "mentionable": true, "hoist": false, "self_assignable": false }));
+    assert_eq!(advance(&owner, "r1", "done", json!({})).await["type"], format!("{W}complete"));
+
+    // Given the role, a member removes someone else's post, as they couldn't before.
+    other.community("post", json!({ "channel": channel, "id": "p1", "content": "spam" })).await;
+    let before = artist.ask("https://wyvrn.app/message-edits/1.0/delete", json!({ "to": { "id": "p1", "author": other.did() } })).await;
+    assert_eq!(before["body"]["code"], "e.p.trust.not-authorized");
+    owner.workflow("start", json!({ "template_id": "member-roles", "instance_id": "m1", "context": { "member": artist.did() } })).await;
+    let given = advance(&owner, "m1", "save", json!({ format!("role-{artist_role}"): true })).await;
+    assert_eq!(kind(&given), "complete", "{given}");
+    let now_told = loop {
+        let told = artist.next_of(&format!("{C}community")).await["body"].clone();
+        if told["my_roles"] != json!([]) {
+            break told;
+        }
+    };
+    assert_eq!(now_told["my_roles"], json!([artist_role]));
+    assert_eq!(now_told["role"], "moderator");
+    assert!(now_told["channels"][0]["permissions"].as_array().unwrap().contains(&json!("manage_messages")));
+    let removed = artist.ask("https://wyvrn.app/message-edits/1.0/delete", json!({ "to": { "id": "p1", "author": other.did() } })).await;
+    assert_eq!(removed["body"]["removed_by"], artist.did(), "{removed}");
+    // A mentionable role may be mentioned by anyone.
+    other.community("post", json!({ "channel": channel, "id": "p2", "content": "@Artist look", "mentions": [{ "who": format!("role:{artist_role}"), "name": "Artist" }, { "who": "everyone", "name": "everyone" }] })).await;
+    let mentioned = other.community("history-request", json!({ "channel": channel })).await["body"]["messages"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(mentioned["mentions"], json!([{ "who": format!("role:{artist_role}"), "name": "Artist" }]));
+
+    // Members list who holds what.
+    let members = owner.community("members-request", json!({})).await;
+    let entry = members["body"]["members"].as_array().unwrap().iter().find(|m| m["did"] == artist.did()).unwrap().clone();
+    assert_eq!(entry["roles"], json!([artist_role]));
+}
+
+#[tokio::test]
+async fn a_channel_can_be_made_read_only_and_rank_limits_moderators() {
+    let server = start_server("").await;
+    let (owner, moderator, member) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &moderator, &member]);
+    let channel = open_channel(&owner, "news").await;
+    for peer in [&owner, &moderator, &member] {
+        peer.community("join", json!({})).await;
+    }
+    owner.community("set-member", json!({ "did": moderator.did(), "role": "moderator" })).await;
+
+    // Read-only: members can't post; a role the channel allows still can.
+    let opened = owner.workflow("start", json!({ "template_id": "channel-permissions", "instance_id": "c1", "context": { "channel": channel } })).await;
+    assert_eq!(opened["body"]["state"], "roles", "{opened}");
+    let locked = advance(&owner, "c1", "read_only", json!({})).await;
+    assert!(locked["body"]["ui"].to_string().contains("Let everyone post"), "{locked}");
+    assert_eq!(member.community("post", json!({ "channel": channel, "content": "hi" })).await["body"]["code"], "e.p.trust.not-authorized");
+    let told = member.community("join", json!({})).await["body"].clone();
+    assert_eq!(told["channels"][0]["read_only"], true);
+    assert!(!told["channels"][0]["permissions"].as_array().unwrap().contains(&json!("post")));
+    advance(&owner, "c1", "edit", json!({ "role": "moderator" })).await;
+    assert_eq!(advance(&owner, "c1", "save", json!({ "allow-post": true, "deny-post": true })).await["body"]["code"], "guard_failed");
+    let saved = advance(&owner, "c1", "save", json!({ "allow-post": true })).await;
+    assert!(saved["body"]["ui"].to_string().contains("Moderator: allows Post"), "{saved}");
+    assert_eq!(kind(&moderator.community("post", json!({ "channel": channel, "content": "news" })).await), "posted");
+    // Someone who doesn't manage channels can't open it.
+    let refused = member.workflow("start", json!({ "template_id": "channel-permissions", "instance_id": "c2", "context": { "channel": channel } })).await;
+    assert_eq!(refused["body"]["code"], "not_authorized");
+
+    // A moderator lets in, and takes out a member, but not an admin; and can't
+    // manage roles at all.
+    assert_eq!(kind(&moderator.community("set-member", json!({ "did": member.did(), "role": null })).await), "members");
+    assert_eq!(moderator.community("set-member", json!({ "did": owner.did(), "role": null })).await["body"]["code"], "e.p.msg.owner");
+    assert_eq!(moderator.community("set-member", json!({ "did": member.did(), "role": "moderator" })).await["body"]["code"], "e.p.trust.not-authorized");
+    assert_eq!(moderator.workflow("start", json!({ "template_id": "roles", "instance_id": "r9" })).await["body"]["code"], "not_authorized");
 }

@@ -121,6 +121,79 @@ pub struct Thread {
     pub count: i64,
 }
 
+/// A role (community/1.0's roles): a name, permissions and a rank, `position`,
+/// higher ranking higher. `everyone` is at 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleDef {
+    pub id: String,
+    pub name: String,
+    pub color: Option<String>,
+    pub icon: Option<String>,
+    pub position: i64,
+    pub permissions: Vec<String>,
+    pub mentionable: bool,
+    pub hoist: bool,
+    pub self_assignable: bool,
+}
+
+/// What a channel allows and denies a role, of the permissions a channel gives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Override {
+    pub channel: String,
+    pub role: String,
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+}
+
+/// An administration workflow under way (workflow/1.0, the server Processor):
+/// whose, which template and about what, where it has got to and what it holds.
+#[derive(Debug, Clone)]
+pub struct Flow {
+    pub id: String,
+    pub owner: String,
+    pub template: String,
+    pub context: Value,
+    pub state: String,
+    pub data: Value,
+    /// `active`, `completed` or `canceled`.
+    pub status: String,
+    pub updated: i64,
+}
+
+const ROLE_COLUMNS: &str = "id, name, color, icon, position, permissions, mentionable, hoist, self_assignable";
+const FLOW_COLUMNS: &str = "id, owner, template, context, state, data, status, updated";
+
+fn list_from(text: Option<String>) -> Vec<String> {
+    text.and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
+}
+
+fn role_from(row: &Row) -> Result<RoleDef> {
+    Ok(RoleDef {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        color: row.get(2)?,
+        icon: row.get(3)?,
+        position: row.get(4)?,
+        permissions: list_from(row.get(5)?),
+        mentionable: row.get(6)?,
+        hoist: row.get(7)?,
+        self_assignable: row.get(8)?,
+    })
+}
+
+fn flow_from(row: &Row) -> Result<Flow> {
+    Ok(Flow {
+        id: row.get(0)?,
+        owner: row.get(1)?,
+        template: row.get(2)?,
+        context: json_from(row.get(3)?).unwrap_or(Value::Null),
+        state: row.get(4)?,
+        data: json_from(row.get(5)?).unwrap_or(Value::Null),
+        status: row.get(6)?,
+        updated: row.get(7)?,
+    })
+}
+
 /// Someone part-way through answering a question (a workflow/1.0 instance).
 #[derive(Debug, Clone)]
 pub struct Answering {
@@ -453,6 +526,43 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         member TEXT,
         resolved_at INTEGER,
         resolved_by TEXT
+    );
+    -- Roles (community/1.0's roles and permissions); `permissions` is a JSON list.
+    CREATE TABLE IF NOT EXISTS roles (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        color TEXT,
+        icon TEXT,
+        position INTEGER NOT NULL,
+        permissions TEXT NOT NULL,
+        mentionable INTEGER NOT NULL DEFAULT 0,
+        hoist INTEGER NOT NULL DEFAULT 0,
+        self_assignable INTEGER NOT NULL DEFAULT 0
+    );
+    -- Who holds which role, everyone left out.
+    CREATE TABLE IF NOT EXISTS member_roles (
+        did TEXT NOT NULL,
+        role TEXT NOT NULL,
+        PRIMARY KEY (did, role)
+    );
+    -- What a channel allows and denies a role, each a JSON list.
+    CREATE TABLE IF NOT EXISTS channel_overrides (
+        channel TEXT NOT NULL,
+        role TEXT NOT NULL,
+        allow TEXT NOT NULL,
+        deny TEXT NOT NULL,
+        PRIMARY KEY (channel, role)
+    );
+    -- Administration workflows under way.
+    CREATE TABLE IF NOT EXISTS flows (
+        id TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        template TEXT NOT NULL,
+        context TEXT NOT NULL,
+        state TEXT NOT NULL,
+        data TEXT NOT NULL,
+        status TEXT NOT NULL,
+        updated INTEGER NOT NULL
     );";
 
 fn schema() -> Schema {
@@ -583,6 +693,39 @@ fn schema() -> Schema {
                 member {MYSQL_DID},
                 resolved_at BIGINT,
                 resolved_by {MYSQL_DID}
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS roles (
+                id VARCHAR(64) NOT NULL PRIMARY KEY,
+                name TEXT NOT NULL,
+                color VARCHAR(16),
+                icon VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+                position BIGINT NOT NULL,
+                permissions TEXT NOT NULL,
+                mentionable BIGINT NOT NULL DEFAULT 0,
+                hoist BIGINT NOT NULL DEFAULT 0,
+                self_assignable BIGINT NOT NULL DEFAULT 0
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS member_roles (
+                did {MYSQL_DID} NOT NULL,
+                role VARCHAR(64) NOT NULL,
+                PRIMARY KEY (did(255), role)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS channel_overrides (
+                channel VARCHAR(255) NOT NULL,
+                role VARCHAR(64) NOT NULL,
+                allow TEXT NOT NULL,
+                deny TEXT NOT NULL,
+                PRIMARY KEY (channel, role)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS flows (
+                id VARCHAR(255) NOT NULL PRIMARY KEY,
+                owner {MYSQL_DID} NOT NULL,
+                template VARCHAR(64) NOT NULL,
+                context MEDIUMTEXT NOT NULL,
+                state VARCHAR(64) NOT NULL,
+                data MEDIUMTEXT NOT NULL,
+                status VARCHAR(32) NOT NULL,
+                updated BIGINT NOT NULL
             ) {MYSQL_TABLE}"
         )
     });
@@ -627,6 +770,10 @@ impl Store {
         if db.execute("UPDATE members SET role = ?2 WHERE did = ?1", params![did, role.as_str()])? == 0 {
             db.execute(Self::ADMIT, params![did, role.as_str(), now])?;
         }
+        // An admin by the older word holds the role `admin`, while there is one.
+        if role == Role::Admin {
+            db.execute("INSERT OR IGNORE INTO member_roles (did, role) SELECT ?1, id FROM roles WHERE id = 'admin'", params![did])?;
+        }
         Ok(())
     }
 
@@ -638,6 +785,7 @@ impl Store {
     pub fn remove_member(&self, did: &str) -> Result<bool> {
         let mut db = self.db.lock();
         db.execute("DELETE FROM member_left WHERE did = ?1", params![did])?;
+        db.execute("DELETE FROM member_roles WHERE did = ?1", params![did])?;
         Ok(db.execute("DELETE FROM members WHERE did = ?1", params![did])? > 0)
     }
 
@@ -718,6 +866,11 @@ impl Store {
                 // Their voice preferences follow them.
                 tx.execute("UPDATE OR IGNORE voice_prefs SET did = ?2 WHERE did = ?1", params![prior, new])?;
                 tx.execute("DELETE FROM voice_prefs WHERE did = ?1", params![prior])?;
+                // Their roles follow them, and so does owning the community.
+                tx.execute("UPDATE OR IGNORE member_roles SET did = ?2 WHERE did = ?1", params![prior, new])?;
+                tx.execute("DELETE FROM member_roles WHERE did = ?1", params![prior])?;
+                tx.execute("UPDATE settings SET value = ?2 WHERE name = 'owner' AND value = ?1", params![prior, new])?;
+                tx.execute("UPDATE flows SET owner = ?2 WHERE owner = ?1", params![prior, new])?;
                 // Reports they made, or that name them, follow them.
                 tx.execute("UPDATE reports SET by_did = ?2 WHERE by_did = ?1", params![prior, new])?;
                 tx.execute("UPDATE reports SET member = ?2 WHERE member = ?1", params![prior, new])?;
@@ -806,6 +959,113 @@ impl Store {
     pub fn set_setting(&self, name: &str, value: &str) -> Result<()> {
         self.db.lock().execute("INSERT OR REPLACE INTO settings (name, value) VALUES (?1, ?2)", params![name, value])?;
         Ok(())
+    }
+
+    // --- Roles --------------------------------------------------------------------
+
+    /// Every role, highest first, `everyone` last.
+    pub fn roles(&self) -> Result<Vec<RoleDef>> {
+        self.db.lock().query(&format!("SELECT {ROLE_COLUMNS} FROM roles ORDER BY position DESC, id"), params![], role_from)
+    }
+
+    pub fn role(&self, id: &str) -> Result<Option<RoleDef>> {
+        self.db.lock().query_row(&format!("SELECT {ROLE_COLUMNS} FROM roles WHERE id = ?1"), params![id], role_from)
+    }
+
+    pub fn save_role(&self, role: &RoleDef) -> Result<()> {
+        let permissions = serde_json::to_string(&role.permissions).unwrap_or_else(|_| "[]".into());
+        self.db.lock().execute(
+            &format!("INSERT OR REPLACE INTO roles ({ROLE_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"),
+            params![role.id, role.name, role.color, role.icon, role.position, permissions, role.mentionable, role.hoist, role.self_assignable],
+        )?;
+        Ok(())
+    }
+
+    /// Ranks the roles as `ids` lists them, lowest first, from 1 (`everyone` keeps 0).
+    pub fn rank_roles(&self, ids: &[String]) -> Result<()> {
+        self.db.lock().transaction(|tx| {
+            for (n, id) in ids.iter().enumerate() {
+                tx.execute("UPDATE roles SET position = ?2 WHERE id = ?1", params![id, n as i64 + 1])?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Deletes a role, with whoever held it and whatever channels said of it.
+    pub fn delete_role(&self, id: &str) -> Result<bool> {
+        self.db.lock().transaction(|tx| {
+            tx.execute("DELETE FROM member_roles WHERE role = ?1", params![id])?;
+            tx.execute("DELETE FROM channel_overrides WHERE role = ?1", params![id])?;
+            Ok(tx.execute("DELETE FROM roles WHERE id = ?1", params![id])? > 0)
+        })
+    }
+
+    /// The roles `did` holds, everyone left out.
+    pub fn member_roles(&self, did: &str) -> Result<Vec<String>> {
+        self.db.lock().query("SELECT role FROM member_roles WHERE did = ?1 ORDER BY role", params![did], |row| row.get(0))
+    }
+
+    /// Who holds what: every `(did, role)`.
+    pub fn all_member_roles(&self) -> Result<Vec<(String, String)>> {
+        self.db.lock().query("SELECT did, role FROM member_roles", params![], |row| Ok((row.get(0)?, row.get(1)?)))
+    }
+
+    pub fn give_role(&self, did: &str, role: &str) -> Result<()> {
+        self.db.lock().execute("INSERT OR IGNORE INTO member_roles (did, role) VALUES (?1, ?2)", params![did, role])?;
+        Ok(())
+    }
+
+    pub fn take_role(&self, did: &str, role: &str) -> Result<()> {
+        self.db.lock().execute("DELETE FROM member_roles WHERE did = ?1 AND role = ?2", params![did, role])?;
+        Ok(())
+    }
+
+    /// What `channel` allows and denies each role it says anything of.
+    pub fn overrides(&self, channel: &str) -> Result<Vec<Override>> {
+        self.db.lock().query("SELECT channel, role, allow, deny FROM channel_overrides WHERE channel = ?1", params![channel], |row| {
+            Ok(Override { channel: row.get(0)?, role: row.get(1)?, allow: list_from(row.get(2)?), deny: list_from(row.get(3)?) })
+        })
+    }
+
+    /// Sets what `channel` allows and denies `role`; with neither, forgets it.
+    pub fn set_override(&self, channel: &str, role: &str, allow: &[String], deny: &[String]) -> Result<()> {
+        let mut db = self.db.lock();
+        if allow.is_empty() && deny.is_empty() {
+            db.execute("DELETE FROM channel_overrides WHERE channel = ?1 AND role = ?2", params![channel, role])?;
+        } else {
+            let (allow, deny) = (serde_json::to_string(allow).unwrap_or_default(), serde_json::to_string(deny).unwrap_or_default());
+            db.execute("INSERT OR REPLACE INTO channel_overrides (channel, role, allow, deny) VALUES (?1, ?2, ?3, ?4)", params![channel, role, allow, deny])?;
+        }
+        Ok(())
+    }
+
+    // --- Administration workflows -------------------------------------------------
+
+    pub fn flow(&self, id: &str) -> Result<Option<Flow>> {
+        self.db.lock().query_row(&format!("SELECT {FLOW_COLUMNS} FROM flows WHERE id = ?1"), params![id], flow_from)
+    }
+
+    /// `owner`'s active workflow of `template` about `context`, if there is one.
+    pub fn active_flow(&self, owner: &str, template: &str, context: &Value) -> Result<Option<Flow>> {
+        let context = context.to_string();
+        self.db.lock().query_row(
+            &format!("SELECT {FLOW_COLUMNS} FROM flows WHERE owner = ?1 AND template = ?2 AND context = ?3 AND status = 'active'"),
+            params![owner, template, context],
+            flow_from,
+        )
+    }
+
+    pub fn save_flow(&self, flow: &Flow) -> Result<()> {
+        self.db.lock().execute(
+            &format!("INSERT OR REPLACE INTO flows ({FLOW_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),
+            params![flow.id, flow.owner, flow.template, flow.context.to_string(), flow.state, flow.data.to_string(), flow.status, flow.updated],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets workflows last touched before `before`.
+    pub fn prune_flows(&self, before: i64) -> Result<usize> {
+        self.db.lock().execute("DELETE FROM flows WHERE updated < ?1", params![before])
     }
 
     // --- Voice ------------------------------------------------------------------

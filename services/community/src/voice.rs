@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use serde_json::{json, Value};
 
 use crate::community::{problem, Community};
-use crate::store::{Member, Role};
+use crate::store::Member;
 
 pub const PIURI: &str = "https://wyvrn.app/community-voice/1.0";
 pub const WATCH_PRESENCE: &str = "https://wyvrn.app/community-voice/1.0/watch-presence";
@@ -149,13 +149,18 @@ fn random_id(bytes: usize) -> String {
     out
 }
 
-/// A voice channel's setting `field` (`speak`, `video`, `screen`): whether a
-/// member with `role` may.
-fn may(voice: &Value, field: &str, role: Role) -> bool {
-    match voice[field].as_str() {
-        Some("admins") => role == Role::Admin,
-        _ => true,
-    }
+/// Whether `did` may do `field` (`speak`, `video`, `screen`) in the voice
+/// channel: the channel's permission (`speak`, or `video` for either kind of
+/// picture), held to the channel's own setting, `admins` meaning those who are
+/// admins in older terms.
+fn may(community: &Community, did: &str, channel: &crate::store::Channel, field: &str) -> bool {
+    let check = || -> anyhow::Result<bool> {
+        let powers = community.powers(did)?;
+        let permission = if field == "speak" { "speak" } else { "video" };
+        let setting = channel.voice.as_ref().and_then(|voice| voice[field].as_str().map(str::to_string));
+        Ok(community.channel_permissions(did, &powers, channel)?.contains(permission) && (setting.as_deref() != Some("admins") || powers.all()))
+    };
+    check().unwrap_or(false)
 }
 
 /// The room's path at the forwarding service: the community's DID hashed, so
@@ -268,18 +273,18 @@ impl Rooms {
         for (channel, room) in &inner.rooms {
             let Some(p) = room.participants.values().find(|p| p.token == token) else { continue };
             let did = &p.did;
-            let channel_settings = community.store.channel(channel).ok().flatten()?.voice?;
-            let role = community.store.member(did).ok().flatten()?.role;
+            let held = community.store.channel(channel).ok().flatten().filter(|held| held.voice.is_some())?;
+            community.store.member(did).ok().flatten()?;
             let path = room_path(community_did, channel);
             let mut publish = vec![format!("{path}/{}/position", p.id)];
-            if may(&channel_settings, "speak", role) && !p.server_muted {
+            if may(community, did, &held, "speak") && !p.server_muted {
                 publish.push(format!("{path}/{}/mic", p.id));
             }
-            if may(&channel_settings, "video", role) {
+            if may(community, did, &held, "video") {
                 publish.push(format!("{path}/{}/camera", p.id));
                 publish.push(format!("{path}/{}/avatar", p.id));
             }
-            if may(&channel_settings, "screen", role) {
+            if may(community, did, &held, "screen") {
                 publish.push(format!("{path}/{}/screen", p.id));
             }
             // A grant that is revalidated has to say when it runs out (moq-auth):
@@ -350,6 +355,9 @@ impl Rooms {
                 if community.rules_owed_by(sender)? {
                     return refuse(message, "e.p.msg.rules-not-accepted", "Accept this community's rules first.");
                 }
+                if !community.may_in(sender, &channel, "connect")? {
+                    return refuse(message, "e.p.trust.not-authorized", "You can't join this voice channel.");
+                }
                 let transport = settings["transport"].as_str().map(str::to_string).or_else(|| community.voice_defaults().ok().flatten().and_then(|v| v["transport"].as_str().map(str::to_string))).unwrap_or_else(|| "moq".into());
                 if transport != "moq" {
                     return refuse(message, "e.p.msg.unsupported", "This server doesn't forward that transport yet.");
@@ -410,7 +418,6 @@ impl Rooms {
                 // Everyone else, the member's other devices included: each has a key of its own.
                 let participants: Vec<Value> = self.participants_body(community, &inner, &channel.id).into_iter().filter(|p| p["participant"] != participant.id.as_str()).collect();
                 drop(inner);
-                let role = member.role;
                 let mut transport_body = json!({ "kind": "moq", "url": voice.relay_url, "path": room_path(community_did, &channel.id), "token": participant.token });
                 if let Some(fingerprint) = &voice.relay_fingerprint {
                     transport_body["fingerprint"] = json!(fingerprint);
@@ -419,7 +426,7 @@ impl Rooms {
                     "channel": channel.id,
                     "participant": participant.id,
                     "transport": transport_body,
-                    "may": { "speak": may(&settings, "speak", role) && !participant.server_muted, "video": may(&settings, "video", role), "screen": may(&settings, "screen", role) },
+                    "may": { "speak": may(community, sender, &channel, "speak") && !participant.server_muted, "video": may(community, sender, &channel, "video"), "screen": may(community, sender, &channel, "screen") },
                     "participants": participants,
                 });
                 let mut outcome = VoiceOutcome::reply(reply_to(message, JOINED, joined));
@@ -446,7 +453,7 @@ impl Rooms {
 
             STATE => {
                 let channel = body["channel"].as_str().unwrap_or_default();
-                let Some((_, settings)) = voice_channel(channel)? else {
+                let Some((held, _)) = voice_channel(channel)? else {
                     return refuse(message, "e.p.msg.unknown-channel", "There is no such voice channel.");
                 };
                 let sharing = Sharing {
@@ -454,7 +461,7 @@ impl Rooms {
                     screen: body["sharing"]["screen"] == true,
                     avatar: body["sharing"]["avatar"] == true,
                 };
-                if ((sharing.camera || sharing.avatar) && !may(&settings, "video", member.role)) || (sharing.screen && !may(&settings, "screen", member.role)) {
+                if ((sharing.camera || sharing.avatar) && !may(community, sender, &held, "video")) || (sharing.screen && !may(community, sender, &held, "screen")) {
                     return refuse(message, "e.p.trust.not-authorized", "You may not share that here.");
                 }
                 let changed = {
@@ -554,11 +561,20 @@ impl Rooms {
             }
 
             MODERATE => {
-                if member.role != Role::Admin {
-                    return refuse(message, "e.p.trust.not-authorized", "Only an admin moderates a voice channel.");
-                }
                 let channel = body["channel"].as_str().unwrap_or_default();
                 let participant = body["participant"].as_str().unwrap_or_default();
+                let Some((held, _)) = voice_channel(channel)? else {
+                    return refuse(message, "e.p.msg.unknown-channel", "There is no such voice channel.");
+                };
+                if !community.may_in(sender, &held, "moderate_voice")? {
+                    return refuse(message, "e.p.trust.not-authorized", "Moderating a voice channel takes Mute and remove people in voice channels.");
+                }
+                let target = self.lock().rooms.get(channel).and_then(|room| room.participants.get(participant)).map(|p| p.did.clone());
+                if let Some(target) = target.filter(|target| target != sender) {
+                    if !community.outranks(&community.powers(sender)?, &target)? {
+                        return refuse(message, "e.p.trust.not-authorized", "You can only moderate someone ranked below you.");
+                    }
+                }
                 let found = {
                     let mut inner = self.lock();
                     let Some(room) = inner.rooms.get_mut(channel) else {

@@ -28,12 +28,12 @@ pub struct Refusal {
 }
 
 impl Refusal {
-    fn new(code: &'static str, comment: impl Into<String>) -> Self {
+    pub fn new(code: &'static str, comment: impl Into<String>) -> Self {
         Self { code, comment: comment.into(), args: json!({}) }
     }
 }
 
-fn failed(error: impl std::fmt::Display) -> Refusal {
+pub fn failed(error: impl std::fmt::Display) -> Refusal {
     tracing::error!(%error, "answering a question failed");
     Refusal::new("action_failed", "Something went wrong here. Try again.")
 }
@@ -46,6 +46,9 @@ pub type Answer = Result<(String, Value), Refusal>;
 pub struct Handled {
     pub answer: Option<Answer>,
     pub posted: bool,
+    /// Roles or a channel's permissions changed: every joined member is sent
+    /// `community` again.
+    pub community_changed: bool,
 }
 
 /// The template, as `fetch-template` hands it over: two states, and one event
@@ -245,27 +248,57 @@ impl Community {
         Ok((Ok((format!("{P}{kind}"), status)), posted))
     }
 
-    /// Acts on one workflow message from `member`. An answer of `None` is for a
-    /// message that isn't this protocol's.
+    /// Acts on one workflow message from `member`: answering a question, or one of
+    /// the administration workflows (`crate::admin_flows`). An answer of `None` is
+    /// for a message that isn't this protocol's.
     pub fn handle_workflow(&self, member: &Member, message: &Value, now: i64) -> Handled {
         let Some(kind) = message["type"].as_str().and_then(|message_type| message_type.strip_prefix(P)) else {
             return Handled::default();
         };
         let body = &message["body"];
+        let instance = body["instance_id"].as_str().unwrap_or_default();
+        // An administration workflow under way, if the instance is one.
+        let flow = match kind {
+            "status" | "advance" | "cancel" => match self.own_flow(&member.did, instance) {
+                Ok(flow) => flow,
+                Err(refusal) => return Handled { answer: Some(Err(refusal)), ..Handled::default() },
+            },
+            _ => None,
+        };
+        if let Some(flow) = flow {
+            let answer = match kind {
+                "status" => self.flow_status_answer(&flow),
+                "cancel" => self.cancel_flow(flow, now),
+                _ => match self.advance_flow(flow, body, now) {
+                    Ok((answer, community_changed)) => return Handled { answer: Some(answer), posted: false, community_changed },
+                    Err(refusal) => Err(refusal),
+                },
+            };
+            return Handled { answer: Some(answer), ..Handled::default() };
+        }
         let status_of = |answering: Result<Answering, Refusal>| answering.and_then(|a| self.answering_status(&a)).map(|status| (format!("{P}status"), status));
         let answer = match kind {
-            "discover" => Ok((
-                format!("{P}workflows"),
-                json!({ "paging": { "total": 1, "next_offset": 0 }, "workflows": [{ "template_id": TEMPLATE, "versions": [VERSION], "title": "Answer a question" }] }),
-            )),
+            "discover" => {
+                let mut workflows = vec![json!({ "template_id": TEMPLATE, "versions": [VERSION], "title": "Answer a question" })];
+                match self.flows_for(&member.did) {
+                    Ok(flows) => workflows.extend(flows.into_iter().map(|(id, title)| json!({ "template_id": id, "versions": [crate::admin_flows::VERSION], "title": title }))),
+                    Err(error) => return Handled { answer: Some(Err(failed(error))), ..Handled::default() },
+                }
+                Ok((format!("{P}workflows"), json!({ "paging": { "total": workflows.len(), "next_offset": 0 }, "workflows": workflows })))
+            }
             "fetch-template" => match body["template_id"].as_str() {
                 Some(TEMPLATE) => Ok((format!("{P}template"), json!({ "template": template() }))),
-                _ => Err(Refusal::new("not_found_remote_template", "This server has no such workflow.")),
+                Some(id) => match crate::admin_flows::template(id) {
+                    Some(template) => Ok((format!("{P}template"), json!({ "template": template }))),
+                    None => Err(Refusal::new("not_found_remote_template", "This server has no such workflow.")),
+                },
+                None => Err(Refusal::new("not_found_remote_template", "This server has no such workflow.")),
             },
+            "start" if body["template_id"].as_str().is_some_and(crate::admin_flows::is_template) => self.start_flow(member, message, now),
             "start" => self.start_answering(member, message, now),
             "status" => status_of(self.mine(member, body)),
             "advance" => match self.advance_answering(member, body, now) {
-                Ok((answer, posted)) => return Handled { answer: Some(answer), posted },
+                Ok((answer, posted)) => return Handled { answer: Some(answer), posted, community_changed: false },
                 Err(refusal) => Err(refusal),
             },
             "cancel" => status_of(self.mine(member, body).and_then(|mut answering| {
@@ -276,10 +309,10 @@ impl Community {
                 }
                 Ok(answering)
             })),
-            "pause" | "resume" => Err(Refusal::new("guard_failed", "A question is answered or left; it can't be paused.")),
-            "publish-template" => Err(Refusal::new("not_authorized", "This server runs its own workflow, and takes no others.")),
+            "pause" | "resume" => Err(Refusal::new("guard_failed", "These are done or left; they can't be paused.")),
+            "publish-template" => Err(Refusal::new("not_authorized", "This server runs its own workflows, and takes no others.")),
             _ => return Handled::default(),
         };
-        Handled { answer: Some(answer), posted: false }
+        Handled { answer: Some(answer), ..Handled::default() }
     }
 }

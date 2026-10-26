@@ -274,7 +274,7 @@ fn text_channel_name(name: &str) -> bool {
 
 const INVALID_NAME: &str = "A text channel's name is one word in lowercase: letters, digits, _, . and -, as in design-review.";
 
-fn line(value: &Value, max: usize) -> Option<String> {
+pub(crate) fn line(value: &Value, max: usize) -> Option<String> {
     let text: String = value.as_str()?.split_whitespace().collect::<Vec<_>>().join(" ");
     let text: String = text.chars().take(max).collect();
     (!text.is_empty()).then_some(text)
@@ -386,7 +386,9 @@ impl Community {
             Some(kept) => kept.load()?,
             None => Changed::default(),
         };
-        Ok(Self { store, config, changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None })
+        let community = Self { store, config, changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None };
+        community.ensure_roles()?;
+        Ok(community)
     }
 
     /// What an admin has changed of the community's name, description and picture.
@@ -396,14 +398,27 @@ impl Community {
 
     /// The community as `member` is told of it.
     pub fn community(&self, member: &Member) -> anyhow::Result<Value> {
-        let channels: Vec<Value> = self.store.channels()?.iter().map(|channel| Self::channel_body(channel, &member.did)).collect();
+        let powers = self.powers(&member.did)?;
+        let mut channels = Vec::new();
+        for channel in self.store.channels()? {
+            let mut body = Self::channel_body(&channel, &member.did);
+            body["permissions"] = json!(self.channel_permissions(&member.did, &powers, &channel)?);
+            if self.read_only(&channel.id)? {
+                body["read_only"] = json!(true);
+            }
+            channels.push(body);
+        }
         let changed = self.changed();
         Ok(json!({
             "name": changed.name.unwrap_or_else(|| self.config.name.clone()),
             "description": changed.description.unwrap_or_else(|| self.config.description.clone()),
-            "role": member.role.as_str(),
+            "role": powers.older_role(),
             "joined": member.joined,
-            "members_may_create_channels": self.config.members_may_create_channels,
+            "owner": self.owner()?,
+            "roles": self.roles_body()?,
+            "my_roles": powers.roles,
+            "permissions": powers.listed(),
+            "members_may_create_channels": self.everyone_has("create_channels")?,
             "admission": self.admission()?.as_str(),
             "members_may_invite": self.members_may_invite()?,
             "channels": channels,
@@ -426,7 +441,7 @@ impl Community {
             if let Some(assistant) = &self.assistant {
                 body["assistant"] = assistant.clone();
             }
-            if member.role == Role::Admin {
+            if powers.has("admit_members") {
                 body["waiting"] = json!(self.store.waiting_count()?);
             }
             Ok(body)
@@ -602,14 +617,31 @@ impl Community {
     }
 
     /// Who a post may call on, from what it asks to: each `{ who, name }`, `who` a
-    /// member's DID, or `everyone` for an admin, and `name` what the post writes
-    /// them as. Anyone else named is left out, not refused: a member taken out
-    /// since the post was written is nobody's mistake.
-    fn mentions_of(&self, body: &Value, member: &Member) -> anyhow::Result<Vec<Mention>> {
+    /// member's DID, `everyone`, or `role:<id>` (`everyone`, and a role that isn't
+    /// mentionable, for those holding `mention_everyone` in the channel), and `name`
+    /// what the post writes them as. Anyone else named is left out, not refused: a
+    /// member taken out since the post was written is nobody's mistake.
+    fn mentions_of(&self, body: &Value, member: &Member, channel: &Channel) -> anyhow::Result<Vec<Mention>> {
         let mut mentions: Vec<Mention> = Vec::new();
+        let mut everyone_allowed = None;
         for named in body["mentions"].as_array().into_iter().flatten().take(MAX_MENTIONS * 2) {
             let Some(who) = named["who"].as_str() else { continue };
-            let allowed = if who == EVERYONE { member.role == Role::Admin } else { self.store.member(who)?.is_some() };
+            let mut may_everyone = || -> anyhow::Result<bool> {
+                if everyone_allowed.is_none() {
+                    everyone_allowed = Some(self.may_in(&member.did, channel, "mention_everyone")?);
+                }
+                Ok(everyone_allowed == Some(true))
+            };
+            let allowed = if who == EVERYONE {
+                may_everyone()?
+            } else if let Some(role) = who.strip_prefix("role:") {
+                match self.store.role(role)?.filter(|role| role.id != crate::roles::EVERYONE_ROLE) {
+                    Some(role) => role.mentionable || may_everyone()?,
+                    None => false,
+                }
+            } else {
+                self.store.member(who)?.is_some()
+            };
             if allowed && !mentions.iter().any(|known| known.who == who) && mentions.len() < MAX_MENTIONS {
                 let name = line(&named["name"], MAX_MENTION_NAME).unwrap_or_else(|| if who == EVERYONE { EVERYONE.to_string() } else { String::new() });
                 mentions.push(Mention { who: who.to_string(), name });
@@ -655,10 +687,7 @@ impl Community {
     }
 
     pub fn members_may_invite(&self) -> anyhow::Result<bool> {
-        Ok(match self.store.setting("members_may_invite")?.as_deref() {
-            Some(set) => set == "true",
-            None => self.config.members_may_invite,
-        })
+        self.everyone_has("create_invites")
     }
 
     fn invite_body(&self, invite: &Invite) -> anyhow::Result<Value> {
@@ -686,7 +715,7 @@ impl Community {
 
     /// The invites `member` may revoke and is told of: all of them for an admin.
     fn invites_body(&self, member: &Member, now: i64) -> anyhow::Result<Value> {
-        let by = (member.role != Role::Admin).then_some(member.did.as_str());
+        let by = (!self.powers(&member.did)?.has("manage_community")).then_some(member.did.as_str());
         let invites = self.store.invites(by, now)?.iter().map(|invite| self.invite_body(invite)).collect::<anyhow::Result<Vec<_>>>()?;
         Ok(json!({ "invites": invites }))
     }
@@ -767,13 +796,11 @@ impl Community {
         Ok(listed)
     }
 
-    /// `community` for every joined admin, the waiting list having changed: its
-    /// `waiting` says how many wait now.
+    /// `community` for every joined member holding `admit_members`, the waiting
+    /// list having changed: its `waiting` says how many wait now.
     fn admins_told(&self) -> anyhow::Result<Vec<(String, Value)>> {
-        self.store
-            .members()?
+        self.joined_holding("admit_members")?
             .iter()
-            .filter(|member| member.role == Role::Admin && member.joined)
             .map(|admin| Ok((admin.did.clone(), json!({ "type": COMMUNITY, "body": self.community(admin)? }))))
             .collect()
     }
@@ -781,19 +808,22 @@ impl Community {
     /// `members`, as `asker` is told: with who is waiting for an admin.
     fn members_for(&self, asker: &Member) -> anyhow::Result<Value> {
         let mut body = self.members_body()?;
-        if asker.role == Role::Admin {
+        if self.powers(&asker.did)?.has("admit_members") {
             body["waiting"] = json!(self.waiting_body()?);
         }
         Ok(body)
     }
 
     fn members_body(&self) -> anyhow::Result<Value> {
-        let members: Vec<Value> = self
-            .store
-            .members()?
+        let mut members = Vec::new();
+        for member in self.store.members()? {
+            let powers = self.powers(&member.did)?;
+            members.push((member, powers));
+        }
+        let members: Vec<Value> = members
             .iter()
-            .map(|member| {
-                let mut listed = json!({ "did": member.did, "role": member.role.as_str(), "joined": member.joined });
+            .map(|(member, powers)| {
+                let mut listed = json!({ "did": member.did, "role": powers.older_role(), "roles": powers.roles, "joined": member.joined });
                 if let Some(name) = &member.name {
                     listed["name"] = json!(name);
                 }
@@ -815,8 +845,9 @@ impl Community {
         Ok(Outcome { reply: Some(reply_to(message, CHANGED, Self::message_body(&post))), changed: vec![post.id], ..Outcome::default() })
     }
 
-    fn may_manage_channels(&self, member: &Member) -> bool {
-        member.role == Role::Admin || self.config.members_may_create_channels
+    fn may_open_channels(&self, member: &Member) -> anyhow::Result<bool> {
+        let powers = self.powers(&member.did)?;
+        Ok(powers.has("create_channels") || powers.has("manage_channels"))
     }
 
     /// Lets in everyone the configuration names, and makes its admins admins. It
@@ -916,8 +947,8 @@ impl Community {
             }
 
             CREATE_CHANNEL => {
-                if !self.may_manage_channels(&member) {
-                    return refuse(message, "e.p.trust.not-authorized", "Only an admin can open a channel here.");
+                if !self.may_open_channels(&member)? {
+                    return refuse(message, "e.p.trust.not-authorized", "You can't open a channel here.");
                 }
                 let voice = match body["kind"].as_str() {
                     None | Some("text") => None,
@@ -925,8 +956,8 @@ impl Community {
                         if self.voice.is_none() {
                             return refuse(message, "e.p.msg.unsupported", "This server has no voice channels.");
                         }
-                        if member.role != Role::Admin {
-                            return refuse(message, "e.p.trust.not-authorized", "Only an admin opens a voice channel.");
+                        if !self.powers(sender)?.has("manage_channels") {
+                            return refuse(message, "e.p.trust.not-authorized", "Opening a voice channel takes Manage channels.");
                         }
                         match clean_voice(&body["voice"], None) {
                             Ok(voice) => Some(voice),
@@ -961,9 +992,9 @@ impl Community {
                 let Some(channel) = self.store.channel(body["channel"].as_str().unwrap_or_default())? else {
                     return refuse(message, "e.p.msg.unknown-channel", "There is no such channel.");
                 };
-                // Whoever opened it may change it, as may an admin.
-                if member.role != Role::Admin && channel.created_by != sender {
-                    return refuse(message, "e.p.trust.not-authorized", "Only an admin, or whoever opened a channel, can change it.");
+                // Whoever opened it may change it, as may whoever manages channels.
+                if channel.created_by != sender && !self.powers(sender)?.has("manage_channels") {
+                    return refuse(message, "e.p.trust.not-authorized", "Only whoever opened a channel, or someone who manages channels, can change it.");
                 }
                 let name = match body.get("name") {
                     Some(name) => match line(name, MAX_CHANNEL_NAME) {
@@ -1013,6 +1044,9 @@ impl Community {
                 if channel.voice.is_some() {
                     return refuse(message, "e.p.msg.voice-channel", "A voice channel takes no posts.");
                 }
+                if !self.may_in(sender, &channel, "post")? {
+                    return refuse(message, "e.p.trust.not-authorized", "You can't post in this channel.");
+                }
                 let content = body["content"].as_str().unwrap_or_default().trim();
                 let question = match body.get("question").filter(|question| !question.is_null()) {
                     Some(question) => match clean_question(question) {
@@ -1053,7 +1087,7 @@ impl Community {
                     // An answer to a post in a thread is in that thread.
                     None => answered.as_ref().and_then(|post| post.thread.clone()),
                 };
-                let mentions = self.mentions_of(body, &member)?;
+                let mentions = self.mentions_of(body, &member, &channel)?;
                 let post = self.store.add_post(&channel.id, &id, content, &member, question.as_ref(), None, now)?;
                 let reply = answered.as_ref().map(|post| (post.id.as_str(), post.author_did.as_str(), snippet.as_deref()));
                 self.store.set_written_with(&post.id, reply, thread.as_deref(), &mentions)?;
@@ -1081,8 +1115,11 @@ impl Community {
                 if removal && message_type == EDIT {
                     return refuse(message, "e.p.trust.not-authorized", "Only whoever wrote a post changes it.");
                 }
-                if removal && member.role != Role::Admin && !self.store.channel(&post.channel)?.is_some_and(|channel| channel.created_by == sender) {
-                    return refuse(message, "e.p.trust.not-authorized", "Only whoever wrote a post takes it back; an admin, or whoever opened the channel, removes it.");
+                let Some(channel) = self.store.channel(&post.channel)? else {
+                    return refuse(message, "e.p.msg.unknown-post", "There is no such post.");
+                };
+                if removal && !self.may_in(sender, &channel, "manage_messages")? {
+                    return refuse(message, "e.p.trust.not-authorized", "Only whoever wrote a post takes it back; someone who manages posts in the channel removes it.");
                 }
                 if post.deleted {
                     return refuse(message, "e.p.msg.deleted", "That post was taken back.");
@@ -1098,7 +1135,7 @@ impl Community {
                         return refuse(message, "e.p.msg.too-long", "That is longer than a post can be here.");
                     }
                     // Who it calls on is said again with it; left out, it is as it was.
-                    let mentions = if body.get("mentions").is_some() { self.mentions_of(body, &member)? } else { post.mentions.clone() };
+                    let mentions = if body.get("mentions").is_some() { self.mentions_of(body, &member, &channel)? } else { post.mentions.clone() };
                     if content != post.content || mentions != post.mentions {
                         self.store.edit_post(&post.id, content, &mentions, now)?;
                     }
@@ -1110,10 +1147,12 @@ impl Community {
                 let Some(post) = self.named_post(body)? else {
                     return refuse(message, "e.p.msg.unknown-post", "There is no such post.");
                 };
-                // Whoever may change the channel says what is pinned in it.
-                let opened = self.store.channel(&post.channel)?.is_some_and(|channel| channel.created_by == sender);
-                if member.role != Role::Admin && !opened {
-                    return refuse(message, "e.p.trust.not-authorized", "Only an admin, or whoever opened the channel, pins a post in it.");
+                // Whoever manages posts in the channel says what is pinned in it.
+                let Some(channel) = self.store.channel(&post.channel)? else {
+                    return refuse(message, "e.p.msg.unknown-post", "There is no such post.");
+                };
+                if !self.may_in(sender, &channel, "manage_messages")? {
+                    return refuse(message, "e.p.trust.not-authorized", "Pinning takes managing posts in the channel.");
                 }
                 if post.deleted {
                     return refuse(message, "e.p.msg.deleted", "That post was taken back.");
@@ -1131,6 +1170,9 @@ impl Community {
                 };
                 if post.deleted {
                     return refuse(message, "e.p.msg.deleted", "That post was taken back.");
+                }
+                if !self.store.channel(&post.channel)?.map(|channel| self.may_in(sender, &channel, "react")).transpose()?.unwrap_or(false) {
+                    return refuse(message, "e.p.trust.not-authorized", "You can't react in this channel.");
                 }
                 let Some(listed) = body["emoji"].as_array() else {
                     return refuse(message, "e.p.msg.invalid-reaction", "A reaction is a list of emoji: all of this member's on the post, which may be none.");
@@ -1155,6 +1197,9 @@ impl Community {
                 };
                 if post.thread.is_some() {
                     return refuse(message, "e.p.msg.in-thread", "A thread doesn't grow from a post in a thread.");
+                }
+                if !self.store.channel(&post.channel)?.map(|channel| self.may_in(sender, &channel, "create_threads")).transpose()?.unwrap_or(false) {
+                    return refuse(message, "e.p.trust.not-authorized", "You can't start threads in this channel.");
                 }
                 // Only someone in the conversation it grows from: whoever wrote the
                 // post, what it answers, or an answer to it.
@@ -1200,8 +1245,8 @@ impl Community {
             MEMBERS_REQUEST => Ok(Outcome::reply(reply_to(message, MEMBERS, self.members_for(&member)?))),
 
             SET_ADMISSION => {
-                if member.role != Role::Admin {
-                    return refuse(message, "e.p.trust.not-authorized", "Only an admin decides who is let in.");
+                if !self.powers(sender)?.has("manage_community") {
+                    return refuse(message, "e.p.trust.not-authorized", "Deciding who is let in takes Manage the community.");
                 }
                 let admission = match body.get("admission").filter(|v| !v.is_null()) {
                     Some(value) => match value.as_str().and_then(Admission::parse) {
@@ -1224,7 +1269,7 @@ impl Community {
                     self.store.set_setting("admission", admission.as_str())?;
                 }
                 if let Some(may) = may_invite {
-                    self.store.set_setting("members_may_invite", if may { "true" } else { "false" })?;
+                    self.set_everyone("create_invites", may)?;
                 }
                 let mut outcome = Outcome::reply(reply_to(message, COMMUNITY, self.community(&member)?));
                 // Everyone joined is told, as of any change to what the community is.
@@ -1233,8 +1278,8 @@ impl Community {
             }
 
             CREATE_INVITE => {
-                if member.role != Role::Admin && !self.members_may_invite()? {
-                    return refuse(message, "e.p.trust.not-authorized", "Only an admin makes invites here.");
+                if !self.powers(sender)?.has("create_invites") {
+                    return refuse(message, "e.p.trust.not-authorized", "You can't make invites here.");
                 }
                 let uses = match body.get("uses").filter(|v| !v.is_null()) {
                     Some(value) => match value.as_i64().filter(|uses| *uses >= 1) {
@@ -1269,8 +1314,8 @@ impl Community {
                 let Some(invite) = self.store.invite(code)? else {
                     return refuse(message, "e.p.msg.unknown-invite", "There is no such invite.");
                 };
-                if member.role != Role::Admin && invite.created_by != sender {
-                    return refuse(message, "e.p.trust.not-authorized", "Only an admin, or whoever made an invite, can revoke it.");
+                if invite.created_by != sender && !self.powers(sender)?.has("manage_community") {
+                    return refuse(message, "e.p.trust.not-authorized", "Only whoever made an invite, or someone who manages the community, can revoke it.");
                 }
                 self.store.revoke_invite(code)?;
                 Ok(Outcome::reply(reply_to(message, INVITES, self.invites_body(&member, now)?)))
@@ -1279,8 +1324,8 @@ impl Community {
             INVITES_REQUEST => Ok(Outcome::reply(reply_to(message, INVITES, self.invites_body(&member, now)?))),
 
             SET_VOICE => {
-                if member.role != Role::Admin {
-                    return refuse(message, "e.p.trust.not-authorized", "Only an admin sets how voice channels work.");
+                if !self.powers(sender)?.has("manage_community") {
+                    return refuse(message, "e.p.trust.not-authorized", "Setting how voice channels work takes Manage the community.");
                 }
                 if self.voice.is_none() {
                     return refuse(message, "e.p.msg.unsupported", "This server has no voice channels.");
@@ -1314,8 +1359,8 @@ impl Community {
             }
 
             SET_RULES => {
-                if member.role != Role::Admin {
-                    return refuse(message, "e.p.trust.not-authorized", "Only an admin sets the rules.");
+                if !self.powers(sender)?.has("manage_community") {
+                    return refuse(message, "e.p.trust.not-authorized", "Setting the rules takes Manage the community.");
                 }
                 let text = match body.get("rules").filter(|v| !v.is_null()) {
                     Some(value) => match value.as_str() {
@@ -1419,15 +1464,15 @@ impl Community {
                 let id = self.store.add_report(&report)?;
                 let mut outcome = Outcome::reply(reply_to(message, REPORT_RECEIVED, json!({ "id": id })));
                 let open = self.reports_body(false)?;
-                for admin in self.store.joined()?.into_iter().filter(|joined| joined.role == Role::Admin && joined.did != sender) {
+                for admin in self.joined_holding("manage_reports")?.into_iter().filter(|joined| joined.did != sender) {
                     outcome.notices.push((admin.did, json!({ "type": REPORTS, "id": uuid::Uuid::new_v4().to_string(), "body": open.clone() })));
                 }
                 Ok(outcome)
             }
 
             REPORTS_REQUEST | RESOLVE_REPORT => {
-                if member.role != Role::Admin {
-                    return refuse(message, "e.p.trust.not-authorized", "Only an admin is told of reports.");
+                if !self.powers(sender)?.has("manage_reports") {
+                    return refuse(message, "e.p.trust.not-authorized", "Reports are for those who deal with them.");
                 }
                 if message_type == RESOLVE_REPORT {
                     let id = body["id"].as_str().unwrap_or_default();
@@ -1440,8 +1485,8 @@ impl Community {
             }
 
             SET_PROFILE => {
-                if member.role != Role::Admin {
-                    return refuse(message, "e.p.trust.not-authorized", "Only an admin changes what the community is called.");
+                if !self.powers(sender)?.has("manage_community") {
+                    return refuse(message, "e.p.trust.not-authorized", "Changing what the community is called takes Manage the community.");
                 }
                 let change = match Change::read(message) {
                     Ok(change) => change,
@@ -1464,28 +1509,69 @@ impl Community {
             }
 
             SET_MEMBER => {
-                if member.role != Role::Admin {
-                    return refuse(message, "e.p.trust.not-authorized", "Only an admin decides who is let in.");
-                }
                 let Some(did) = body["did"].as_str().filter(|did| did.starts_with("did:") && did.len() <= 4096) else {
                     return refuse(message, "e.p.msg.invalid-member", "That isn't a DID.");
                 };
+                let powers = self.powers(sender)?;
                 let existing = self.store.member(did)?;
                 let waiting = if existing.is_none() { self.store.waiting_one(did)? } else { None };
                 let was_waiting = waiting.is_some();
-                let last_admin = existing.as_ref().is_some_and(|m| m.role == Role::Admin) && self.store.admin_count()? <= 1;
+                if existing.is_some() && self.owner()?.as_deref() == Some(did) {
+                    return refuse(message, "e.p.msg.owner", "The owner can't be taken out or given roles this way.");
+                }
+                let not_allowed = |why: &str| refuse(message, "e.p.trust.not-authorized", why);
                 match body["role"].as_str() {
                     Some(role) => {
-                        let Some(role) = Role::parse(role) else {
-                            return refuse(message, "e.p.msg.invalid-role", "A member is an admin or a member.");
+                        if !matches!(role, "admin" | "moderator" | "member") {
+                            return refuse(message, "e.p.msg.invalid-role", "A role here is admin, moderator or member.");
+                        }
+                        // Letting in someone waiting as a member is the waiting list's;
+                        // anything else is giving roles.
+                        let plain_admission = was_waiting && role == "member";
+                        if plain_admission && !powers.has("admit_members") {
+                            return not_allowed("Letting people in takes Let people in from the waiting list.");
+                        }
+                        if !plain_admission && !powers.has("manage_roles") {
+                            return not_allowed("Giving roles takes Manage roles.");
+                        }
+                        if existing.is_some() && !self.outranks(&powers, did)? {
+                            return not_allowed("You can only change the roles of someone ranked below you.");
+                        }
+                        let roles = match role {
+                            "admin" => vec![crate::roles::ADMIN_ROLE],
+                            "moderator" => vec![crate::roles::MODERATOR_ROLE],
+                            _ => Vec::new(),
                         };
-                        if last_admin && role != Role::Admin {
-                            return refuse(message, "e.p.msg.last-admin", "A community needs an admin: make someone else one first.");
+                        let mut given = Vec::new();
+                        for id in &roles {
+                            match self.store.role(id)? {
+                                Some(def) if powers.above(def.position) => given.push(def.id),
+                                Some(_) => return not_allowed("You can only give roles ranked below your own."),
+                                None => return refuse(message, "e.p.msg.invalid-role", "This community has no such role now."),
+                            }
+                        }
+                        // `member` takes Admin and Moderator away; the others stay.
+                        let taken: Vec<&str> = [crate::roles::ADMIN_ROLE, crate::roles::MODERATOR_ROLE].into_iter().filter(|id| !roles.contains(id)).collect();
+                        if existing.is_some() {
+                            let held = self.store.member_roles(did)?;
+                            for id in taken.iter().filter(|id| held.iter().any(|h| h == *id)) {
+                                if !self.store.role(id)?.is_some_and(|def| powers.above(def.position)) {
+                                    return not_allowed("You can only take away roles ranked below your own.");
+                                }
+                            }
                         }
                         if self.store.is_superseded(did)? {
                             return refuse(message, "e.p.trust.superseded", "That DID has been replaced by another.");
                         }
-                        self.store.set_member(did, role, now)?;
+                        if existing.is_none() {
+                            self.store.set_member(did, Role::Member, now)?;
+                        }
+                        for id in &taken {
+                            self.store.take_role(did, id)?;
+                        }
+                        for id in &given {
+                            self.store.give_role(did, id)?;
+                        }
                         // Someone let in from the waiting list asked to be sent posts:
                         // they are joined, and told what the community is.
                         if let Some(waiting) = &waiting {
@@ -1501,10 +1587,22 @@ impl Community {
                             outcome.notices.extend(self.admins_told()?);
                             return Ok(outcome);
                         }
+                        // Someone whose roles changed is told what they may do now.
+                        let mut outcome = Outcome::reply(reply_to(message, MEMBERS, self.members_for(&member)?));
+                        if let Some(changed) = self.store.member(did)?.filter(|m| m.joined && m.did != sender) {
+                            outcome.notices.push((did.to_string(), json!({ "type": COMMUNITY, "body": self.community(&changed)? })));
+                        }
+                        Ok(outcome)
                     }
                     None => {
-                        if last_admin {
-                            return refuse(message, "e.p.msg.last-admin", "A community needs an admin: make someone else one first.");
+                        if was_waiting && !powers.has("admit_members") {
+                            return not_allowed("Turning people away takes Let people in from the waiting list.");
+                        }
+                        if existing.is_some() && !(powers.has("kick_members") && self.outranks(&powers, did)?) {
+                            return not_allowed("Taking someone out takes Take members out, and ranking above them.");
+                        }
+                        if !was_waiting && existing.is_none() && !powers.has("kick_members") && !powers.has("admit_members") {
+                            return not_allowed("You can't take people out.");
                         }
                         // Turned away, if they were waiting; taken out, if they were in.
                         // Either way they are told, and nothing more of the community.
@@ -1517,10 +1615,9 @@ impl Community {
                         } else if existing.is_some() {
                             outcome.notices.push((did.to_string(), json!({ "type": REMOVED, "body": { "was": "member" } })));
                         }
-                        return Ok(outcome);
+                        Ok(outcome)
                     }
                 }
-                Ok(Outcome::reply(reply_to(message, MEMBERS, self.members_for(&member)?)))
             }
 
             PROFILE => {
