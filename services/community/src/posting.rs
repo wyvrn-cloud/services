@@ -42,9 +42,11 @@ pub fn read_extra(body: &Value, channel: &Channel, in_thread: bool, now: i64) ->
             return Err(("e.p.msg.invalid-media", "A post carries one to ten things.".into()));
         }
         for attachment in attachments {
-            let by_reference = attachment["data"]["links"].as_array().is_some_and(|links| !links.is_empty() && links.iter().all(|l| l.as_str().is_some_and(|l| l.starts_with("https://"))));
+            // (http as well as https: what is fetched is checked against the hash.)
+            let web = |link: &str| link.starts_with("https://") || link.starts_with("http://");
+            let by_reference = attachment["data"]["links"].as_array().is_some_and(|links| !links.is_empty() && links.iter().all(|l| l.as_str().is_some_and(web)));
             if attachment["id"].as_str().is_none() || !by_reference || attachment["data"]["hash"].as_str().is_none() {
-                return Err(("e.p.msg.invalid-media", "Each attachment is by reference: an id, https links and a hash.".into()));
+                return Err(("e.p.msg.invalid-media", "Each attachment is by reference: an id, web links and a hash.".into()));
             }
         }
         let ids: Vec<&str> = attachments.iter().filter_map(|a| a["id"].as_str()).collect();
