@@ -156,7 +156,9 @@ impl Config {
     /// `COMMUNITY_DID_METHOD`, `COMMUNITY_NAME`, and `COMMUNITY_ADMINS` and
     /// `COMMUNITY_MEMBERS` (DIDs separated by commas or whitespace), and for voice
     /// channels `COMMUNITY_VOICE_RELAY_URL`, `COMMUNITY_VOICE_RELAY_FINGERPRINT` and
-    /// `COMMUNITY_VOICE_TRANSPORT`.
+    /// `COMMUNITY_VOICE_TRANSPORT`; for the files members attach `COMMUNITY_FILES_DIR`
+    /// and `COMMUNITY_FILES_MAX_BYTES`, and for the community's own packs
+    /// `COMMUNITY_STICKERS_PATH`.
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading config {}: {e}", path.display()))?;
@@ -190,6 +192,17 @@ impl Config {
             if let Some(transport) = env("COMMUNITY_VOICE_TRANSPORT") {
                 voice.transport = transport;
             }
+        }
+        // Files members attach, turned on by naming where they are kept.
+        if let Some(dir) = env("COMMUNITY_FILES_DIR") {
+            config.files.get_or_insert_with(FilesConfig::default).dir = dir.into();
+        }
+        if let (Some(files), Some(most)) = (config.files.as_mut(), env("COMMUNITY_FILES_MAX_BYTES")) {
+            files.max_file_bytes = most.trim().parse().map_err(|e| anyhow::anyhow!("COMMUNITY_FILES_MAX_BYTES is {most:?}: {e}"))?;
+        }
+        // The community's own packs, likewise.
+        if let Some(path) = env("COMMUNITY_STICKERS_PATH") {
+            config.stickers.get_or_insert_with(StickersConfig::default).path = path.into();
         }
         if !config.server.public_url.ends_with('/') {
             config.server.public_url.push('/');
