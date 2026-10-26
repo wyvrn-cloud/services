@@ -78,6 +78,7 @@ pub async fn serve(config: Config, assistant: Option<Assistant>) -> anyhow::Resu
     tokio::spawn(server::run_deliveries(state.clone()));
     tokio::spawn(server::run_pruning(state.clone()));
     tokio::spawn(server::run_voice_sweep(state.clone()));
+    tokio::spawn(server::run_polls(state.clone()));
     if let Some(mediator) = &config.mediator {
         let service = Arc::new(server::CommunityService(state.clone()));
         tokio::spawn(wyvrn_service::mediator::run_pickups(service, mediator.poll_every()));

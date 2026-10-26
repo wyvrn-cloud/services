@@ -189,6 +189,8 @@ pub struct Community {
     pub assistant: Option<Value>,
     /// The server's own DID, for what it posts itself (AutoMod's alerts).
     pub own: Option<String>,
+    /// How many live connections each member has open now (who may be seen online).
+    pub live: std::sync::RwLock<std::collections::HashMap<String, usize>>,
 }
 
 /// What handling a message came to.
@@ -209,6 +211,8 @@ pub struct Outcome {
     pub changed: Vec<String>,
     /// The post just made, for an assistant to answer.
     pub posted_id: Option<String>,
+    /// For every live connection open now (someone seen online, or not).
+    pub live: Vec<Value>,
 }
 
 impl Outcome {
@@ -365,7 +369,16 @@ impl Community {
         if let Some(category) = &channel.category {
             body["category"] = json!(category);
         }
+        if let Some(tags) = &channel.forum {
+            body["kind"] = json!("forum");
+            body["tags"] = tags.clone();
+        }
         body
+    }
+
+    /// A post as `message` says it.
+    pub fn post_body(&self, post: &Post, _now: i64) -> Value {
+        Self::message_body(post)
     }
 
     /// The server with voice channels (community-voice/1.0).
@@ -394,7 +407,7 @@ impl Community {
             Some(kept) => kept.load()?,
             None => Changed::default(),
         };
-        let community = Self { store, config, changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None };
+        let community = Self { store, config, changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, live: Default::default() };
         community.ensure_roles()?;
         Ok(community)
     }
@@ -462,6 +475,8 @@ impl Community {
             if !categories.is_empty() {
                 body["categories"] = json!(categories.iter().map(|c| json!({ "id": c.id, "name": c.name })).collect::<Vec<_>>());
             }
+            let (share, status) = self.store.presence(&member.did)?;
+            body["presence"] = json!({ "share": share, "status": status });
             if self.has_onboarding()? {
                 body["onboarding"] = json!({ "done": self.store.onboarded(&member.did)? });
             }
@@ -601,6 +616,7 @@ impl Community {
         if let Some(thread) = &post.thread {
             body["thread"] = json!(thread);
         }
+        crate::posting::extra_body(post, &mut body, crate::gates::now());
         if !post.mentions.is_empty() {
             body["mentions"] = json!(post.mentions);
         }
@@ -624,6 +640,9 @@ impl Community {
         }
         if let Some(thread) = &post.grew {
             let mut grew = json!({ "created_by": thread.created_by, "created_at": thread.created_at, "count": thread.count });
+            if let Some(last_at) = thread.last_at {
+                grew["last_at"] = json!(last_at);
+            }
             if let Some(name) = &thread.name {
                 grew["name"] = json!(name);
             }
@@ -851,6 +870,7 @@ impl Community {
     }
 
     fn members_body(&self) -> anyhow::Result<Value> {
+        let online = self.seen_online()?;
         let mut members = Vec::new();
         for member in self.store.members()? {
             let powers = self.powers(&member.did)?;
@@ -859,7 +879,10 @@ impl Community {
         let members: Vec<Value> = members
             .iter()
             .map(|(member, powers)| {
-                let mut listed = json!({ "did": member.did, "role": powers.older_role(), "roles": powers.roles, "joined": member.joined });
+                let mut listed = json!({ "did": member.did, "role": powers.older_role(), "roles": powers.roles, "joined": member.joined, "since": member.since });
+                if let Some(status) = online.get(&member.did) {
+                    listed["presence"] = json!(status);
+                }
                 if let Some(name) = &member.name {
                     listed["name"] = json!(name);
                 }
@@ -944,7 +967,9 @@ impl Community {
             },
             None => None,
         };
-        if content.is_empty() {
+        // (Something to show besides text will do: media, or a poll.)
+        let carries = body.get("media").is_some_and(|m| !m.is_null()) || body.get("poll").is_some_and(|p| !p.is_null());
+        if content.is_empty() && !carries {
             return refuse(message, "e.p.msg.empty", "A post needs something in it.");
         }
         if content.chars().count() > self.config.max_post_length {
@@ -973,9 +998,17 @@ impl Community {
                 Some(thread) => Some(thread.id),
                 None => return refuse(message, "e.p.msg.unknown-thread", "There is no such thread in this channel."),
             },
-            // An answer to a post in a thread is in that thread.
-            None => answered.as_ref().and_then(|post| post.thread.clone()),
+            // An answer to a post in a thread is in that thread; in a forum, an
+            // answer to a thread's first post is in its thread too.
+            None => answered.as_ref().and_then(|post| post.thread.clone().or_else(|| (channel.forum.is_some() && post.grew.is_some()).then(|| post.id.clone()))),
         };
+        let extra = match crate::posting::read_extra(body, &channel, thread.is_some(), now) {
+            Ok(extra) => extra,
+            Err((code, why)) => return refuse(message, code, &why),
+        };
+        if extra.as_ref().is_some_and(|extra| extra.get("media").is_some()) && !self.may_in(sender, &channel, "attach_files")? {
+            return refuse(message, "e.p.trust.not-authorized", "You can't post files in this channel.");
+        }
         let mentions = self.mentions_of(body, member, &channel)?;
         let noted = if checked {
             match self.automod(member, &channel, message, mentions.len(), now)? {
@@ -989,6 +1022,15 @@ impl Community {
         let post = self.store.add_post(&channel.id, &id, content, member, question.as_ref(), None, now)?;
         let reply = answered.as_ref().map(|post| (post.id.as_str(), post.author_did.as_str(), snippet.as_deref()));
         self.store.set_written_with(&post.id, reply, thread.as_deref(), &mentions)?;
+        if let Some(extra) = &extra {
+            self.store.set_post_extra(&post.id, extra)?;
+        }
+        // A post in a forum that isn't in a thread begins one, named its title.
+        let begins_thread = channel.forum.is_some() && thread.is_none();
+        if begins_thread {
+            let title = extra.as_ref().and_then(|extra| extra["title"].as_str()).map(str::to_string);
+            self.store.add_thread(&post.id, &channel.id, title.as_deref(), sender, now)?;
+        }
         let mut outcome = Outcome {
             reply: Some(reply_to(message, POSTED, json!({ "channel": post.channel, "seq": post.seq, "id": post.id }))),
             posted: true,
@@ -999,6 +1041,9 @@ impl Community {
         if let Some(thread) = thread {
             self.store.touch_thread(&thread)?;
             outcome.changed.push(thread);
+        }
+        if begins_thread {
+            outcome.changed.push(post.id.clone());
         }
         // What AutoMod noted as it let the post through: an alert posted, say.
         if let Some(noted) = noted {
@@ -1079,6 +1124,9 @@ impl Community {
         if let Some(outcome) = self.handle_structure(&member, message_type, message, now)? {
             return Ok(outcome);
         }
+        if let Some(outcome) = self.handle_posting(&member, message_type, message, now)? {
+            return Ok(outcome);
+        }
 
         match message_type {
             JOIN | LEAVE => {
@@ -1114,8 +1162,15 @@ impl Community {
                             Err(why) => return refuse(message, "e.p.msg.invalid-voice", why),
                         }
                     }
-                    Some(_) => return refuse(message, "e.p.msg.invalid-kind", "A channel is a text channel or a voice channel."),
+                    Some("forum") => {
+                        if !self.powers(sender)?.has("manage_channels") {
+                            return refuse(message, "e.p.trust.not-authorized", "Opening a forum takes Manage channels.");
+                        }
+                        None
+                    }
+                    Some(_) => return refuse(message, "e.p.msg.invalid-kind", "A channel is a text channel, a forum or a voice channel."),
                 };
+                let forum = body["kind"].as_str() == Some("forum");
                 let Some(name) = line(&body["name"], MAX_CHANNEL_NAME) else {
                     return refuse(message, "e.p.msg.empty", "A channel needs a name.");
                 };
@@ -1133,6 +1188,16 @@ impl Community {
                 self.audit(now, sender, "channel.create", Some(&id), Some(json!({ "name": name, "kind": if voice.is_some() { "voice" } else { "text" } })));
                 if let Some(voice) = &voice {
                     self.store.set_channel_voice(&id, voice)?;
+                }
+                if forum {
+                    let tags = match body.get("tags").filter(|t| !t.is_null()) {
+                        Some(given) => match crate::posting::read_tags(given, None) {
+                            Ok(tags) => tags,
+                            Err(why) => return refuse(message, "e.p.msg.invalid-tags", why),
+                        },
+                        None => json!([]),
+                    };
+                    self.store.set_forum(&id, &tags)?;
                 }
                 let mut community = self.community(&member)?;
                 community["created"] = json!(id);
@@ -1175,6 +1240,18 @@ impl Community {
                     match clean_voice(given, Some(held)) {
                         Ok(voice) => self.store.set_channel_voice(&channel.id, &voice)?,
                         Err(why) => return refuse(message, "e.p.msg.invalid-voice", why),
+                    }
+                }
+                if let Some(given) = body.get("tags").filter(|v| !v.is_null()) {
+                    let Some(held) = &channel.forum else {
+                        return refuse(message, "e.p.msg.invalid-tags", "Only a forum has tags.");
+                    };
+                    if !self.powers(sender)?.has("manage_channels") {
+                        return refuse(message, "e.p.trust.not-authorized", "A forum's tags take Manage channels.");
+                    }
+                    match crate::posting::read_tags(given, Some(held)) {
+                        Ok(tags) => self.store.set_forum(&channel.id, &tags)?,
+                        Err(why) => return refuse(message, "e.p.msg.invalid-tags", why),
                     }
                 }
                 if let Some(given) = body.get("slow_mode").filter(|v| !v.is_null()) {

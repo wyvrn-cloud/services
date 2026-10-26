@@ -1497,3 +1497,82 @@ async fn channels_are_ordered_in_categories_newcomers_are_onboarded_and_insights
     assert_eq!(insights["body"]["members"], 2);
     assert_eq!(member.community("insights-request", json!({})).await["type"], PROBLEM);
 }
+
+#[tokio::test]
+async fn polls_forums_media_search_and_the_member_list() {
+    let server = start_server("").await;
+    let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member]);
+    let general = open_channel(&owner, "general").await;
+    for peer in [&owner, &member] {
+        peer.community("join", json!({})).await;
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+
+    // A poll: votes replace votes, everyone sees who chose what.
+    let bad = owner.community("post", json!({ "channel": general, "content": "", "poll": { "question": "Lunch?", "answers": [{ "text": "Soup" }], "ends_at": now + 7200 } })).await;
+    assert_eq!(bad["body"]["code"], "e.p.msg.invalid-poll");
+    let asked = owner.community("post", json!({ "channel": general, "id": "poll1", "content": "", "poll": { "question": "Lunch?", "answers": [{ "id": "a", "text": "Soup" }, { "id": "b", "text": "Salad", "emoji": "🥗" }], "ends_at": now + 7200 } })).await;
+    assert_eq!(kind(&asked), "posted", "{asked}");
+    let voted = member.community("vote", json!({ "to": { "id": "poll1" }, "answers": ["a"] })).await;
+    assert_eq!(voted["body"]["poll"]["results"], json!([{ "id": "a", "voters": [member.did()] }, { "id": "b", "voters": [] }]), "{voted}");
+    let changed = member.community("vote", json!({ "to": { "id": "poll1" }, "answers": ["b"] })).await;
+    assert_eq!(changed["body"]["poll"]["results"][1]["voters"], json!([member.did()]));
+    assert_eq!(member.community("vote", json!({ "to": { "id": "poll1" }, "answers": ["a", "b"] })).await["body"]["code"], "e.p.msg.invalid-vote");
+    assert!(changed["body"]["poll"].get("closed").is_none());
+
+    // Media: by reference only, and only where files may be posted.
+    let attached = json!({ "channel": general, "content": "", "media": [{ "attachment": "f1" }], "attachments": [{ "id": "f1", "media_type": "image/png", "data": { "links": ["https://files.example/f/x"], "hash": "Qm1" } }] });
+    assert_eq!(kind(&member.community("post", attached.clone()).await), "posted");
+    let inline = json!({ "channel": general, "content": "", "media": [{ "attachment": "f1" }], "attachments": [{ "id": "f1", "data": { "base64": "AAAA" } }] });
+    assert_eq!(member.community("post", inline).await["body"]["code"], "e.p.msg.invalid-media");
+    owner.workflow("start", json!({ "template_id": "channel-permissions", "instance_id": "cp", "context": { "channel": general } })).await;
+    advance(&owner, "cp", "edit", json!({ "role": "everyone" })).await;
+    advance(&owner, "cp", "save", json!({ "deny-attach_files": true })).await;
+    assert_eq!(member.community("post", attached).await["body"]["code"], "e.p.trust.not-authorized");
+    let history = owner.community("history-request", json!({ "channel": general })).await;
+    let posted = history["body"]["messages"].as_array().unwrap().iter().find(|m| m.get("media").is_some()).unwrap().clone();
+    assert_eq!(posted["attachments"][0]["data"]["links"][0], "https://files.example/f/x");
+
+    // A forum: each post begins a titled, tagged thread; an answer is in it.
+    assert_eq!(member.community("create-channel", json!({ "name": "help", "kind": "forum" })).await["body"]["code"], "e.p.trust.not-authorized");
+    let made = owner.community("create-channel", json!({ "name": "help", "kind": "forum", "tags": [{ "name": "Bug", "emoji": "🐛" }, { "name": "Idea" }] })).await;
+    let forum = made["body"]["created"].as_str().unwrap().to_string();
+    let listed = made["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == forum.as_str()).unwrap().clone();
+    assert_eq!(listed["kind"], "forum");
+    let bug = listed["tags"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!(member.community("post", json!({ "channel": forum, "content": "It crashes" })).await["body"]["code"], "e.p.msg.title-needed");
+    member.community("post", json!({ "channel": forum, "id": "t1", "title": "Crash on start", "tags": [bug, "nope"], "content": "It crashes" })).await;
+    member.community("post", json!({ "channel": forum, "content": "Which version?", "reply_to": { "id": "t1", "author": member.did() } })).await;
+    let threads = owner.community("history-request", json!({ "channel": forum })).await;
+    let first = threads["body"]["messages"][0].clone();
+    assert_eq!(first["title"], "Crash on start", "{threads}");
+    assert_eq!(first["tags"], json!([bug]));
+    assert_eq!(first["grew"]["name"], "Crash on start");
+    assert_eq!(first["grew"]["count"], 1);
+    assert!(first["grew"]["last_at"].as_i64().is_some());
+    assert_eq!(threads["body"]["messages"].as_array().unwrap().len(), 1);
+
+    // Search, by every word, whatever the case; and history from a time.
+    owner.community("post", json!({ "channel": general, "content": "The Blue whale is big" })).await;
+    owner.community("post", json!({ "channel": general, "content": "a blue bird" })).await;
+    let found = member.community("search-request", json!({ "query": "BLUE whale" })).await;
+    assert_eq!(found["body"]["messages"].as_array().unwrap().len(), 1, "{found}");
+    let both = member.community("search-request", json!({ "query": "blue", "limit": 1 })).await;
+    assert_eq!(both["body"]["more"], true);
+    let rest = member.community("search-request", json!({ "query": "blue", "before": both["body"]["next"] })).await;
+    assert_eq!(rest["body"]["messages"][0]["content"], "The Blue whale is big");
+    assert_eq!(member.community("search-request", json!({ "query": "a" })).await["body"]["code"], "e.p.msg.invalid-query");
+    let around = member.community("history-request", json!({ "channel": general, "at": now - 3600, "limit": 4 })).await;
+    assert_eq!(around["body"]["more"], false, "{around}");
+    assert_eq!(around["body"]["newer"], true);
+
+    // The member list: since when, and who chose to be seen online (none connected here).
+    let members = owner.community("members-request", json!({})).await;
+    assert!(members["body"]["members"][0]["since"].as_i64().is_some());
+    let shared = member.community("set-presence", json!({ "share": true, "status": "dnd" })).await;
+    assert_eq!(shared["body"]["presence"], json!({ "share": true, "status": "dnd" }));
+    assert_eq!(member.community("set-presence", json!({ "status": "away" })).await["body"]["code"], "e.p.msg.invalid-presence");
+    let members = owner.community("members-request", json!({})).await;
+    assert!(members["body"]["members"].as_array().unwrap().iter().all(|m| m.get("presence").is_none()));
+}

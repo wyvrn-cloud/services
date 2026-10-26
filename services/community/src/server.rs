@@ -91,6 +91,14 @@ impl AppState {
     fn live_sender(&self, id: u64) -> Option<mpsc::Sender<Value>> {
         self.live.lock().unwrap_or_else(|p| p.into_inner()).get(&id).map(|(_, out)| out.clone())
     }
+
+    /// Puts `message` on every live connection open now.
+    fn to_every_live(&self, message: &Value) {
+        let senders: Vec<mpsc::Sender<Value>> = self.live.lock().unwrap_or_else(|p| p.into_inner()).values().map(|(_, out)| out.clone()).collect();
+        for out in senders {
+            let _ = out.try_send(message.clone());
+        }
+    }
 }
 
 /// Sends what a voice message came to: presence to live connections, the rest to
@@ -270,6 +278,9 @@ impl Service for CommunityService {
         let outcome = state.community.handle(&sender, &received.message, now())?;
         for (did, notice) in outcome.notices {
             send_later(state, did, notice);
+        }
+        for message in &outcome.live {
+            state.to_every_live(message);
         }
         // Who it says it is to someone looking its DID up changes with it.
         if outcome.profile_changed {
@@ -452,6 +463,12 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket) {
                 *holder_cell.lock().unwrap_or_else(|p| p.into_inner()) = Some(sender.clone());
                 state.live.lock().unwrap_or_else(|p| p.into_inner()).insert(id, (sender.clone(), out.clone()));
                 state.rooms.open_live(id, &sender);
+                // Seen online now, for whoever keeps a live connection, if they chose to be.
+                match state.community.live_changed(&sender, true) {
+                    Ok(Some(notice)) => state.to_every_live(&notice),
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(%error, "couldn't say who is online"),
+                }
             }
             // One member's connection: anyone else's message on it is ignored.
             Some(held) if held != &sender => continue,
@@ -481,6 +498,13 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket) {
         }
     }
     state.live.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
+    if let Some(held) = &holder {
+        match state.community.live_changed(held, false) {
+            Ok(Some(notice)) => state.to_every_live(&notice),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "couldn't say who is online"),
+        }
+    }
     let presence = state.rooms.close_live(&state.community, id);
     voice_send(&state, &VoiceOutcome { live: presence, ..VoiceOutcome::default() });
     packing.abort();
@@ -501,6 +525,28 @@ async fn voice_auth(State(state): State<Arc<AppState>>, Json(request): Json<Valu
     match state.rooms.grant(&state.community, &did, token, now()) {
         Some(grant) => Json(grant).into_response(),
         None => (StatusCode::FORBIDDEN, Json(json!({ "reason": "forbidden" }))).into_response(),
+    }
+}
+
+/// Tells everyone joined of each poll as it ends, as it then stands; looked for
+/// every 30 seconds.
+pub async fn run_polls(state: Arc<AppState>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let ended = match state.community.store.polls_just_ended(now()) {
+            Ok(ended) => ended,
+            Err(error) => {
+                tracing::warn!(%error, "couldn't look for polls that ended");
+                continue;
+            }
+        };
+        for id in ended {
+            let (Ok(Some(post)), Ok(joined)) = (state.community.store.post_by_id(&id), state.community.store.joined()) else { continue };
+            let notice = state.community.changed_notice(&post);
+            for member in joined {
+                send_later(&state, member.did, notice.clone());
+            }
+        }
     }
 }
 

@@ -57,6 +57,8 @@ pub struct Channel {
     pub voice: Option<Value>,
     /// Seconds a member waits between posts here; 0 for none.
     pub slow_mode: i64,
+    /// A forum's tags, as JSON (`[{ id, name, emoji? }]`); `None` for a channel that isn't one.
+    pub forum: Option<Value>,
     /// Its place in the order an admin set, if one did, and its category.
     pub position: Option<i64>,
     pub category: Option<String>,
@@ -111,6 +113,11 @@ pub struct Post {
     pub grew: Option<Thread>,
     /// The voice channel the post invites people into (community-voice/1.0).
     pub voice_invite: Option<String>,
+    /// What else it carries, as JSON: `media` and `attachments`, a `poll`, a
+    /// forum thread's `title` and `tags`.
+    pub extra: Option<Value>,
+    /// Each member's vote, where it is a poll: `(did, answer ids)`.
+    pub votes: Vec<(String, Vec<String>)>,
 }
 
 /// Someone a post calls on: a member's DID or `everyone`, and the name the post
@@ -132,6 +139,8 @@ pub struct Thread {
     pub created_at: i64,
     /// How many posts are in it.
     pub count: i64,
+    /// When its last post was posted.
+    pub last_at: Option<i64>,
 }
 
 /// A role (community/1.0's roles): a name, permissions and a rank, `position`,
@@ -281,12 +290,14 @@ const POST_COLUMNS: &str = "serial, channel, seq, id, content, posted_at, author
     (SELECT reply_author FROM post_state WHERE post_state.post = posts.id), \
     (SELECT reply_snippet FROM post_state WHERE post_state.post = posts.id), \
     (SELECT removed_by FROM post_removals WHERE post_removals.post = posts.id), \
-    (SELECT channel FROM post_voice_invites WHERE post_voice_invites.post = posts.id)";
+    (SELECT channel FROM post_voice_invites WHERE post_voice_invites.post = posts.id), \
+    (SELECT extra FROM post_extra WHERE post_extra.post = posts.id)";
 const CHANNEL_COLUMNS: &str = "id, name, topic, closed, created_at, created_by, (SELECT COALESCE(MAX(seq), 0) FROM posts WHERE posts.channel = channels.id), \
     (SELECT settings FROM channel_voice WHERE channel_voice.channel = channels.id), \
     (SELECT seconds FROM channel_slow WHERE channel_slow.channel = channels.id), \
     (SELECT position FROM channel_order WHERE channel_order.channel = channels.id), \
-    (SELECT category FROM channel_order WHERE channel_order.channel = channels.id)";
+    (SELECT category FROM channel_order WHERE channel_order.channel = channels.id), \
+    (SELECT tags FROM channel_forum WHERE channel_forum.channel = channels.id)";
 
 fn member_from(row: &Row) -> Result<Member> {
     let role: String = row.get(1)?;
@@ -329,6 +340,8 @@ fn post_from(row: &Row) -> Result<Post> {
         reply_snippet: row.get(19)?,
         removed_by: row.get(20)?,
         voice_invite: row.get(21)?,
+        extra: json_from(row.get(22)?),
+        votes: Vec::new(),
         // Read after, each by a query of its own (`Store::filled`).
         reactions: Vec::new(),
         grew: None,
@@ -348,6 +361,7 @@ fn channel_from(row: &Row) -> Result<Channel> {
         slow_mode: row.get::<Option<i64>>(8)?.unwrap_or(0),
         position: row.get(9)?,
         category: row.get(10)?,
+        forum: json_from(row.get(11)?),
     })
 }
 
@@ -664,6 +678,33 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         position INTEGER NOT NULL,
         category TEXT
     );
+    -- What a post carries beyond its text, as JSON (media, a poll, a forum title and tags).
+    CREATE TABLE IF NOT EXISTS post_extra (
+        post TEXT PRIMARY KEY,
+        extra TEXT NOT NULL
+    );
+    -- Each member's vote on a poll, and the polls whose end everyone has been told of.
+    CREATE TABLE IF NOT EXISTS votes (
+        post TEXT NOT NULL,
+        did TEXT NOT NULL,
+        answers TEXT NOT NULL,
+        at INTEGER NOT NULL,
+        PRIMARY KEY (post, did)
+    );
+    CREATE TABLE IF NOT EXISTS polls_ended (
+        post TEXT PRIMARY KEY
+    );
+    -- Forums, and their tags as JSON.
+    CREATE TABLE IF NOT EXISTS channel_forum (
+        channel TEXT PRIMARY KEY,
+        tags TEXT NOT NULL
+    );
+    -- Who chose to be seen online, and as what.
+    CREATE TABLE IF NOT EXISTS presence (
+        did TEXT PRIMARY KEY,
+        share INTEGER NOT NULL,
+        status TEXT NOT NULL
+    );
     -- Who has been through onboarding.
     CREATE TABLE IF NOT EXISTS onboarded (
         did TEXT PRIMARY KEY,
@@ -892,6 +933,29 @@ fn schema() -> Schema {
                 channel VARCHAR(255) NOT NULL PRIMARY KEY,
                 position BIGINT NOT NULL,
                 category VARCHAR(64)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS post_extra (
+                post VARCHAR(255) NOT NULL PRIMARY KEY,
+                extra MEDIUMTEXT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS votes (
+                post VARCHAR(255) NOT NULL,
+                did {MYSQL_DID} NOT NULL,
+                answers TEXT NOT NULL,
+                at BIGINT NOT NULL,
+                PRIMARY KEY (post, did(255))
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS polls_ended (
+                post VARCHAR(255) NOT NULL PRIMARY KEY
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS channel_forum (
+                channel VARCHAR(255) NOT NULL PRIMARY KEY,
+                tags TEXT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS presence (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                share BIGINT NOT NULL,
+                status VARCHAR(16) NOT NULL
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS onboarded (
                 did {MYSQL_DID} NOT NULL PRIMARY KEY,
@@ -1614,6 +1678,11 @@ impl Store {
                 None => post.reactions.push((emoji, vec![did])),
             }
         }
+        if post.extra.as_ref().is_some_and(|extra| extra.get("poll").is_some()) {
+            post.votes = db.query("SELECT did, answers FROM votes WHERE post = ?1 ORDER BY at, did", params![post.id.clone()], |row| {
+                Ok((row.get::<String>(0)?, list_from(row.get(1)?)))
+            })?;
+        }
         drop(db);
         post.grew = self.thread(&post.id)?;
         Ok(post)
@@ -1683,6 +1752,8 @@ impl Store {
         }
         db.execute("UPDATE posts SET content = '', question = NULL, answer = NULL WHERE id = ?1", params![id])?;
         db.execute("DELETE FROM reactions WHERE post = ?1", params![id])?;
+        db.execute("DELETE FROM post_extra WHERE post = ?1", params![id])?;
+        db.execute("DELETE FROM votes WHERE post = ?1", params![id])?;
         Self::touch(&mut db, id)?;
         db.execute("UPDATE post_state SET deleted = 1, pinned = 0, mentions = NULL WHERE post = ?1", params![id])?;
         Ok(())
@@ -1725,9 +1796,10 @@ impl Store {
 
     pub fn thread(&self, id: &str) -> Result<Option<Thread>> {
         self.db.lock().query_row(
-            "SELECT id, channel, name, created_by, created_at, (SELECT COUNT(*) FROM post_state WHERE post_state.thread = threads.id) FROM threads WHERE id = ?1",
+            "SELECT id, channel, name, created_by, created_at, (SELECT COUNT(*) FROM post_state WHERE post_state.thread = threads.id), \
+             (SELECT MAX(posted_at) FROM posts WHERE posts.id IN (SELECT post FROM post_state WHERE post_state.thread = threads.id)) FROM threads WHERE id = ?1",
             params![id],
-            |row| Ok(Thread { id: row.get(0)?, channel: row.get(1)?, name: row.get(2)?, created_by: row.get(3)?, created_at: row.get(4)?, count: row.get(5)? }),
+            |row| Ok(Thread { id: row.get(0)?, channel: row.get(1)?, name: row.get(2)?, created_by: row.get(3)?, created_at: row.get(4)?, count: row.get(5)?, last_at: row.get(6)? }),
         )
     }
 
@@ -1829,6 +1901,108 @@ impl Store {
             )?,
         };
         self.all_filled(posts)
+    }
+
+    /// The posts of `channel` (in `thread`, or in none) around the time `at`: up to
+    /// `half` before it and `half` from it, oldest first; and whether there are
+    /// older ones, and newer ones, beyond those.
+    pub fn channel_posts_around(&self, channel: &str, thread: Option<&str>, at: i64, half: usize) -> Result<(Vec<Post>, bool, bool)> {
+        const IN_THREAD: &str = "(SELECT thread FROM post_state WHERE post_state.post = posts.id)";
+        let in_thread = match thread {
+            Some(_) => format!("{IN_THREAD} = ?4"),
+            None => format!("{IN_THREAD} IS NULL AND ?4 IS NULL"),
+        };
+        let mut before = self.db.lock().query(
+            &format!("SELECT {POST_COLUMNS} FROM posts WHERE channel = ?1 AND posted_at < ?2 AND {in_thread} ORDER BY seq DESC LIMIT ?3"),
+            params![channel, at, half as i64 + 1, thread],
+            post_from,
+        )?;
+        let mut after = self.db.lock().query(
+            &format!("SELECT {POST_COLUMNS} FROM posts WHERE channel = ?1 AND posted_at >= ?2 AND {in_thread} ORDER BY seq LIMIT ?3"),
+            params![channel, at, half as i64 + 1, thread],
+            post_from,
+        )?;
+        let (older, newer) = (before.len() > half, after.len() > half);
+        before.truncate(half);
+        after.truncate(half);
+        before.reverse();
+        before.extend(after);
+        Ok((self.all_filled(before)?, older, newer))
+    }
+
+    /// Posts whose text has each of `words`, whatever its case, not taken back:
+    /// newest first, older than `before` (a serial), in `channel` and by `author`
+    /// where given.
+    pub fn search(&self, words: &[String], channel: Option<&str>, author: Option<&str>, before: Option<i64>, limit: usize) -> Result<Vec<Post>> {
+        let mut sql = format!(
+            "SELECT {POST_COLUMNS} FROM posts WHERE serial < ?1 AND (?2 IS NULL OR channel = ?2) AND (?3 IS NULL OR author_did = ?3) \
+             AND NOT EXISTS (SELECT 1 FROM post_state WHERE post_state.post = posts.id AND deleted = 1)"
+        );
+        let mut values = params![before.unwrap_or(i64::MAX), channel, author, limit as i64].to_vec();
+        for word in words {
+            // (`!` escapes, not `\\`: MySQL reads a backslash in a string as an escape itself.)
+            let pattern = format!("%{}%", word.to_lowercase().replace('!', "!!").replace('%', "!%").replace('_', "!_"));
+            values.push(wyvrn_service::db::ToValue::to_value(&pattern));
+            sql.push_str(&format!(" AND LOWER(content) LIKE ?{} ESCAPE '!'", values.len()));
+        }
+        sql.push_str(" ORDER BY serial DESC LIMIT ?4");
+        let posts = self.db.lock().query(&sql, &values, post_from)?;
+        self.all_filled(posts)
+    }
+
+    pub fn set_post_extra(&self, id: &str, extra: &Value) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO post_extra (post, extra) VALUES (?1, ?2)", params![id, extra.to_string()])?;
+        Ok(())
+    }
+
+    /// Records `did`'s whole vote on the poll `post`; none takes it back. The post
+    /// takes the next `rev`.
+    pub fn vote(&self, post: &str, did: &str, answers: &[String], now: i64) -> Result<()> {
+        let mut db = self.db.lock();
+        if answers.is_empty() {
+            db.execute("DELETE FROM votes WHERE post = ?1 AND did = ?2", params![post, did])?;
+        } else {
+            db.execute("INSERT OR REPLACE INTO votes (post, did, answers, at) VALUES (?1, ?2, ?3, ?4)", params![post, did, serde_json::to_string(answers).unwrap_or_default(), now])?;
+        }
+        Self::touch(&mut db, post)?;
+        Ok(())
+    }
+
+    /// Polls that ended by `now` that everyone hasn't been told of yet; each is
+    /// marked told, and takes the next `rev`.
+    pub fn polls_just_ended(&self, now: i64) -> Result<Vec<String>> {
+        let mut db = self.db.lock();
+        let ended: Vec<(String, String)> = db.query(
+            "SELECT post, extra FROM post_extra WHERE extra LIKE '%\"poll\"%' AND post NOT IN (SELECT post FROM polls_ended)",
+            params![],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut told = Vec::new();
+        for (post, extra) in ended {
+            let ends = serde_json::from_str::<Value>(&extra).ok().and_then(|extra| extra["poll"]["ends_at"].as_i64());
+            if ends.is_some_and(|ends| ends <= now) {
+                db.execute("INSERT OR IGNORE INTO polls_ended (post) VALUES (?1)", params![post])?;
+                Self::touch(&mut db, &post)?;
+                told.push(post);
+            }
+        }
+        Ok(told)
+    }
+
+    /// Makes `channel` a forum with `tags`, or changes them.
+    pub fn set_forum(&self, channel: &str, tags: &Value) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO channel_forum (channel, tags) VALUES (?1, ?2)", params![channel, tags.to_string()])?;
+        Ok(())
+    }
+
+    /// `did`'s choice to be seen online, and as what: `(share, status)`.
+    pub fn presence(&self, did: &str) -> Result<(bool, String)> {
+        Ok(self.db.lock().query_row("SELECT share, status FROM presence WHERE did = ?1", params![did], |row| Ok((row.get::<bool>(0)?, row.get::<String>(1)?)))?.unwrap_or((false, "online".into())))
+    }
+
+    pub fn set_presence(&self, did: &str, share: bool, status: &str) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO presence (did, share, status) VALUES (?1, ?2, ?3)", params![did, share, status])?;
+        Ok(())
     }
 
     // --- Answering a question --------------------------------------------------

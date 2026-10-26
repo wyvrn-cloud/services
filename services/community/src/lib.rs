@@ -17,6 +17,7 @@ pub mod community;
 pub mod config;
 pub mod gates;
 pub mod moderation;
+pub mod posting;
 pub mod questions;
 pub mod roles;
 pub mod serve;
