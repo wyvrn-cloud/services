@@ -22,6 +22,10 @@ pub struct Config {
     /// Voice channels (community-voice/1.0): left out, there are none.
     #[serde(default)]
     pub voice: Option<VoiceConfig>,
+    /// An AI assistant answering in every channel (wyvrn-claude; assistant.rs).
+    /// The community server itself leaves it out.
+    #[serde(default)]
+    pub assistant: Option<crate::assistant::AssistantConfig>,
 }
 
 /// Where voice channels' media is forwarded, and how its tokens are signed.

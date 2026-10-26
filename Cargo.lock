@@ -4969,6 +4969,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyvrn-claude"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "tokio",
+ "wyvrn-community",
+ "wyvrn-service",
+]
+
+[[package]]
 name = "wyvrn-community"
 version = "0.0.1"
 dependencies = [

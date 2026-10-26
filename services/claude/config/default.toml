@@ -1,0 +1,53 @@
+# wyvrn-claude: what `cargo run` and the Docker image start with. The environment
+# overrides the settings a deployment most often changes (see README.md).
+
+[server]
+bind = "0.0.0.0:8080"
+# Where the server is reached: its DIDComm endpoint.
+public_url = "http://localhost:8080/"
+# "peer" needs nothing published; "web" makes the server did:web:<its own domain>.
+did_method = "peer"
+
+[identity]
+path = "data/identity.json"
+
+[store]
+path = "data/claude.sqlite"
+
+[community]
+name = "Claude rooms"
+description = ""
+# Who is let in. Nobody else is answered. An admin can also let people in, and
+# make other admins, from their app; the lists here are added to what the
+# server already holds each time it starts, and never take anyone out.
+admins = []
+members = []
+# Whether a member who isn't an admin may open a channel.
+members_may_create_channels = false
+# Who asking to join lets in, until an admin sets it in the app: "admin" (nobody;
+# an admin lets them in from the waiting list), "invite" (whoever brings a valid
+# invite) or "open" (everyone).
+admission = "admin"
+# Whether a member who isn't an admin may make invites, until an admin sets it.
+members_may_invite = false
+# As many as may wait to be let in at once.
+max_waiting = 500
+
+# To have messages to the server arrive through a mediator instead of at public_url
+# (a server at home, or one a phone app has to reach):
+# [mediator]
+# did = "did:web:mediator.wyvrn.app"
+
+# Claude in every room (the API key is ANTHROPIC_API_KEY, from the environment).
+[assistant]
+name = "Claude"
+model = "claude-sonnet-5-5"
+# What Claude is told before every room's conversation, besides where it is.
+system = ""
+max_tokens = 2048
+# How many of a room's latest posts Claude is given.
+context_posts = 40
+# Requests one member may make a day (0: no limit), and tokens the service may
+# use in 30 days (0: no limit).
+daily_requests_per_member = 50
+period_tokens = 0

@@ -112,8 +112,14 @@ async fn start_server(settings: &str) -> Running {
     .unwrap();
     let (agent, did_document) = server::build_agent(&config, Identity::generate().unwrap()).unwrap();
     let did = agent.did();
-    let community = Community::new(Store::in_memory().unwrap(), config.community.clone(), Some(wyvrn_service::profile::Kept::scratch().unwrap())).unwrap().with_voice(config.voice.clone());
-    let state = Arc::new(AppState::new(agent, Default::default(), community, did_document, didcomm_quickstart::default_resolver()));
+    let mut community = Community::new(Store::in_memory().unwrap(), config.community.clone(), Some(wyvrn_service::profile::Kept::scratch().unwrap())).unwrap().with_voice(config.voice.clone());
+    let assistant = config.assistant.clone().map(wyvrn_community::assistant::Assistant::new);
+    community.assistant = assistant.as_ref().map(wyvrn_community::assistant::Assistant::listing);
+    let state = AppState::new(agent, Default::default(), community, did_document, didcomm_quickstart::default_resolver());
+    let state = Arc::new(match assistant {
+        Some(assistant) => state.with_assistant(assistant),
+        None => state,
+    });
     tokio::spawn(server::run_deliveries(state.clone()));
     let app = server::router(state.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1093,4 +1099,62 @@ async fn a_member_in_a_room_from_two_devices_is_two_participants_and_can_move_to
     while !empty["body"]["channels"][0]["participants"].as_array().unwrap().is_empty() {
         empty = live.next_of(&bob, "presence").await;
     }
+}
+
+/// A stand-in for Anthropic's Messages API: answers every request with `answer`,
+/// and keeps what it was asked.
+async fn stand_in_model(answer: &'static str) -> (String, Arc<tokio::sync::Mutex<Vec<Value>>>) {
+    let asked = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let kept = asked.clone();
+    let app = axum::Router::new().route(
+        "/v1/messages",
+        axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+            let kept = kept.clone();
+            async move {
+                kept.lock().await.push(body);
+                axum::Json(json!({ "content": [{ "type": "text", "text": answer }], "usage": { "input_tokens": 10, "output_tokens": 5 } }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1/messages", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, asked)
+}
+
+#[tokio::test]
+async fn claude_answers_in_a_room_from_what_was_said_there_within_its_limits() {
+    let (api, asked) = stand_in_model("A wyvern has two legs.").await;
+    let server = start_server(&format!("[assistant]\napi_url = \"{api}\"\napi_key = \"test-key\"\ndaily_requests_per_member = 1\n")).await;
+    let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member]);
+    let joined = member.community("join", json!({})).await;
+    // Whoever is let in is told what their posts are sent to.
+    assert_eq!(joined["body"]["assistant"]["name"], "Claude");
+    assert_eq!(joined["body"]["assistant"]["provider"], "Anthropic");
+    let room = open_channel(&admin, "wyverns").await;
+    member.next_of(&format!("{C}community")).await;
+
+    let posted = member.community("post", json!({ "channel": room, "content": "what is a wyvern?" })).await;
+    assert_eq!(kind(&posted), "posted");
+    let mine = member.next_message().await;
+    assert_eq!(mine["content"], "what is a wyvern?");
+    // Claude answers in the room, as the server, answering that post.
+    let answer = member.next_message().await;
+    assert_eq!(answer["content"], "A wyvern has two legs.");
+    assert_eq!(answer["author"]["did"], server.did);
+    assert_eq!(answer["author"]["name"], "Claude");
+    assert_eq!(answer["reply_to"]["id"], mine["id"]);
+    // It was asked with the room's conversation, the asker under their name.
+    let request = asked.lock().await.last().cloned().unwrap();
+    assert_eq!(request["messages"][0]["role"], "user");
+    assert!(request["messages"][0]["content"].as_str().unwrap().ends_with("what is a wyvern?"));
+    assert!(request["system"].as_str().unwrap().contains("\"wyverns\""));
+
+    // Over the day's limit, the member is told so in the room, and the model isn't asked.
+    member.community("post", json!({ "channel": room, "content": "and a dragon?" })).await;
+    member.next_message().await;
+    let refused = member.next_message().await;
+    assert!(refused["content"].as_str().unwrap().contains("in a day"), "{refused}");
+    assert_eq!(asked.lock().await.len(), 1);
 }

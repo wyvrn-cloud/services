@@ -10,9 +10,11 @@
 //! It knows nothing of who its members are or what they are for. Something that
 //! posts on a program's behalf (a bot) is a member like any other.
 
+pub mod assistant;
 pub mod community;
 pub mod config;
 pub mod questions;
+pub mod serve;
 pub mod server;
 pub mod store;
 pub mod voice;

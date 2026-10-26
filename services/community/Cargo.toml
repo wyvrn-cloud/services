@@ -8,6 +8,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The assistant asks Anthropic's Messages API (assistant.rs).
+reqwest = { workspace = true, features = ["json"] }
 wyvrn-service = { workspace = true }
 didcomm-agent = { workspace = true }
 didcomm-core = { workspace = true }

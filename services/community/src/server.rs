@@ -59,12 +59,32 @@ pub struct AppState {
     /// Members' live connections, by number: where to put what is sent them there.
     pub live: Mutex<HashMap<u64, (String, mpsc::Sender<Value>)>>,
     pub next_live: AtomicU64,
+    /// The AI assistant answering in its channels, where it has one
+    /// (wyvrn-claude; assistant.rs).
+    pub assistant: Option<Arc<crate::assistant::Assistant>>,
 }
 
 impl AppState {
     /// The parts a new server starts with, beside what `main` builds.
     pub fn new(agent: Agent, voice: wyvrn_service::Voice, community: Community, did_document: Option<address::Published>, resolver: Box<dyn DIDResolver>) -> Self {
-        Self { agent, voice, community, did_document, resolver, deliver: Notify::new(), rooms: Rooms::default(), live: Mutex::new(HashMap::new()), next_live: AtomicU64::new(1) }
+        Self {
+            agent,
+            voice,
+            community,
+            did_document,
+            resolver,
+            deliver: Notify::new(),
+            rooms: Rooms::default(),
+            live: Mutex::new(HashMap::new()),
+            next_live: AtomicU64::new(1),
+            assistant: None,
+        }
+    }
+
+    /// With an AI assistant answering in every channel.
+    pub fn with_assistant(mut self, assistant: crate::assistant::Assistant) -> Self {
+        self.assistant = Some(Arc::new(assistant));
+        self
     }
 
     fn live_sender(&self, id: u64) -> Option<mpsc::Sender<Value>> {
@@ -272,8 +292,81 @@ impl Service for CommunityService {
         if outcome.posted {
             state.deliver.notify_one();
         }
+        // A post in a room: the assistant answers it, in its own time.
+        if let (Some(_), Some(id)) = (&state.assistant, outcome.posted_id.clone()) {
+            tokio::spawn(answer(state.clone(), id));
+        }
         Ok(outcome.reply)
     }
+}
+
+/// The assistant's answer to post `id` (assistant.rs): from the room's (or the
+/// thread's) latest posts, posted in its thread as the server's own, under the
+/// assistant's name, and sent to everyone like any post. What stops it -- a
+/// limit, or the model not answering -- is said in the room instead, so nobody
+/// is left waiting.
+pub async fn answer(state: Arc<AppState>, id: String) {
+    if let Err(err) = answer_post(&state, &id).await {
+        tracing::warn!(post = %id, "the assistant couldn't answer: {err:#}");
+    }
+}
+
+async fn answer_post(state: &Arc<AppState>, id: &str) -> anyhow::Result<()> {
+    let Some(assistant) = &state.assistant else { return Ok(()) };
+    let store = &state.community.store;
+    let Some(asked) = store.post_by_id(id)? else { return Ok(()) };
+    let own = state.voice.speaking_as().unwrap_or_else(|| state.agent.did());
+    if asked.author_did == own || asked.deleted {
+        return Ok(());
+    }
+    let Some(channel) = store.channel(&asked.channel)? else { return Ok(()) };
+    let at = now();
+    let day = format!("assistant:day:{}:{}", at / 86_400, asked.author_did);
+    let period = format!("assistant:period:{}", at / crate::assistant::PERIOD_SECS);
+    let used: u32 = store.setting(&day)?.and_then(|v| v.parse().ok()).unwrap_or(0);
+    let spent: u64 = store.setting(&period)?.and_then(|v| v.parse().ok()).unwrap_or(0);
+    let text = match assistant.refusal(used, spent) {
+        Some(why) => why.to_string(),
+        None => {
+            // The room's, or the thread's with the post it grew from first.
+            let mut posts = store.channel_posts_before(&asked.channel, asked.thread.as_deref(), Some(asked.seq + 1), assistant.config.context_posts)?;
+            posts.reverse();
+            if let Some(root) = asked.thread.as_deref().map(|thread| store.post_by_id(thread)).transpose()?.flatten() {
+                posts.insert(0, root);
+            }
+            let turns = crate::assistant::turns_of(&posts, &own);
+            store.set_setting(&day, &(used + 1).to_string())?;
+            match assistant.ask(&channel.name, &turns).await {
+                Ok((text, tokens)) => {
+                    store.set_setting(&period, &(spent + tokens).to_string())?;
+                    text
+                }
+                Err(err) => {
+                    tracing::warn!(post = %id, "the model didn't answer: {err:#}");
+                    format!("{} couldn’t answer just now. Try again in a moment.", assistant.config.name)
+                }
+            }
+        }
+    };
+    // As the server, under the assistant's name: a member of its own community.
+    store.admit(&own, crate::store::Role::Member, at)?;
+    store.set_name(&own, Some(&assistant.config.name))?;
+    let Some(author) = store.member(&own)? else { return Ok(()) };
+    let text: String = text.chars().take(state.community.config.max_post_length).collect();
+    let post = store.add_post(&asked.channel, &uuid::Uuid::new_v4().to_string(), text.trim(), &author, None, None, now())?;
+    let snippet: String = asked.content.chars().take(120).collect();
+    store.set_written_with(&post.id, Some((asked.id.as_str(), asked.author_did.as_str(), Some(snippet.as_str()))), asked.thread.as_deref(), &[])?;
+    if let Some(thread) = &asked.thread {
+        store.touch_thread(thread)?;
+        if let Some(root) = store.post_by_id(thread)? {
+            let notice = state.community.changed_notice(&root);
+            for member in store.joined()? {
+                send_later(state, member.did, notice.clone());
+            }
+        }
+    }
+    state.deliver.notify_one();
+    Ok(())
 }
 
 /// A community-voice/1.0 message from `sender`, over the live connection `live`

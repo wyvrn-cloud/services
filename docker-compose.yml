@@ -176,6 +176,34 @@ services:
       - community
     restart: unless-stopped
 
+  # Claude rooms (services/claude): a community server whose every channel is a
+  # room with Claude answering in it, with the operator's Anthropic API key. Any
+  # Wyvrn app joins it as it joins a community. Started with
+  #   docker compose --profile claude up -d
+  # Who gets in is set as for a community (CLAUDE_ADMINS, then admission in the
+  # app); CLAUDE_DAILY_REQUESTS and CLAUDE_PERIOD_TOKENS limit what is asked.
+  claude:
+    build:
+      context: .
+      dockerfile: services/claude/Dockerfile
+    profiles: ["claude"]
+    ports:
+      - "${CLAUDE_PORT:-8088}:8080"
+    environment:
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      CLAUDE_MODEL: "${CLAUDE_MODEL:-}"
+      COMMUNITY_PUBLIC_URL: "${CLAUDE_PUBLIC_URL:-http://localhost:8088/}"
+      COMMUNITY_DID_METHOD: "${CLAUDE_DID_METHOD:-peer}"
+      COMMUNITY_NAME: "${CLAUDE_NAME:-Claude rooms}"
+      COMMUNITY_ADMINS: "${CLAUDE_ADMINS:-}"
+      COMMUNITY_MEMBERS: "${CLAUDE_MEMBERS:-}"
+      COMMUNITY_DATABASE_URL: "${CLAUDE_DATABASE_URL:-}"
+      CLAUDE_DAILY_REQUESTS: "${CLAUDE_DAILY_REQUESTS:-}"
+      CLAUDE_PERIOD_TOKENS: "${CLAUDE_PERIOD_TOKENS:-}"
+    volumes:
+      - claude-data:/app/data
+    restart: unless-stopped
+
   # An outbound relay (services/relay): agents registered with it send through it,
   # over a WebSocket, so that where their messages go sees the relay and not them.
   # RELAY_CARRIES is "sends" (their messages to others) or "all" (their own
@@ -210,3 +238,4 @@ volumes:
   did-host-data:
   announce-data:
   relay-data:
+  claude-data:

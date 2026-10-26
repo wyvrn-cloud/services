@@ -184,6 +184,9 @@ pub struct Community {
     kept: Option<Kept>,
     /// Voice channels, where the server has them (community-voice/1.0).
     pub voice: Option<VoiceConfig>,
+    /// An AI assistant answering in its channels, as `community` says of it
+    /// (community/1.0's `assistant`; assistant.rs).
+    pub assistant: Option<Value>,
 }
 
 /// What handling a message came to.
@@ -202,6 +205,8 @@ pub struct Outcome {
     /// Posts that changed (edited, taken back, pinned, reacted to, grown into a
     /// thread): everyone who has joined is sent each as it now stands.
     pub changed: Vec<String>,
+    /// The post just made, for an assistant to answer.
+    pub posted_id: Option<String>,
 }
 
 impl Outcome {
@@ -381,7 +386,7 @@ impl Community {
             Some(kept) => kept.load()?,
             None => Changed::default(),
         };
-        Ok(Self { store, config, changed: std::sync::RwLock::new(changed), kept, voice: None })
+        Ok(Self { store, config, changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None })
     }
 
     /// What an admin has changed of the community's name, description and picture.
@@ -417,6 +422,9 @@ impl Community {
             }
             if let Some(voice) = self.voice_defaults()? {
                 body["voice"] = voice;
+            }
+            if let Some(assistant) = &self.assistant {
+                body["assistant"] = assistant.clone();
             }
             if member.role == Role::Admin {
                 body["waiting"] = json!(self.store.waiting_count()?);
@@ -1049,7 +1057,12 @@ impl Community {
                 let post = self.store.add_post(&channel.id, &id, content, &member, question.as_ref(), None, now)?;
                 let reply = answered.as_ref().map(|post| (post.id.as_str(), post.author_did.as_str(), snippet.as_deref()));
                 self.store.set_written_with(&post.id, reply, thread.as_deref(), &mentions)?;
-                let mut outcome = Outcome { reply: Some(reply_to(message, POSTED, json!({ "channel": post.channel, "seq": post.seq, "id": post.id }))), posted: true, ..Outcome::default() };
+                let mut outcome = Outcome {
+                    reply: Some(reply_to(message, POSTED, json!({ "channel": post.channel, "seq": post.seq, "id": post.id }))),
+                    posted: true,
+                    posted_id: Some(post.id.clone()),
+                    ..Outcome::default()
+                };
                 // The post a thread grew from says how many are in it now.
                 if let Some(thread) = thread {
                     self.store.touch_thread(&thread)?;
