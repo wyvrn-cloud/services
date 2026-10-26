@@ -22,6 +22,10 @@ pub struct Config {
     /// Voice channels (community-voice/1.0): left out, there are none.
     #[serde(default)]
     pub voice: Option<VoiceConfig>,
+    /// The community's own sticker and emoji packs (stickers/1.0's service): left
+    /// out, none.
+    #[serde(default)]
+    pub stickers: Option<StickersConfig>,
     /// Files members attach to posts, kept here (files/1.0's host): left out, none.
     #[serde(default)]
     pub files: Option<FilesConfig>,
@@ -50,6 +54,20 @@ pub struct FilesConfig {
 impl Default for FilesConfig {
     fn default() -> Self {
         Self { dir: "files".into(), max_file_bytes: 25 * 1024 * 1024, quota_bytes: 1024 * 1024 * 1024, total_bytes: 0 }
+    }
+}
+
+/// The community's own packs: where they are kept (`COMMUNITY_STICKERS_DATABASE_URL`
+/// names a database instead).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct StickersConfig {
+    pub path: std::path::PathBuf,
+}
+
+impl Default for StickersConfig {
+    fn default() -> Self {
+        Self { path: "stickers.sqlite".into() }
     }
 }
 

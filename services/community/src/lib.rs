@@ -15,6 +15,7 @@ pub mod assistant;
 pub mod automod;
 pub mod community;
 pub mod config;
+pub mod expressions;
 pub mod files;
 pub mod gates;
 pub mod moderation;

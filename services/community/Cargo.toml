@@ -13,6 +13,8 @@ reqwest = { workspace = true, features = ["json"] }
 wyvrn-service = { workspace = true }
 # Files members attach, kept here (files/1.0's host, at the community's own DID).
 wyvrn-files = { path = "../files" }
+# The community's own sticker and emoji packs (stickers/1.0's service, at its DID).
+wyvrn-stickers = { path = "../stickers" }
 didcomm-agent = { workspace = true }
 didcomm-core = { workspace = true }
 didcomm-crypto-askar = { workspace = true }
@@ -32,6 +34,7 @@ regex = "1"
 sha2 = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
 reqwest-websocket = "0.6"
 # The tests talk to the server as members' apps would.
 reqwest = { workspace = true }

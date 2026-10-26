@@ -633,6 +633,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Files members attach (files.rs): a chunk is at most what the host takes in one.
         .route("/u/{id}", axum::routing::put(crate::files::put_chunk).head(crate::files::upload_standing).layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)))
         .route("/f/{id}", get(crate::files::fetch).head(crate::files::fetch))
+        // The community's own packs (expressions.rs).
+        .route("/s/{name}", get(crate::expressions::manifest))
+        .route("/s/{name}/pack.json", get(crate::expressions::manifest))
+        .route("/s/{name}/{file}", get(crate::expressions::pack_file))
+        .route("/s/drafts/{instance}/{file}", get(crate::expressions::draft_file))
         .route("/healthz", get(|| async { "ok" }))
         .merge(address::routes(state.agent.did(), state.did_document.clone()))
         // A browser app sends its messages, and fetches files, from another origin.

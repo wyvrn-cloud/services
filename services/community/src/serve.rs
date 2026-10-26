@@ -39,6 +39,9 @@ pub async fn serve(config: Config, assistant: Option<Assistant>) -> anyhow::Resu
     let kept = wyvrn_service::profile::Kept::open(&location, "community")?;
     let mut community = Community::new(open_store(&config)?, config.community.clone(), Some(kept))?.with_voice(config.voice.clone());
     community.assistant = assistant.as_ref().map(Assistant::listing);
+    if let Some(stickers) = &config.stickers {
+        community.expressions = Some(crate::expressions::Expressions::open(&stickers.path, &config.server.public_url).context("the community's packs")?);
+    }
     if let Some(files) = &config.files {
         community.files = Some(crate::files::Files::open(files, &config.server.public_url).context("the files members attach")?);
     }

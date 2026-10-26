@@ -256,6 +256,16 @@ impl Community {
             return Handled::default();
         };
         let body = &message["body"];
+        // The community's packs, made by whoever may manage them, as the community.
+        if let (Some(expressions), Some(own)) = (&self.expressions, &self.own) {
+            if kind != "discover" && expressions.concerns(message) {
+                if !self.powers(&member.did).is_ok_and(|powers| powers.has("manage_expressions")) {
+                    return Handled { answer: Some(Err(Refusal::new("not_authorized", "The community's emoji and stickers take Manage expressions."))), ..Handled::default() };
+                }
+                let answer = expressions.processor.handle(own, message, now).map(|answer| answer.map_err(|refusal| Refusal { code: refusal.code, comment: refusal.comment, args: refusal.args }));
+                return Handled { answer, ..Handled::default() };
+            }
+        }
         let instance = body["instance_id"].as_str().unwrap_or_default();
         // An administration workflow under way, if the instance is one.
         let flow = match kind {
@@ -283,6 +293,14 @@ impl Community {
                 match self.flows_for(&member.did) {
                     Ok(flows) => workflows.extend(flows.into_iter().map(|(id, title)| json!({ "template_id": id, "versions": [crate::admin_flows::VERSION], "title": title }))),
                     Err(error) => return Handled { answer: Some(Err(failed(error))), ..Handled::default() },
+                }
+                // And the packs' own, for whoever may make them.
+                if let (Some(expressions), Some(own)) = (&self.expressions, &self.own) {
+                    if self.powers(&member.did).is_ok_and(|powers| powers.has("manage_expressions")) {
+                        if let Some(Ok((_, listed))) = expressions.processor.handle(own, message, now) {
+                            workflows.extend(listed["workflows"].as_array().cloned().unwrap_or_default());
+                        }
+                    }
                 }
                 Ok((format!("{P}workflows"), json!({ "paging": { "total": workflows.len(), "next_offset": 0 }, "workflows": workflows })))
             }

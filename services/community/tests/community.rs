@@ -122,6 +122,7 @@ async fn start_server_with(settings: &str, files: bool) -> Running {
     community.assistant = assistant.as_ref().map(wyvrn_community::assistant::Assistant::listing);
     if files {
         community.files = Some(wyvrn_community::files::Files::scratch(&Default::default(), &url).unwrap());
+        community.expressions = Some(wyvrn_community::expressions::Expressions::scratch(&url).unwrap());
     }
     let state = AppState::new(agent, Default::default(), community, did_document, didcomm_quickstart::default_resolver());
     let state = Arc::new(match assistant {
@@ -1611,4 +1612,47 @@ async fn members_put_the_files_they_attach_at_the_community() {
     // Someone who isn't in is answered as they are for anything else.
     let refused = stranger.ask("https://wyvrn.app/files/1.0/upload", ask).await;
     assert_eq!(refused["type"], PROBLEM, "{refused}");
+}
+
+/// A PNG that says it is `side` by `side`: enough for a pack to take it.
+fn png_data_url(side: u32, salt: u8) -> String {
+    use base64::Engine;
+    let mut bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
+    bytes.extend(side.to_be_bytes());
+    bytes.extend(side.to_be_bytes());
+    bytes.extend([8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    bytes.extend(b"\x00\x00\x00\x01IDAT");
+    bytes.push(salt);
+    format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+#[tokio::test]
+async fn the_community_has_emoji_packs_of_its_own_made_by_whoever_may_manage_them() {
+    let server = start_server_with("", true).await;
+    let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member]);
+    member.community("join", json!({})).await;
+
+    // A member without Manage expressions neither sees nor starts the workflow.
+    assert!(!member.workflow("discover", json!({})).await.to_string().contains("new-emoji-pack"));
+    assert_eq!(member.workflow("start", json!({ "template_id": "new-emoji-pack", "instance_id": "m1" })).await["body"]["code"], "not_authorized");
+
+    // The owner makes one, as the community.
+    assert!(owner.workflow("discover", json!({})).await.to_string().contains("new-emoji-pack"));
+    let started = owner.workflow("start", json!({ "template_id": "new-emoji-pack", "instance_id": "e1" })).await;
+    assert_eq!(kind(&started), "status", "{started}");
+    advance(&owner, "e1", "set_title", json!({ "title": "Workshop" })).await;
+    let added = advance(&owner, "e1", "add_emoji", json!({ "image": png_data_url(64, 1), "shortcode": "hammer_time" })).await;
+    assert_eq!(kind(&added), "status", "{added}");
+    advance(&owner, "e1", "publish", json!({})).await;
+    advance(&owner, "e1", "skip_icon", json!({})).await;
+    let done = advance(&owner, "e1", "set_name", json!({ "name": "workshop" })).await;
+    assert_eq!(kind(&done), "complete", "{done}");
+
+    // Every member is told of it, and anyone fetches it by its address.
+    let told = member.community("join", json!({})).await;
+    let link = told["body"]["expressions"]["packs"][0].as_str().unwrap().to_string();
+    assert!(link.starts_with(&format!("{}s/", server.url)), "{link}");
+    let pack: Value = reqwest::get(&link).await.unwrap().json().await.unwrap();
+    assert_eq!(pack["title"], "Workshop", "{pack}");
 }

@@ -191,6 +191,8 @@ pub struct Community {
     pub own: Option<String>,
     /// Files members attach, where the community keeps them (files.rs).
     pub files: Option<crate::files::Files>,
+    /// The community's own sticker and emoji packs (expressions.rs).
+    pub expressions: Option<crate::expressions::Expressions>,
     /// How many live connections each member has open now (who may be seen online).
     pub live: std::sync::RwLock<std::collections::HashMap<String, usize>>,
 }
@@ -409,7 +411,7 @@ impl Community {
             Some(kept) => kept.load()?,
             None => Changed::default(),
         };
-        let community = Self { store, config, changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, live: Default::default() };
+        let community = Self { store, config, changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, expressions: None, live: Default::default() };
         community.ensure_roles()?;
         Ok(community)
     }
@@ -479,6 +481,12 @@ impl Community {
             }
             if let Some(files) = &self.files {
                 body["files"] = json!({ "max_file_bytes": files.max_file_bytes() });
+            }
+            if let (Some(expressions), Some(own)) = (&self.expressions, &self.own) {
+                let packs = expressions.packs(own)?;
+                if !packs.is_empty() {
+                    body["expressions"] = json!({ "packs": packs });
+                }
             }
             let (share, status) = self.store.presence(&member.did)?;
             body["presence"] = json!({ "share": share, "status": status });
