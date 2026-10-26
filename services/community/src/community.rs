@@ -362,6 +362,9 @@ impl Community {
         if channel.slow_mode > 0 {
             body["slow_mode"] = json!(channel.slow_mode);
         }
+        if let Some(category) = &channel.category {
+            body["category"] = json!(category);
+        }
         body
     }
 
@@ -454,6 +457,13 @@ impl Community {
             }
             if let Some(wait) = self.post_wait()? {
                 body["gates"] = json!({ "post_wait": wait });
+            }
+            let categories = self.store.categories()?;
+            if !categories.is_empty() {
+                body["categories"] = json!(categories.iter().map(|c| json!({ "id": c.id, "name": c.name })).collect::<Vec<_>>());
+            }
+            if self.has_onboarding()? {
+                body["onboarding"] = json!({ "done": self.store.onboarded(&member.did)? });
             }
             Ok(body)
         })
@@ -1064,6 +1074,9 @@ impl Community {
             return Ok(outcome);
         }
         if let Some(outcome) = self.handle_held(&member, message_type, message, now)? {
+            return Ok(outcome);
+        }
+        if let Some(outcome) = self.handle_structure(&member, message_type, message, now)? {
             return Ok(outcome);
         }
 

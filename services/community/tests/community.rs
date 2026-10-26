@@ -1436,3 +1436,64 @@ async fn automod_refuses_holds_and_alerts_and_join_gates_ask_before_letting_in()
     owner.community("set-member", json!({ "did": newcomer.did(), "role": "moderator" })).await;
     assert_eq!(kind(&newcomer.community("post", json!({ "channel": channel, "content": "hi" })).await), "posted");
 }
+
+#[tokio::test]
+async fn channels_are_ordered_in_categories_newcomers_are_onboarded_and_insights_count_totals() {
+    let server = start_server("").await;
+    let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member]);
+    let general = open_channel(&owner, "general").await;
+    let art = open_channel(&owner, "art").await;
+    let code = open_channel(&owner, "code").await;
+    member.community("join", json!({})).await;
+
+    // Projects, a category, takes art and code; code goes up within it.
+    owner.workflow("start", json!({ "template_id": "channels", "instance_id": "c1" })).await;
+    advance(&owner, "c1", "create_category", json!({ "name": "Projects" })).await;
+    let projects = owner.community("join", json!({})).await["body"]["categories"][0]["id"].as_str().unwrap().to_string();
+    for channel in [&art, &code] {
+        advance(&owner, "c1", "move", json!({ "channel": channel })).await;
+        let moved = advance(&owner, "c1", "to", json!({ "category": projects })).await;
+        assert_eq!(moved["body"]["state"], "list", "{moved}");
+    }
+    advance(&owner, "c1", "up", json!({ "channel": code })).await;
+    assert_eq!(advance(&owner, "c1", "up", json!({ "channel": code })).await["body"]["code"], "guard_failed");
+    advance(&owner, "c1", "done", json!({})).await;
+    let told = member.community("join", json!({})).await["body"].clone();
+    assert_eq!(told["categories"], json!([{ "id": projects, "name": "Projects" }]));
+    let order: Vec<(&str, Option<&str>)> = told["channels"].as_array().unwrap().iter().map(|c| (c["name"].as_str().unwrap(), c["category"].as_str())).collect();
+    assert_eq!(order, [("general", None), ("code", Some(projects.as_str())), ("art", Some(projects.as_str()))]);
+
+    // Onboarding: a welcome, a role to pick, and a channel suggested.
+    owner.workflow("start", json!({ "template_id": "roles", "instance_id": "r1" })).await;
+    advance(&owner, "r1", "create", json!({ "name": "Artist" })).await;
+    advance(&owner, "r1", "save", json!({ "name": "Artist", "self_assignable": true })).await;
+    owner.workflow("start", json!({ "template_id": "onboarding-setup", "instance_id": "o1" })).await;
+    let set = advance(&owner, "o1", "save", json!({ "welcome": "Hello, and welcome.", format!("suggest-{art}"): true })).await;
+    assert_eq!(kind(&set), "complete", "{set}");
+    assert_eq!(member.community("join", json!({})).await["body"]["onboarding"], json!({ "done": false }));
+    let welcome = member.workflow("start", json!({ "template_id": "onboarding", "instance_id": "w1" })).await;
+    assert!(welcome["body"]["ui"].to_string().contains("Hello, and welcome."), "{welcome}");
+    assert_eq!(welcome["body"]["artifacts"]["suggested"], json!([art]));
+    let roles = advance(&member, "w1", "next", json!({})).await;
+    let artist = roles["body"]["ui"].to_string();
+    let artist_id = artist.split("role-").nth(1).unwrap().split('"').next().unwrap().to_string();
+    advance(&member, "w1", "pick", json!({ format!("role-{artist_id}"): true })).await;
+    assert_eq!(kind(&advance(&member, "w1", "done", json!({})).await), "complete");
+    let after = member.community("join", json!({})).await["body"].clone();
+    assert_eq!(after["onboarding"], json!({ "done": true }));
+    assert_eq!(after["my_roles"], json!([artist_id]));
+
+    // Insights: totals for the owner, refused to a member.
+    member.community("post", json!({ "channel": general, "content": "one" })).await;
+    owner.community("post", json!({ "channel": general, "content": "two" })).await;
+    let insights = owner.community("insights-request", json!({})).await;
+    let days = insights["body"]["days"].as_array().unwrap();
+    assert_eq!(days.len(), 90, "{insights}");
+    let today = days.last().unwrap();
+    assert_eq!(today["posts"], 2);
+    assert_eq!(today["active"], 2);
+    assert_eq!(today["by_channel"][general.as_str()], 2);
+    assert_eq!(insights["body"]["members"], 2);
+    assert_eq!(member.community("insights-request", json!({})).await["type"], PROBLEM);
+}

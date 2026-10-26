@@ -18,13 +18,16 @@ pub const MEMBER_ROLES: &str = "member-roles";
 pub const CHANNEL_PERMISSIONS_FLOW: &str = "channel-permissions";
 pub const AUTOMOD_FLOW: &str = "automod";
 pub const JOIN_GATES_FLOW: &str = "join-gates";
+pub const CHANNELS_FLOW: &str = "channels";
+pub const ONBOARDING_SETUP_FLOW: &str = "onboarding-setup";
+pub const ONBOARDING_FLOW: &str = "onboarding";
 pub const VERSION: &str = "1.0";
 const P: &str = "https://didcomm.org/workflow/1.0/";
 const MAX_ROLES: usize = 100;
 const MAX_ROLE_NAME: usize = 32;
 
 /// Each template: its id, title, states and the events that move between them.
-fn templates() -> [(&'static str, &'static str, Value); 5] {
+fn templates() -> [(&'static str, &'static str, Value); 8] {
     [
         (
             ROLES,
@@ -77,6 +80,39 @@ fn templates() -> [(&'static str, &'static str, Value); 5] {
             json!({
                 "states": [{ "name": "form", "type": "start" }, { "name": "done", "type": "final" }],
                 "transitions": { "save": { "from": "form", "to": "done" } }
+            }),
+        ),
+        (
+            CHANNELS_FLOW,
+            "Channels and categories",
+            json!({
+                "states": [{ "name": "list", "type": "start" }, { "name": "category", "type": "normal" }, { "name": "move", "type": "normal" }, { "name": "done", "type": "final" }],
+                "transitions": {
+                    "up": { "from": "list", "to": "list" }, "down": { "from": "list", "to": "list" },
+                    "create_category": { "from": "list", "to": "list" }, "edit_category": { "from": "list", "to": "category" },
+                    "category_up": { "from": "list", "to": "list" }, "category_down": { "from": "list", "to": "list" },
+                    "move": { "from": "list", "to": "move" }, "done": { "from": "list", "to": "done" },
+                    "save": { "from": "category", "to": "list" }, "delete": { "from": "category", "to": "list" }, "back": { "from": ["category", "move"], "to": "list" },
+                    "to": { "from": "move", "to": "list" }
+                }
+            }),
+        ),
+        (
+            ONBOARDING_SETUP_FLOW,
+            "Onboarding",
+            json!({
+                "states": [{ "name": "form", "type": "start" }, { "name": "done", "type": "final" }],
+                "transitions": { "save": { "from": "form", "to": "done" } }
+            }),
+        ),
+        (
+            ONBOARDING_FLOW,
+            "Welcome",
+            json!({
+                "states": [{ "name": "welcome", "type": "start" }, { "name": "roles", "type": "normal" }, { "name": "channels", "type": "normal" }, { "name": "done", "type": "final" }],
+                "transitions": {
+                    "next": { "from": "welcome", "to": "roles" }, "pick": { "from": "roles", "to": "channels" }, "done": { "from": "channels", "to": "done" }
+                }
             }),
         ),
     ]
@@ -150,7 +186,9 @@ impl Community {
             .filter(|(id, _, _)| match *id {
                 ROLES | MEMBER_ROLES => powers.has("manage_roles"),
                 AUTOMOD_FLOW => powers.has("manage_automod"),
-                JOIN_GATES_FLOW => powers.has("manage_community"),
+                JOIN_GATES_FLOW | ONBOARDING_SETUP_FLOW => powers.has("manage_community"),
+                CHANNELS_FLOW => powers.has("manage_channels"),
+                ONBOARDING_FLOW => true,
                 _ => powers.has("manage_channels") || opened_one,
             })
             .map(|(id, title, _)| (id, title))
@@ -371,6 +409,11 @@ impl Community {
                 (AUTOMOD_FLOW, "list") => (self.automod_list_ui(flow).map_err(failed)?, vec!["edit", "create", "toggle", "done"]),
                 (AUTOMOD_FLOW, "edit") => (self.automod_edit_ui(flow).map_err(failed)?, vec!["save", "delete", "back"]),
                 (JOIN_GATES_FLOW, _) => (self.join_gates_ui().map_err(failed)?, vec!["save"]),
+                (CHANNELS_FLOW, "list") => (self.channels_list_ui().map_err(failed)?, vec!["up", "down", "create_category", "edit_category", "category_up", "category_down", "move", "done"]),
+                (CHANNELS_FLOW, "category") => (self.category_ui(flow).map_err(failed)?, vec!["save", "delete", "back"]),
+                (CHANNELS_FLOW, "move") => (self.move_ui(flow).map_err(failed)?, vec!["to", "back"]),
+                (ONBOARDING_SETUP_FLOW, _) => (self.onboarding_setup_ui().map_err(failed)?, vec!["save"]),
+                (ONBOARDING_FLOW, state) => self.onboarding_ui(flow, state).map_err(failed)?,
                 (CHANNEL_PERMISSIONS_FLOW, "role") => {
                     let channel = self.flow_channel(flow)?;
                     let held = self.channel_permissions(&flow.owner, &powers, &channel).map_err(failed)?;
@@ -384,6 +427,10 @@ impl Community {
             for (key, value) in object {
                 artifacts[key] = value.clone();
             }
+        }
+        // The channels onboarding suggests, for an app to offer as it finishes.
+        if flow.template == ONBOARDING_FLOW {
+            artifacts["suggested"] = self.onboarding().map_err(failed)?["suggested"].clone();
         }
         Ok(json!({
             "instance_id": flow.id,
@@ -439,12 +486,19 @@ impl Community {
                 }
                 json!({})
             }
-            JOIN_GATES_FLOW => {
+            JOIN_GATES_FLOW | ONBOARDING_SETUP_FLOW => {
                 if !powers.has("manage_community") {
-                    return Err(not_allowed("The join gates take Manage the community."));
+                    return Err(not_allowed("That takes Manage the community."));
                 }
                 json!({})
             }
+            CHANNELS_FLOW => {
+                if !powers.has("manage_channels") {
+                    return Err(not_allowed("Ordering channels takes Manage channels."));
+                }
+                json!({})
+            }
+            ONBOARDING_FLOW => json!({}),
             _ => return Err(Refusal::new("template_not_found", "This server has no such workflow.")),
         };
         let wanted = body["instance_id"].as_str().or(message["thid"].as_str()).or(message["id"].as_str()).unwrap_or_default();
@@ -460,9 +514,10 @@ impl Community {
             return Err(Refusal::new("multiplicity_violation", "That instance id has been used."));
         }
         let state = match template {
-            ROLES | AUTOMOD_FLOW => "list",
+            ROLES | AUTOMOD_FLOW | CHANNELS_FLOW => "list",
             MEMBER_ROLES => "pick",
-            JOIN_GATES_FLOW => "form",
+            JOIN_GATES_FLOW | ONBOARDING_SETUP_FLOW => "form",
+            ONBOARDING_FLOW => "welcome",
             _ => "roles",
         };
         let flow = Flow { id: wanted.into(), owner: member.did.clone(), template: template.into(), context, state: state.into(), data: json!({}), status: "active".into(), updated: now };
@@ -501,7 +556,9 @@ impl Community {
         let still = match flow.template.as_str() {
             CHANNEL_PERMISSIONS_FLOW => self.may_manage_channel(&flow.owner, &powers, &self.flow_channel(&flow)?),
             AUTOMOD_FLOW => powers.has("manage_automod"),
-            JOIN_GATES_FLOW => powers.has("manage_community"),
+            JOIN_GATES_FLOW | ONBOARDING_SETUP_FLOW => powers.has("manage_community"),
+            CHANNELS_FLOW => powers.has("manage_channels"),
+            ONBOARDING_FLOW => true,
             _ => powers.has("manage_roles"),
         };
         if !still {
@@ -580,6 +637,7 @@ impl Community {
                 true
             }
             (AUTOMOD_FLOW, _, _) | (JOIN_GATES_FLOW, _, _) => self.advance_moderation_flow(&mut flow, event, input, now)?,
+            (CHANNELS_FLOW, _, _) | (ONBOARDING_SETUP_FLOW, _, _) | (ONBOARDING_FLOW, _, _) => self.advance_structure_flow(&mut flow, event, input, now)?,
             (ROLES, "list", "done") | (CHANNEL_PERMISSIONS_FLOW, "roles", "done") => {
                 flow.status = "completed".into();
                 false
@@ -927,6 +985,286 @@ impl Community {
                 }
                 self.store.set_setting("gates", &gates.to_string()).map_err(failed)?;
                 self.audit(now, &flow.owner, "community.gates", None, Some(gates));
+                flow.status = "completed".into();
+                Ok(true)
+            }
+            _ => Err(refused("That can't be done here.")),
+        }
+    }
+
+    // --- Channels' order and categories, and onboarding --------------------------------
+
+    /// The channels as listed now, each with its category: what moving one changes.
+    fn channel_order(&self) -> anyhow::Result<Vec<(String, Option<String>)>> {
+        let categories = self.store.categories()?;
+        Ok(self.store.channels()?.into_iter().map(|c| (c.id, c.category.filter(|id| categories.iter().any(|k| k.id == *id)))).collect())
+    }
+
+    fn channels_list_ui(&self) -> anyhow::Result<Value> {
+        let channels = self.store.channels()?;
+        let categories = self.store.categories()?;
+        let mut items = vec![json!({ "type": "title", "text": "Channels and categories" })];
+        items.push(json!({ "type": "text", "text": "The order everyone sees them in. Categories only group channels: they change no permissions." }));
+        let row = |channel: &crate::store::Channel| {
+            let kind = if channel.voice.is_some() { "🔊 " } else { "#" };
+            let closed = if channel.closed { " (closed)" } else { "" };
+            json!({ "type": "row", "children": [
+                { "type": "text", "text": format!("{kind}{}{closed}", channel.name) },
+                button("↑", "up", json!({ "channel": channel.id })),
+                button("↓", "down", json!({ "channel": channel.id })),
+                button("Category…", "move", json!({ "channel": channel.id }))
+            ] })
+        };
+        for channel in channels.iter().filter(|c| c.category.as_ref().is_none_or(|id| !categories.iter().any(|k| k.id == *id))) {
+            items.push(row(channel));
+        }
+        for category in &categories {
+            items.push(json!({ "type": "row", "children": [
+                { "type": "title", "text": category.name },
+                button("↑", "category_up", json!({ "category": category.id })),
+                button("↓", "category_down", json!({ "category": category.id })),
+                button("Rename…", "edit_category", json!({ "category": category.id }))
+            ] }));
+            for channel in channels.iter().filter(|c| c.category.as_deref() == Some(category.id.as_str())) {
+                items.push(row(channel));
+            }
+        }
+        items.push(json!({ "type": "divider" }));
+        items.push(json!({ "type": "form", "children": [
+            { "type": "text-input", "form-id": "name", "label": "New category", "placeholder": "Projects", "required": true },
+            button("Add category", "create_category", json!({}))
+        ] }));
+        items.push(button("Done", "done", json!({})));
+        Ok(Value::Array(items))
+    }
+
+    fn category_ui(&self, flow: &Flow) -> anyhow::Result<Value> {
+        let id = flow.data["category"].as_str().unwrap_or_default();
+        let name = self.store.categories()?.into_iter().find(|c| c.id == id).map(|c| c.name).unwrap_or_default();
+        Ok(json!([
+            { "type": "title", "text": format!("Category: {name}") },
+            { "type": "form", "children": [
+                { "type": "text-input", "form-id": "name", "label": "Name", "value": name, "required": true },
+                button("Save", "save", json!({}))
+            ] },
+            button("Delete category", "delete", json!({})),
+            button("Back", "back", json!({}))
+        ]))
+    }
+
+    fn move_ui(&self, flow: &Flow) -> anyhow::Result<Value> {
+        let id = flow.data["channel"].as_str().unwrap_or_default();
+        let name = self.store.channel(id)?.map(|c| c.name).unwrap_or_default();
+        let mut items = vec![json!({ "type": "title", "text": format!("Move #{name} to") }), button("No category", "to", json!({ "category": "" }))];
+        for category in self.store.categories()? {
+            items.push(button(&category.name, "to", json!({ "category": category.id })));
+        }
+        items.push(button("Back", "back", json!({})));
+        Ok(Value::Array(items))
+    }
+
+    fn onboarding_setup_ui(&self) -> anyhow::Result<Value> {
+        let set = self.onboarding()?;
+        let suggested: Vec<&str> = set["suggested"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        let mut fields = vec![json!({ "type": "text-area", "form-id": "welcome", "label": "Welcome (Markdown)", "value": set["welcome"].as_str().unwrap_or_default() })];
+        fields.push(json!({ "type": "title", "text": "Channels to suggest" }));
+        for channel in self.store.channels()?.iter().filter(|c| !c.closed) {
+            let kind = if channel.voice.is_some() { "🔊 " } else { "#" };
+            fields.push(json!({ "type": "check-box", "form-id": format!("suggest-{}", channel.id), "label": format!("{kind}{}", channel.name), "value": suggested.contains(&channel.id.as_str()) }));
+        }
+        let offered: Vec<String> = self.store.roles()?.into_iter().filter(|role| role.self_assignable).map(|role| role.name).collect();
+        fields.push(json!({ "type": "text", "text": if offered.is_empty() {
+            "No roles are offered to pick. A role is, once Roles marks it “Members may take it, or drop it, themselves”.".to_string()
+        } else {
+            format!("Roles members may pick: {}. (Which, is each role's own setting, in Roles.)", offered.join(", "))
+        } }));
+        fields.push(button("Save", "save", json!({})));
+        Ok(json!([{ "type": "title", "text": "Onboarding" }, { "type": "text", "text": "What a newcomer is shown as they come in: a welcome, roles to pick, and channels to start in." }, { "type": "form", "children": fields }]))
+    }
+
+    fn onboarding_ui(&self, flow: &Flow, state: &str) -> anyhow::Result<(Value, Vec<&'static str>)> {
+        let set = self.onboarding()?;
+        let name = self.changed().name.unwrap_or_else(|| self.config.name.clone());
+        Ok(match state {
+            "welcome" => {
+                let mut items = vec![json!({ "type": "title", "text": format!("Welcome to {name}") })];
+                if let Some(welcome) = set["welcome"].as_str().filter(|w| !w.trim().is_empty()) {
+                    items.push(json!({ "type": "text", "text": welcome }));
+                }
+                if self.rules()?.is_some() {
+                    items.push(json!({ "type": "information", "text": "This community has rules: they are in its menu." }));
+                }
+                items.push(button("Next", "next", json!({})));
+                (Value::Array(items), vec!["next"])
+            }
+            "roles" => {
+                let held = self.store.member_roles(&flow.owner)?;
+                let mut fields = Vec::new();
+                for role in self.store.roles()?.into_iter().filter(|role| role.self_assignable) {
+                    let label = match &role.icon {
+                        Some(icon) => format!("{icon} {}", role.name),
+                        None => role.name.clone(),
+                    };
+                    fields.push(json!({ "type": "check-box", "form-id": format!("role-{}", role.id), "label": label, "value": held.contains(&role.id) }));
+                }
+                if fields.is_empty() {
+                    fields.push(json!({ "type": "text", "text": "There are no roles to pick here." }));
+                }
+                fields.push(button("Next", "pick", json!({})));
+                (json!([{ "type": "title", "text": "Pick your roles" }, { "type": "form", "children": fields }]), vec!["pick"])
+            }
+            _ => {
+                let suggested: Vec<String> = set["suggested"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+                let mut items = vec![json!({ "type": "title", "text": "Where to start" })];
+                for channel in self.store.channels()?.into_iter().filter(|c| suggested.contains(&c.id) && !c.closed) {
+                    let kind = if channel.voice.is_some() { "🔊 " } else { "#" };
+                    let topic = if channel.topic.is_empty() { String::new() } else { format!(" — {}", channel.topic) };
+                    items.push(json!({ "type": "text", "text": format!("{kind}{}{topic}", channel.name) }));
+                }
+                if items.len() == 1 {
+                    items.push(json!({ "type": "text", "text": "Every channel is open to you: look around." }));
+                }
+                items.push(button("Done", "done", json!({})));
+                (Value::Array(items), vec!["done"])
+            }
+        })
+    }
+
+    /// An event of the `channels`, `onboarding-setup` or `onboarding` workflow;
+    /// whether `community` changed for anyone.
+    fn advance_structure_flow(&self, flow: &mut Flow, event: &str, input: &Value, now: i64) -> Result<bool, Refusal> {
+        match (flow.template.as_str(), flow.state.as_str(), event) {
+            (CHANNELS_FLOW, "list", "up" | "down") => {
+                let id = input["channel"].as_str().unwrap_or_default();
+                let mut order = self.channel_order().map_err(failed)?;
+                let at = order.iter().position(|(c, _)| c == id).ok_or_else(|| refused("There is no such channel."))?;
+                let category = order[at].1.clone();
+                // Past the next channel of the same group, if there is one.
+                let other = if event == "up" {
+                    order[..at].iter().rposition(|(_, k)| *k == category)
+                } else {
+                    order[at + 1..].iter().position(|(_, k)| *k == category).map(|n| at + 1 + n)
+                };
+                let Some(other) = other else { return Err(refused(if event == "up" { "It is first already." } else { "It is last already." })) };
+                order.swap(at, other);
+                self.store.order_channels(&order).map_err(failed)?;
+                self.audit(now, &flow.owner, "channel.update", Some(id), Some(json!({ "moved": event })));
+                Ok(true)
+            }
+            (CHANNELS_FLOW, "list", "create_category") => {
+                let name = line(&input["name"], 40).ok_or_else(|| refused("A category needs a name."))?;
+                let categories = self.store.categories().map_err(failed)?;
+                if categories.len() >= 50 {
+                    return Err(refused("That is as many categories as a community holds."));
+                }
+                let id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+                let position = categories.iter().map(|c| c.position).max().unwrap_or(-1) + 1;
+                self.store.save_category(&crate::store::Category { id: id.clone(), name: name.clone(), position }).map_err(failed)?;
+                self.audit(now, &flow.owner, "channel.update", None, Some(json!({ "category": name, "created": true })));
+                Ok(true)
+            }
+            (CHANNELS_FLOW, "list", "category_up" | "category_down") => {
+                let id = input["category"].as_str().unwrap_or_default();
+                let mut categories = self.store.categories().map_err(failed)?;
+                let at = categories.iter().position(|c| c.id == id).ok_or_else(|| refused("There is no such category."))?;
+                let other = if event == "category_up" { at.checked_sub(1) } else { Some(at + 1).filter(|n| *n < categories.len()) };
+                let Some(other) = other else { return Err(refused("It can't go further.")) };
+                categories.swap(at, other);
+                for (n, category) in categories.iter_mut().enumerate() {
+                    category.position = n as i64;
+                    self.store.save_category(category).map_err(failed)?;
+                }
+                Ok(true)
+            }
+            (CHANNELS_FLOW, "list", "edit_category") => {
+                let id = input["category"].as_str().unwrap_or_default();
+                if !self.store.categories().map_err(failed)?.iter().any(|c| c.id == id) {
+                    return Err(refused("There is no such category."));
+                }
+                flow.data["category"] = json!(id);
+                flow.state = "category".into();
+                Ok(false)
+            }
+            (CHANNELS_FLOW, "list", "move") => {
+                let id = input["channel"].as_str().unwrap_or_default();
+                if self.store.channel(id).map_err(failed)?.is_none() {
+                    return Err(refused("There is no such channel."));
+                }
+                flow.data["channel"] = json!(id);
+                flow.state = "move".into();
+                Ok(false)
+            }
+            (CHANNELS_FLOW, "list", "done") => {
+                flow.status = "completed".into();
+                Ok(false)
+            }
+            (CHANNELS_FLOW, "category", "save") => {
+                let id = flow.data["category"].as_str().unwrap_or_default().to_string();
+                let name = line(&input["name"], 40).ok_or_else(|| refused("A category needs a name."))?;
+                let mut category = self.store.categories().map_err(failed)?.into_iter().find(|c| c.id == id).ok_or_else(|| refused("That category is gone."))?;
+                category.name = name;
+                self.store.save_category(&category).map_err(failed)?;
+                flow.state = "list".into();
+                Ok(true)
+            }
+            (CHANNELS_FLOW, "category", "delete") => {
+                let id = flow.data["category"].as_str().unwrap_or_default().to_string();
+                self.store.delete_category(&id).map_err(failed)?;
+                flow.state = "list".into();
+                Ok(true)
+            }
+            (CHANNELS_FLOW, "move", "to") => {
+                let id = flow.data["channel"].as_str().unwrap_or_default().to_string();
+                let target = input["category"].as_str().filter(|c| !c.is_empty()).map(str::to_string);
+                if let Some(target) = &target {
+                    if !self.store.categories().map_err(failed)?.iter().any(|c| c.id == *target) {
+                        return Err(refused("There is no such category."));
+                    }
+                }
+                // Last in its new group.
+                let mut order = self.channel_order().map_err(failed)?;
+                order.retain(|(c, _)| *c != id);
+                let after = order.iter().rposition(|(_, k)| *k == target).map_or(order.len(), |n| n + 1);
+                order.insert(after.min(order.len()), (id.clone(), target.clone()));
+                self.store.order_channels(&order).map_err(failed)?;
+                self.audit(now, &flow.owner, "channel.update", Some(&id), Some(json!({ "category": target })));
+                flow.state = "list".into();
+                Ok(true)
+            }
+            (CHANNELS_FLOW, _, "back") => {
+                flow.state = "list".into();
+                Ok(false)
+            }
+            (ONBOARDING_SETUP_FLOW, "form", "save") => {
+                let welcome: String = input["welcome"].as_str().unwrap_or_default().trim().chars().take(4000).collect();
+                let suggested: Vec<String> = self.store.channels().map_err(failed)?.into_iter().filter(|c| ticked(&input[format!("suggest-{}", c.id)])).map(|c| c.id).collect();
+                let set = json!({ "welcome": welcome, "suggested": suggested });
+                self.store.set_setting("onboarding", &set.to_string()).map_err(failed)?;
+                self.audit(now, &flow.owner, "community.onboarding", None, Some(set));
+                flow.status = "completed".into();
+                Ok(true)
+            }
+            (ONBOARDING_FLOW, "welcome", "next") => {
+                flow.state = "roles".into();
+                Ok(false)
+            }
+            (ONBOARDING_FLOW, "roles", "pick") => {
+                let held = self.store.member_roles(&flow.owner).map_err(failed)?;
+                let mut changed = false;
+                for role in self.store.roles().map_err(failed)?.into_iter().filter(|role| role.self_assignable) {
+                    let wanted = ticked(&input[format!("role-{}", role.id)]);
+                    match (wanted, held.contains(&role.id)) {
+                        (true, false) => self.store.give_role(&flow.owner, &role.id).map_err(failed)?,
+                        (false, true) => self.store.take_role(&flow.owner, &role.id).map_err(failed)?,
+                        _ => continue,
+                    }
+                    changed = true;
+                }
+                flow.state = "channels".into();
+                Ok(changed)
+            }
+            (ONBOARDING_FLOW, "channels", "done") => {
+                self.store.set_onboarded(&flow.owner, now).map_err(failed)?;
                 flow.status = "completed".into();
                 Ok(true)
             }

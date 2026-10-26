@@ -22,4 +22,5 @@ pub mod roles;
 pub mod serve;
 pub mod server;
 pub mod store;
+pub mod structure;
 pub mod voice;

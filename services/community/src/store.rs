@@ -57,6 +57,17 @@ pub struct Channel {
     pub voice: Option<Value>,
     /// Seconds a member waits between posts here; 0 for none.
     pub slow_mode: i64,
+    /// Its place in the order an admin set, if one did, and its category.
+    pub position: Option<i64>,
+    pub category: Option<String>,
+}
+
+/// A named group of channels, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Category {
+    pub id: String,
+    pub name: String,
+    pub position: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -273,7 +284,9 @@ const POST_COLUMNS: &str = "serial, channel, seq, id, content, posted_at, author
     (SELECT channel FROM post_voice_invites WHERE post_voice_invites.post = posts.id)";
 const CHANNEL_COLUMNS: &str = "id, name, topic, closed, created_at, created_by, (SELECT COALESCE(MAX(seq), 0) FROM posts WHERE posts.channel = channels.id), \
     (SELECT settings FROM channel_voice WHERE channel_voice.channel = channels.id), \
-    (SELECT seconds FROM channel_slow WHERE channel_slow.channel = channels.id)";
+    (SELECT seconds FROM channel_slow WHERE channel_slow.channel = channels.id), \
+    (SELECT position FROM channel_order WHERE channel_order.channel = channels.id), \
+    (SELECT category FROM channel_order WHERE channel_order.channel = channels.id)";
 
 fn member_from(row: &Row) -> Result<Member> {
     let role: String = row.get(1)?;
@@ -333,6 +346,8 @@ fn channel_from(row: &Row) -> Result<Channel> {
         latest_seq: row.get(6)?,
         voice: json_from(row.get(7)?),
         slow_mode: row.get::<Option<i64>>(8)?.unwrap_or(0),
+        position: row.get(9)?,
+        category: row.get(10)?,
     })
 }
 
@@ -638,6 +653,28 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         rule TEXT NOT NULL,
         body TEXT NOT NULL
     );
+    -- Categories of channels, and each channel's place and category.
+    CREATE TABLE IF NOT EXISTS categories (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        position INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS channel_order (
+        channel TEXT PRIMARY KEY,
+        position INTEGER NOT NULL,
+        category TEXT
+    );
+    -- Who has been through onboarding.
+    CREATE TABLE IF NOT EXISTS onboarded (
+        did TEXT PRIMARY KEY,
+        at INTEGER NOT NULL
+    );
+    -- Each coming in and leaving, for insights: `joined` or `left`.
+    CREATE TABLE IF NOT EXISTS member_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL,
+        at INTEGER NOT NULL
+    );
     -- Answers to the questions on joining, as JSON.
     CREATE TABLE IF NOT EXISTS join_answers (
         did TEXT PRIMARY KEY,
@@ -846,6 +883,25 @@ fn schema() -> Schema {
                 rule VARCHAR(64) NOT NULL,
                 body MEDIUMTEXT NOT NULL
             ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS categories (
+                id VARCHAR(64) NOT NULL PRIMARY KEY,
+                name TEXT NOT NULL,
+                position BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS channel_order (
+                channel VARCHAR(255) NOT NULL PRIMARY KEY,
+                position BIGINT NOT NULL,
+                category VARCHAR(64)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS onboarded (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                at BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS member_events (
+                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                kind VARCHAR(16) NOT NULL,
+                at BIGINT NOT NULL
+            ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS join_answers (
                 did {MYSQL_DID} NOT NULL PRIMARY KEY,
                 answers MEDIUMTEXT NOT NULL,
@@ -901,8 +957,8 @@ impl Store {
     /// new is sent only what is posted from now on.
     pub fn set_member(&self, did: &str, role: Role, now: i64) -> Result<()> {
         let mut db = self.db.lock();
-        if db.execute("UPDATE members SET role = ?2 WHERE did = ?1", params![did, role.as_str()])? == 0 {
-            db.execute(Self::ADMIT, params![did, role.as_str(), now])?;
+        if db.execute("UPDATE members SET role = ?2 WHERE did = ?1", params![did, role.as_str()])? == 0 && db.execute(Self::ADMIT, params![did, role.as_str(), now])? > 0 {
+            db.execute("INSERT INTO member_events (kind, at) VALUES ('joined', ?1)", params![now])?;
         }
         // An admin by the older word holds the role `admin`, while there is one.
         if role == Role::Admin {
@@ -913,14 +969,24 @@ impl Store {
 
     /// Lets `did` in as `role` unless they are in already, whatever as.
     pub fn admit(&self, did: &str, role: Role, now: i64) -> Result<bool> {
-        Ok(self.db.lock().execute(Self::ADMIT, params![did, role.as_str(), now])? > 0)
+        let mut db = self.db.lock();
+        let admitted = db.execute(Self::ADMIT, params![did, role.as_str(), now])? > 0;
+        if admitted {
+            db.execute("INSERT INTO member_events (kind, at) VALUES ('joined', ?1)", params![now])?;
+        }
+        Ok(admitted)
     }
 
     pub fn remove_member(&self, did: &str) -> Result<bool> {
         let mut db = self.db.lock();
         db.execute("DELETE FROM member_left WHERE did = ?1", params![did])?;
         db.execute("DELETE FROM member_roles WHERE did = ?1", params![did])?;
-        Ok(db.execute("DELETE FROM members WHERE did = ?1", params![did])? > 0)
+        let removed = db.execute("DELETE FROM members WHERE did = ?1", params![did])? > 0;
+        if removed {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+            db.execute("INSERT INTO member_events (kind, at) VALUES ('left', ?1)", params![now])?;
+        }
+        Ok(removed)
     }
 
     /// Forgets a member who was only ever named, and whose app never joined.
@@ -940,7 +1006,9 @@ impl Store {
 
     /// A member who had joined has left, at `now`.
     pub fn note_left(&self, did: &str, now: i64) -> Result<()> {
-        self.db.lock().execute("INSERT OR REPLACE INTO member_left (did, at) VALUES (?1, ?2)", params![did, now])?;
+        let mut db = self.db.lock();
+        db.execute("INSERT OR REPLACE INTO member_left (did, at) VALUES (?1, ?2)", params![did, now])?;
+        db.execute("INSERT INTO member_events (kind, at) VALUES ('left', ?1)", params![now])?;
         Ok(())
     }
 
@@ -1423,8 +1491,85 @@ impl Store {
 
     // --- Channels --------------------------------------------------------------
 
+    /// Every channel: open ones first, then in no category, then by category, each
+    /// group in the order set (a channel never placed last, oldest first).
     pub fn channels(&self) -> Result<Vec<Channel>> {
-        self.db.lock().query(&format!("SELECT {CHANNEL_COLUMNS} FROM channels ORDER BY closed, created_at, id"), params![], channel_from)
+        let mut channels = self.db.lock().query(&format!("SELECT {CHANNEL_COLUMNS} FROM channels ORDER BY closed, created_at, id"), params![], channel_from)?;
+        let categories = self.categories()?;
+        let rank = |channel: &Channel| {
+            let category = channel.category.as_ref().and_then(|id| categories.iter().find(|c| c.id == *id)).map_or(-1, |c| c.position);
+            (channel.closed, category, channel.position.unwrap_or(i64::MAX))
+        };
+        channels.sort_by_key(|channel| rank(channel));
+        Ok(channels)
+    }
+
+    /// The categories, in order.
+    pub fn categories(&self) -> Result<Vec<Category>> {
+        self.db.lock().query("SELECT id, name, position FROM categories ORDER BY position, id", params![], |row| {
+            Ok(Category { id: row.get(0)?, name: row.get(1)?, position: row.get(2)? })
+        })
+    }
+
+    pub fn save_category(&self, category: &Category) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO categories (id, name, position) VALUES (?1, ?2, ?3)", params![category.id, category.name, category.position])?;
+        Ok(())
+    }
+
+    /// Deletes a category; its channels go to none.
+    pub fn delete_category(&self, id: &str) -> Result<()> {
+        self.db.lock().transaction(|tx| {
+            tx.execute("UPDATE channel_order SET category = NULL WHERE category = ?1", params![id])?;
+            tx.execute("DELETE FROM categories WHERE id = ?1", params![id])?;
+            Ok(())
+        })
+    }
+
+    /// Places every channel as `order` lists them, each with its category.
+    pub fn order_channels(&self, order: &[(String, Option<String>)]) -> Result<()> {
+        self.db.lock().transaction(|tx| {
+            for (n, (channel, category)) in order.iter().enumerate() {
+                tx.execute("INSERT OR REPLACE INTO channel_order (channel, position, category) VALUES (?1, ?2, ?3)", params![channel, n as i64, category])?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn onboarded(&self, did: &str) -> Result<bool> {
+        Ok(self.db.lock().query_row("SELECT 1 FROM onboarded WHERE did = ?1", params![did], |_| Ok(()))?.is_some())
+    }
+
+    pub fn set_onboarded(&self, did: &str, now: i64) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO onboarded (did, at) VALUES (?1, ?2)", params![did, now])?;
+        Ok(())
+    }
+
+    /// Posts since `since`, a day (UTC) and channel at a time: `(day, channel, count)`,
+    /// `day` the second it starts.
+    pub fn posts_by_day(&self, since: i64) -> Result<Vec<(i64, String, i64)>> {
+        self.db.lock().query(
+            "SELECT posted_at - posted_at % 86400 AS day, channel, COUNT(*) FROM posts WHERE posted_at >= ?1 GROUP BY day, channel",
+            params![since],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+    }
+
+    /// How many different members posted each day since `since`: `(day, count)`.
+    pub fn posters_by_day(&self, since: i64) -> Result<Vec<(i64, i64)>> {
+        self.db.lock().query(
+            "SELECT posted_at - posted_at % 86400 AS day, COUNT(DISTINCT author_did) FROM posts WHERE posted_at >= ?1 GROUP BY day",
+            params![since],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+    }
+
+    /// Comings in and leavings since `since`, a day at a time: `(day, kind, count)`.
+    pub fn member_events_by_day(&self, since: i64) -> Result<Vec<(i64, String, i64)>> {
+        self.db.lock().query(
+            "SELECT at - at % 86400 AS day, kind, COUNT(*) FROM member_events WHERE at >= ?1 GROUP BY day, kind",
+            params![since],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
     }
 
     pub fn channel(&self, id: &str) -> Result<Option<Channel>> {
