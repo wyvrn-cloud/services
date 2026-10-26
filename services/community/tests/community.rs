@@ -104,6 +104,11 @@ impl Running {
 }
 
 async fn start_server(settings: &str) -> Running {
+    start_server_with(settings, false).await
+}
+
+/// A server, keeping the files members attach where `files` says so.
+async fn start_server_with(settings: &str, files: bool) -> Running {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let config: wyvrn_community::config::Config = toml::from_str(&format!(
@@ -115,6 +120,9 @@ async fn start_server(settings: &str) -> Running {
     let mut community = Community::new(Store::in_memory().unwrap(), config.community.clone(), Some(wyvrn_service::profile::Kept::scratch().unwrap())).unwrap().with_voice(config.voice.clone());
     let assistant = config.assistant.clone().map(wyvrn_community::assistant::Assistant::new);
     community.assistant = assistant.as_ref().map(wyvrn_community::assistant::Assistant::listing);
+    if files {
+        community.files = Some(wyvrn_community::files::Files::scratch(&Default::default(), &url).unwrap());
+    }
     let state = AppState::new(agent, Default::default(), community, did_document, didcomm_quickstart::default_resolver());
     let state = Arc::new(match assistant {
         Some(assistant) => state.with_assistant(assistant),
@@ -1575,4 +1583,32 @@ async fn polls_forums_media_search_and_the_member_list() {
     assert_eq!(member.community("set-presence", json!({ "status": "away" })).await["body"]["code"], "e.p.msg.invalid-presence");
     let members = owner.community("members-request", json!({})).await;
     assert!(members["body"]["members"].as_array().unwrap().iter().all(|m| m.get("presence").is_none()));
+}
+
+#[tokio::test]
+async fn members_put_the_files_they_attach_at_the_community() {
+    let server = start_server_with("", true).await;
+    let (owner, member, stranger) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member]);
+    let told = member.community("join", json!({})).await;
+    assert_eq!(told["body"]["files"]["max_file_bytes"], 25 * 1024 * 1024, "{told}");
+
+    let bytes = b"a picture, as far as anyone knows".to_vec();
+    let hash = wyvrn_files::hash::of_bytes(&bytes);
+    let ask = json!({ "name": "pic.png", "media_type": "image/png", "byte_count": bytes.len(), "hash": hash });
+    let granted = member.ask("https://wyvrn.app/files/1.0/upload", ask.clone()).await;
+    assert_eq!(kind(&granted), "upload-granted", "{granted}");
+    let http = reqwest::Client::new();
+    let put = http.put(granted["body"]["upload_url"].as_str().unwrap()).header("upload-offset", "0").body(bytes.clone()).send().await.unwrap();
+    assert_eq!(put.status(), 204);
+    let done = member.ask("https://wyvrn.app/files/1.0/complete", json!({ "file": granted["body"]["file"] })).await;
+    assert_eq!(kind(&done), "completed", "{done}");
+    let url = done["body"]["url"].as_str().unwrap();
+    assert!(url.starts_with(&server.url), "{url}");
+    let fetched = http.get(url).send().await.unwrap().bytes().await.unwrap();
+    assert_eq!(fetched.to_vec(), bytes);
+
+    // Someone who isn't in is answered as they are for anything else.
+    let refused = stranger.ask("https://wyvrn.app/files/1.0/upload", ask).await;
+    assert_eq!(refused["type"], PROBLEM, "{refused}");
 }

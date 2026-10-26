@@ -11,6 +11,8 @@ publish.workspace = true
 # The assistant asks Anthropic's Messages API (assistant.rs).
 reqwest = { workspace = true, features = ["json"] }
 wyvrn-service = { workspace = true }
+# Files members attach, kept here (files/1.0's host, at the community's own DID).
+wyvrn-files = { path = "../files" }
 didcomm-agent = { workspace = true }
 didcomm-core = { workspace = true }
 didcomm-crypto-askar = { workspace = true }
@@ -22,7 +24,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
-tower-http = { workspace = true }
+tower-http = { workspace = true, features = ["fs"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
 # Unicode categories, for what a text channel may be called (community.rs).

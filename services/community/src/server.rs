@@ -271,6 +271,17 @@ impl Service for CommunityService {
             }
         }
 
+        // Files a member attaches, kept here: for whoever may attach files somewhere.
+        if crate::files::is_files(&received.message) {
+            if let (Some(files), Some(_)) = (&state.community.files, state.community.store.member(&sender)?) {
+                let powers = state.community.powers(&sender)?;
+                let may = powers.has("attach_files") || state.community.store.channels()?.iter().any(|channel| state.community.channel_permissions(&sender, &powers, channel).is_ok_and(|held| held.contains("attach_files")));
+                if may {
+                    return Ok(files.handle(&sender, &received.message, now()).map(|(kind, body)| received.reply(&kind, body)));
+                }
+            }
+        }
+
         // Voice channels: from a member, or refused as everything is from anyone else.
         if received.message["type"].as_str().is_some_and(|message_type| message_type.starts_with(voice::PIURI)) {
             return answer_voice(state, &sender, &received.message, None);
@@ -619,10 +630,18 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(root).post(|State(state): State<Arc<AppState>>, body: Bytes| receive(Arc::new(CommunityService(state)), body)))
         .route("/voice/auth", post(voice_auth))
+        // Files members attach (files.rs): a chunk is at most what the host takes in one.
+        .route("/u/{id}", axum::routing::put(crate::files::put_chunk).head(crate::files::upload_standing).layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)))
+        .route("/f/{id}", get(crate::files::fetch).head(crate::files::fetch))
         .route("/healthz", get(|| async { "ok" }))
         .merge(address::routes(state.agent.did(), state.did_document.clone()))
-        // A browser app sends its messages from another origin.
-        .layer(CorsLayer::permissive())
+        // A browser app sends its messages, and fetches files, from another origin.
+        .layer(CorsLayer::permissive().expose_headers([
+            axum::http::header::ETAG,
+            axum::http::header::CONTENT_DISPOSITION,
+            axum::http::HeaderName::from_static("upload-offset"),
+            axum::http::HeaderName::from_static("upload-length"),
+        ]))
         .with_state(state)
 }
 

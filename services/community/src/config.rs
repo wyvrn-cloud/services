@@ -22,10 +22,35 @@ pub struct Config {
     /// Voice channels (community-voice/1.0): left out, there are none.
     #[serde(default)]
     pub voice: Option<VoiceConfig>,
+    /// Files members attach to posts, kept here (files/1.0's host): left out, none.
+    #[serde(default)]
+    pub files: Option<FilesConfig>,
     /// An AI assistant answering in every channel (wyvrn-claude; assistant.rs).
     /// The community server itself leaves it out.
     #[serde(default)]
     pub assistant: Option<crate::assistant::AssistantConfig>,
+}
+
+/// Files members attach (community/1.0's "Files, stickers…"): where they are kept,
+/// and how much. Their records are in `dir/files.sqlite`, unless the environment
+/// names a database for them (`COMMUNITY_FILES_DATABASE_URL`; with only
+/// `DATABASE_URL` set they share the community's).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct FilesConfig {
+    pub dir: std::path::PathBuf,
+    /// The largest file a member may attach.
+    pub max_file_bytes: u64,
+    /// The most one member may keep here in all.
+    pub quota_bytes: u64,
+    /// The most kept of everyone's; 0 for no limit but the disk.
+    pub total_bytes: u64,
+}
+
+impl Default for FilesConfig {
+    fn default() -> Self {
+        Self { dir: "files".into(), max_file_bytes: 25 * 1024 * 1024, quota_bytes: 1024 * 1024 * 1024, total_bytes: 0 }
+    }
 }
 
 /// Where voice channels' media is forwarded, and how its tokens are signed.

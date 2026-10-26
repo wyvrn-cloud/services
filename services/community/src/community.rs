@@ -189,6 +189,8 @@ pub struct Community {
     pub assistant: Option<Value>,
     /// The server's own DID, for what it posts itself (AutoMod's alerts).
     pub own: Option<String>,
+    /// Files members attach, where the community keeps them (files.rs).
+    pub files: Option<crate::files::Files>,
     /// How many live connections each member has open now (who may be seen online).
     pub live: std::sync::RwLock<std::collections::HashMap<String, usize>>,
 }
@@ -407,7 +409,7 @@ impl Community {
             Some(kept) => kept.load()?,
             None => Changed::default(),
         };
-        let community = Self { store, config, changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, live: Default::default() };
+        let community = Self { store, config, changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, live: Default::default() };
         community.ensure_roles()?;
         Ok(community)
     }
@@ -474,6 +476,9 @@ impl Community {
             let categories = self.store.categories()?;
             if !categories.is_empty() {
                 body["categories"] = json!(categories.iter().map(|c| json!({ "id": c.id, "name": c.name })).collect::<Vec<_>>());
+            }
+            if let Some(files) = &self.files {
+                body["files"] = json!({ "max_file_bytes": files.max_file_bytes() });
             }
             let (share, status) = self.store.presence(&member.did)?;
             body["presence"] = json!({ "share": share, "status": status });
