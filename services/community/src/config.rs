@@ -80,6 +80,9 @@ pub struct CommunityConfig {
     pub members_may_invite: bool,
     /// As many as may wait to be let in at once.
     pub max_waiting: usize,
+    /// As many posts as one member makes in a minute, in all channels; 0 for no
+    /// limit. Whoever holds `administrator` isn't held to it.
+    pub max_posts_per_minute: usize,
 }
 
 impl Default for CommunityConfig {
@@ -95,6 +98,7 @@ impl Default for CommunityConfig {
             admission: "admin".to_string(),
             members_may_invite: false,
             max_waiting: 500,
+            max_posts_per_minute: 30,
         }
     }
 }

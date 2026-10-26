@@ -158,7 +158,8 @@ fn may(community: &Community, did: &str, channel: &crate::store::Channel, field:
         let powers = community.powers(did)?;
         let permission = if field == "speak" { "speak" } else { "video" };
         let setting = channel.voice.as_ref().and_then(|voice| voice[field].as_str().map(str::to_string));
-        Ok(community.channel_permissions(did, &powers, channel)?.contains(permission) && (setting.as_deref() != Some("admins") || powers.all()))
+        let timed_out = field == "speak" && community.timed_out(did, crate::gates::now())?;
+        Ok(!timed_out && community.channel_permissions(did, &powers, channel)?.contains(permission) && (setting.as_deref() != Some("admins") || powers.all()))
     };
     check().unwrap_or(false)
 }

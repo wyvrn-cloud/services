@@ -16,13 +16,15 @@ use crate::store::{Channel, Flow, Member, RoleDef};
 pub const ROLES: &str = "roles";
 pub const MEMBER_ROLES: &str = "member-roles";
 pub const CHANNEL_PERMISSIONS_FLOW: &str = "channel-permissions";
+pub const AUTOMOD_FLOW: &str = "automod";
+pub const JOIN_GATES_FLOW: &str = "join-gates";
 pub const VERSION: &str = "1.0";
 const P: &str = "https://didcomm.org/workflow/1.0/";
 const MAX_ROLES: usize = 100;
 const MAX_ROLE_NAME: usize = 32;
 
 /// Each template: its id, title, states and the events that move between them.
-fn templates() -> [(&'static str, &'static str, Value); 3] {
+fn templates() -> [(&'static str, &'static str, Value); 5] {
     [
         (
             ROLES,
@@ -55,6 +57,26 @@ fn templates() -> [(&'static str, &'static str, Value); 3] {
                     "edit": { "from": "roles", "to": "role" }, "done": { "from": "roles", "to": "done" },
                     "save": { "from": "role", "to": "roles" }, "back": { "from": "role", "to": "roles" }
                 }
+            }),
+        ),
+        (
+            AUTOMOD_FLOW,
+            "AutoMod",
+            json!({
+                "states": [{ "name": "list", "type": "start" }, { "name": "edit", "type": "normal" }, { "name": "done", "type": "final" }],
+                "transitions": {
+                    "edit": { "from": "list", "to": "edit" }, "create": { "from": "list", "to": "edit" },
+                    "toggle": { "from": "list", "to": "list" }, "done": { "from": "list", "to": "done" },
+                    "save": { "from": "edit", "to": "list" }, "delete": { "from": "edit", "to": "list" }, "back": { "from": "edit", "to": "list" }
+                }
+            }),
+        ),
+        (
+            JOIN_GATES_FLOW,
+            "Join gates",
+            json!({
+                "states": [{ "name": "form", "type": "start" }, { "name": "done", "type": "final" }],
+                "transitions": { "save": { "from": "form", "to": "done" } }
             }),
         ),
     ]
@@ -127,6 +149,8 @@ impl Community {
             .into_iter()
             .filter(|(id, _, _)| match *id {
                 ROLES | MEMBER_ROLES => powers.has("manage_roles"),
+                AUTOMOD_FLOW => powers.has("manage_automod"),
+                JOIN_GATES_FLOW => powers.has("manage_community"),
                 _ => powers.has("manage_channels") || opened_one,
             })
             .map(|(id, title, _)| (id, title))
@@ -344,6 +368,9 @@ impl Community {
                 }
                 (MEMBER_ROLES, _) => (self.member_roles_ui(flow, &powers)?, vec!["save"]),
                 (CHANNEL_PERMISSIONS_FLOW, "roles") => (self.channel_roles_ui(flow, &powers)?, vec!["read_only", "unlock", "edit", "done"]),
+                (AUTOMOD_FLOW, "list") => (self.automod_list_ui(flow).map_err(failed)?, vec!["edit", "create", "toggle", "done"]),
+                (AUTOMOD_FLOW, "edit") => (self.automod_edit_ui(flow).map_err(failed)?, vec!["save", "delete", "back"]),
+                (JOIN_GATES_FLOW, _) => (self.join_gates_ui().map_err(failed)?, vec!["save"]),
                 (CHANNEL_PERMISSIONS_FLOW, "role") => {
                     let channel = self.flow_channel(flow)?;
                     let held = self.channel_permissions(&flow.owner, &powers, &channel).map_err(failed)?;
@@ -406,6 +433,18 @@ impl Community {
                 }
                 json!({ "channel": id })
             }
+            AUTOMOD_FLOW => {
+                if !powers.has("manage_automod") {
+                    return Err(not_allowed("AutoMod takes Set AutoMod's rules."));
+                }
+                json!({})
+            }
+            JOIN_GATES_FLOW => {
+                if !powers.has("manage_community") {
+                    return Err(not_allowed("The join gates take Manage the community."));
+                }
+                json!({})
+            }
             _ => return Err(Refusal::new("template_not_found", "This server has no such workflow.")),
         };
         let wanted = body["instance_id"].as_str().or(message["thid"].as_str()).or(message["id"].as_str()).unwrap_or_default();
@@ -421,8 +460,9 @@ impl Community {
             return Err(Refusal::new("multiplicity_violation", "That instance id has been used."));
         }
         let state = match template {
-            ROLES => "list",
+            ROLES | AUTOMOD_FLOW => "list",
             MEMBER_ROLES => "pick",
+            JOIN_GATES_FLOW => "form",
             _ => "roles",
         };
         let flow = Flow { id: wanted.into(), owner: member.did.clone(), template: template.into(), context, state: state.into(), data: json!({}), status: "active".into(), updated: now };
@@ -460,6 +500,8 @@ impl Community {
         // Someone who no longer may is shown so, not let go on.
         let still = match flow.template.as_str() {
             CHANNEL_PERMISSIONS_FLOW => self.may_manage_channel(&flow.owner, &powers, &self.flow_channel(&flow)?),
+            AUTOMOD_FLOW => powers.has("manage_automod"),
+            JOIN_GATES_FLOW => powers.has("manage_community"),
             _ => powers.has("manage_roles"),
         };
         if !still {
@@ -493,6 +535,7 @@ impl Community {
                 let mut order: Vec<String> = roles.iter().rev().filter(|role| role.id != EVERYONE_ROLE).map(|role| role.id.clone()).collect();
                 order.insert(0, id.clone());
                 self.store.rank_roles(&order).map_err(failed)?;
+                self.audit(now, &flow.owner, "role.create", Some(&id), Some(json!({ "name": line(&input["name"], MAX_ROLE_NAME) })));
                 flow.data["role"] = json!(id);
                 flow.state = "edit".into();
                 true
@@ -513,6 +556,7 @@ impl Community {
                 }
                 order.swap(at, other);
                 self.store.rank_roles(&order.iter().map(|r| r.id.clone()).collect::<Vec<_>>()).map_err(failed)?;
+                self.audit(now, &flow.owner, "role.rank", Some(&role.id), Some(json!({ "moved": event })));
                 true
             }
             (ROLES, "list", "hand_over") => {
@@ -531,9 +575,11 @@ impl Community {
                     return Err(refused("You own it already."));
                 }
                 self.store.set_setting("owner", &heir.did).map_err(failed)?;
+                self.audit(now, &flow.owner, "owner.transfer", Some(&heir.did), None);
                 flow.data["note"] = json!(format!("{} owns the community now.", heir.name.clone().unwrap_or_else(|| heir.did.clone())));
                 true
             }
+            (AUTOMOD_FLOW, _, _) | (JOIN_GATES_FLOW, _, _) => self.advance_moderation_flow(&mut flow, event, input, now)?,
             (ROLES, "list", "done") | (CHANNEL_PERMISSIONS_FLOW, "roles", "done") => {
                 flow.status = "completed".into();
                 false
@@ -566,6 +612,7 @@ impl Community {
                     }
                 }
                 self.store.save_role(&role).map_err(failed)?;
+                self.audit(now, &flow.owner, "role.update", Some(&role.id), Some(json!({ "name": role.name, "permissions": role.permissions, "color": role.color, "mentionable": role.mentionable })));
                 flow.data["note"] = json!(format!("Saved {}.", role.name));
                 flow.state = "list".into();
                 true
@@ -576,6 +623,7 @@ impl Community {
                     return Err(refused("Every member's role can't be deleted."));
                 }
                 self.store.delete_role(&role.id).map_err(failed)?;
+                self.audit(now, &flow.owner, "role.delete", Some(&role.id), Some(json!({ "name": role.name })));
                 flow.data["note"] = json!(format!("Deleted {}.", role.name));
                 flow.state = "list".into();
                 true
@@ -590,13 +638,23 @@ impl Community {
                     return Err(not_allowed("You can only give roles to someone ranked below you."));
                 }
                 let held = self.store.member_roles(&member.did).map_err(failed)?;
+                let (mut given, mut taken) = (Vec::new(), Vec::new());
                 for role in self.store.roles().map_err(failed)?.iter().filter(|role| role.id != EVERYONE_ROLE && powers.above(role.position)) {
                     let wanted = ticked(&input[format!("role-{}", role.id)]);
                     match (wanted, held.contains(&role.id)) {
-                        (true, false) => self.store.give_role(&member.did, &role.id).map_err(failed)?,
-                        (false, true) => self.store.take_role(&member.did, &role.id).map_err(failed)?,
+                        (true, false) => {
+                            self.store.give_role(&member.did, &role.id).map_err(failed)?;
+                            given.push(role.id.clone());
+                        }
+                        (false, true) => {
+                            self.store.take_role(&member.did, &role.id).map_err(failed)?;
+                            taken.push(role.id.clone());
+                        }
                         _ => {}
                     }
+                }
+                if !given.is_empty() || !taken.is_empty() {
+                    self.audit(now, &flow.owner, "member.roles", Some(&member.did), Some(json!({ "given": given, "taken": taken })));
                 }
                 flow.status = "completed".into();
                 true
@@ -611,6 +669,7 @@ impl Community {
                     deny.push("post".into());
                 }
                 self.store.set_override(&channel.id, EVERYONE_ROLE, &allow, &deny).map_err(failed)?;
+                self.audit(now, &flow.owner, "channel.permissions", Some(&channel.id), Some(json!({ "role": EVERYONE_ROLE, "read_only": event == "read_only" })));
                 true
             }
             (CHANNEL_PERMISSIONS_FLOW, "roles", "edit") => {
@@ -644,6 +703,7 @@ impl Community {
                     }
                 }
                 self.store.set_override(&channel.id, &role_id, &allow, &deny).map_err(failed)?;
+                self.audit(now, &flow.owner, "channel.permissions", Some(&channel.id), Some(json!({ "role": role_id, "allow": allow, "deny": deny })));
                 flow.state = "roles".into();
                 true
             }
@@ -665,5 +725,212 @@ impl Community {
             return Err(not_allowed("You can only change roles ranked below your own."));
         }
         Ok(role)
+    }
+
+    // --- AutoMod's rules, and the join gates ------------------------------------------
+
+    fn automod_list_ui(&self, flow: &Flow) -> anyhow::Result<Value> {
+        let mut items = vec![json!({ "type": "title", "text": "AutoMod" })];
+        items.push(json!({ "type": "text", "text": "Rules that check each post before it is placed. The first rule a post triggers decides. Whoever manages posts in a channel isn't checked there." }));
+        if let Some(note) = flow.data["note"].as_str() {
+            items.push(json!({ "type": "pass", "text": note }));
+        }
+        let rules = self.store.automod_rules()?;
+        if rules.is_empty() {
+            items.push(json!({ "type": "text", "text": "No rules yet." }));
+        }
+        for rule in &rules {
+            let on = rule["enabled"] == true;
+            let id = rule["id"].as_str().unwrap_or_default();
+            items.push(json!({ "type": "row", "children": [
+                { "type": "text", "text": format!("{} ({})", rule["name"].as_str().unwrap_or("A rule"), if on { "on" } else { "off" }) },
+                button("Edit", "edit", json!({ "rule": id })),
+                button(if on { "Turn off" } else { "Turn on" }, "toggle", json!({ "rule": id }))
+            ] }));
+        }
+        items.push(json!({ "type": "divider" }));
+        items.push(json!({ "type": "form", "children": [
+            { "type": "text-input", "form-id": "name", "label": "New rule", "placeholder": "Spam links", "required": true },
+            button("Add rule", "create", json!({}))
+        ] }));
+        items.push(button("Done", "done", json!({})));
+        Ok(Value::Array(items))
+    }
+
+    fn automod_rule(&self, id: &str) -> Result<Value, Refusal> {
+        self.store.automod_rules().map_err(failed)?.into_iter().find(|rule| rule["id"] == id).ok_or_else(|| refused("There is no such rule."))
+    }
+
+    fn automod_edit_ui(&self, flow: &Flow) -> anyhow::Result<Value> {
+        let rule = self.automod_rule(flow.data["rule"].as_str().unwrap_or_default()).map_err(|refusal| anyhow::anyhow!(refusal.comment))?;
+        let lines = |field: &str| rule[field].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>();
+        let alert = rule["alert_channel"].as_str().and_then(|id| self.store.channel(id).ok().flatten()).map(|c| c.name).unwrap_or_default();
+        let mut fields = vec![
+            json!({ "type": "text-input", "form-id": "name", "label": "Name", "value": rule["name"], "required": true }),
+            json!({ "type": "check-box", "form-id": "enabled", "label": "On", "value": rule["enabled"] == true }),
+            json!({ "type": "title", "text": "What triggers it" }),
+            json!({ "type": "text-area", "form-id": "words", "label": "Words, one a line (* stands for any letters)", "value": lines("words").join("\n") }),
+            json!({ "type": "text-area", "form-id": "patterns", "label": "Patterns, one a line (regular expressions)", "value": lines("patterns").join("\n") }),
+            json!({ "type": "check-box", "form-id": "links", "label": "Links", "value": rule["links"] == true }),
+            json!({ "type": "text-input", "form-id": "allowed_domains", "label": "Links allowed to (domains, separated by commas)", "value": lines("allowed_domains").join(", ") }),
+            json!({ "type": "text-input", "form-id": "max_mentions", "label": "Most mentions in one post (empty: no limit)", "value": rule["max_mentions"].as_u64().map(|n| n.to_string()).unwrap_or_default() }),
+            json!({ "type": "title", "text": "What it does" }),
+            json!({ "type": "check-box", "form-id": "block", "label": "Refuse the post", "value": rule["block"] == true }),
+            json!({ "type": "check-box", "form-id": "hold", "label": "Hold it for a moderator", "value": rule["hold"] == true }),
+            json!({ "type": "text-input", "form-id": "alert_channel", "label": "Tell a channel of it (the channel's name)", "placeholder": "mod-log", "value": alert }),
+            json!({ "type": "text-input", "form-id": "timeout_minutes", "label": "Time its author out for (minutes; empty: no)", "value": rule["timeout_seconds"].as_i64().map(|s| (s / 60).to_string()).unwrap_or_default() }),
+            json!({ "type": "title", "text": "Who and where it doesn't check" }),
+        ];
+        let exempt_roles = lines("exempt_roles");
+        for role in self.store.roles()?.iter().filter(|role| role.id != EVERYONE_ROLE) {
+            fields.push(json!({ "type": "check-box", "form-id": format!("exempt-role-{}", role.id), "label": format!("Role: {}", role.name), "value": exempt_roles.contains(&role.id.as_str()) }));
+        }
+        let exempt_channels = lines("exempt_channels");
+        for channel in self.store.channels()?.iter().filter(|c| c.voice.is_none() && !c.closed) {
+            fields.push(json!({ "type": "check-box", "form-id": format!("exempt-channel-{}", channel.id), "label": format!("#{}", channel.name), "value": exempt_channels.contains(&channel.id.as_str()) }));
+        }
+        fields.push(button("Save", "save", json!({})));
+        Ok(json!([
+            { "type": "title", "text": format!("Rule: {}", rule["name"].as_str().unwrap_or("A rule")) },
+            { "type": "form", "children": fields },
+            button("Delete rule", "delete", json!({})),
+            button("Back", "back", json!({}))
+        ]))
+    }
+
+    fn join_gates_ui(&self) -> anyhow::Result<Value> {
+        let gates = self.gates()?;
+        let questions = gates["questions"].as_array().cloned().unwrap_or_default();
+        let mut fields = vec![json!({ "type": "text-input", "form-id": "post_wait", "label": "Minutes a new member waits before posting (empty: none). Anyone with a role doesn't wait.", "value": gates["post_wait"].as_i64().map(|m| m.to_string()).unwrap_or_default() })];
+        fields.push(json!({ "type": "title", "text": "Questions on joining" }));
+        fields.push(json!({ "type": "text", "text": "Asked of whoever asks to join; their answers are shown beside them on the waiting list." }));
+        for n in 0..crate::gates::MAX_QUESTIONS {
+            let question = questions.get(n);
+            let options = question.and_then(|q| q["options"].as_array()).map(|o| o.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" | ")).unwrap_or_default();
+            fields.push(json!({ "type": "text-input", "form-id": format!("q{n}"), "label": format!("Question {}", n + 1), "value": question.map(|q| q["text"].clone()).unwrap_or(json!("")) }));
+            fields.push(json!({ "type": "text-input", "form-id": format!("q{n}-options"), "label": "Answers to choose from, separated by | (empty: they write one)", "value": options }));
+            fields.push(json!({ "type": "check-box", "form-id": format!("q{n}-required"), "label": "Needs an answer", "value": question.is_some_and(|q| q["required"] == true) }));
+        }
+        fields.push(json!({ "type": "text", "text": "A credential to show on joining: not available on this server yet." }));
+        fields.push(button("Save", "save", json!({})));
+        Ok(json!([{ "type": "title", "text": "Join gates" }, { "type": "form", "children": fields }]))
+    }
+
+    /// An event of the `automod` or `join-gates` workflow; whether `community`
+    /// changed for anyone (the join gates' wait).
+    fn advance_moderation_flow(&self, flow: &mut Flow, event: &str, input: &Value, now: i64) -> Result<bool, Refusal> {
+        let words = |field: &str, split: &[char]| -> Vec<String> {
+            input[field].as_str().unwrap_or_default().split(split).map(str::trim).filter(|w| !w.is_empty()).map(str::to_string).collect()
+        };
+        match (flow.template.as_str(), flow.state.as_str(), event) {
+            (AUTOMOD_FLOW, "list", "create") => {
+                let name = line(&input["name"], 60).ok_or_else(|| refused("A rule needs a name."))?;
+                let rules = self.store.automod_rules().map_err(failed)?;
+                if rules.len() >= 50 {
+                    return Err(refused("That is as many rules as AutoMod holds."));
+                }
+                let id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+                let rule = json!({ "id": id, "name": name, "enabled": false, "words": [], "patterns": [], "links": false, "allowed_domains": [], "block": true, "hold": false, "exempt_roles": [], "exempt_channels": [] });
+                self.store.save_automod_rule(&id, rules.len() as i64, &rule).map_err(failed)?;
+                flow.data["rule"] = json!(id);
+                flow.state = "edit".into();
+                Ok(false)
+            }
+            (AUTOMOD_FLOW, "list", "edit") => {
+                let rule = self.automod_rule(input["rule"].as_str().unwrap_or_default())?;
+                flow.data["rule"] = rule["id"].clone();
+                flow.state = "edit".into();
+                Ok(false)
+            }
+            (AUTOMOD_FLOW, "list", "toggle") => {
+                let mut rule = self.automod_rule(input["rule"].as_str().unwrap_or_default())?;
+                let on = rule["enabled"] != true;
+                rule["enabled"] = json!(on);
+                let position = self.store.automod_rules().map_err(failed)?.iter().position(|r| r["id"] == rule["id"]).unwrap_or(0) as i64;
+                self.store.save_automod_rule(rule["id"].as_str().unwrap_or_default(), position, &rule).map_err(failed)?;
+                self.audit(now, &flow.owner, "community.automod", None, Some(json!({ "rule": rule["name"], "enabled": on })));
+                Ok(false)
+            }
+            (AUTOMOD_FLOW, "list", "done") => {
+                flow.status = "completed".into();
+                Ok(false)
+            }
+            (AUTOMOD_FLOW, "edit", "save") => {
+                let held = self.automod_rule(flow.data["rule"].as_str().unwrap_or_default())?;
+                let id = held["id"].as_str().unwrap_or_default().to_string();
+                let name = line(&input["name"], 60).ok_or_else(|| refused("A rule needs a name."))?;
+                let patterns = words("patterns", &['\n']);
+                for pattern in &patterns {
+                    crate::automod::compile(pattern).map_err(|why| refused(&format!("“{pattern}” isn't a pattern this can use: {why}")))?;
+                }
+                let alert = match line(&input["alert_channel"], 40).map(|name| name.trim_start_matches('#').to_string()) {
+                    Some(name) => Some(self.store.channel_named(&name).map_err(failed)?.filter(|c| c.voice.is_none()).ok_or_else(|| refused("There is no text channel by that name."))?.id),
+                    None => None,
+                };
+                let timeout = match input["timeout_minutes"].as_str().map(str::trim).filter(|t| !t.is_empty()) {
+                    Some(text) => Some(text.parse::<i64>().ok().filter(|m| (1..=40_320).contains(m)).ok_or_else(|| refused("A timeout is from 1 minute to 28 days (40,320 minutes)."))? * 60),
+                    None => None,
+                };
+                let mentions = match input["max_mentions"].as_str().map(str::trim).filter(|t| !t.is_empty()) {
+                    Some(text) => Some(text.parse::<u64>().ok().filter(|n| (1..=50).contains(n)).ok_or_else(|| refused("The most mentions is a number from 1 to 50."))?),
+                    None => None,
+                };
+                let roles: Vec<String> = self.store.roles().map_err(failed)?.into_iter().filter(|role| ticked(&input[format!("exempt-role-{}", role.id)])).map(|role| role.id).collect();
+                let channels: Vec<String> = self.store.channels().map_err(failed)?.into_iter().filter(|c| ticked(&input[format!("exempt-channel-{}", c.id)])).map(|c| c.id).collect();
+                let rule = json!({
+                    "id": id, "name": name, "enabled": ticked(&input["enabled"]),
+                    "words": words("words", &['\n', ',']), "patterns": patterns,
+                    "links": ticked(&input["links"]), "allowed_domains": words("allowed_domains", &[',', ' ']),
+                    "max_mentions": mentions, "block": ticked(&input["block"]), "hold": ticked(&input["hold"]),
+                    "alert_channel": alert, "timeout_seconds": timeout, "exempt_roles": roles, "exempt_channels": channels,
+                });
+                let position = self.store.automod_rules().map_err(failed)?.iter().position(|r| r["id"] == id.as_str()).unwrap_or(0) as i64;
+                self.store.save_automod_rule(&id, position, &rule).map_err(failed)?;
+                self.audit(now, &flow.owner, "community.automod", None, Some(rule.clone()));
+                flow.data["note"] = json!(format!("Saved {name}."));
+                flow.state = "list".into();
+                Ok(false)
+            }
+            (AUTOMOD_FLOW, "edit", "delete") => {
+                let rule = self.automod_rule(flow.data["rule"].as_str().unwrap_or_default())?;
+                self.store.delete_automod_rule(rule["id"].as_str().unwrap_or_default()).map_err(failed)?;
+                self.audit(now, &flow.owner, "community.automod", None, Some(json!({ "deleted": rule["name"] })));
+                flow.data["note"] = json!(format!("Deleted {}.", rule["name"].as_str().unwrap_or("the rule")));
+                flow.state = "list".into();
+                Ok(false)
+            }
+            (AUTOMOD_FLOW, "edit", "back") => {
+                flow.state = "list".into();
+                Ok(false)
+            }
+            (JOIN_GATES_FLOW, "form", "save") => {
+                let post_wait = match input["post_wait"].as_str().map(str::trim).filter(|t| !t.is_empty()) {
+                    Some(text) => Some(text.parse::<i64>().ok().filter(|m| (0..=10_080).contains(m)).ok_or_else(|| refused("The wait is from 0 minutes to a week (10,080)."))?),
+                    None => None,
+                };
+                let mut questions = Vec::new();
+                for n in 0..crate::gates::MAX_QUESTIONS {
+                    let Some(text) = line(&input[format!("q{n}")], 200) else { continue };
+                    let options = words(&format!("q{n}-options"), &['|']);
+                    if options.len() > 10 {
+                        return Err(refused("A question offers at most ten answers."));
+                    }
+                    let mut question = json!({ "id": format!("q{}", n + 1), "text": text, "required": ticked(&input[format!("q{n}-required")]) });
+                    if !options.is_empty() {
+                        question["options"] = json!(options);
+                    }
+                    questions.push(question);
+                }
+                let mut gates = json!({ "questions": questions });
+                if let Some(wait) = post_wait.filter(|w| *w > 0) {
+                    gates["post_wait"] = json!(wait);
+                }
+                self.store.set_setting("gates", &gates.to_string()).map_err(failed)?;
+                self.audit(now, &flow.owner, "community.gates", None, Some(gates));
+                flow.status = "completed".into();
+                Ok(true)
+            }
+            _ => Err(refused("That can't be done here.")),
+        }
     }
 }

@@ -12,8 +12,11 @@
 
 pub mod admin_flows;
 pub mod assistant;
+pub mod automod;
 pub mod community;
 pub mod config;
+pub mod gates;
+pub mod moderation;
 pub mod questions;
 pub mod roles;
 pub mod serve;

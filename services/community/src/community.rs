@@ -187,6 +187,8 @@ pub struct Community {
     /// An AI assistant answering in its channels, as `community` says of it
     /// (community/1.0's `assistant`; assistant.rs).
     pub assistant: Option<Value>,
+    /// The server's own DID, for what it posts itself (AutoMod's alerts).
+    pub own: Option<String>,
 }
 
 /// What handling a message came to.
@@ -210,7 +212,7 @@ pub struct Outcome {
 }
 
 impl Outcome {
-    fn reply(reply: Value) -> Self {
+    pub(crate) fn reply(reply: Value) -> Self {
         Self { reply: Some(reply), ..Self::default() }
     }
 }
@@ -219,7 +221,7 @@ fn thread_of(message: &Value) -> Option<&str> {
     message["thid"].as_str().or(message["id"].as_str())
 }
 
-fn reply_to(message: &Value, message_type: &str, body: Value) -> Value {
+pub(crate) fn reply_to(message: &Value, message_type: &str, body: Value) -> Value {
     let mut reply = json!({ "type": message_type, "body": body });
     if let Some(thid) = thread_of(message) {
         reply["thid"] = json!(thid);
@@ -257,7 +259,7 @@ pub fn is_emoji(text: &str) -> bool {
         && text.chars().any(|c| c as u32 >= 0xA9)
 }
 
-fn refuse(message: &Value, code: &str, comment: &str) -> anyhow::Result<Outcome> {
+pub(crate) fn refuse(message: &Value, code: &str, comment: &str) -> anyhow::Result<Outcome> {
     Ok(Outcome::reply(problem(message, code, comment)))
 }
 
@@ -357,6 +359,9 @@ impl Community {
             body["kind"] = json!("voice");
             body["voice"] = voice.clone();
         }
+        if channel.slow_mode > 0 {
+            body["slow_mode"] = json!(channel.slow_mode);
+        }
         body
     }
 
@@ -386,7 +391,7 @@ impl Community {
             Some(kept) => kept.load()?,
             None => Changed::default(),
         };
-        let community = Self { store, config, changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None };
+        let community = Self { store, config, changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None };
         community.ensure_roles()?;
         Ok(community)
     }
@@ -443,6 +448,12 @@ impl Community {
             }
             if powers.has("admit_members") {
                 body["waiting"] = json!(self.store.waiting_count()?);
+            }
+            if let Some(until) = self.store.timed_out_until(&member.did, crate::gates::now())? {
+                body["timed_out_until"] = json!(until);
+            }
+            if let Some(wait) = self.post_wait()? {
+                body["gates"] = json!({ "post_wait": wait });
             }
             Ok(body)
         })
@@ -508,7 +519,7 @@ impl Community {
         Ok(Some(Outcome::reply(reply_to(message, RULES, json!({ "name": name, "rules": rules.text, "rules_version": rules.version })))))
     }
 
-    fn report_body(&self, report: &Report) -> anyhow::Result<Value> {
+    pub(crate) fn report_body(&self, report: &Report) -> anyhow::Result<Value> {
         let mut body = json!({ "id": report.id, "reported_at": report.reported_at, "by": self.who(&report.by)?, "reason": report.reason });
         if let Some(note) = &report.note {
             body["note"] = json!(note);
@@ -534,7 +545,7 @@ impl Community {
         Ok(body)
     }
 
-    fn reports_body(&self, resolved_too: bool) -> anyhow::Result<Value> {
+    pub(crate) fn reports_body(&self, resolved_too: bool) -> anyhow::Result<Value> {
         let reports = self.store.reports(resolved_too)?.iter().map(|report| self.report_body(report)).collect::<anyhow::Result<Vec<_>>>()?;
         Ok(json!({ "reports": reports }))
     }
@@ -705,7 +716,7 @@ impl Community {
     }
 
     /// `{ did, name? }` for a member, as the server knows them.
-    fn who(&self, did: &str) -> anyhow::Result<Value> {
+    pub(crate) fn who(&self, did: &str) -> anyhow::Result<Value> {
         let mut who = json!({ "did": did });
         if let Some(name) = self.store.member(did)?.and_then(|member| member.name) {
             who["name"] = json!(name);
@@ -723,6 +734,10 @@ impl Community {
     /// A `join` from someone who isn't a member: let in, by `admission` and the
     /// invite they bring, or put on the waiting list.
     fn join_from_outside(&self, sender: &str, message: &Value, now: i64) -> anyhow::Result<Outcome> {
+        // Someone banned is answered as anyone is who isn't let in.
+        if self.store.banned(sender, now)?.is_some() {
+            return refuse(message, "e.p.trust.not-authorized", "This community is by invitation: you are not on its list.");
+        }
         let code = message["body"]["invite"].as_str().filter(|code| !code.is_empty() && code.len() <= 255);
         let invite = match code {
             Some(code) => self.store.invite(code)?.filter(|invite| invite.valid(now)),
@@ -783,6 +798,9 @@ impl Community {
     /// One who is waiting, as `waiting` in `members` and `asked-to-join` say them.
     fn waiting_entry(&self, waiting: &Waiting) -> anyhow::Result<Value> {
         let mut listed = json!({ "did": waiting.did, "asked_at": waiting.asked_at });
+        if let Some(answers) = self.store.join_answers(&waiting.did)?.filter(|answers| answers.as_array().is_some_and(|a| !a.is_empty())) {
+            listed["answers"] = answers;
+        }
         if let Some(name) = &waiting.name {
             listed["name"] = json!(name);
         }
@@ -798,7 +816,7 @@ impl Community {
 
     /// `community` for every joined member holding `admit_members`, the waiting
     /// list having changed: its `waiting` says how many wait now.
-    fn admins_told(&self) -> anyhow::Result<Vec<(String, Value)>> {
+    pub(crate) fn admins_told(&self) -> anyhow::Result<Vec<(String, Value)>> {
         self.joined_holding("admit_members")?
             .iter()
             .map(|admin| Ok((admin.did.clone(), json!({ "type": COMMUNITY, "body": self.community(admin)? }))))
@@ -806,8 +824,16 @@ impl Community {
     }
 
     /// `members`, as `asker` is told: with who is waiting for an admin.
-    fn members_for(&self, asker: &Member) -> anyhow::Result<Value> {
+    pub(crate) fn members_for(&self, asker: &Member) -> anyhow::Result<Value> {
         let mut body = self.members_body()?;
+        if self.powers(&asker.did)?.has("timeout_members") {
+            let now = crate::gates::now();
+            for listed in body["members"].as_array_mut().into_iter().flatten() {
+                if let Some(until) = self.store.timed_out_until(listed["did"].as_str().unwrap_or_default(), now)? {
+                    listed["timed_out_until"] = json!(until);
+                }
+            }
+        }
         if self.powers(&asker.did)?.has("admit_members") {
             body["waiting"] = json!(self.waiting_body()?);
         }
@@ -875,6 +901,103 @@ impl Community {
         Ok(())
     }
 
+    /// A `post` from `member`: checked, placed and answered. `checked` is false
+    /// only for a post AutoMod held that a moderator let through, which isn't
+    /// held to slow mode, timeouts or AutoMod again.
+    pub(crate) fn post(&self, member: &Member, message: &Value, now: i64, checked: bool) -> anyhow::Result<Outcome> {
+        let sender = member.did.as_str();
+        let body = &message["body"];
+        let Some(channel) = self.store.channel(body["channel"].as_str().unwrap_or_default())? else {
+            return refuse(message, "e.p.msg.unknown-channel", "There is no such channel.");
+        };
+        if channel.closed {
+            return refuse(message, "e.p.msg.closed", "That channel is closed.");
+        }
+        if channel.voice.is_some() {
+            return refuse(message, "e.p.msg.voice-channel", "A voice channel takes no posts.");
+        }
+        if !self.may_in(sender, &channel, "post")? {
+            return refuse(message, "e.p.trust.not-authorized", "You can't post in this channel.");
+        }
+        // A post sent again after a lost answer isn't held to slow mode.
+        let again = body["id"].as_str().map(|id| self.store.post_by_id(id)).transpose()?.flatten().is_some_and(|post| post.author_did == sender);
+        if !again && checked {
+            if let Some(refused) = self.posting_refused(member, &channel, now)? {
+                return refused.answer(message);
+            }
+        }
+        let content = body["content"].as_str().unwrap_or_default().trim();
+        let question = match body.get("question").filter(|question| !question.is_null()) {
+            Some(question) => match clean_question(question) {
+                Ok(question) => Some(question),
+                Err(why) => return refuse(message, "e.p.msg.invalid-question", why),
+            },
+            None => None,
+        };
+        if content.is_empty() {
+            return refuse(message, "e.p.msg.empty", "A post needs something in it.");
+        }
+        if content.chars().count() > self.config.max_post_length {
+            return refuse(message, "e.p.msg.too-long", "That is longer than a post can be here.");
+        }
+        // Sent twice (a retry), it is the same post: answered as it was.
+        let id = body["id"].as_str().filter(|id| !id.is_empty() && id.len() <= 64).map(str::to_string).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        if let Some(existing) = self.store.post_by_id(&id)? {
+            if existing.author_did != sender {
+                return refuse(message, "e.p.msg.id-taken", "That id has been used.");
+            }
+            return Ok(Outcome::reply(reply_to(message, POSTED, json!({ "channel": existing.channel, "seq": existing.seq, "id": existing.id }))));
+        }
+        // What it answers, and the thread it is in: both posts of this channel.
+        let answered = match body.get("reply_to").filter(|reference| !reference.is_null()) {
+            Some(reference) => match self.referred(reference)?.filter(|post| post.channel == channel.id) {
+                Some(post) => Some(post),
+                None => return refuse(message, "e.p.msg.unknown-post", "The post that answers isn't in this channel."),
+            },
+            None => None,
+        };
+        // The quotation is the answerer's: what the post said as they answered it.
+        let snippet = line(&body["reply_to"]["snippet"], MAX_SNIPPET);
+        let thread = match body["thread"].as_str().filter(|id| !id.is_empty()) {
+            Some(thread) => match self.store.thread(thread)?.filter(|thread| thread.channel == channel.id) {
+                Some(thread) => Some(thread.id),
+                None => return refuse(message, "e.p.msg.unknown-thread", "There is no such thread in this channel."),
+            },
+            // An answer to a post in a thread is in that thread.
+            None => answered.as_ref().and_then(|post| post.thread.clone()),
+        };
+        let mentions = self.mentions_of(body, member, &channel)?;
+        let noted = if checked {
+            match self.automod(member, &channel, message, mentions.len(), now)? {
+                crate::automod::Verdict::Placed => None,
+                crate::automod::Verdict::PlacedNoted(noted) => Some(noted),
+                crate::automod::Verdict::Stopped(stopped) => return Ok(stopped),
+            }
+        } else {
+            None
+        };
+        let post = self.store.add_post(&channel.id, &id, content, member, question.as_ref(), None, now)?;
+        let reply = answered.as_ref().map(|post| (post.id.as_str(), post.author_did.as_str(), snippet.as_deref()));
+        self.store.set_written_with(&post.id, reply, thread.as_deref(), &mentions)?;
+        let mut outcome = Outcome {
+            reply: Some(reply_to(message, POSTED, json!({ "channel": post.channel, "seq": post.seq, "id": post.id }))),
+            posted: true,
+            posted_id: Some(post.id.clone()),
+            ..Outcome::default()
+        };
+        // The post a thread grew from says how many are in it now.
+        if let Some(thread) = thread {
+            self.store.touch_thread(&thread)?;
+            outcome.changed.push(thread);
+        }
+        // What AutoMod noted as it let the post through: an alert posted, say.
+        if let Some(noted) = noted {
+            outcome.posted |= noted.posted;
+            outcome.notices.extend(noted.notices);
+        }
+        Ok(outcome)
+    }
+
     /// A verified `from_prior`: whoever was `prior` is `new` now. Returns what to
     /// tell them, if they were a member -- which also shows their app the news
     /// arrived, so it can stop repeating it.
@@ -916,7 +1039,14 @@ impl Community {
             return match message_type {
                 JOIN => match self.rules_before_join(sender, message)? {
                     Some(rules) => Ok(rules),
-                    None => self.join_from_outside(sender, message, now),
+                    None => match self.store.banned(sender, now)?.is_some() {
+                        // (Not asked anything: refused as anyone is who isn't let in.)
+                        true => self.join_from_outside(sender, message, now),
+                        false => match self.questions_before_join(sender, message, now)? {
+                            Some(asked) => Ok(asked),
+                            None => self.join_from_outside(sender, message, now),
+                        },
+                    },
                 },
                 LEAVE if self.store.remove_waiting(sender)? => Ok(Outcome { notices: self.admins_told()?, ..Outcome::default() }),
                 PROFILE if self.store.waiting_one(sender)?.is_some() => {
@@ -929,6 +1059,13 @@ impl Community {
                 _ => refuse(message, "e.p.trust.not-authorized", "This community is by invitation: you are not on its list."),
             };
         };
+
+        if let Some(outcome) = self.handle_moderation(&member, message_type, message, now)? {
+            return Ok(outcome);
+        }
+        if let Some(outcome) = self.handle_held(&member, message_type, message, now)? {
+            return Ok(outcome);
+        }
 
         match message_type {
             JOIN | LEAVE => {
@@ -980,6 +1117,7 @@ impl Community {
                 }
                 let id = uuid::Uuid::new_v4().to_string();
                 self.store.add_channel(&id, &name, &line(&body["topic"], MAX_TOPIC).unwrap_or_default(), sender, now)?;
+                self.audit(now, sender, "channel.create", Some(&id), Some(json!({ "name": name, "kind": if voice.is_some() { "voice" } else { "text" } })));
                 if let Some(voice) = &voice {
                     self.store.set_channel_voice(&id, voice)?;
                 }
@@ -1026,7 +1164,26 @@ impl Community {
                         Err(why) => return refuse(message, "e.p.msg.invalid-voice", why),
                     }
                 }
+                if let Some(given) = body.get("slow_mode").filter(|v| !v.is_null()) {
+                    if channel.voice.is_some() {
+                        return refuse(message, "e.p.msg.invalid-slow-mode", "A voice channel takes no posts, nor slow mode.");
+                    }
+                    if !self.powers(sender)?.has("manage_channels") {
+                        return refuse(message, "e.p.trust.not-authorized", "Slow mode takes Manage channels.");
+                    }
+                    match given.as_i64().filter(|s| (0..=crate::moderation::MAX_SLOW_MODE).contains(s)) {
+                        Some(seconds) => self.store.set_slow_mode(&channel.id, seconds)?,
+                        None => return refuse(message, "e.p.msg.invalid-slow-mode", "Slow mode is from 0 to 21,600 seconds."),
+                    }
+                }
                 self.store.update_channel(&channel.id, &name, &topic, closed)?;
+                let mut details = serde_json::Map::new();
+                for field in ["name", "topic", "closed", "voice", "slow_mode"] {
+                    if let Some(value) = body.get(field) {
+                        details.insert(field.into(), value.clone());
+                    }
+                }
+                self.audit(now, sender, "channel.update", Some(&channel.id), Some(Value::Object(details)));
                 Ok(Outcome { reply: Some(reply_to(message, COMMUNITY, self.community(&member)?)), channels_changed: true, ..Outcome::default() })
             }
 
@@ -1034,76 +1191,7 @@ impl Community {
                 refuse(message, "e.p.msg.rules-not-accepted", "Accept this community's rules before posting.")
             }
 
-            POST => {
-                let Some(channel) = self.store.channel(body["channel"].as_str().unwrap_or_default())? else {
-                    return refuse(message, "e.p.msg.unknown-channel", "There is no such channel.");
-                };
-                if channel.closed {
-                    return refuse(message, "e.p.msg.closed", "That channel is closed.");
-                }
-                if channel.voice.is_some() {
-                    return refuse(message, "e.p.msg.voice-channel", "A voice channel takes no posts.");
-                }
-                if !self.may_in(sender, &channel, "post")? {
-                    return refuse(message, "e.p.trust.not-authorized", "You can't post in this channel.");
-                }
-                let content = body["content"].as_str().unwrap_or_default().trim();
-                let question = match body.get("question").filter(|question| !question.is_null()) {
-                    Some(question) => match clean_question(question) {
-                        Ok(question) => Some(question),
-                        Err(why) => return refuse(message, "e.p.msg.invalid-question", why),
-                    },
-                    None => None,
-                };
-                if content.is_empty() {
-                    return refuse(message, "e.p.msg.empty", "A post needs something in it.");
-                }
-                if content.chars().count() > self.config.max_post_length {
-                    return refuse(message, "e.p.msg.too-long", "That is longer than a post can be here.");
-                }
-                // Sent twice (a retry), it is the same post: answered as it was.
-                let id = body["id"].as_str().filter(|id| !id.is_empty() && id.len() <= 64).map(str::to_string).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                if let Some(existing) = self.store.post_by_id(&id)? {
-                    if existing.author_did != sender {
-                        return refuse(message, "e.p.msg.id-taken", "That id has been used.");
-                    }
-                    return Ok(Outcome::reply(reply_to(message, POSTED, json!({ "channel": existing.channel, "seq": existing.seq, "id": existing.id }))));
-                }
-                // What it answers, and the thread it is in: both posts of this channel.
-                let answered = match body.get("reply_to").filter(|reference| !reference.is_null()) {
-                    Some(reference) => match self.referred(reference)?.filter(|post| post.channel == channel.id) {
-                        Some(post) => Some(post),
-                        None => return refuse(message, "e.p.msg.unknown-post", "The post that answers isn't in this channel."),
-                    },
-                    None => None,
-                };
-                // The quotation is the answerer's: what the post said as they answered it.
-                let snippet = line(&body["reply_to"]["snippet"], MAX_SNIPPET);
-                let thread = match body["thread"].as_str().filter(|id| !id.is_empty()) {
-                    Some(thread) => match self.store.thread(thread)?.filter(|thread| thread.channel == channel.id) {
-                        Some(thread) => Some(thread.id),
-                        None => return refuse(message, "e.p.msg.unknown-thread", "There is no such thread in this channel."),
-                    },
-                    // An answer to a post in a thread is in that thread.
-                    None => answered.as_ref().and_then(|post| post.thread.clone()),
-                };
-                let mentions = self.mentions_of(body, &member, &channel)?;
-                let post = self.store.add_post(&channel.id, &id, content, &member, question.as_ref(), None, now)?;
-                let reply = answered.as_ref().map(|post| (post.id.as_str(), post.author_did.as_str(), snippet.as_deref()));
-                self.store.set_written_with(&post.id, reply, thread.as_deref(), &mentions)?;
-                let mut outcome = Outcome {
-                    reply: Some(reply_to(message, POSTED, json!({ "channel": post.channel, "seq": post.seq, "id": post.id }))),
-                    posted: true,
-                    posted_id: Some(post.id.clone()),
-                    ..Outcome::default()
-                };
-                // The post a thread grew from says how many are in it now.
-                if let Some(thread) = thread {
-                    self.store.touch_thread(&thread)?;
-                    outcome.changed.push(thread);
-                }
-                Ok(outcome)
-            }
+            POST => self.post(&member, message, now, true),
 
             EDIT | DELETE => {
                 let Some(post) = self.named_post(body)? else {
@@ -1126,6 +1214,9 @@ impl Community {
                 }
                 if message_type == DELETE {
                     self.store.delete_post(&post.id, removal.then_some(sender))?;
+                    if removal {
+                        self.audit(now, sender, "post.remove", Some(&post.id), Some(json!({ "channel": post.channel, "author": post.author_did })));
+                    }
                 } else {
                     let content = body["content"].as_str().unwrap_or_default().trim();
                     if content.is_empty() {
@@ -1160,6 +1251,7 @@ impl Community {
                 let pinned = message_type == PIN;
                 if pinned != post.pinned {
                     self.store.set_pinned(&post.id, pinned)?;
+                    self.audit(now, sender, if pinned { "post.pin" } else { "post.unpin" }, Some(&post.id), Some(json!({ "channel": post.channel, "author": post.author_did })));
                 }
                 self.changed_answer(message, &post.id)
             }
@@ -1170,6 +1262,9 @@ impl Community {
                 };
                 if post.deleted {
                     return refuse(message, "e.p.msg.deleted", "That post was taken back.");
+                }
+                if self.timed_out(sender, now)? {
+                    return refuse(message, "e.p.msg.timed-out", "You are timed out here for now.");
                 }
                 if !self.store.channel(&post.channel)?.map(|channel| self.may_in(sender, &channel, "react")).transpose()?.unwrap_or(false) {
                     return refuse(message, "e.p.trust.not-authorized", "You can't react in this channel.");
@@ -1197,6 +1292,9 @@ impl Community {
                 };
                 if post.thread.is_some() {
                     return refuse(message, "e.p.msg.in-thread", "A thread doesn't grow from a post in a thread.");
+                }
+                if self.timed_out(sender, now)? {
+                    return refuse(message, "e.p.msg.timed-out", "You are timed out here for now.");
                 }
                 if !self.store.channel(&post.channel)?.map(|channel| self.may_in(sender, &channel, "create_threads")).transpose()?.unwrap_or(false) {
                     return refuse(message, "e.p.trust.not-authorized", "You can't start threads in this channel.");
@@ -1271,6 +1369,7 @@ impl Community {
                 if let Some(may) = may_invite {
                     self.set_everyone("create_invites", may)?;
                 }
+                self.audit(now, sender, "community.admission", None, Some(body.clone()));
                 let mut outcome = Outcome::reply(reply_to(message, COMMUNITY, self.community(&member)?));
                 // Everyone joined is told, as of any change to what the community is.
                 outcome.channels_changed = true;
@@ -1304,6 +1403,7 @@ impl Community {
                 };
                 let invite = Invite { code: new_code(), uses_left: uses, expires_at, note, created_at: now, created_by: sender.to_string() };
                 self.store.add_invite(&invite)?;
+                self.audit(now, sender, "invite.create", Some(&invite.code), None);
                 let mut answer = self.invites_body(&member, now)?;
                 answer["created"] = json!(invite.code);
                 Ok(Outcome::reply(reply_to(message, INVITES, answer)))
@@ -1318,6 +1418,7 @@ impl Community {
                     return refuse(message, "e.p.trust.not-authorized", "Only whoever made an invite, or someone who manages the community, can revoke it.");
                 }
                 self.store.revoke_invite(code)?;
+                self.audit(now, sender, "invite.revoke", Some(code), None);
                 Ok(Outcome::reply(reply_to(message, INVITES, self.invites_body(&member, now)?)))
             }
 
@@ -1344,6 +1445,7 @@ impl Community {
                     },
                     Some(_) => return refuse(message, "e.p.msg.invalid-voice", "invites_to is a channel's id."),
                 }
+                self.audit(now, sender, "community.voice", None, Some(body.clone()));
                 let mut outcome = Outcome::reply(reply_to(message, COMMUNITY, self.community(&member)?));
                 outcome.channels_changed = true;
                 Ok(outcome)
@@ -1404,6 +1506,7 @@ impl Community {
                 if let Some(rules) = self.rules()? {
                     self.store.accept_rules(sender, rules.version)?;
                 }
+                self.audit(now, sender, "community.rules", None, Some(json!({ "version": self.rules()?.map(|rules| rules.version), "required": self.rules()?.is_some_and(|rules| rules.required) })));
                 let mut outcome = Outcome::reply(reply_to(message, COMMUNITY, self.community(&member)?));
                 outcome.channels_changed = true;
                 Ok(outcome)
@@ -1480,6 +1583,7 @@ impl Community {
                         return refuse(message, "e.p.msg.unknown-report", "There is no such report.");
                     }
                     self.store.resolve_report(id, sender, now)?;
+                    self.audit(now, sender, "report.resolve", Some(id), None);
                 }
                 Ok(Outcome::reply(reply_to(message, REPORTS, self.reports_body(body["resolved"] == true)?)))
             }
@@ -1500,6 +1604,11 @@ impl Community {
                 if let Some(kept) = &self.kept {
                     kept.save(&changed)?;
                 }
+                let mut said = body["profile"].clone();
+                if let Some(profile) = said.as_object_mut() {
+                    profile.remove("displayPicture");
+                }
+                self.audit(now, sender, "community.profile", None, Some(said));
                 let mut outcome = Outcome::reply(reply_to(message, COMMUNITY, self.community(&member)?));
                 // Everyone joined is told what it is called now, as they are of a
                 // change to its channels.
@@ -1566,11 +1675,20 @@ impl Community {
                         if existing.is_none() {
                             self.store.set_member(did, Role::Member, now)?;
                         }
+                        let held = self.store.member_roles(did)?;
+                        let really_taken: Vec<&&str> = taken.iter().filter(|id| held.iter().any(|h| h == **id)).collect();
+                        let really_given: Vec<&String> = given.iter().filter(|id| !held.contains(id)).collect();
                         for id in &taken {
                             self.store.take_role(did, id)?;
                         }
                         for id in &given {
                             self.store.give_role(did, id)?;
+                        }
+                        if waiting.is_some() || existing.is_none() {
+                            self.audit(now, sender, "member.admit", Some(did), None);
+                        }
+                        if !really_taken.is_empty() || !really_given.is_empty() {
+                            self.audit(now, sender, "member.roles", Some(did), Some(json!({ "given": really_given, "taken": really_taken })));
                         }
                         // Someone let in from the waiting list asked to be sent posts:
                         // they are joined, and told what the community is.
@@ -1608,6 +1726,11 @@ impl Community {
                         // Either way they are told, and nothing more of the community.
                         self.store.remove_waiting(did)?;
                         self.store.remove_member(did)?;
+                        if was_waiting {
+                            self.audit(now, sender, "member.turn-away", Some(did), None);
+                        } else if existing.is_some() {
+                            self.audit(now, sender, "member.remove", Some(did), None);
+                        }
                         let mut outcome = Outcome::reply(reply_to(message, MEMBERS, self.members_for(&member)?));
                         if was_waiting {
                             outcome.notices.push((did.to_string(), json!({ "type": REMOVED, "body": { "was": "waiting" } })));

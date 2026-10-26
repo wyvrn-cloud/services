@@ -55,6 +55,8 @@ pub struct Channel {
     pub latest_seq: i64,
     /// A voice channel's settings (community-voice/1.0); `None` for a text channel.
     pub voice: Option<Value>,
+    /// Seconds a member waits between posts here; 0 for none.
+    pub slow_mode: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +162,39 @@ pub struct Flow {
     pub updated: i64,
 }
 
+/// One thing done, as the audit log keeps it.
+#[derive(Debug, Clone)]
+pub struct AuditEntry {
+    pub id: i64,
+    pub at: i64,
+    pub actor: String,
+    pub action: String,
+    pub target: Option<String>,
+    pub details: Option<Value>,
+}
+
+/// A ban in force: who, by whom, since when, until when (`None`: until lifted).
+#[derive(Debug, Clone)]
+pub struct Ban {
+    pub did: String,
+    pub by: String,
+    pub at: i64,
+    pub until: Option<i64>,
+    pub reason: Option<String>,
+}
+
+/// A post AutoMod held for a moderator, with what is needed to place it later.
+#[derive(Debug, Clone)]
+pub struct Held {
+    pub id: String,
+    pub channel: String,
+    pub author: String,
+    pub held_at: i64,
+    pub rule: String,
+    /// The `post` as it was sent.
+    pub body: Value,
+}
+
 const ROLE_COLUMNS: &str = "id, name, color, icon, position, permissions, mentionable, hoist, self_assignable";
 const FLOW_COLUMNS: &str = "id, owner, template, context, state, data, status, updated";
 
@@ -231,7 +266,8 @@ const POST_COLUMNS: &str = "serial, channel, seq, id, content, posted_at, author
     (SELECT removed_by FROM post_removals WHERE post_removals.post = posts.id), \
     (SELECT channel FROM post_voice_invites WHERE post_voice_invites.post = posts.id)";
 const CHANNEL_COLUMNS: &str = "id, name, topic, closed, created_at, created_by, (SELECT COALESCE(MAX(seq), 0) FROM posts WHERE posts.channel = channels.id), \
-    (SELECT settings FROM channel_voice WHERE channel_voice.channel = channels.id)";
+    (SELECT settings FROM channel_voice WHERE channel_voice.channel = channels.id), \
+    (SELECT seconds FROM channel_slow WHERE channel_slow.channel = channels.id)";
 
 fn member_from(row: &Row) -> Result<Member> {
     let role: String = row.get(1)?;
@@ -290,6 +326,7 @@ fn channel_from(row: &Row) -> Result<Channel> {
         created_by: row.get(5)?,
         latest_seq: row.get(6)?,
         voice: json_from(row.get(7)?),
+        slow_mode: row.get::<Option<i64>>(8)?.unwrap_or(0),
     })
 }
 
@@ -553,6 +590,53 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         deny TEXT NOT NULL,
         PRIMARY KEY (channel, role)
     );
+    -- The audit log: who did what, kept for as long as the community is.
+    CREATE TABLE IF NOT EXISTS audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        at INTEGER NOT NULL,
+        actor TEXT NOT NULL,
+        action TEXT NOT NULL,
+        target TEXT,
+        details TEXT
+    );
+    CREATE TABLE IF NOT EXISTS bans (
+        did TEXT PRIMARY KEY,
+        by_did TEXT NOT NULL,
+        at INTEGER NOT NULL,
+        until INTEGER,
+        reason TEXT
+    );
+    CREATE TABLE IF NOT EXISTS timeouts (
+        did TEXT PRIMARY KEY,
+        until INTEGER NOT NULL,
+        reason TEXT
+    );
+    -- A text channel's slow mode, in seconds.
+    CREATE TABLE IF NOT EXISTS channel_slow (
+        channel TEXT PRIMARY KEY,
+        seconds INTEGER NOT NULL
+    );
+    -- AutoMod's rules, each as JSON.
+    CREATE TABLE IF NOT EXISTS automod_rules (
+        id TEXT PRIMARY KEY,
+        position INTEGER NOT NULL,
+        rule TEXT NOT NULL
+    );
+    -- Posts AutoMod held for a moderator.
+    CREATE TABLE IF NOT EXISTS held (
+        id TEXT PRIMARY KEY,
+        channel TEXT NOT NULL,
+        author TEXT NOT NULL,
+        held_at INTEGER NOT NULL,
+        rule TEXT NOT NULL,
+        body TEXT NOT NULL
+    );
+    -- Answers to the questions on joining, as JSON.
+    CREATE TABLE IF NOT EXISTS join_answers (
+        did TEXT PRIMARY KEY,
+        answers TEXT NOT NULL,
+        at INTEGER NOT NULL
+    );
     -- Administration workflows under way.
     CREATE TABLE IF NOT EXISTS flows (
         id TEXT PRIMARY KEY,
@@ -716,6 +800,48 @@ fn schema() -> Schema {
                 allow TEXT NOT NULL,
                 deny TEXT NOT NULL,
                 PRIMARY KEY (channel, role)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS audit (
+                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                at BIGINT NOT NULL,
+                actor {MYSQL_DID} NOT NULL,
+                action VARCHAR(64) NOT NULL,
+                target TEXT,
+                details MEDIUMTEXT
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS bans (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                by_did {MYSQL_DID} NOT NULL,
+                at BIGINT NOT NULL,
+                until BIGINT,
+                reason TEXT
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS timeouts (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                until BIGINT NOT NULL,
+                reason TEXT
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS channel_slow (
+                channel VARCHAR(255) NOT NULL PRIMARY KEY,
+                seconds BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS automod_rules (
+                id VARCHAR(64) NOT NULL PRIMARY KEY,
+                position BIGINT NOT NULL,
+                rule MEDIUMTEXT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS held (
+                id VARCHAR(255) NOT NULL PRIMARY KEY,
+                channel VARCHAR(255) NOT NULL,
+                author {MYSQL_DID} NOT NULL,
+                held_at BIGINT NOT NULL,
+                rule VARCHAR(64) NOT NULL,
+                body MEDIUMTEXT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS join_answers (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                answers MEDIUMTEXT NOT NULL,
+                at BIGINT NOT NULL
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS flows (
                 id VARCHAR(255) NOT NULL PRIMARY KEY,
@@ -881,6 +1007,10 @@ impl Store {
                 tx.execute("INSERT OR REPLACE INTO rules_accepted (did, version) VALUES (?1, ?2)", params![new, version.max(kept)])?;
                 tx.execute("DELETE FROM rules_accepted WHERE did = ?1", params![prior])?;
             }
+            // A ban or a timeout follows the DID, member or not.
+            tx.execute("UPDATE OR IGNORE bans SET did = ?2 WHERE did = ?1", params![prior, new])?;
+            tx.execute("UPDATE OR IGNORE timeouts SET did = ?2 WHERE did = ?1", params![prior, new])?;
+            tx.execute("UPDATE OR IGNORE join_answers SET did = ?2 WHERE did = ?1", params![prior, new])?;
             tx.execute("INSERT OR REPLACE INTO superseded (did, became, at) VALUES (?1, ?2, ?3)", params![prior, new, now])?;
             Ok(old.is_some())
         })
@@ -1037,6 +1167,141 @@ impl Store {
             db.execute("INSERT OR REPLACE INTO channel_overrides (channel, role, allow, deny) VALUES (?1, ?2, ?3, ?4)", params![channel, role, allow, deny])?;
         }
         Ok(())
+    }
+
+    // --- Moderation ---------------------------------------------------------------
+
+    /// Writes one thing done in the audit log.
+    pub fn audit(&self, at: i64, actor: &str, action: &str, target: Option<&str>, details: Option<&Value>) -> Result<()> {
+        let details = details.map(Value::to_string);
+        self.db.lock().execute("INSERT INTO audit (at, actor, action, target, details) VALUES (?1, ?2, ?3, ?4, ?5)", params![at, actor, action, target, details])?;
+        Ok(())
+    }
+
+    /// The audit log, newest first: entries before `before` (an id), at most
+    /// `limit`, narrowed by actor, target and action where given.
+    pub fn audit_entries(&self, before: Option<i64>, limit: usize, actor: Option<&str>, target: Option<&str>, action: Option<&str>) -> Result<Vec<AuditEntry>> {
+        let before = before.unwrap_or(i64::MAX);
+        self.db.lock().query(
+            "SELECT id, at, actor, action, target, details FROM audit WHERE id < ?1 \
+             AND (?2 IS NULL OR actor = ?2) AND (?3 IS NULL OR target = ?3) AND (?4 IS NULL OR action = ?4) \
+             ORDER BY id DESC LIMIT ?5",
+            params![before, actor, target, action, limit as i64],
+            |row| Ok(AuditEntry { id: row.get(0)?, at: row.get(1)?, actor: row.get(2)?, action: row.get(3)?, target: row.get(4)?, details: json_from(row.get(5)?) }),
+        )
+    }
+
+    pub fn ban(&self, ban: &Ban) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO bans (did, by_did, at, until, reason) VALUES (?1, ?2, ?3, ?4, ?5)", params![ban.did, ban.by, ban.at, ban.until, ban.reason])?;
+        Ok(())
+    }
+
+    pub fn unban(&self, did: &str) -> Result<bool> {
+        Ok(self.db.lock().execute("DELETE FROM bans WHERE did = ?1", params![did])? > 0)
+    }
+
+    /// The bans in force at `now`, newest first.
+    pub fn bans(&self, now: i64) -> Result<Vec<Ban>> {
+        self.db.lock().query(
+            "SELECT did, by_did, at, until, reason FROM bans WHERE until IS NULL OR until > ?1 ORDER BY at DESC",
+            params![now],
+            |row| Ok(Ban { did: row.get(0)?, by: row.get(1)?, at: row.get(2)?, until: row.get(3)?, reason: row.get(4)? }),
+        )
+    }
+
+    /// `did`'s ban, if one is in force at `now`.
+    pub fn banned(&self, did: &str, now: i64) -> Result<Option<Ban>> {
+        self.db.lock().query_row(
+            "SELECT did, by_did, at, until, reason FROM bans WHERE did = ?1 AND (until IS NULL OR until > ?2)",
+            params![did, now],
+            |row| Ok(Ban { did: row.get(0)?, by: row.get(1)?, at: row.get(2)?, until: row.get(3)?, reason: row.get(4)? }),
+        )
+    }
+
+    pub fn set_timeout(&self, did: &str, until: Option<i64>, reason: Option<&str>) -> Result<()> {
+        let mut db = self.db.lock();
+        match until {
+            Some(until) => db.execute("INSERT OR REPLACE INTO timeouts (did, until, reason) VALUES (?1, ?2, ?3)", params![did, until, reason])?,
+            None => db.execute("DELETE FROM timeouts WHERE did = ?1", params![did])?,
+        };
+        Ok(())
+    }
+
+    /// When `did`'s timeout ends, if they are timed out at `now`.
+    pub fn timed_out_until(&self, did: &str, now: i64) -> Result<Option<i64>> {
+        self.db.lock().query_row("SELECT until FROM timeouts WHERE did = ?1 AND until > ?2", params![did, now], |row| row.get(0))
+    }
+
+    pub fn set_slow_mode(&self, channel: &str, seconds: i64) -> Result<()> {
+        let mut db = self.db.lock();
+        if seconds > 0 {
+            db.execute("INSERT OR REPLACE INTO channel_slow (channel, seconds) VALUES (?1, ?2)", params![channel, seconds])?;
+        } else {
+            db.execute("DELETE FROM channel_slow WHERE channel = ?1", params![channel])?;
+        }
+        Ok(())
+    }
+
+    /// When `did` last posted in `channel`, threads included.
+    pub fn last_post_in(&self, channel: &str, did: &str) -> Result<Option<i64>> {
+        self.db.lock().query_value("SELECT MAX(posted_at) FROM posts WHERE channel = ?1 AND author_did = ?2", params![channel, did])
+    }
+
+    /// How many posts `did` has made, anywhere, since `since`.
+    pub fn posts_since(&self, did: &str, since: i64) -> Result<i64> {
+        self.db.lock().query_value("SELECT COUNT(*) FROM posts WHERE author_did = ?1 AND posted_at >= ?2", params![did, since])
+    }
+
+    /// `did`'s posts in `channel` since `since`, not taken back, newest first.
+    pub fn recent_posts_by(&self, channel: Option<&str>, did: &str, since: i64, limit: usize) -> Result<Vec<String>> {
+        self.db.lock().query(
+            "SELECT id FROM posts WHERE author_did = ?1 AND posted_at >= ?2 AND (?3 IS NULL OR channel = ?3) \
+             AND NOT EXISTS (SELECT 1 FROM post_state WHERE post_state.post = posts.id AND deleted = 1) ORDER BY serial DESC LIMIT ?4",
+            params![did, since, channel, limit as i64],
+            |row| row.get(0),
+        )
+    }
+
+    /// AutoMod's rules, in order.
+    pub fn automod_rules(&self) -> Result<Vec<Value>> {
+        self.db.lock().query("SELECT rule FROM automod_rules ORDER BY position, id", params![], |row| Ok(json_from(row.get(0)?).unwrap_or(Value::Null)))
+    }
+
+    pub fn save_automod_rule(&self, id: &str, position: i64, rule: &Value) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO automod_rules (id, position, rule) VALUES (?1, ?2, ?3)", params![id, position, rule.to_string()])?;
+        Ok(())
+    }
+
+    pub fn delete_automod_rule(&self, id: &str) -> Result<bool> {
+        Ok(self.db.lock().execute("DELETE FROM automod_rules WHERE id = ?1", params![id])? > 0)
+    }
+
+    pub fn hold(&self, held: &Held) -> Result<()> {
+        self.db.lock().execute(
+            "INSERT OR REPLACE INTO held (id, channel, author, held_at, rule, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![held.id, held.channel, held.author, held.held_at, held.rule, held.body.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Every held post, oldest first.
+    pub fn held(&self) -> Result<Vec<Held>> {
+        self.db.lock().query("SELECT id, channel, author, held_at, rule, body FROM held ORDER BY held_at, id", params![], |row| {
+            Ok(Held { id: row.get(0)?, channel: row.get(1)?, author: row.get(2)?, held_at: row.get(3)?, rule: row.get(4)?, body: json_from(row.get(5)?).unwrap_or(Value::Null) })
+        })
+    }
+
+    pub fn unhold(&self, id: &str) -> Result<bool> {
+        Ok(self.db.lock().execute("DELETE FROM held WHERE id = ?1", params![id])? > 0)
+    }
+
+    pub fn set_join_answers(&self, did: &str, answers: &Value, at: i64) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO join_answers (did, answers, at) VALUES (?1, ?2, ?3)", params![did, answers.to_string(), at])?;
+        Ok(())
+    }
+
+    pub fn join_answers(&self, did: &str) -> Result<Option<Value>> {
+        Ok(self.db.lock().query_row("SELECT answers FROM join_answers WHERE did = ?1", params![did], |row| row.get::<String>(0))?.and_then(|text| serde_json::from_str(&text).ok()))
     }
 
     // --- Administration workflows -------------------------------------------------

@@ -1290,3 +1290,149 @@ async fn a_channel_can_be_made_read_only_and_rank_limits_moderators() {
     assert_eq!(moderator.community("set-member", json!({ "did": member.did(), "role": "moderator" })).await["body"]["code"], "e.p.trust.not-authorized");
     assert_eq!(moderator.workflow("start", json!({ "template_id": "roles", "instance_id": "r9" })).await["body"]["code"], "not_authorized");
 }
+
+#[tokio::test]
+async fn bans_timeouts_slow_mode_and_bulk_removal_are_kept_in_the_audit_log() {
+    let server = start_server("max_posts_per_minute = 5").await;
+    let (owner, moderator, member, stranger) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &moderator, &member]);
+    let channel = open_channel(&owner, "general").await;
+    for peer in [&owner, &moderator, &member] {
+        peer.community("join", json!({})).await;
+    }
+    owner.community("set-member", json!({ "did": moderator.did(), "role": "moderator" })).await;
+
+    // Slow mode: one post a minute, but not for whoever may ignore it.
+    let set = owner.community("update-channel", json!({ "channel": channel, "slow_mode": 60 })).await;
+    assert_eq!(set["body"]["channels"][0]["slow_mode"], 60, "{set}");
+    assert_eq!(member.community("update-channel", json!({ "channel": channel, "slow_mode": 0 })).await["body"]["code"], "e.p.trust.not-authorized");
+    assert_eq!(kind(&member.community("post", json!({ "channel": channel, "id": "m1", "content": "one" })).await), "posted");
+    let slow = member.community("post", json!({ "channel": channel, "content": "two" })).await;
+    assert_eq!(slow["body"]["code"], "e.p.msg.slow-mode", "{slow}");
+    assert!(slow["body"]["args"]["retry_after"].as_i64().unwrap() > 0);
+    // Sent again after a lost answer, a post is the same post.
+    assert_eq!(kind(&member.community("post", json!({ "channel": channel, "id": "m1", "content": "one" })).await), "posted");
+    assert_eq!(kind(&moderator.community("post", json!({ "channel": channel, "content": "mods may" })).await), "posted");
+    owner.community("update-channel", json!({ "channel": channel, "slow_mode": 0 })).await;
+
+    // A server's own limit: so many a minute, anywhere.
+    for n in 0..4 {
+        member.community("post", json!({ "channel": channel, "id": format!("r{n}"), "content": "fast" })).await;
+    }
+    assert_eq!(member.community("post", json!({ "channel": channel, "content": "too fast" })).await["body"]["code"], "e.p.req.rate-limited");
+
+    // A timeout: still in, but quiet. Told until when.
+    let timed = moderator.community("timeout", json!({ "did": member.did(), "seconds": 600, "reason": "cool off" })).await;
+    let listed = timed["body"]["members"].as_array().unwrap().iter().find(|m| m["did"] == member.did()).unwrap().clone();
+    assert!(listed["timed_out_until"].as_i64().is_some(), "{timed}");
+    let told = member.community("join", json!({})).await["body"].clone();
+    assert!(told["timed_out_until"].as_i64().is_some());
+    assert_eq!(member.ask("https://wyvrn.app/message-reactions/1.0/reactions", json!({ "to": { "id": "m1" }, "emoji": ["👍"] })).await["body"]["code"], "e.p.msg.timed-out");
+    assert_eq!(moderator.community("timeout", json!({ "did": owner.did(), "seconds": 600 })).await["body"]["code"], "e.p.msg.owner");
+    assert_eq!(member.community("timeout", json!({ "did": moderator.did(), "seconds": 600 })).await["body"]["code"], "e.p.trust.not-authorized");
+    moderator.community("timeout", json!({ "did": member.did(), "seconds": 0 })).await;
+    assert!(member.community("join", json!({})).await["body"].get("timed_out_until").is_none());
+
+    // Bulk removal: the member's posts in the last hour.
+    let bulk = moderator.community("bulk-delete", json!({ "channel": channel, "author": member.did(), "seconds": 3600 })).await;
+    assert_eq!(bulk["body"]["removed"], 5, "{bulk}");
+    let history = owner.community("history-request", json!({ "channel": channel })).await;
+    assert!(history["body"]["messages"].as_array().unwrap().iter().filter(|m| m["author"]["did"] == member.did()).all(|m| m["deleted"] == true));
+
+    // Moderators don't ban by default; the owner bans, and the banned stay out.
+    assert_eq!(moderator.community("ban", json!({ "did": member.did() })).await["body"]["code"], "e.p.trust.not-authorized");
+    let banned = owner.community("ban", json!({ "did": member.did(), "reason": "spam" })).await;
+    assert_eq!(banned["body"]["bans"][0]["did"], member.did(), "{banned}");
+    assert_eq!(member.next_of(&format!("{C}removed")).await["body"]["was"], "banned");
+    assert_eq!(member.community("join", json!({})).await["body"]["code"], "e.p.trust.not-authorized");
+    // Someone who never was a member can be banned before they ask.
+    owner.community("ban", json!({ "did": stranger.did(), "seconds": 3600 })).await;
+    assert_eq!(stranger.community("join", json!({})).await["body"]["code"], "e.p.trust.not-authorized");
+    owner.community("unban", json!({ "did": member.did() })).await;
+    assert_eq!(kind(&member.community("join", json!({})).await), "waiting");
+
+    // The audit log says who did all that; the member's history gathers what was done to them.
+    let audit = owner.community("audit-request", json!({})).await;
+    let actions: Vec<&str> = audit["body"]["entries"].as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap()).collect();
+    for expected in ["member.unban", "member.ban", "post.bulk-remove", "member.timeout", "channel.update", "member.roles", "channel.create"] {
+        assert!(actions.contains(&expected), "{expected} in {actions:?}");
+    }
+    let only = owner.community("audit-request", json!({ "action": "member.timeout", "limit": 1 })).await;
+    assert_eq!(only["body"]["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(only["body"]["more"], true);
+    assert_eq!(member.community("audit-request", json!({})).await["type"], PROBLEM);
+    let history = moderator.community("member-history-request", json!({ "did": member.did() })).await;
+    let done: Vec<&str> = history["body"]["actions"].as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap()).collect();
+    assert_eq!(done, ["member.unban", "member.ban", "member.timeout", "member.timeout"], "{history}");
+}
+
+#[tokio::test]
+async fn automod_refuses_holds_and_alerts_and_join_gates_ask_before_letting_in() {
+    let server = start_server("").await;
+    let (owner, member, newcomer) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member]);
+    let channel = open_channel(&owner, "general").await;
+    let log = open_channel(&owner, "mod-log").await;
+    for peer in [&owner, &member] {
+        peer.community("join", json!({})).await;
+    }
+
+    // Two rules: one refuses a word and times out; one holds links.
+    owner.workflow("start", json!({ "template_id": "automod", "instance_id": "a1" })).await;
+    advance(&owner, "a1", "create", json!({ "name": "No scams" })).await;
+    let bad = advance(&owner, "a1", "save", json!({ "name": "No scams", "patterns": "(unclosed" })).await;
+    assert_eq!(bad["body"]["code"], "guard_failed", "{bad}");
+    let saved = advance(&owner, "a1", "save", json!({ "name": "No scams", "enabled": true, "words": "scam*", "block": true, "alert_channel": "mod-log", "timeout_minutes": "5" })).await;
+    assert!(saved["body"]["ui"].to_string().contains("Saved No scams."), "{saved}");
+    advance(&owner, "a1", "create", json!({ "name": "Links" })).await;
+    advance(&owner, "a1", "save", json!({ "name": "Links", "enabled": true, "links": true, "allowed_domains": "wyvrn.app", "hold": true })).await;
+    assert_eq!(kind(&advance(&owner, "a1", "done", json!({})).await), "complete");
+
+    // Refused, said in the log channel, and timed out.
+    let refused = member.community("post", json!({ "channel": channel, "content": "this is a SCAMMER" })).await;
+    assert_eq!(refused["body"]["code"], "e.p.msg.automod", "{refused}");
+    assert_eq!(refused["body"]["args"]["rule"], "No scams");
+    let alerted = owner.community("history-request", json!({ "channel": log })).await["body"]["messages"][0].clone();
+    assert!(alerted["content"].as_str().unwrap().contains("refused a post"), "{alerted}");
+    assert_eq!(alerted["author"]["name"], "AutoMod");
+    assert_eq!(member.community("post", json!({ "channel": channel, "content": "sorry" })).await["body"]["code"], "e.p.msg.timed-out");
+    owner.community("timeout", json!({ "did": member.did(), "seconds": 0 })).await;
+
+    // Held: answered posted-but-held, sent to nobody; a moderator lets it through.
+    assert_eq!(kind(&member.community("post", json!({ "channel": channel, "content": "docs at https://wyvrn.app/x" })).await), "posted");
+    let held = member.community("post", json!({ "channel": channel, "id": "h1", "content": "look https://evil.example" })).await;
+    assert_eq!(held["body"]["held"], true, "{held}");
+    assert!(held["body"].get("seq").is_none());
+    let told = owner.next_of(&format!("{C}held")).await;
+    assert_eq!(told["body"]["posts"][0]["id"], "h1");
+    let seen = owner.community("history-request", json!({ "channel": channel })).await;
+    assert!(!seen["body"].to_string().contains("evil.example"));
+    let released = owner.community("release-held", json!({ "id": "h1" })).await;
+    assert_eq!(released["body"]["posts"], json!([]), "{released}");
+    let placed = owner.community("history-request", json!({ "channel": channel })).await;
+    assert!(placed["body"].to_string().contains("evil.example"));
+    let audit = owner.community("audit-request", json!({})).await.to_string();
+    assert!(audit.contains("automod.release") && audit.contains("automod.hold") && audit.contains("automod.block"));
+
+    // Join gates: questions first, then the waiting list shows the answers.
+    owner.community("set-admission", json!({ "admission": "admin" })).await;
+    owner.workflow("start", json!({ "template_id": "join-gates", "instance_id": "g1" })).await;
+    let gated = advance(&owner, "g1", "save", json!({ "post_wait": "10", "q0": "How did you find us?", "q0-required": true, "q1": "Pick one", "q1-options": "Art | Code" })).await;
+    assert_eq!(kind(&gated), "complete", "{gated}");
+    let asked = newcomer.community("join", json!({})).await;
+    assert_eq!(kind(&asked), "join-questions", "{asked}");
+    assert_eq!(asked["body"]["questions"][1]["options"], json!(["Art", "Code"]));
+    assert_eq!(newcomer.community("join", json!({ "answers": { "q2": "Art" } })).await["body"]["code"], "e.p.msg.invalid-answers");
+    assert_eq!(newcomer.community("join", json!({ "answers": { "q1": "A friend", "q2": "Music" } })).await["body"]["code"], "e.p.msg.invalid-answers");
+    assert_eq!(kind(&newcomer.community("join", json!({ "answers": { "q1": "A friend", "q2": "Code" } })).await), "waiting");
+    let members = owner.community("members-request", json!({})).await;
+    assert_eq!(members["body"]["waiting"][0]["answers"], json!([{ "question": "How did you find us?", "answer": "A friend" }, { "question": "Pick one", "answer": "Code" }]));
+    // Let in, they wait ten minutes to post; someone with a role doesn't.
+    owner.community("set-member", json!({ "did": newcomer.did(), "role": "member" })).await;
+    let told = newcomer.next_of(&format!("{C}community")).await;
+    assert_eq!(told["body"]["gates"]["post_wait"], 10);
+    let early = newcomer.community("post", json!({ "channel": channel, "content": "hi" })).await;
+    assert_eq!(early["body"]["code"], "e.p.msg.too-new", "{early}");
+    owner.community("set-member", json!({ "did": newcomer.did(), "role": "moderator" })).await;
+    assert_eq!(kind(&newcomer.community("post", json!({ "channel": channel, "content": "hi" })).await), "posted");
+}
