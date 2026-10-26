@@ -177,6 +177,8 @@ pub struct AuditEntry {
 #[derive(Debug, Clone)]
 pub struct Ban {
     pub did: String,
+    /// What they were called when banned.
+    pub name: Option<String>,
     pub by: String,
     pub at: i64,
     pub until: Option<i64>,
@@ -193,6 +195,10 @@ pub struct Held {
     pub rule: String,
     /// The `post` as it was sent.
     pub body: Value,
+}
+
+fn ban_from(row: &Row) -> Result<Ban> {
+    Ok(Ban { did: row.get(0)?, name: row.get(1)?, by: row.get(2)?, at: row.get(3)?, until: row.get(4)?, reason: row.get(5)? })
 }
 
 const ROLE_COLUMNS: &str = "id, name, color, icon, position, permissions, mentionable, hoist, self_assignable";
@@ -601,6 +607,7 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
     );
     CREATE TABLE IF NOT EXISTS bans (
         did TEXT PRIMARY KEY,
+        name TEXT,
         by_did TEXT NOT NULL,
         at INTEGER NOT NULL,
         until INTEGER,
@@ -811,6 +818,7 @@ fn schema() -> Schema {
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS bans (
                 did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                name TEXT,
                 by_did {MYSQL_DID} NOT NULL,
                 at BIGINT NOT NULL,
                 until BIGINT,
@@ -1192,7 +1200,10 @@ impl Store {
     }
 
     pub fn ban(&self, ban: &Ban) -> Result<()> {
-        self.db.lock().execute("INSERT OR REPLACE INTO bans (did, by_did, at, until, reason) VALUES (?1, ?2, ?3, ?4, ?5)", params![ban.did, ban.by, ban.at, ban.until, ban.reason])?;
+        self.db.lock().execute(
+            "INSERT OR REPLACE INTO bans (did, name, by_did, at, until, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![ban.did, ban.name, ban.by, ban.at, ban.until, ban.reason],
+        )?;
         Ok(())
     }
 
@@ -1203,18 +1214,18 @@ impl Store {
     /// The bans in force at `now`, newest first.
     pub fn bans(&self, now: i64) -> Result<Vec<Ban>> {
         self.db.lock().query(
-            "SELECT did, by_did, at, until, reason FROM bans WHERE until IS NULL OR until > ?1 ORDER BY at DESC",
+            "SELECT did, name, by_did, at, until, reason FROM bans WHERE until IS NULL OR until > ?1 ORDER BY at DESC",
             params![now],
-            |row| Ok(Ban { did: row.get(0)?, by: row.get(1)?, at: row.get(2)?, until: row.get(3)?, reason: row.get(4)? }),
+            ban_from,
         )
     }
 
     /// `did`'s ban, if one is in force at `now`.
     pub fn banned(&self, did: &str, now: i64) -> Result<Option<Ban>> {
         self.db.lock().query_row(
-            "SELECT did, by_did, at, until, reason FROM bans WHERE did = ?1 AND (until IS NULL OR until > ?2)",
+            "SELECT did, name, by_did, at, until, reason FROM bans WHERE did = ?1 AND (until IS NULL OR until > ?2)",
             params![did, now],
-            |row| Ok(Ban { did: row.get(0)?, by: row.get(1)?, at: row.get(2)?, until: row.get(3)?, reason: row.get(4)? }),
+            ban_from,
         )
     }
 

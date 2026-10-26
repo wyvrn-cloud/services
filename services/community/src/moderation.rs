@@ -48,7 +48,17 @@ impl Refused {
 
 impl Community {
     /// Writes in the audit log; a failure to is logged, and doesn't undo what was done.
+    /// A member who is the target is named as they are called now (`details.name`),
+    /// so the entry still says who after they are gone.
     pub fn audit(&self, now: i64, actor: &str, action: &str, target: Option<&str>, details: Option<Value>) {
+        let mut details = details;
+        if let Some(name) = target.filter(|t| t.starts_with("did:")).and_then(|did| self.store.member(did).ok().flatten()).and_then(|m| m.name) {
+            let mut said = details.take().filter(Value::is_object).unwrap_or_else(|| json!({}));
+            if said.get("name").is_none() {
+                said["name"] = json!(name);
+            }
+            details = Some(said);
+        }
         if let Err(error) = self.store.audit(now, actor, action, target, details.as_ref()) {
             tracing::error!(%error, action, "couldn't write the audit log");
         }
@@ -76,6 +86,9 @@ impl Community {
     fn ban_body(&self, ban: &Ban) -> anyhow::Result<Value> {
         // (Someone banned is no member: what they were called is the audit log's to say.)
         let mut body = json!({ "did": ban.did, "by": self.who(&ban.by)?, "at": ban.at });
+        if let Some(name) = &ban.name {
+            body["name"] = json!(name);
+        }
         if let Some(until) = ban.until {
             body["until"] = json!(until);
         }
@@ -165,7 +178,11 @@ impl Community {
                     _ => return refuse(message, "e.p.msg.invalid-ban", "Posts are removed from the last hour, the last day, or not at all.").map(Some),
                 };
                 let reason = line(&body["reason"], MAX_REASON);
-                self.store.ban(&Ban { did: did.to_string(), by: sender.to_string(), at: now, until, reason: reason.clone() })?;
+                let name = match &existing {
+                    Some(member) => member.name.clone(),
+                    None => self.store.waiting_one(did)?.and_then(|waiting| waiting.name),
+                };
+                self.store.ban(&Ban { did: did.to_string(), name, by: sender.to_string(), at: now, until, reason: reason.clone() })?;
                 let was_waiting = self.store.remove_waiting(did)?;
                 let mut outcome = Outcome::reply(reply_to(message, BANS, json!({})));
                 let mut removed = Vec::new();
@@ -186,6 +203,9 @@ impl Community {
                     outcome.notices.extend(self.admins_told()?);
                 }
                 let mut details = json!({ "removed": removed.len() });
+                if let Some(name) = existing.as_ref().and_then(|m| m.name.clone()) {
+                    details["name"] = json!(name);
+                }
                 if let Some(until) = until {
                     details["until"] = json!(until);
                 }
