@@ -863,7 +863,7 @@ fn schema() -> Schema {
             CREATE TABLE IF NOT EXISTS thread_follows (
                 did {MYSQL_DID} NOT NULL,
                 thread VARCHAR(255) NOT NULL,
-                PRIMARY KEY (did, thread)
+                PRIMARY KEY (did(255), thread)
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS post_voice_invites (
                 post VARCHAR(255) NOT NULL PRIMARY KEY,
