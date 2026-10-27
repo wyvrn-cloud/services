@@ -469,6 +469,9 @@ impl Community {
             if powers.has("admit_members") {
                 body["waiting"] = json!(self.store.waiting_count()?);
             }
+            if let Some(level) = self.store.notify_level(&member.did)? {
+                body["notifications"] = json!({ "level": level, "following": self.store.followed_threads(&member.did)? });
+            }
             if let Some(until) = self.store.timed_out_until(&member.did, crate::gates::now())? {
                 body["timed_out_until"] = json!(until);
             }
@@ -1044,6 +1047,10 @@ impl Community {
             let title = extra.as_ref().and_then(|extra| extra["title"].as_str()).map(str::to_string);
             self.store.add_thread(&post.id, &channel.id, title.as_deref(), sender, now)?;
         }
+        // Whoever posts in a thread, or begins one, follows it.
+        if let Some(followed) = thread.as_deref().or(begins_thread.then_some(post.id.as_str())) {
+            self.store.follow_thread(sender, followed, true)?;
+        }
         let mut outcome = Outcome {
             reply: Some(reply_to(message, POSTED, json!({ "channel": post.channel, "seq": post.seq, "id": post.id }))),
             posted: true,
@@ -1411,6 +1418,9 @@ impl Community {
                 }
                 let name = line(&body["name"], MAX_THREAD_NAME);
                 self.store.add_thread(&post.id, &post.channel, name.as_deref(), sender, now)?;
+                // Whoever grew it follows it, and so does whoever wrote the post.
+                self.store.follow_thread(sender, &post.id, true)?;
+                self.store.follow_thread(&post.author_did, &post.id, true)?;
                 self.changed_answer(message, &post.id)
             }
 

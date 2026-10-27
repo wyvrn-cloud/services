@@ -877,8 +877,12 @@ impl Live {
     }
 
     async fn send(&mut self, peer: &Peer, kind: &str, body: Value) {
+        self.send_as(peer, &format!("{V}{kind}"), body).await
+    }
+
+    async fn send_as(&mut self, peer: &Peer, message_type: &str, body: Value) {
         use futures_util::SinkExt;
-        let message = json!({ "id": uuid::Uuid::new_v4().to_string(), "type": format!("{V}{kind}"), "body": body, "return_route": "all" });
+        let message = json!({ "id": uuid::Uuid::new_v4().to_string(), "type": message_type, "body": body, "return_route": "all" });
         let packed = peer.agent.messaging().pack(&message, &peer.server, Some(&peer.did())).await.unwrap();
         let frame = match String::from_utf8(packed.message) {
             Ok(text) => reqwest_websocket::Message::Text(text),
@@ -889,16 +893,20 @@ impl Live {
 
     /// The next message of `kind` on the connection.
     async fn next_of(&mut self, peer: &Peer, kind: &str) -> Value {
+        self.next_typed(peer, &format!("{V}{kind}")).await
+    }
+
+    async fn next_typed(&mut self, peer: &Peer, message_type: &str) -> Value {
         use futures_util::StreamExt;
         loop {
-            let frame = tokio::time::timeout(Duration::from_secs(10), self.socket.next()).await.unwrap_or_else(|_| panic!("a {kind} within ten seconds")).unwrap().unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(10), self.socket.next()).await.unwrap_or_else(|_| panic!("a {message_type} within ten seconds")).unwrap().unwrap();
             let bytes = match frame {
                 reqwest_websocket::Message::Text(text) => text.into_bytes(),
                 reqwest_websocket::Message::Binary(bytes) => bytes.to_vec(),
                 _ => continue,
             };
             let received = peer.agent.receive(&bytes).await.unwrap();
-            if received.message["type"] == format!("{V}{kind}") {
+            if received.message["type"] == message_type {
                 return received.message;
             }
         }
@@ -1656,3 +1664,94 @@ async fn the_community_has_emoji_packs_of_its_own_made_by_whoever_may_manage_the
     let pack: Value = reqwest::get(&link).await.unwrap().json().await.unwrap();
     assert_eq!(pack["title"], "Workshop", "{pack}");
 }
+
+#[tokio::test]
+async fn a_member_not_watching_is_sent_through_the_mediator_only_what_they_chose() {
+    let server = start_server("").await;
+    let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member]);
+    let channel = open_channel(&admin, "general").await;
+    member.community("join", json!({})).await;
+    let post = |id: &str, extra: Value| {
+        let mut body = json!({ "channel": channel, "id": id, "content": id });
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        body
+    };
+
+    // An app that has never said is sent everything, as before.
+    admin.community("post", post("before", json!({}))).await;
+    assert_eq!(member.next_message().await["id"], "before");
+
+    // Having said (with no level: the default), mentions.
+    let chose = member.community("set-notifications", json!({})).await;
+    assert_eq!(chose["body"]["notifications"], json!({ "level": "mentions", "following": [] }));
+    // Each post that isn't theirs to hear of is passed over: the next to arrive
+    // is the next that concerns them.
+    admin.community("post", post("plain", json!({}))).await;
+    admin.community("post", post("named", json!({ "mentions": [{ "who": member.did(), "name": "m" }] }))).await;
+    assert_eq!(member.next_message().await["id"], "named");
+    admin.community("post", post("plain2", json!({}))).await;
+    admin.community("post", post("all-of-you", json!({ "mentions": [{ "who": "everyone", "name": "everyone" }] }))).await;
+    assert_eq!(member.next_message().await["id"], "all-of-you");
+    // Their own post isn't sent back through the mediator; an answer to it is.
+    member.community("post", post("mine", json!({}))).await;
+    admin.community("post", post("answer", json!({ "reply_to": { "id": "mine", "author": member.did() } }))).await;
+    assert_eq!(member.next_message().await["id"], "answer");
+
+    // A thread they follow: in it, they hear of everything.
+    admin.community("post", post("root", json!({}))).await;
+    assert_eq!(kind(&admin.community("create-thread", json!({ "to": { "id": "root" } })).await), "changed");
+    admin.community("post", post("unfollowed", json!({ "thread": "root" }))).await;
+    let following = member.community("set-notifications", json!({ "follow": ["root", "no-such-thread"] })).await;
+    assert_eq!(following["body"]["notifications"]["following"], json!(["root"]));
+    admin.community("post", post("followed", json!({ "thread": "root" }))).await;
+    assert_eq!(member.next_message().await["id"], "followed");
+
+    // Nothing: not even a mention.
+    member.community("set-notifications", json!({ "level": "nothing" })).await;
+    admin.community("post", post("named2", json!({ "mentions": [{ "who": member.did(), "name": "m" }] }))).await;
+    member.nothing_more().await;
+    assert_eq!(member.community("set-notifications", json!({ "level": "loud" })).await["body"]["code"], "e.p.msg.invalid-level");
+    // ...and all: everything.
+    member.community("set-notifications", json!({ "level": "all" })).await;
+    admin.community("post", post("everything", json!({}))).await;
+    assert_eq!(member.next_message().await["id"], "everything");
+}
+
+#[tokio::test]
+async fn a_watching_connection_is_sent_everything_and_the_mediator_nothing_of_it() {
+    let server = start_server("").await;
+    let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member]);
+    let channel = open_channel(&admin, "general").await;
+    member.community("join", json!({})).await;
+
+    // Only on a live connection.
+    assert_eq!(member.community("watch", json!({})).await["body"]["code"], "e.p.req.live-only");
+    let mut live = Live::open(&member, &server).await;
+    live.send_as(&member, &format!("{C}watch"), json!({})).await;
+    let watching = live.next_typed(&member, &format!("{C}community")).await;
+    let rev = watching["body"]["latest_rev"].as_i64().unwrap();
+    // Speaking of it settled what reaches them otherwise.
+    assert_eq!(watching["body"]["notifications"]["level"], "mentions");
+
+    // Watching: every post, and every change to one, there and not through the mediator.
+    admin.community("post", json!({ "channel": channel, "id": "w1", "content": "hello" })).await;
+    assert_eq!(live.next_typed(&member, &format!("{C}message")).await["body"]["id"], "w1");
+    let pinned = admin.ask("https://wyvrn.app/message-pins/1.0/pin", json!({ "to": { "id": "w1" } })).await;
+    assert_eq!(kind(&pinned), "changed", "{pinned}");
+    assert_eq!(live.next_typed(&member, &format!("{C}changed")).await["body"]["pinned"], true);
+    member.nothing_more().await;
+
+    // Stopped, it is as for anyone not watching: a mention comes through the mediator.
+    live.send_as(&member, &format!("{C}watch"), json!({ "stop": true })).await;
+    live.next_typed(&member, &format!("{C}community")).await;
+    admin.community("post", json!({ "channel": channel, "id": "w2", "content": "quiet" })).await;
+    admin.community("post", json!({ "channel": channel, "id": "w3", "content": "@m", "mentions": [{ "who": member.did(), "name": "m" }] })).await;
+    assert_eq!(member.next_message().await["id"], "w3");
+    // What wasn't sent is caught up on from the rev held.
+    let caught = member.community("changes-request", json!({ "after_rev": rev })).await;
+    let ids: Vec<&str> = caught["body"]["messages"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["w1", "w2", "w3"]);
+}
+

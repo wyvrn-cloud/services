@@ -575,6 +575,19 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         did TEXT PRIMARY KEY,
         ring INTEGER NOT NULL
     );
+    -- What reaches a member through the mediator while they aren't watching
+    -- (community/1.0's set-notifications): all, mentions or nothing. Absent while
+    -- their app has never said, and they are sent everything.
+    CREATE TABLE IF NOT EXISTS notify_prefs (
+        did TEXT PRIMARY KEY,
+        level TEXT NOT NULL
+    );
+    -- The threads each member follows.
+    CREATE TABLE IF NOT EXISTS thread_follows (
+        did TEXT NOT NULL,
+        thread TEXT NOT NULL,
+        PRIMARY KEY (did, thread)
+    );
     -- A post that invites people into a voice channel, and which channel.
     CREATE TABLE IF NOT EXISTS post_voice_invites (
         post TEXT PRIMARY KEY,
@@ -842,6 +855,15 @@ fn schema() -> Schema {
             CREATE TABLE IF NOT EXISTS voice_prefs (
                 did {MYSQL_DID} NOT NULL PRIMARY KEY,
                 ring BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS notify_prefs (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                level VARCHAR(16) NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS thread_follows (
+                did {MYSQL_DID} NOT NULL,
+                thread VARCHAR(255) NOT NULL,
+                PRIMARY KEY (did, thread)
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS post_voice_invites (
                 post VARCHAR(255) NOT NULL PRIMARY KEY,
@@ -1132,6 +1154,11 @@ impl Store {
                 // Their voice preferences follow them.
                 tx.execute("UPDATE OR IGNORE voice_prefs SET did = ?2 WHERE did = ?1", params![prior, new])?;
                 tx.execute("DELETE FROM voice_prefs WHERE did = ?1", params![prior])?;
+                // So do what reaches them, and the threads they follow.
+                tx.execute("UPDATE OR IGNORE notify_prefs SET did = ?2 WHERE did = ?1", params![prior, new])?;
+                tx.execute("DELETE FROM notify_prefs WHERE did = ?1", params![prior])?;
+                tx.execute("UPDATE OR IGNORE thread_follows SET did = ?2 WHERE did = ?1", params![prior, new])?;
+                tx.execute("DELETE FROM thread_follows WHERE did = ?1", params![prior])?;
                 // Their roles follow them, and so does owning the community.
                 tx.execute("UPDATE OR IGNORE member_roles SET did = ?2 WHERE did = ?1", params![prior, new])?;
                 tx.execute("DELETE FROM member_roles WHERE did = ?1", params![prior])?;
@@ -1485,6 +1512,46 @@ impl Store {
 
     pub fn set_voice_rings(&self, did: &str, ring: bool) -> Result<()> {
         self.db.lock().execute("INSERT OR REPLACE INTO voice_prefs (did, ring) VALUES (?1, ?2)", params![did, ring])?;
+        Ok(())
+    }
+
+    // --- What reaches a member ----------------------------------------------------
+
+    /// What reaches `did` through the mediator while they aren't watching: `all`,
+    /// `mentions` or `nothing`; `None` while their app has never said.
+    pub fn notify_level(&self, did: &str) -> Result<Option<String>> {
+        self.db.lock().query_row("SELECT level FROM notify_prefs WHERE did = ?1", params![did], |row| row.get(0))
+    }
+
+    pub fn set_notify_level(&self, did: &str, level: &str) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO notify_prefs (did, level) VALUES (?1, ?2)", params![did, level])?;
+        Ok(())
+    }
+
+    /// Their app has spoken of this: from now on `level` (the default) unless they
+    /// chose before.
+    pub fn settle_notify_level(&self, did: &str, level: &str) -> Result<()> {
+        self.db.lock().execute("INSERT OR IGNORE INTO notify_prefs (did, level) VALUES (?1, ?2)", params![did, level])?;
+        Ok(())
+    }
+
+    /// The threads `did` follows, by the id of the post each grew from.
+    pub fn followed_threads(&self, did: &str) -> Result<Vec<String>> {
+        self.db.lock().query("SELECT thread FROM thread_follows WHERE did = ?1 ORDER BY thread", params![did], |row| row.get(0))
+    }
+
+    pub fn follows_thread(&self, did: &str, thread: &str) -> Result<bool> {
+        Ok(self.db.lock().query_row("SELECT 1 FROM thread_follows WHERE did = ?1 AND thread = ?2", params![did, thread], |row| row.get::<i64>(0))?.is_some())
+    }
+
+    /// Follows the thread `thread`, or stops following it. Only a thread there is.
+    pub fn follow_thread(&self, did: &str, thread: &str, follow: bool) -> Result<()> {
+        let mut db = self.db.lock();
+        if follow {
+            db.execute("INSERT OR IGNORE INTO thread_follows (did, thread) SELECT ?1, id FROM threads WHERE id = ?2", params![did, thread])?;
+        } else {
+            db.execute("DELETE FROM thread_follows WHERE did = ?1 AND thread = ?2", params![did, thread])?;
+        }
         Ok(())
     }
 

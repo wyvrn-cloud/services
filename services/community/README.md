@@ -10,8 +10,11 @@ and [`workflow/1.0`](https://didcomm.org/workflow/1.0) for answering questions.
 - **By invitation.** Only a DID on its list is answered. Anyone else is told
   they aren't on it, and nothing of what is in it. An admin lets people in.
 - **Channels.** An admin opens, renames and closes them (members too, if the
-  community says so). What is posted in one is sent to every member whose app
-  has joined, and kept, so that it can be read back.
+  community says so). What is posted in one is kept, so that it can be read
+  back, and sent to every member whose app has joined: all of it over the live
+  connection of an app that has the community on screen (`watch`), and through
+  the member's mediator, where it is a push, only what they chose: everything, a
+  mention, an answer to them or a thread they follow (the default), or nothing.
 - **Questions.** A post can ask up to four questions, each with a few answers
   to choose from. A member's app answers with a small form; the first to
   finish has answered it, and the answer is posted in their name.

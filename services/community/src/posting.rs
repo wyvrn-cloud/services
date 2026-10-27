@@ -16,6 +16,13 @@ pub const SEARCH_REQUEST: &str = "https://wyvrn.app/community/1.0/search-request
 pub const SEARCH_RESULTS: &str = "https://wyvrn.app/community/1.0/search-results";
 pub const SET_PRESENCE: &str = "https://wyvrn.app/community/1.0/set-presence";
 pub const MEMBER_PRESENCE: &str = "https://wyvrn.app/community/1.0/member-presence";
+pub const WATCH: &str = "https://wyvrn.app/community/1.0/watch";
+pub const SET_NOTIFICATIONS: &str = "https://wyvrn.app/community/1.0/set-notifications";
+
+/// What reaches a member through the mediator while they aren't watching, and
+/// what a member's app is taken to have chosen once it has spoken of it.
+pub const LEVELS: &[&str] = &["all", "mentions", "nothing"];
+pub const DEFAULT_LEVEL: &str = "mentions";
 
 const MAX_ATTACHMENTS: usize = 10;
 const MAX_POLL_ANSWERS: usize = 10;
@@ -261,6 +268,23 @@ impl Community {
                 outcome
             }
 
+            SET_NOTIFICATIONS => {
+                match body["level"].as_str() {
+                    Some(level) if LEVELS.contains(&level) => self.store.set_notify_level(sender, level)?,
+                    Some(_) => return refuse(message, "e.p.msg.invalid-level", "What reaches you is all, mentions or nothing.").map(Some),
+                    None => self.store.settle_notify_level(sender, DEFAULT_LEVEL)?,
+                }
+                for (field, follow) in [("follow", true), ("unfollow", false)] {
+                    for thread in body[field].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                        self.store.follow_thread(sender, thread, follow)?;
+                    }
+                }
+                Outcome::reply(reply_to(message, COMMUNITY, self.community(member)?))
+            }
+
+            // Only on a live connection, which the server takes before it gets here.
+            WATCH => return refuse(message, "e.p.req.live-only", "Watching is asked for on a live connection.").map(Some),
+
             crate::community::HISTORY_REQUEST if body.get("at").is_some_and(Value::is_i64) => {
                 let Some(channel) = self.store.channel(body["channel"].as_str().unwrap_or_default())? else {
                     return refuse(message, "e.p.msg.unknown-channel", "There is no such channel.").map(Some);
@@ -275,5 +299,60 @@ impl Community {
             _ => return Ok(None),
         };
         Ok(Some(outcome))
+    }
+}
+
+impl Community {
+    /// Whether `post` goes to `member` through the mediator while no connection of
+    /// theirs is watching (community/1.0's "What reaches a member, and how"). A
+    /// member whose app has never said is sent everything, as before.
+    pub fn reaches(&self, member: &Member, post: &Post) -> anyhow::Result<bool> {
+        let level = self.store.notify_level(&member.did)?;
+        if level.is_none() {
+            return Ok(true);
+        }
+        // Their own post they have from the connection they posted on.
+        if post.author_did == member.did {
+            return Ok(false);
+        }
+        match level.as_deref() {
+            Some("all") => return Ok(true),
+            Some("nothing") => return Ok(false),
+            _ => {}
+        }
+        if post.reply_author.as_deref() == Some(member.did.as_str()) {
+            return Ok(true);
+        }
+        let mut roles: Option<Vec<String>> = None;
+        for mention in &post.mentions {
+            if mention.who == member.did || mention.who == "everyone" {
+                return Ok(true);
+            }
+            if let Some(role) = mention.who.strip_prefix("role:") {
+                if roles.is_none() {
+                    roles = Some(self.store.member_roles(&member.did)?);
+                }
+                if roles.as_ref().is_some_and(|held| held.iter().any(|r| r == role)) {
+                    return Ok(true);
+                }
+            }
+        }
+        if let Some(asked) = post.answer.as_ref().and_then(|answer| answer["to"].as_str()) {
+            if self.store.post_by_id(asked)?.is_some_and(|asked| asked.author_did == member.did) {
+                return Ok(true);
+            }
+        }
+        if let Some(thread) = &post.thread {
+            if self.store.follows_thread(&member.did, thread)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether a `changed` goes to `member` through the mediator: only to one who
+    /// chose everything, or whose app has never said.
+    pub fn changes_reach(&self, member: &Member) -> anyhow::Result<bool> {
+        Ok(matches!(self.store.notify_level(&member.did)?.as_deref(), None | Some("all")))
     }
 }

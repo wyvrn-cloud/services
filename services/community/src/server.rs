@@ -16,7 +16,7 @@ use axum::{
     Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tokio::sync::mpsc;
@@ -30,6 +30,7 @@ use wyvrn_service::{address, http::receive, now, Incoming, Service};
 
 use crate::community::{self, Community};
 use crate::config::Config;
+use crate::posting::{DEFAULT_LEVEL, WATCH};
 use crate::questions;
 use crate::voice::{self, Rooms, VoiceOutcome};
 
@@ -58,6 +59,9 @@ pub struct AppState {
     pub rooms: Rooms,
     /// Members' live connections, by number: where to put what is sent them there.
     pub live: Mutex<HashMap<u64, (String, mpsc::Sender<Value>)>>,
+    /// The live connections that are watching (community/1.0's `watch`): sent every
+    /// post and change, which then don't go through their mediator.
+    pub watching: Mutex<HashSet<u64>>,
     pub next_live: AtomicU64,
     /// The AI assistant answering in its channels, where it has one
     /// (wyvrn-claude; assistant.rs).
@@ -77,6 +81,7 @@ impl AppState {
             deliver: Notify::new(),
             rooms: Rooms::default(),
             live: Mutex::new(HashMap::new()),
+            watching: Mutex::new(HashSet::new()),
             next_live: AtomicU64::new(1),
             assistant: None,
         }
@@ -90,6 +95,26 @@ impl AppState {
 
     fn live_sender(&self, id: u64) -> Option<mpsc::Sender<Value>> {
         self.live.lock().unwrap_or_else(|p| p.into_inner()).get(&id).map(|(_, out)| out.clone())
+    }
+
+    /// Puts `message` on every watching connection of `did`'s. Whether any took it:
+    /// one that can't is no longer watching, and the message goes as if it weren't.
+    fn to_watching(&self, did: &str, message: &Value) -> bool {
+        let ids: Vec<u64> = {
+            let live = self.live.lock().unwrap_or_else(|p| p.into_inner());
+            let watching = self.watching.lock().unwrap_or_else(|p| p.into_inner());
+            watching.iter().filter(|id| live.get(id).is_some_and(|(holder, _)| holder == did)).copied().collect()
+        };
+        let mut sent = false;
+        for id in ids {
+            match self.live_sender(id) {
+                Some(out) if out.try_send(message.clone()).is_ok() => sent = true,
+                _ => {
+                    self.watching.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
+                }
+            }
+        }
+        sent
     }
 
     /// Puts `message` on every live connection open now.
@@ -146,8 +171,9 @@ pub fn build_agent(config: &Config, identity: Identity) -> anyhow::Result<(Agent
     // Voice channels, where the server has them; and the live connection they
     // need, listed after the address messages are posted to.
     let features = if config.voice.is_some() { features.with_protocol(voice::PIURI, &["server"]) } else { features };
+    // Every community has one: posts go live to whoever is watching (community/1.0).
     let document = match document {
-        Some(mut published) if config.voice.is_some() => {
+        Some(mut published) => {
             let did = published.did().to_string();
             if let Some(services) = published.document["service"].as_array_mut() {
                 services.push(json!({ "id": format!("{did}#live"), "type": "DIDCommMessaging", "serviceEndpoint": { "uri": socket_url(&config.server.public_url), "accept": ["didcomm/v2"], "routingKeys": [] } }));
@@ -182,6 +208,18 @@ async fn rotation(state: &AppState, received: &Received, sender: &str) -> Option
             None
         }
     }
+}
+
+/// Sends a post as it now stands to everyone joined: over a watching connection,
+/// or through the mediator to whoever chose to be sent changes. Anyone else asks
+/// for what changed when they next watch.
+fn send_changed(state: &Arc<AppState>, notice: &Value) -> anyhow::Result<()> {
+    for member in state.community.store.joined()? {
+        if !state.to_watching(&member.did, notice) && state.community.changes_reach(&member)? {
+            send_later(state, member.did, notice.clone());
+        }
+    }
+    Ok(())
 }
 
 /// Sends `message` to `did` without holding up whoever caused it.
@@ -312,10 +350,7 @@ impl Service for CommunityService {
         // can't be reached now: they ask for what changed when they are back.
         for id in &outcome.changed {
             if let Some(post) = state.community.store.post_by_id(id)? {
-                let notice = state.community.changed_notice(&post);
-                for member in state.community.store.joined()? {
-                    send_later(state, member.did, notice.clone());
-                }
+                send_changed(state, &state.community.changed_notice(&post))?;
             }
         }
         if outcome.posted {
@@ -388,10 +423,7 @@ async fn answer_post(state: &Arc<AppState>, id: &str) -> anyhow::Result<()> {
     if let Some(thread) = &asked.thread {
         store.touch_thread(thread)?;
         if let Some(root) = store.post_by_id(thread)? {
-            let notice = state.community.changed_notice(&root);
-            for member in store.joined()? {
-                send_later(state, member.did, notice.clone());
-            }
+            send_changed(state, &state.community.changed_notice(&root))?;
         }
     }
     state.deliver.notify_one();
@@ -408,6 +440,24 @@ fn answer_voice(state: &Arc<AppState>, sender: &str, message: &Value, live: Opti
     let outcome = state.rooms.handle(&state.community, &did, &member, message, live, now())?;
     voice_send(state, &outcome);
     Ok(outcome.reply)
+}
+
+/// community/1.0's `watch`, on the live connection `live`: send it everything
+/// posted and changed, or stop. Answered with `community`, whose `latest_rev` is
+/// where an app catches up from. Speaking of it settles what reaches them otherwise.
+fn watch(state: &Arc<AppState>, live: u64, sender: &str, message: &Value) -> anyhow::Result<Option<Value>> {
+    let Some(member) = state.community.store.member(sender)? else {
+        return Ok(Some(community::problem(message, "e.p.trust.not-authorized", "This community is by invitation: you are not on its list.")));
+    };
+    state.community.store.settle_notify_level(sender, DEFAULT_LEVEL)?;
+    let mut watching = state.watching.lock().unwrap_or_else(|p| p.into_inner());
+    if message["body"]["stop"].as_bool() == Some(true) {
+        watching.remove(&live);
+    } else {
+        watching.insert(live);
+    }
+    drop(watching);
+    Ok(Some(community::reply_to(message, community::COMMUNITY, state.community.community(&member)?)))
 }
 
 /// A member's live connection (community-voice/1.0's Connectivity): DIDComm over a
@@ -486,7 +536,12 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket) {
             Some(_) => {}
         }
         let is_voice = received.message["type"].as_str().is_some_and(|t| t.starts_with(voice::PIURI));
-        let reply = if is_voice {
+        let reply = if received.message["type"] == WATCH {
+            watch(&state, id, &sender, &received.message).unwrap_or_else(|error| {
+                tracing::warn!(%error, "couldn't answer watch");
+                None
+            })
+        } else if is_voice {
             answer_voice(&state, &sender, &received.message, Some(id)).unwrap_or_else(|error| {
                 tracing::warn!(%error, "couldn't answer a voice message");
                 None
@@ -509,6 +564,7 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket) {
         }
     }
     state.live.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
+    state.watching.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
     if let Some(held) = &holder {
         match state.community.live_changed(held, false) {
             Ok(Some(notice)) => state.to_every_live(&notice),
@@ -552,10 +608,9 @@ pub async fn run_polls(state: Arc<AppState>) {
             }
         };
         for id in ended {
-            let (Ok(Some(post)), Ok(joined)) = (state.community.store.post_by_id(&id), state.community.store.joined()) else { continue };
-            let notice = state.community.changed_notice(&post);
-            for member in joined {
-                send_later(&state, member.did, notice.clone());
+            let Ok(Some(post)) = state.community.store.post_by_id(&id) else { continue };
+            if let Err(error) = send_changed(&state, &state.community.changed_notice(&post)) {
+                tracing::warn!(%error, "couldn't tell of a poll that ended");
             }
         }
     }
@@ -587,9 +642,18 @@ pub async fn deliver_pending(state: &Arc<AppState>) -> anyhow::Result<()> {
                 Err(error) => return tracing::error!(%error, "couldn't read posts to deliver"),
             };
             for post in posts {
-                if let Err(error) = state.voice.send(&state.agent, &member.did, &state.community.message(&post)).await {
-                    tracing::warn!(did = %member.did, serial = post.serial, %error, "couldn't deliver a post; will try again");
-                    return;
+                // Watching: everything, there. Otherwise only what concerns them,
+                // through the mediator; what isn't sent they catch up on.
+                let message = state.community.message(&post);
+                let reaches = match state.community.reaches(&member, &post) {
+                    Ok(reaches) => reaches,
+                    Err(error) => return tracing::error!(%error, "couldn't tell whether a post concerns a member"),
+                };
+                if !state.to_watching(&member.did, &message) && reaches {
+                    if let Err(error) = state.voice.send(&state.agent, &member.did, &message).await {
+                        tracing::warn!(did = %member.did, serial = post.serial, %error, "couldn't deliver a post; will try again");
+                        return;
+                    }
                 }
                 if let Err(error) = state.community.store.set_delivered(&member.did, post.serial) {
                     return tracing::error!(%error, "couldn't record a delivery");
