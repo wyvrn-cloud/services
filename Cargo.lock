@@ -4984,6 +4984,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "didcomm-agent",
  "didcomm-core",
  "didcomm-crypto-askar",
@@ -5000,7 +5001,9 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
+ "wyvrn-files",
  "wyvrn-service",
+ "wyvrn-stickers",
 ]
 
 [[package]]
