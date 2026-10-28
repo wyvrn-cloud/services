@@ -38,7 +38,7 @@ fn seed_of(secret_jwk: &str) -> Result<[u8; 32], String> {
 
 /// The key as the log library signs with it, under the id it expects of an update
 /// key (`did:key:<multikey>#<multikey>`) unless `kid` says otherwise.
-pub(crate) fn signing_secret(secret_jwk: &str, kid: Option<&str>) -> Result<Secret, String> {
+pub fn signing_secret(secret_jwk: &str, kid: Option<&str>) -> Result<Secret, String> {
     let seed = seed_of(secret_jwk)?;
     let mut secret = Secret::generate_ed25519(None, Some(&seed));
     let public = secret.get_public_keymultibase().map_err(|e| e.to_string())?;

@@ -41,7 +41,7 @@ pub fn check(bytes: &[u8], did: &str, document: &Value) -> Result<Value, String>
 
 /// Whether `signed` (a presentation or a credential) carries a proof made by a key
 /// that `document` lists under `relationship`. `Err` if it carries no proof at all.
-pub(crate) fn signed_by(signed: &Value, document: &Value, relationship: &str) -> Result<bool, String> {
+pub fn signed_by(signed: &Value, document: &Value, relationship: &str) -> Result<bool, String> {
     let proofs: Vec<Value> = match &signed["proof"] {
         Value::Array(many) => many.clone(),
         Value::Object(_) => vec![signed["proof"].clone()],
