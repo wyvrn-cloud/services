@@ -26,6 +26,7 @@
 pub mod api;
 pub mod keys;
 pub mod linkage;
+pub mod linked;
 pub mod read;
 pub mod resolve;
 pub mod urls;

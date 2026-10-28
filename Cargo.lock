@@ -5069,6 +5069,7 @@ dependencies = [
  "chrono",
  "didwebvh-rs 0.8.0",
  "ed25519-dalek 2.2.0",
+ "flate2",
  "serde",
  "serde_json",
  "sha2 0.10.9",

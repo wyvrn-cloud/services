@@ -141,6 +141,10 @@ pub struct ProfileFields {
     pub logo: Option<Value>,
     pub banner: Option<Value>,
     pub background: Option<Value>,
+    /// Credentials others issued about this DID, carried as they are beside the
+    /// profile: linked accounts (linked-accounts/1.0). Any not about it are left out.
+    #[serde(default)]
+    pub credentials: Vec<Value>,
 }
 
 fn image_object(image: &Value) -> Value {
@@ -200,7 +204,7 @@ pub async fn whois(did: &str, profile: &ProfileFields, authentication_secret_jwk
         "@context": contexts,
         "type": ["VerifiablePresentation"],
         "holder": did,
-        "verifiableCredential": [credential],
+        "verifiableCredential": std::iter::once(credential).chain(profile.credentials.iter().filter(|c| c["credentialSubject"]["id"].as_str() == Some(did)).cloned()).collect::<Vec<_>>(),
     });
     // eddsa-jcs-2022 has the proof carry the @context of what it signs.
     let options = SignOptions::new().with_proof_purpose("authentication").with_context(proof_contexts());

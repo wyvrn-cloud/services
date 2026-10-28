@@ -29,6 +29,7 @@ fn profile(profile: &Profile) -> Value {
     json!({
         "kind": profile.kind, "name": profile.name, "description": profile.description,
         "image": image(&profile.image), "logo": image(&profile.logo), "banner": image(&profile.banner), "background": image(&profile.background),
+        "linkedAccounts": profile.linked,
     })
 }
 
@@ -150,4 +151,13 @@ pub fn check_linkage(configuration: &str, origin: &str, did: &str, document_json
 /// origin it is. Fails if it isn't a bare HTTPS one.
 pub fn linkage_origin(text: &str) -> Result<String, String> {
     crate::linkage::origin_of(text).ok_or_else(|| "That is not a website's address: it should look like example.com".to_string())
+}
+
+/// [`crate::linked::check`]: `status_list_json` is empty when the credential names
+/// no status list or it couldn't be fetched (then a credential that names one fails).
+pub fn check_linked_account(credential_json: &str, issuer_document_json: &str, status_list_json: &str, now: &str) -> Result<(), String> {
+    let credential: Value = parse("the credential", credential_json)?;
+    let issuer_document: Value = parse("the issuer's document", issuer_document_json)?;
+    let status_list: Option<Value> = if status_list_json.trim().is_empty() { None } else { Some(parse("the status list", status_list_json)?) };
+    crate::linked::check(&credential, &issuer_document, status_list.as_ref(), now)
 }

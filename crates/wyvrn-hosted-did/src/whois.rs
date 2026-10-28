@@ -160,6 +160,8 @@ pub struct Profile {
     pub logo: Option<Image>,
     pub banner: Option<Image>,
     pub background: Option<Image>,
+    /// Linked-account credentials about it, not yet checked ([`crate::linked`]).
+    pub linked: Vec<Value>,
 }
 
 /// The profile in a whois that [`check`] has passed for `did`: the credential of
@@ -180,6 +182,7 @@ pub fn profile(presentation: &Value, did: &str) -> Option<Profile> {
         logo: Image::of(&subject["brand"]["logo"]),
         banner: Image::of(&subject["brand"]["image"]),
         background: Image::of(&subject["wyvrn"]["background"]),
+        linked: crate::linked::of(presentation, did),
     })
 }
 

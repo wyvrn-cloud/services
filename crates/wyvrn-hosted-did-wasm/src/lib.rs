@@ -73,3 +73,10 @@ pub fn hosted_check_linkage(configuration: String, origin: String, did: String, 
 pub fn hosted_linkage_origin(text: String) -> Result<String, JsValue> {
     api::linkage_origin(&text).map_err(rejected)
 }
+
+/// Whether a linked-account credential checks out against its issuer's document
+/// and status list (`""` when there is none to read): `true`, or why not.
+#[wasm_bindgen(js_name = hostedCheckLinkedAccount)]
+pub fn hosted_check_linked_account(credential_json: String, issuer_document_json: String, status_list_json: String, now: String) -> Result<bool, JsValue> {
+    api::check_linked_account(&credential_json, &issuer_document_json, &status_list_json, &now).map(|()| true).map_err(rejected)
+}
