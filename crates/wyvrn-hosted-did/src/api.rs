@@ -98,6 +98,12 @@ pub fn sign_attachment(bytes: &[u8], authentication_secret_jwk: &str) -> Result<
     write::sign_attachment(bytes, authentication_secret_jwk).map(|jws| jws.to_string())
 }
 
+/// [`write::sign_compact`]: `payload` signed under `header_json`, as a compact JWS.
+pub fn sign_compact(header_json: &str, payload: &[u8], authentication_secret_jwk: &str) -> Result<String, String> {
+    let header: Value = parse("the header", header_json)?;
+    write::sign_compact(&header, payload, authentication_secret_jwk)
+}
+
 /// Which of `keys_json` (an array of Ed25519 multikeys) signed `bytes`, by the
 /// detached signature `jws_json` (`{protected, signature}`, as
 /// [`sign_attachment`] makes one): that key, or an empty string if none did.

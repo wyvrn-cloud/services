@@ -39,6 +39,12 @@ pub fn hosted_sign_attachment(bytes: &[u8], authentication_secret_jwk: String) -
     api::sign_attachment(bytes, &authentication_secret_jwk).map_err(rejected)
 }
 
+/// Signs `payload` under the header `header_json` (alg EdDSA): a compact JWS.
+#[wasm_bindgen(js_name = hostedSignCompact)]
+pub fn hosted_sign_compact(header_json: String, payload: &[u8], authentication_secret_jwk: String) -> Result<String, JsValue> {
+    api::sign_compact(&header_json, payload, &authentication_secret_jwk).map_err(rejected)
+}
+
 #[wasm_bindgen(js_name = hostedSignedBy)]
 pub fn hosted_signed_by(bytes: &[u8], jws_json: String, keys_json: String) -> Result<String, JsValue> {
     api::signed_by(bytes, &jws_json, &keys_json).map_err(rejected)

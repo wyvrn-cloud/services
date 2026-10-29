@@ -127,6 +127,20 @@ pub fn sign_attachment(bytes: &[u8], authentication_secret_jwk: &str) -> Result<
     Ok(json!({ "protected": protected, "signature": b64.encode(signature.to_bytes()) }))
 }
 
+/// `payload` signed with the authentication key under `header` (which must say
+/// `"alg": "EdDSA"`), as a compact JWS: `header.payload.signature`. For a JWT
+/// whose header says more than [`sign_attachment`]'s does: an SD-JWT's `typ`
+/// and `kid`, say.
+pub fn sign_compact(header: &Value, payload: &[u8], authentication_secret_jwk: &str) -> Result<String, String> {
+    if header["alg"] != "EdDSA" {
+        return Err("the header must say alg EdDSA".to_string());
+    }
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let input = format!("{}.{}", b64.encode(header.to_string()), b64.encode(payload));
+    let signature = SigningKey::from_bytes(&seed_of(authentication_secret_jwk)?).sign(input.as_bytes());
+    Ok(format!("{input}.{}", b64.encode(signature.to_bytes())))
+}
+
 /// What goes into a profile: all of it optional.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -211,4 +225,25 @@ pub async fn whois(did: &str, profile: &ProfileFields, authentication_secret_jwk
     let proof = DataIntegrityProof::sign(&presentation, &signer, options).await.map_err(|e| e.to_string())?;
     presentation["proof"] = serde_json::to_value(proof).map_err(|e| e.to_string())?;
     Ok(presentation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: &str = r#"{"kty":"OKP","crv":"Ed25519","d":"nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}"#;
+
+    #[test]
+    fn a_compact_jws_carries_its_header_and_verifies_against_the_key() {
+        let header = json!({ "alg": "EdDSA", "typ": "dc+sd-jwt", "kid": "did:x#key-1" });
+        let jws = sign_compact(&header, br#"{"did":"did:x"}"#, SECRET).unwrap();
+        let parts: Vec<&str> = jws.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        assert_eq!(serde_json::from_slice::<Value>(&b64.decode(parts[0]).unwrap()).unwrap(), header);
+        let key = public_multikey(SECRET).unwrap();
+        let detached = json!({ "protected": parts[0], "signature": parts[2] });
+        assert_eq!(crate::keys::signer_among(br#"{"did":"did:x"}"#, &detached, std::slice::from_ref(&key)), Some(&key));
+        assert!(sign_compact(&json!({ "alg": "ES256" }), b"x", SECRET).is_err());
+    }
 }
