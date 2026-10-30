@@ -45,6 +45,19 @@ pub fn hosted_sign_compact(header_json: String, payload: &[u8], authentication_s
     api::sign_compact(&header_json, payload, &authentication_secret_jwk).map_err(rejected)
 }
 
+/// A Verifiable Presentation proved for one verifier (`challenge`, `domain`).
+#[wasm_bindgen(js_name = hostedSignPresentation)]
+pub fn hosted_sign_presentation(presentation_json: String, secret_jwk: String, verification_method: String, challenge: String, domain: String, created: String) -> Result<String, JsValue> {
+    api::sign_presentation(&presentation_json, &secret_jwk, &verification_method, &challenge, &domain, &created).map_err(rejected)
+}
+
+/// Throws unless a presentation was proved for `challenge` and `domain` by a key the
+/// holder's document lists under `authentication`.
+#[wasm_bindgen(js_name = hostedCheckPresentation)]
+pub fn hosted_check_presentation(signed_json: String, document_json: String, challenge: String, domain: String) -> Result<(), JsValue> {
+    api::check_presentation(&signed_json, &document_json, &challenge, &domain).map_err(rejected)
+}
+
 #[wasm_bindgen(js_name = hostedSignedBy)]
 pub fn hosted_signed_by(bytes: &[u8], jws_json: String, keys_json: String) -> Result<String, JsValue> {
     api::signed_by(bytes, &jws_json, &keys_json).map_err(rejected)
