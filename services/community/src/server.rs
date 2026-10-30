@@ -55,6 +55,10 @@ pub struct AppState {
     pub resolver: Box<dyn DIDResolver>,
     /// Rung when there is something new to send to members.
     pub deliver: Notify,
+    /// Who just posted: the next delivery sends to them before anyone else, so
+    /// their own post comes back to them (and their other devices) without
+    /// waiting behind everyone's.
+    pub deliver_first: Mutex<Vec<String>>,
     /// Voice channels' rooms (community-voice/1.0).
     pub rooms: Rooms,
     /// Members' live connections, by number: where to put what is sent them there.
@@ -79,6 +83,7 @@ impl AppState {
             did_document,
             resolver,
             deliver: Notify::new(),
+            deliver_first: Mutex::new(Vec::new()),
             rooms: Rooms::default(),
             live: Mutex::new(HashMap::new()),
             watching: Mutex::new(HashSet::new()),
@@ -354,6 +359,9 @@ impl Service for CommunityService {
             }
         }
         if outcome.posted {
+            if outcome.posted_id.is_some() {
+                state.deliver_first.lock().expect("deliver_first lock").push(sender.clone());
+            }
             state.deliver.notify_one();
         }
         // A post in a room: the assistant answers it, in its own time.
@@ -627,42 +635,55 @@ pub async fn run_voice_sweep(state: Arc<AppState>) {
 
 /// Sends every member who has joined the posts they haven't had, in order. One
 /// who can't be reached is left where they are, and tried again on the next pass.
+/// Whoever just posted (`AppState::deliver_first`) is sent theirs first, before the
+/// rest are started.
 pub async fn deliver_pending(state: &Arc<AppState>) -> anyhow::Result<()> {
     let store = &state.community.store;
     let latest = store.latest_serial()?;
+    let first: Vec<String> = std::mem::take(&mut *state.deliver_first.lock().expect("deliver_first lock"));
+    let (posters, rest): (Vec<_>, Vec<_>) = store.joined()?.into_iter().filter(|member| member.delivered < latest).partition(|member| first.contains(&member.did));
+    for member in posters {
+        deliver_to(state, member).await;
+    }
     let limit = Arc::new(Semaphore::new(DELIVERY_CONCURRENCY));
     let mut sends = tokio::task::JoinSet::new();
-    for member in store.joined()?.into_iter().filter(|member| member.delivered < latest) {
+    for member in rest {
         let state = state.clone();
         let limit = limit.clone();
         sends.spawn(async move {
             let _permit = limit.acquire().await;
-            let posts = match state.community.store.posts_after(member.delivered, DELIVERY_BATCH) {
-                Ok(posts) => posts,
-                Err(error) => return tracing::error!(%error, "couldn't read posts to deliver"),
-            };
-            for post in posts {
-                // Watching: everything, there. Otherwise only what concerns them,
-                // through the mediator; what isn't sent they catch up on.
-                let message = state.community.message(&post);
-                let reaches = match state.community.reaches(&member, &post) {
-                    Ok(reaches) => reaches,
-                    Err(error) => return tracing::error!(%error, "couldn't tell whether a post concerns a member"),
-                };
-                if !state.to_watching(&member.did, &message) && reaches {
-                    if let Err(error) = state.voice.send(&state.agent, &member.did, &message).await {
-                        tracing::warn!(did = %member.did, serial = post.serial, %error, "couldn't deliver a post; will try again");
-                        return;
-                    }
-                }
-                if let Err(error) = state.community.store.set_delivered(&member.did, post.serial) {
-                    return tracing::error!(%error, "couldn't record a delivery");
-                }
-            }
+            deliver_to(&state, member).await;
         });
     }
     while sends.join_next().await.is_some() {}
     Ok(())
+}
+
+/// Sends one member the posts they haven't had, in order, as far as they can be
+/// reached.
+async fn deliver_to(state: &Arc<AppState>, member: crate::store::Member) {
+    let posts = match state.community.store.posts_after(member.delivered, DELIVERY_BATCH) {
+        Ok(posts) => posts,
+        Err(error) => return tracing::error!(%error, "couldn't read posts to deliver"),
+    };
+    for post in posts {
+        // Watching: everything, there. Otherwise only what concerns them,
+        // through the mediator; what isn't sent they catch up on.
+        let message = state.community.message(&post);
+        let reaches = match state.community.reaches(&member, &post) {
+            Ok(reaches) => reaches,
+            Err(error) => return tracing::error!(%error, "couldn't tell whether a post concerns a member"),
+        };
+        if !state.to_watching(&member.did, &message) && reaches {
+            if let Err(error) = state.voice.send(&state.agent, &member.did, &message).await {
+                tracing::warn!(did = %member.did, serial = post.serial, %error, "couldn't deliver a post; will try again");
+                return;
+            }
+        }
+        if let Err(error) = state.community.store.set_delivered(&member.did, post.serial) {
+            return tracing::error!(%error, "couldn't record a delivery");
+        }
+    }
 }
 
 /// Delivers whenever something is posted, and again a while after anyone
