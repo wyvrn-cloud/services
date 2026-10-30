@@ -120,6 +120,20 @@ pub async fn whois(did: &str, profile_json: &str, authentication_secret_jwk: &st
     write::whois(did, &profile, authentication_secret_jwk, verification_method, valid_from).await.map(|vp| vp.to_string())
 }
 
+/// [`presentation::sign`]: `presentation_json` proved for one verifier, as JSON.
+pub fn sign_presentation(presentation_json: &str, secret_jwk: &str, verification_method: &str, challenge: &str, domain: &str, created: &str) -> Result<String, String> {
+    let presentation: Value = parse("the presentation", presentation_json)?;
+    crate::presentation::sign(&presentation, secret_jwk, verification_method, challenge, domain, created).map(|vp| vp.to_string())
+}
+
+/// [`presentation::check`]: `Ok` if `signed_json` was proved for `challenge` and
+/// `domain` by a key `document_json` lists under `authentication`.
+pub fn check_presentation(signed_json: &str, document_json: &str, challenge: &str, domain: &str) -> Result<(), String> {
+    let signed: Value = parse("the presentation", signed_json)?;
+    let document: Value = parse("the document", document_json)?;
+    crate::presentation::check(&signed, &document, challenge, domain)
+}
+
 /// [`write::public_multikey`].
 pub fn public_multikey(secret_jwk: &str) -> Result<String, String> {
     write::public_multikey(secret_jwk)

@@ -26,7 +26,7 @@ pub struct Written {
     pub version_id: String,
 }
 
-fn seed_of(secret_jwk: &str) -> Result<[u8; 32], String> {
+pub(crate) fn seed_of(secret_jwk: &str) -> Result<[u8; 32], String> {
     let jwk: Value = serde_json::from_str(secret_jwk).map_err(|_| "the key is not a JWK".to_string())?;
     if jwk["kty"] != "OKP" || jwk["crv"] != "Ed25519" {
         return Err("the key is not an Ed25519 key".to_string());
