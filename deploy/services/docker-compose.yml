@@ -179,6 +179,43 @@ services:
       RELAY_ALLOW: "${RELAY_ALLOW:-}"
       RELAY_DATABASE_URL: "${RELAY_DATABASE_URL:?set RELAY_DATABASE_URL in .env}"
 
+  # The verification service (wyvrn-verify, a repo of its own): linked accounts,
+  # sign-in credentials and the hosted verifier for websites. The app is built to
+  # use did:web:verify.wyvrn.app (VITE_VERIFY_SERVICE_DID). Its keys and records
+  # are in its database.
+  verify:
+    <<: *service
+    profiles: ["verify"]
+    image: wyvrn-verify
+    build:
+      # The folder holding the wyvrn-* checkouts: it builds from wyvrn-services
+      # and wyvrn-sign-in beside it.
+      context: ../../..
+      dockerfile: wyvrn-verify/Dockerfile
+    ports:
+      - "127.0.0.1:${VERIFY_PORT:-8188}:8080"
+    environment:
+      # Bluesky only signs in to an https client.
+      VERIFY_PUBLIC_URL: "https://${VERIFY_DOMAIN:?set VERIFY_DOMAIN in .env}/"
+      VERIFY_DID_METHOD: "web"
+      VERIFY_DATABASE_URL: "${VERIFY_DATABASE_URL:?set VERIFY_DATABASE_URL in .env}"
+      # Who may use its admin page (the websites its hosted verifier serves).
+      VERIFY_ADMINS: "${VERIFY_ADMINS:-}"
+      # The DID host whose addresses it checks and links accounts to.
+      VERIFY_ADDRESS_HOST: "${DID_HOST_DOMAIN:-id.wyvrn.app}"
+      # Its address at the DID host; sign-in credentials are then issued by it.
+      VERIFY_PUBLIC_ADDRESS: "${VERIFY_PUBLIC_ADDRESS:-}"
+      VERIFY_PROFILE_NAME: "${VERIFY_PROFILE_NAME:-}"
+      VERIFY_PROFILE_DESCRIPTION: "${VERIFY_PROFILE_DESCRIPTION:-}"
+      # Each platform is offered once its OAuth client is set; the redirect to
+      # register is https://<VERIFY_DOMAIN>/oauth/callback.
+      VERIFY_TWITCH_CLIENT_ID: "${VERIFY_TWITCH_CLIENT_ID:-}"
+      VERIFY_TWITCH_CLIENT_SECRET: "${VERIFY_TWITCH_CLIENT_SECRET:-}"
+      VERIFY_DISCORD_CLIENT_ID: "${VERIFY_DISCORD_CLIENT_ID:-}"
+      VERIFY_DISCORD_CLIENT_SECRET: "${VERIFY_DISCORD_CLIENT_SECRET:-}"
+      VERIFY_YOUTUBE_CLIENT_ID: "${VERIFY_YOUTUBE_CLIENT_ID:-}"
+      VERIFY_YOUTUBE_CLIENT_SECRET: "${VERIFY_YOUTUBE_CLIENT_SECRET:-}"
+
 volumes:
   # Every file the files service holds. The only thing this stack keeps outside
   # the databases: `docker volume inspect wyvrn-services_files-data` says where.

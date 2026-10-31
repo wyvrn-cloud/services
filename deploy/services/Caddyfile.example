@@ -90,6 +90,18 @@ stickers.example {
 # 	}
 # }
 
+# The verification service. Not behind a bot check such as Anubis: nearly all of
+# it is read by programs, not people -- Bluesky's and Mastodon's servers fetch
+# its OAuth client metadata, apps post DIDComm messages to / and read its DID
+# document and status lists, and websites call its hosted verifier.
+# verify.example {
+# 	encode gzip
+# 	route {
+# 		import wyvrn-limits
+# 		reverse_proxy 127.0.0.1:8188
+# 	}
+# }
+
 # Link cards, in front of the web app (README.md, "Link cards"): add these to the
 # block the web app's domain already has, above what serves the app itself.
 #
