@@ -214,8 +214,9 @@ impl Host {
             tokio::spawn(server::run_voice_sweep(state.clone())),
             tokio::spawn(server::run_polls(state.clone())),
         ];
+        // Moving out, the address is the owner's server's to write next.
         if let Some(holding) = holding {
-            tasks.push(tokio::spawn(holding.run()));
+            tasks.push(tokio::spawn(if record.state == State::Moving { Box::pin(holding.keep_speaking()) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> } else { Box::pin(holding.run()) }));
         }
         tracing::info!(community = %record.name, did = %state.agent.did(), storage = record.storage.as_str(), "opened a community");
         Ok(Tenant { name: record.name.clone(), router: server::router(state.clone()), state, tasks, last_used: AtomicI64::new(now()) })

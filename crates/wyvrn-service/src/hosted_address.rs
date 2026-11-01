@@ -249,6 +249,15 @@ impl Holding {
         Ok(())
     }
 
+    /// Speaks as the address it holds already, and asks its DID host nothing: for a
+    /// service on its way to another server, which will write the address's next
+    /// entry itself (community/1.0, "Hosted communities, and moving").
+    pub async fn keep_speaking(self) {
+        if let Ok(Some(log)) = self.kept.load(&self.address) {
+            self.tell_held(&log.did).await;
+        }
+    }
+
     /// Holds the address for as long as the service runs: tried until it is had (the
     /// host has to be able to fetch the service's own `did:web` document first, so
     /// not before the service is serving), and its whois published again whenever

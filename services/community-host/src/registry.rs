@@ -137,10 +137,12 @@ pub struct Record {
     pub sealed_until: Option<i64>,
 }
 
-/// Whether `name` can be a community's name here: 2 to 40 lowercase letters,
-/// digits and `-`, starting with a letter, as a DID host's name segment allows.
+/// Whether `name` can be a community's name here: 3 to 32 lowercase letters,
+/// digits and `-`, starting with a letter, with no `-` last or doubled: what a DID
+/// host takes as a name's label (`community:<name>`).
 pub fn valid_name(name: &str) -> bool {
-    (2..=40).contains(&name.len())
+    (3..=32).contains(&name.len())
+        && !name.contains("--")
         && name.starts_with(|c: char| c.is_ascii_lowercase())
         && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         && !name.ends_with('-')
@@ -183,7 +185,7 @@ impl Registry {
     /// Adds a community, to be opened at once (so that it takes up its address).
     pub fn create(&self, name: &str, title: &str, storage: Storage, owner: &str, by: &str, now: i64) -> anyhow::Result<Record> {
         if !valid_name(name) {
-            anyhow::bail!("{name:?} can't be a community's name: 2 to 40 lowercase letters, digits and -, starting with a letter");
+            anyhow::bail!("{name:?} can't be a community's name: 3 to 32 lowercase letters, digits and -, starting with a letter");
         }
         let mut db = self.db.lock();
         let added = db.execute(
@@ -263,10 +265,10 @@ mod tests {
 
     #[test]
     fn a_name_is_what_a_did_hosts_segment_can_be() {
-        for good in ["ab", "makers", "the-workshop", "a1"] {
+        for good in ["abc", "makers", "the-workshop", "a12"] {
             assert!(valid_name(good), "{good}");
         }
-        for bad in ["a", "1abc", "-ab", "ab-", "Ab", "a_b", "a.b", &"a".repeat(41)] {
+        for bad in ["ab", "1abc", "-abc", "abc-", "a--b", "Abc", "a_bc", "a.bc", &"a".repeat(33)] {
             assert!(!valid_name(bad), "{bad}");
         }
     }
