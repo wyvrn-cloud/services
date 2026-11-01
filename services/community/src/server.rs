@@ -37,11 +37,11 @@ use crate::voice::{self, Rooms, VoiceOutcome};
 /// How many members are sent to at once.
 const DELIVERY_CONCURRENCY: usize = 8;
 /// How long before someone who couldn't be reached is tried again.
-const DELIVERY_RETRY: Duration = Duration::from_secs(60);
+pub const DELIVERY_RETRY: Duration = Duration::from_secs(60);
 /// How many posts one member is sent in one pass.
 const DELIVERY_BATCH: usize = 100;
 /// How often answers nobody finished are forgotten, and how old they have to be.
-const PRUNE_EVERY: Duration = Duration::from_secs(60 * 60);
+pub const PRUNE_EVERY: Duration = Duration::from_secs(60 * 60);
 const ANSWERING_KEPT_FOR: i64 = 24 * 60 * 60;
 
 pub struct AppState {
@@ -159,9 +159,18 @@ fn voice_send(state: &Arc<AppState>, outcome: &VoiceOutcome) {
 
 /// The agent for `config`: the server's own DID, which members write to.
 pub fn build_agent(config: &Config, identity: Identity) -> anyhow::Result<(Agent, Option<address::Published>)> {
+    build_agent_for(config, identity, Some("COMMUNITY"))
+}
+
+/// As [`build_agent`], with who it says it is taken from the environment settings
+/// starting `profile_env` (`COMMUNITY_PROFILE_NAME`, …), or from `config` alone.
+pub fn build_agent_for(config: &Config, identity: Identity, profile_env: Option<&str>) -> anyhow::Result<(Agent, Option<address::Published>)> {
     let (agent, document) = address::build_agent(identity, &config.server.public_url, config.server.did_method)?;
     // Who it is, for whoever looks its DID up before writing to it.
-    let profile = config.profile.or("COMMUNITY", &config.community.name, &config.community.description);
+    let profile = match profile_env {
+        Some(prefix) => config.profile.or(prefix, &config.community.name, &config.community.description),
+        None => config.profile.or_plainly(&config.community.name, &config.community.description),
+    };
     let document = document.map(|document| document.with_profile(&profile)).transpose()?;
     let features = Features::standard()
         .with_protocol(community::PIURI, &["server"])
@@ -237,6 +246,20 @@ fn send_later(state: &Arc<AppState>, did: String, message: Value) {
     });
 }
 
+/// Begins a move to another server, or calls it off, and tells every joined member
+/// (community/1.0's "Hosted communities, and moving"). Sent unasked, so from the
+/// address the community speaks as, with the `from_prior` that brings whoever knew
+/// it by its `did:web` there.
+pub fn set_moving(state: &Arc<AppState>, moving: bool) -> anyhow::Result<()> {
+    if state.community.set_moving(moving)? {
+        tracing::info!(moving, "the community's move to another server");
+        for (did, notice) in state.community.community_notices()? {
+            send_later(state, did, notice);
+        }
+    }
+    Ok(())
+}
+
 /// The server as the shared plumbing sees it: its agent, and what it answers.
 pub struct CommunityService(pub Arc<AppState>);
 
@@ -289,6 +312,12 @@ impl Service for CommunityService {
             }
         }
 
+        // Moving to another server: forms and files change it, and are refused as
+        // everything is but reading (Community::handle). Voice changes nothing kept.
+        let message_type = received.message["type"].as_str().unwrap_or_default();
+        if (message_type.starts_with(questions::PIURI) || crate::files::is_files(&received.message)) && state.community.moving()? {
+            return Ok(Some(community::problem(&received.message, "e.p.req.moving", "This community is moving to another server. It can be read, and nothing changed, until it has.")));
+        }
         // A question's answer, from someone let in. (Anyone else falls through, and
         // is told they aren't.)
         if received.message["type"].as_str().is_some_and(|message_type| message_type.starts_with(questions::PIURI)) {
@@ -603,33 +632,45 @@ async fn voice_auth(State(state): State<Arc<AppState>>, Json(request): Json<Valu
     }
 }
 
-/// Tells everyone joined of each poll as it ends, as it then stands; looked for
-/// every 30 seconds.
-pub async fn run_polls(state: Arc<AppState>) {
-    loop {
-        tokio::time::sleep(Duration::from_secs(30)).await;
-        let ended = match state.community.store.polls_just_ended(now()) {
-            Ok(ended) => ended,
-            Err(error) => {
-                tracing::warn!(%error, "couldn't look for polls that ended");
-                continue;
-            }
-        };
-        for id in ended {
-            let Ok(Some(post)) = state.community.store.post_by_id(&id) else { continue };
-            if let Err(error) = send_changed(&state, &state.community.changed_notice(&post)) {
-                tracing::warn!(%error, "couldn't tell of a poll that ended");
-            }
+/// How often [`polls_once`] is wanted.
+pub const POLLS_EVERY: Duration = Duration::from_secs(30);
+/// How often [`sweep_once`] is wanted.
+pub const SWEEP_EVERY: Duration = Duration::from_secs(15);
+
+/// Tells everyone joined of each poll that has ended since last asked, as it then
+/// stands.
+pub fn polls_once(state: &Arc<AppState>) {
+    let ended = match state.community.store.polls_just_ended(now()) {
+        Ok(ended) => ended,
+        Err(error) => return tracing::warn!(%error, "couldn't look for polls that ended"),
+    };
+    for id in ended {
+        let Ok(Some(post)) = state.community.store.post_by_id(&id) else { continue };
+        if let Err(error) = send_changed(state, &state.community.changed_notice(&post)) {
+            tracing::warn!(%error, "couldn't tell of a poll that ended");
         }
     }
 }
 
-/// Takes out of their rooms those who have gone quiet, every 15 seconds.
+/// Polls as they end, looked for every 30 seconds.
+pub async fn run_polls(state: Arc<AppState>) {
+    loop {
+        tokio::time::sleep(POLLS_EVERY).await;
+        polls_once(&state);
+    }
+}
+
+/// Takes out of their rooms those who have gone quiet.
+pub fn sweep_once(state: &Arc<AppState>) {
+    let presence = state.rooms.sweep(&state.community, now());
+    voice_send(state, &VoiceOutcome { live: presence, ..VoiceOutcome::default() });
+}
+
+/// The voice rooms swept every 15 seconds.
 pub async fn run_voice_sweep(state: Arc<AppState>) {
     loop {
-        tokio::time::sleep(Duration::from_secs(15)).await;
-        let presence = state.rooms.sweep(&state.community, now());
-        voice_send(&state, &VoiceOutcome { live: presence, ..VoiceOutcome::default() });
+        tokio::time::sleep(SWEEP_EVERY).await;
+        sweep_once(&state);
     }
 }
 
@@ -686,6 +727,13 @@ async fn deliver_to(state: &Arc<AppState>, member: crate::store::Member) {
     }
 }
 
+/// Whether a member who has joined hasn't been sent everything yet: someone who
+/// couldn't be reached, to be tried again ([`DELIVERY_RETRY`]).
+pub fn deliveries_owed(state: &AppState) -> anyhow::Result<bool> {
+    let latest = state.community.store.latest_serial()?;
+    Ok(state.community.store.joined()?.iter().any(|member| member.delivered < latest))
+}
+
 /// Delivers whenever something is posted, and again a while after anyone
 /// couldn't be reached.
 pub async fn run_deliveries(state: Arc<AppState>) {
@@ -698,15 +746,20 @@ pub async fn run_deliveries(state: Arc<AppState>) {
 }
 
 /// Forgets answers, and administration workflows, that were started and left.
+pub fn prune_once(state: &AppState) {
+    if let Err(error) = state.community.store.prune_answering(now() - ANSWERING_KEPT_FOR) {
+        tracing::warn!(%error, "pruning failed");
+    }
+    // Administration workflows left open, as long as answers are kept.
+    if let Err(error) = state.community.store.prune_flows(now() - ANSWERING_KEPT_FOR) {
+        tracing::warn!(%error, "pruning failed");
+    }
+}
+
+/// Pruned every hour.
 pub async fn run_pruning(state: Arc<AppState>) {
     loop {
-        if let Err(error) = state.community.store.prune_answering(now() - ANSWERING_KEPT_FOR) {
-            tracing::warn!(%error, "pruning failed");
-        }
-        // Administration workflows left open, as long as answers are kept.
-        if let Err(error) = state.community.store.prune_flows(now() - ANSWERING_KEPT_FOR) {
-            tracing::warn!(%error, "pruning failed");
-        }
+        prune_once(&state);
         tokio::time::sleep(PRUNE_EVERY).await;
     }
 }

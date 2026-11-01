@@ -15,10 +15,19 @@
 //! A deployment says which with `<SERVICE>_DATABASE_URL` or `DATABASE_URL`
 //! ([`Location::from_env`]): `mysql://user:password@host:3306/database`. Each
 //! service needs a database of its own: their tables share names.
+//!
+//! **Many stores in one database.** A host of many communities keeps each one's
+//! stores apart by naming its tables ([`Location::Shared`]): a database of a MySQL
+//! server and a prefix, `"<database>"."<prefix><table>"`, written into each
+//! statement as it is said ([`renamed`]). So a statement names a table only where
+//! that can find it: after `FROM`, `INTO`, `JOIN`, `UPDATE [OR IGNORE]`, `TABLE [IF
+//! NOT EXISTS]` and an index's `ON`, never qualifying a column with its table. Such
+//! stores share the server's connections ([`pool`]): one each would be thousands.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use mysql::prelude::Queryable;
@@ -29,6 +38,12 @@ pub enum Location {
     Sqlite(PathBuf),
     /// `mysql://user:password@host:port/database`.
     MySql(String),
+    /// Tables named `"<database>"."<prefix><table>"` on the MySQL server at
+    /// `server` (`mysql://user:password@host:port`, no database), whose connections
+    /// are shared with every other store there: one of many communities kept by one
+    /// host. The database is made if it isn't there. Both names are letters, digits
+    /// and `_`; the prefix may be empty.
+    Shared { server: String, database: String, prefix: String },
 }
 
 impl Location {
@@ -71,6 +86,7 @@ impl fmt::Display for Location {
         match self {
             Self::Sqlite(path) => write!(f, "{}", path.display()),
             Self::MySql(url) => write!(f, "{}", Self::without_password(url)),
+            Self::Shared { server, database, prefix } => write!(f, "{} {database} ({prefix}…)", Self::without_password(server)),
         }
     }
 }
@@ -282,6 +298,7 @@ impl Row {
 enum Backend {
     Sqlite(rusqlite::Connection),
     MySql(Box<MySql>),
+    Pooled(mysql::Pool),
 }
 
 struct MySql {
@@ -293,11 +310,24 @@ struct MySql {
 /// A service's database.
 pub struct Db {
     backend: Mutex<Backend>,
+    naming: Option<Naming>,
+}
+
+/// What a store's tables are called where it shares a database (see
+/// [`Location::Shared`]): `None`, as they are written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Naming {
+    /// The database, said with each table, where connections are shared.
+    database: Option<String>,
+    prefix: String,
 }
 
 /// The database, held: nothing else is said to it until this is dropped.
 pub struct Session<'a> {
     backend: MutexGuard<'a, Backend>,
+    naming: Option<&'a Naming>,
+    /// A shared connection, taken at the first statement and given back with the session.
+    pooled: Option<mysql::PooledConn>,
     in_transaction: bool,
 }
 
@@ -314,9 +344,10 @@ impl Db {
                 if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                     std::fs::create_dir_all(parent).map_err(|err| Error::Other(format!("making {}: {err}", parent.display())))?;
                 }
-                Self::sqlite(rusqlite::Connection::open(path)?, schema)
+                Self::sqlite(rusqlite::Connection::open(path)?, schema, None)
             }
             Location::MySql(url) => Self::mysql(mysql_options(url)?, schema, service),
+            Location::Shared { server, database, prefix } => Self::shared(server, database, prefix, schema, service),
         }
     }
 
@@ -324,13 +355,27 @@ impl Db {
     /// `WYVRN_TEST_DATABASE_URL` names a MySQL server: then a database of its own
     /// there, made for it and left behind, so that the same tests can be run
     /// against the real thing.
+    ///
+    /// `WYVRN_TEST_TABLE_PREFIX` names its tables with that prefix, as a host of
+    /// many communities does (on MySQL, in a database shared by the tests that
+    /// run at once): every store's tests run so find a statement that names a
+    /// table where the prefix can't be written in.
     pub fn scratch(schema: &Schema) -> Result<Self> {
+        let prefix = std::env::var("WYVRN_TEST_TABLE_PREFIX").ok().filter(|prefix| !prefix.is_empty());
         match std::env::var("WYVRN_TEST_DATABASE_URL").ok().filter(|url| !url.is_empty()) {
-            None => Self::sqlite(rusqlite::Connection::open_in_memory()?, schema),
+            None => {
+                let naming = prefix.map(|prefix| Naming { database: None, prefix: format!("{prefix}{}_", scratch_name()) });
+                Self::sqlite(rusqlite::Connection::open_in_memory()?, schema, naming)
+            }
             Some(url) => {
                 let Location::MySql(url) = Location::parse(&url)? else {
                     return Err(Error::Other("WYVRN_TEST_DATABASE_URL is for a MySQL server".into()));
                 };
+                if let Some(prefix) = prefix {
+                    let server = mysql_options(&url)?;
+                    let server = mysql::OptsBuilder::from_opts(server).db_name(None::<String>);
+                    return Self::shared_with(server.into(), "wyvrn_test_shared", &format!("{prefix}{}_", scratch_name()), schema, "test");
+                }
                 let server = mysql_options(&url)?;
                 let name = format!("wyvrn_test_{}", scratch_name());
                 let mut connection = mysql::Conn::new(server.clone())?;
@@ -341,41 +386,210 @@ impl Db {
         }
     }
 
-    fn sqlite(connection: rusqlite::Connection, schema: &Schema) -> Result<Self> {
+    fn sqlite(connection: rusqlite::Connection, schema: &Schema, naming: Option<Naming>) -> Result<Self> {
         // A service's own commands (`members`, `add`, …) open the same file while
         // the server has it open.
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.busy_timeout(Duration::from_secs(5))?;
-        connection.execute_batch(schema.sqlite)?;
-        Ok(Self { backend: Mutex::new(Backend::Sqlite(connection)) })
+        match &naming {
+            None => connection.execute_batch(schema.sqlite)?,
+            Some(naming) => connection.execute_batch(&renamed(schema.sqlite, naming))?,
+        }
+        Ok(Self { backend: Mutex::new(Backend::Sqlite(connection)), naming })
     }
 
     fn mysql(options: mysql::Opts, schema: &Schema, service: &str) -> Result<Self> {
-        let mut connection = mysql_connection(&options)?;
-        for statement in schema.mysql.split(';').map(str::trim).filter(|statement| !statement.is_empty()) {
-            connection.query_drop(statement)?;
+        let connection = mysql_connection(&options)?;
+        let db = Self { backend: Mutex::new(Backend::MySql(Box::new(MySql { connection, options, used: Instant::now() }))), naming: None };
+        db.made(schema, service)?;
+        Ok(db)
+    }
+
+    fn shared(server: &str, database: &str, prefix: &str, schema: &Schema, service: &str) -> Result<Self> {
+        let options = mysql_options(server)?;
+        if options.get_db_name().is_some() {
+            return Err(Error::Other(format!("a shared server's URL names no database, and this one does ({})", Location::without_password(server))));
         }
-        // Whose database this is. Two services' tables share names, and not
-        // columns: one started on another's would fail at its first question.
-        connection.query_drop(format!("CREATE TABLE IF NOT EXISTS wyvrn_service (service VARCHAR(64) NOT NULL PRIMARY KEY) {MYSQL_TABLE}"))?;
-        let owner: Option<String> = connection.query_first("SELECT service FROM wyvrn_service LIMIT 1")?;
+        Self::shared_with(options, database, prefix, schema, service)
+    }
+
+    fn shared_with(server: mysql::Opts, database: &str, prefix: &str, schema: &Schema, service: &str) -> Result<Self> {
+        let plain = |name: &str| name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if database.is_empty() || !plain(database) || !plain(prefix) {
+            return Err(Error::Other(format!("a database and a table prefix are letters, digits and _ ({database:?}, {prefix:?})")));
+        }
+        let pool = pool(server)?;
+        pool.get_conn()?.query_drop(format!("CREATE DATABASE IF NOT EXISTS \"{database}\""))?;
+        let naming = Naming { database: Some(database.to_string()), prefix: prefix.to_string() };
+        let db = Self { backend: Mutex::new(Backend::Pooled(pool)), naming: Some(naming) };
+        db.made(schema, service)?;
+        Ok(db)
+    }
+
+    /// Makes a MySQL store's tables, and marks it as `service`'s: two services'
+    /// tables share names, and not columns, so one started on another's would fail
+    /// at its first question.
+    fn made(&self, schema: &Schema, service: &str) -> Result<()> {
+        let mut session = self.lock();
+        for statement in schema.mysql.split(';').map(str::trim).filter(|statement| !statement.is_empty()) {
+            session.plainly(statement)?;
+        }
+        session.plainly(&format!("CREATE TABLE IF NOT EXISTS wyvrn_service (service VARCHAR(64) NOT NULL PRIMARY KEY) {MYSQL_TABLE}"))?;
+        let owner: Option<String> = session.query_row("SELECT service FROM wyvrn_service LIMIT 1", &[], |row| row.get(0))?;
         match owner {
-            None => connection.exec_drop("INSERT INTO wyvrn_service (service) VALUES (?)", (service,))?,
+            None => {
+                session.execute("INSERT INTO wyvrn_service (service) VALUES (?1)", params![service])?;
+            }
             Some(owner) if owner == service => {}
             Some(owner) => {
                 return Err(Error::Other(format!(
-                    "this database is {owner}'s, and this is {service}: each service needs a database of its own (a different name at the end of its DATABASE_URL)"
+                    "this database is {owner}'s, and this is {service}: each service needs a database of its own (a different name at the end of its DATABASE_URL), or tables of its own (a different prefix)"
                 )))
             }
         }
-        Ok(Self { backend: Mutex::new(Backend::MySql(Box::new(MySql { connection, options, used: Instant::now() }))) })
+        Ok(())
     }
 
     /// Holds the database: what is said through the session is said with nothing
     /// from anywhere else in this process between.
     pub fn lock(&self) -> Session<'_> {
-        Session { backend: self.backend.lock().unwrap_or_else(|poisoned| poisoned.into_inner()), in_transaction: false }
+        Session {
+            backend: self.backend.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            naming: self.naming.as_ref(),
+            pooled: None,
+            in_transaction: false,
+        }
     }
+}
+
+/// The connections to the MySQL server `server` names, shared by every store
+/// there that shares them ([`Location::Shared`]). At most
+/// `WYVRN_MYSQL_CONNECTIONS` (64) at once; a store waits for one past that.
+fn pool(server: mysql::Opts) -> Result<mysql::Pool> {
+    static POOLS: OnceLock<Mutex<HashMap<String, mysql::Pool>>> = OnceLock::new();
+    let mut pools = POOLS.get_or_init(Default::default).lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // (Known by everything in it: `Opts` can't be a key itself. Never printed.)
+    let key = format!("{server:?}");
+    if let Some(pool) = pools.get(&key) {
+        return Ok(pool.clone());
+    }
+    let most = std::env::var("WYVRN_MYSQL_CONNECTIONS").ok().and_then(|n| n.parse().ok()).filter(|&n: &usize| n > 0).unwrap_or(64);
+    let constraints = mysql::PoolConstraints::new(0, most).ok_or_else(|| Error::Other("WYVRN_MYSQL_CONNECTIONS can't be used".into()))?;
+    // Nothing a store does outlives its session (a transaction is ended in it), so
+    // a connection goes back as it is: resetting it would undo what `init` set.
+    // Not asked whether it is there each time it is taken: one that has gone is
+    // found by the statement, and said again on another (Session::say).
+    let options = mysql::OptsBuilder::from_opts(server)
+        .init(SESSION.to_vec())
+        .pool_opts(mysql::PoolOpts::default().with_constraints(constraints).with_reset_connection(false).with_check_health(false));
+    let pool = mysql::Pool::new(options)?;
+    pools.insert(key, pool.clone());
+    Ok(pool)
+}
+
+/// Said on every new MySQL connection. `||` joins text and "…" quotes a name, as
+/// in SQLite; and a value that doesn't fit its column is refused, not cut short.
+const SESSION: [&str; 2] = ["SET SESSION sql_mode = 'STRICT_ALL_TABLES,PIPES_AS_CONCAT,ANSI_QUOTES,NO_ENGINE_SUBSTITUTION'", "SET NAMES utf8mb4 COLLATE utf8mb4_bin"];
+
+/// `sql` with every table it names called as `naming` says: `posts` becomes
+/// `"c12_posts"`, or `"db"."c12_posts"` where the database is said too. A table
+/// is the name after `FROM`, `INTO`, `JOIN`, `UPDATE` and `TABLE` (past `OR
+/// IGNORE` and `IF NOT EXISTS`), and after `ON` in `CREATE INDEX`, whose own name
+/// is given the prefix (an index's name is the database's in SQLite). A table a
+/// statement qualifies its columns with (`reactions.emoji`) and gives no other
+/// name keeps its own as one (`"c12_reactions" AS reactions`). Strings and `--`
+/// comments are left as they are. Keywords are recognised in capitals only, as
+/// every statement here is written.
+fn renamed(sql: &str, naming: &Naming) -> String {
+    /// Whether `sql` names a column `table.column`.
+    fn qualifies(sql: &str, table: &str) -> bool {
+        let wanted = format!("{table}.");
+        sql.match_indices(&wanted).any(|(at, _)| !sql[..at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '"'))
+    }
+    /// Whether what follows a table gives it a name of its own.
+    fn aliased(rest: &str) -> bool {
+        const NOT_A_NAME: &[&str] = &[
+            "WHERE", "ORDER", "GROUP", "LIMIT", "OFFSET", "LEFT", "RIGHT", "INNER", "CROSS", "OUTER", "NATURAL", "JOIN", "ON", "USING", "UNION", "EXCEPT",
+            "INTERSECT", "HAVING", "WINDOW", "SET", "VALUES", "SELECT", "DEFAULT",
+        ];
+        let rest = rest.trim_start();
+        let word: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+        !word.is_empty() && !NOT_A_NAME.contains(&word.as_str())
+    }
+    #[derive(PartialEq)]
+    enum Next {
+        Nothing,
+        Table,
+        IndexName,
+        IndexOn,
+    }
+    let table = |name: &str| match &naming.database {
+        Some(database) => format!("\"{database}\".\"{}{name}\"", naming.prefix),
+        None => format!("\"{}{name}\"", naming.prefix),
+    };
+    let mut said = String::with_capacity(sql.len() + 64);
+    let mut next = Next::Nothing;
+    let bytes = sql.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        let c = bytes[at];
+        if c == b'\'' {
+            let end = sql[at + 1..].find('\'').map_or(sql.len(), |i| at + 1 + i + 1);
+            said.push_str(&sql[at..end]);
+            at = end;
+        } else if c == b'-' && bytes.get(at + 1) == Some(&b'-') {
+            let end = sql[at..].find('\n').map_or(sql.len(), |i| at + i);
+            said.push_str(&sql[at..end]);
+            at = end;
+        } else if c == b'"' || c.is_ascii_alphanumeric() || c == b'_' {
+            let (end, name) = if c == b'"' {
+                let end = sql[at + 1..].find('"').map_or(sql.len(), |i| at + 1 + i + 1);
+                (end, sql[at + 1..end.saturating_sub(1).max(at + 1)].to_string())
+            } else {
+                let end = sql[at..].find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(sql.len(), |i| at + i);
+                (end, sql[at..end].to_string())
+            };
+            let word = &sql[at..end];
+            match (c == b'"', word) {
+                (false, "FROM" | "INTO" | "JOIN" | "UPDATE" | "TABLE") => {
+                    said.push_str(word);
+                    next = Next::Table;
+                }
+                (false, "INDEX") => {
+                    said.push_str(word);
+                    next = Next::IndexName;
+                }
+                (false, "ON") if next == Next::IndexOn => {
+                    said.push_str(word);
+                    next = Next::Table;
+                }
+                (false, "OR" | "IGNORE" | "IF" | "NOT" | "EXISTS") if matches!(next, Next::Table | Next::IndexName) => said.push_str(word),
+                _ if next == Next::Table => {
+                    said.push_str(&table(&name));
+                    if qualifies(sql, &name) && !aliased(&sql[end..]) {
+                        said.push_str(" AS ");
+                        said.push_str(&name);
+                    }
+                    next = Next::Nothing;
+                }
+                _ if next == Next::IndexName => {
+                    said.push_str(&format!("\"{}{name}\"", naming.prefix));
+                    next = Next::IndexOn;
+                }
+                _ => said.push_str(word),
+            }
+            at = end;
+        } else {
+            if !c.is_ascii_whitespace() && next == Next::Table || c == b'(' && next == Next::IndexName || c == b';' {
+                // A subquery, `INDEX (…)` in a MySQL table, or the statement's end.
+                next = Next::Nothing;
+            }
+            let end = at + sql[at..].chars().next().map_or(1, char::len_utf8);
+            said.push_str(&sql[at..end]);
+            at = end;
+        }
+    }
+    said
 }
 
 fn scratch_name() -> String {
@@ -394,10 +608,9 @@ fn mysql_options(url: &str) -> Result<mysql::Opts> {
 
 fn mysql_connection(options: &mysql::Opts) -> Result<mysql::Conn> {
     let mut connection = mysql::Conn::new(options.clone())?;
-    // `||` joins text and "…" quotes a name, as in SQLite; and a value that doesn't
-    // fit its column is refused, not cut short.
-    connection.query_drop("SET SESSION sql_mode = 'STRICT_ALL_TABLES,PIPES_AS_CONCAT,ANSI_QUOTES,NO_ENGINE_SUBSTITUTION'")?;
-    connection.query_drop("SET NAMES utf8mb4 COLLATE utf8mb4_bin")?;
+    for statement in SESSION {
+        connection.query_drop(statement)?;
+    }
     Ok(connection)
 }
 
@@ -511,6 +724,25 @@ struct Outcome {
     rows: Vec<Row>,
 }
 
+/// Says a statement on a MySQL connection.
+fn say_on(connection: &mut impl Queryable, sql: &str, params: &[Value]) -> Result<Outcome> {
+    let (said, values) = to_mysql(sql, params)?;
+    let mut answer = connection.exec_iter(said, values)?;
+    let affected = answer.affected_rows() as usize;
+    let inserted = answer.last_insert_id().unwrap_or(0) as i64;
+    let mut rows = Vec::new();
+    for row in answer.by_ref() {
+        rows.push(from_mysql(row?));
+    }
+    Ok(Outcome { affected, inserted, rows })
+}
+
+/// Whether a MySQL error says the connection has gone, so that the statement can
+/// be said again on another.
+fn gone(error: &Error) -> bool {
+    matches!(error, Error::MySql(mysql::Error::IoError(_) | mysql::Error::CodecError(_)))
+}
+
 impl MySql {
     /// The connection, known to be there: one left a while is asked, and made
     /// again if it has gone (a server restarted, an idle connection closed).
@@ -523,20 +755,55 @@ impl MySql {
     }
 
     fn say(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
-        let (said, values) = to_mysql(sql, params)?;
-        let mut answer = self.connection.exec_iter(said, values)?;
-        let affected = answer.affected_rows() as usize;
-        let inserted = answer.last_insert_id().unwrap_or(0) as i64;
-        let mut rows = Vec::new();
-        for row in answer.by_ref() {
-            rows.push(from_mysql(row?));
-        }
-        Ok(Outcome { affected, inserted, rows })
+        say_on(&mut self.connection, sql, params)
     }
 }
 
+/// How many times a statement is said on another shared connection when the one
+/// it was said on has gone: after a server restarts, every one kept has.
+const TRIES: usize = 4;
+
 impl Session<'_> {
+    /// Says `work` on the shared connection this session holds, taking one first. A
+    /// connection that has gone is let go of (not given back) and, outside a
+    /// transaction, the work is done again on another.
+    fn on_shared<T>(&mut self, work: impl Fn(&mut mysql::PooledConn) -> Result<T>) -> Result<T> {
+        let Backend::Pooled(pool) = &*self.backend else { unreachable!("on_shared without a pool") };
+        let pool = pool.clone();
+        let in_transaction = self.in_transaction;
+        waiting(|| {
+            let mut tries = 0;
+            loop {
+                if self.pooled.is_none() {
+                    self.pooled = Some(pool.get_conn()?);
+                }
+                let connection = self.pooled.as_mut().expect("just taken");
+                match work(connection) {
+                    Err(error) if gone(&error) => {
+                        drop(self.pooled.take().map(mysql::PooledConn::unwrap));
+                        tries += 1;
+                        if in_transaction || tries >= TRIES {
+                            return Err(error);
+                        }
+                    }
+                    done => return done,
+                }
+            }
+        })
+    }
+
     fn say(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
+        let renamed_sql;
+        let sql = match self.naming {
+            Some(naming) => {
+                renamed_sql = renamed(sql, naming);
+                renamed_sql.as_str()
+            }
+            None => sql,
+        };
+        if matches!(&*self.backend, Backend::Pooled(_)) {
+            return self.on_shared(|connection| say_on(connection, sql, params));
+        }
         let in_transaction = self.in_transaction;
         match &mut *self.backend {
             Backend::Sqlite(connection) => {
@@ -556,13 +823,14 @@ impl Session<'_> {
                     // The connection went (the server restarted, or closed it): said
                     // again on a new one. Not part-way through a transaction, whose
                     // earlier statements went with it.
-                    Err(Error::MySql(mysql::Error::IoError(_) | mysql::Error::CodecError(_))) if !in_transaction => {
+                    Err(error) if gone(&error) && !in_transaction => {
                         mysql.connection = mysql_connection(&mysql.options)?;
                         mysql.say(sql, params)
                     }
                     answer => answer,
                 }
             }),
+            Backend::Pooled(_) => unreachable!("said above"),
         }
     }
 
@@ -598,7 +866,7 @@ impl Session<'_> {
     pub fn transaction<T, E: From<Error>>(&mut self, work: impl FnOnce(&mut Self) -> std::result::Result<T, E>) -> std::result::Result<T, E> {
         self.plainly(match &*self.backend {
             Backend::Sqlite(_) => "BEGIN IMMEDIATE",
-            Backend::MySql(_) => "START TRANSACTION",
+            Backend::MySql(_) | Backend::Pooled(_) => "START TRANSACTION",
         })?;
         self.in_transaction = true;
         let done = work(self);
@@ -615,15 +883,21 @@ impl Session<'_> {
         }
     }
 
-    /// Says a statement with no parameters and no answer, as it is written.
+    /// Says a statement with no parameters and no answer (its tables named as the
+    /// store's are).
     fn plainly(&mut self, sql: &str) -> Result<()> {
+        let sql = match self.naming {
+            Some(naming) => renamed(sql, naming),
+            None => sql.to_string(),
+        };
         let in_transaction = self.in_transaction;
         match &mut *self.backend {
-            Backend::Sqlite(connection) => connection.execute_batch(sql)?,
+            Backend::Sqlite(connection) => connection.execute_batch(&sql)?,
             Backend::MySql(mysql) => waiting(|| {
                 mysql.ready(in_transaction)?;
-                Ok::<_, Error>(mysql.connection.query_drop(sql)?)
+                Ok::<_, Error>(mysql.connection.query_drop(&sql)?)
             })?,
+            Backend::Pooled(_) => self.on_shared(|connection| Ok(connection.query_drop(&sql)?))?,
         }
         Ok(())
     }
@@ -650,6 +924,84 @@ mod tests {
         assert_eq!(places, [1, 0, 1]);
         assert_eq!(for_mysql("INSERT OR IGNORE INTO t (a) VALUES (?1)").0, "INSERT IGNORE INTO t (a) VALUES (?)");
         assert_eq!(for_mysql("INSERT OR REPLACE INTO t (a) VALUES (?1)").0, "REPLACE INTO t (a) VALUES (?)");
+    }
+
+    #[test]
+    fn a_shared_stores_tables_are_named_with_its_prefix_wherever_a_statement_names_one() {
+        let alone = Naming { database: None, prefix: "c7_".into() };
+        let shared = Naming { database: Some("hosted".into()), prefix: "c7_".into() };
+        let cases = [
+            ("SELECT a FROM posts WHERE b = 'FROM x' AND c IN (SELECT d FROM members)", r#"SELECT a FROM "c7_posts" WHERE b = 'FROM x' AND c IN (SELECT d FROM "c7_members")"#),
+            ("INSERT OR IGNORE INTO \"keys\" (a) VALUES (?1)", r#"INSERT OR IGNORE INTO "c7_keys" (a) VALUES (?1)"#),
+            ("UPDATE OR IGNORE roles SET a = 1", r#"UPDATE OR IGNORE "c7_roles" SET a = 1"#),
+            ("DELETE FROM t", r#"DELETE FROM "c7_t""#),
+            ("SELECT p.a FROM posts p LEFT JOIN reactions r ON r.post = p.id", r#"SELECT p.a FROM "c7_posts" p LEFT JOIN "c7_reactions" r ON r.post = p.id"#),
+            ("SELECT COUNT(*) FROM (SELECT a FROM posts)", r#"SELECT COUNT(*) FROM (SELECT a FROM "c7_posts")"#),
+            (
+                "-- FROM nowhere\nCREATE TABLE IF NOT EXISTS packs (a TEXT);\nCREATE INDEX IF NOT EXISTS packs_owner ON packs (a)",
+                "-- FROM nowhere\nCREATE TABLE IF NOT EXISTS \"c7_packs\" (a TEXT);\nCREATE INDEX IF NOT EXISTS \"c7_packs_owner\" ON \"c7_packs\" (a)",
+            ),
+            ("CREATE TABLE IF NOT EXISTS t (a INT, INDEX (a)) ENGINE=InnoDB", r#"CREATE TABLE IF NOT EXISTS "c7_t" (a INT, INDEX (a)) ENGINE=InnoDB"#),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(renamed(sql, &alone), expected);
+        }
+        assert_eq!(renamed("SELECT a FROM posts", &shared), r#"SELECT a FROM "hosted"."c7_posts""#);
+        // A table its columns are qualified with keeps its name, unless it has another.
+        assert_eq!(
+            renamed("SELECT reactions.emoji FROM reactions LEFT JOIN members ON members.did = reactions.did WHERE reactions.seq = ?1", &alone),
+            r#"SELECT reactions.emoji FROM "c7_reactions" AS reactions LEFT JOIN "c7_members" AS members ON members.did = reactions.did WHERE reactions.seq = ?1"#
+        );
+        assert_eq!(renamed("SELECT r.a FROM reactions r WHERE reactions.b", &alone), r#"SELECT r.a FROM "c7_reactions" r WHERE reactions.b"#);
+        assert_eq!(renamed("UPDATE posts SET a = 1 WHERE posts.b = 2", &alone), r#"UPDATE "c7_posts" AS posts SET a = 1 WHERE posts.b = 2"#);
+        // Nothing else is touched: from, an ON of a join, a word that only looks like a table.
+        assert_eq!(renamed("SELECT 'it''s' FROM t WHERE x = ?1", &alone), r#"SELECT 'it''s' FROM "c7_t" WHERE x = ?1"#);
+    }
+
+    #[test]
+    fn two_stores_with_prefixes_share_a_sqlite_database_and_see_only_their_own() {
+        // One file for both, as in a test: two connections to a shared in-memory database.
+        let name = format!("file:shared_{}?mode=memory&cache=shared", scratch_name());
+        let open = |prefix: &str| {
+            let connection = rusqlite::Connection::open_with_flags(&name, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE | rusqlite::OpenFlags::SQLITE_OPEN_URI).unwrap();
+            Db::sqlite(connection, &SCHEMA, Some(Naming { database: None, prefix: prefix.into() })).unwrap()
+        };
+        let (one, two) = (open("a_"), open("b_"));
+        one.lock().execute("INSERT INTO things (name, size) VALUES (?1, 1)", params!["one's"]).unwrap();
+        two.lock().execute("INSERT INTO things (name, size) VALUES (?1, 2)", params!["one's"]).unwrap();
+        assert_eq!(one.lock().query_value::<i64>("SELECT size FROM things WHERE name = ?1", params!["one's"]).unwrap(), 1);
+        assert_eq!(two.lock().query_value::<i64>("SELECT COUNT(*) FROM things", params![]).unwrap(), 1);
+    }
+
+    #[test]
+    fn shared_mysql_stores_keep_apart_share_connections_and_are_each_one_services() {
+        let Some(url) = server() else { return };
+        let Location::MySql(url) = Location::parse(&url).unwrap() else { panic!("WYVRN_TEST_DATABASE_URL is for a MySQL server") };
+        let server: mysql::Opts = mysql::OptsBuilder::from_opts(mysql_options(&url).unwrap()).db_name(None::<String>).into();
+        let database = format!("wyvrn_test_{}", scratch_name());
+        let one = Db::shared_with(server.clone(), &database, "c1_", &SCHEMA, "community").unwrap();
+        let two = Db::shared_with(server.clone(), &database, "c2_", &SCHEMA, "community").unwrap();
+        one.lock().execute("INSERT INTO things (name, size) VALUES (?1, 1)", params!["same"]).unwrap();
+        two.lock().execute("INSERT INTO things (name, size) VALUES (?1, 2)", params!["same"]).unwrap();
+        assert_eq!(one.lock().query_value::<i64>("SELECT size FROM things WHERE name = ?1", params!["same"]).unwrap(), 1);
+        assert_eq!(two.lock().query_value::<i64>("SELECT size FROM things WHERE name = ?1", params!["same"]).unwrap(), 2);
+        // Another service under the same prefix is refused, as on a database of its own.
+        assert!(Db::shared_with(server.clone(), &database, "c1_", &SCHEMA, "stickers").is_err());
+        assert!(Db::shared_with(server.clone(), &database, "c1-x", &SCHEMA, "community").is_err());
+
+        // A transaction holds its connection; one that fails leaves nothing.
+        let failed: Result<()> = one.lock().transaction(|session| {
+            session.execute("UPDATE things SET size = 100", params![])?;
+            Err(Error::Other("no".into()))
+        });
+        assert!(failed.is_err());
+        assert_eq!(one.lock().query_value::<i64>("SELECT size FROM things", params![]).unwrap(), 1);
+
+        // A connection killed under it: the statement is said again on another.
+        let mut root = mysql::Conn::new(mysql_options(&url).unwrap()).unwrap();
+        let connection: i64 = one.lock().query_value("SELECT CONNECTION_ID()", params![]).unwrap();
+        root.query_drop(format!("KILL {connection}")).unwrap();
+        assert_eq!(one.lock().query_value::<i64>("SELECT size FROM things", params![]).unwrap(), 1);
     }
 
     #[test]

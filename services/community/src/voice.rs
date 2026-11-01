@@ -107,6 +107,16 @@ struct Inner {
 #[derive(Default)]
 pub struct Rooms {
     inner: Mutex<Inner>,
+    /// What every participant's token starts with: where one host keeps many
+    /// communities, which of them the forwarding service's question is for.
+    token_prefix: String,
+}
+
+impl Rooms {
+    /// Rooms whose participants' tokens start with `prefix`.
+    pub fn with_token_prefix(prefix: &str) -> Self {
+        Self { token_prefix: prefix.to_string(), ..Self::default() }
+    }
 }
 
 /// What handling a message came to.
@@ -392,7 +402,7 @@ impl Rooms {
                                 did: sender.to_string(),
                                 device: device.clone(),
                                 live,
-                                token: random_id(24),
+                                token: format!("{}{}", self.token_prefix, random_id(24)),
                                 muted: false,
                                 deafened: false,
                                 server_muted: false,

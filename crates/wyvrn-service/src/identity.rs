@@ -30,7 +30,7 @@ fn schema() -> Schema {
 pub fn load_or_generate(location: &Location, path: &Path, service: &str) -> anyhow::Result<Identity> {
     match location {
         Location::Sqlite(_) => Identity::load_or_generate(path).with_context(|| format!("identity file {}", path.display())),
-        Location::MySql(_) => {
+        Location::MySql(_) | Location::Shared { .. } => {
             let db = Db::open(location, &schema(), service).with_context(|| format!("the identity in {location}"))?;
             in_database(&db, path)
         }

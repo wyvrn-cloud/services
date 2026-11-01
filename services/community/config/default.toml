@@ -32,6 +32,8 @@ admission = "admin"
 members_may_invite = false
 # As many as may wait to be let in at once.
 max_waiting = 500
+# As many members as there may be, those who left included; 0 for no limit.
+max_members = 0
 
 # To have messages to the server arrive through a mediator instead of at public_url
 # (a server at home, or one a phone app has to reach):

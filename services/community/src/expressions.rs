@@ -22,11 +22,9 @@ pub struct Expressions {
 }
 
 impl Expressions {
-    /// Packs kept in `path` (or the database the environment names for them,
-    /// `COMMUNITY_STICKERS_DATABASE_URL`), served under `public_url`'s `s/`.
-    pub fn open(path: &std::path::Path, public_url: &str) -> anyhow::Result<Self> {
-        let location = wyvrn_service::db::Location::from_env("COMMUNITY_STICKERS", path)?;
-        Ok(Self::with(Store::open(&location)?, public_url))
+    /// Packs kept at `location`, served under `public_url`'s `s/`.
+    pub fn open(location: &wyvrn_service::db::Location, public_url: &str) -> anyhow::Result<Self> {
+        Ok(Self::with(Store::open(location)?, public_url))
     }
 
     pub fn scratch(public_url: &str) -> anyhow::Result<Self> {

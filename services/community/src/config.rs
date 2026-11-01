@@ -126,6 +126,9 @@ pub struct CommunityConfig {
     /// As many posts as one member makes in a minute, in all channels; 0 for no
     /// limit. Whoever holds `administrator` isn't held to it.
     pub max_posts_per_minute: usize,
+    /// As many members as there may be, those who left included; 0 for no limit.
+    /// Past it nobody more is let in (`e.p.req.community-full`).
+    pub max_members: usize,
 }
 
 impl Default for CommunityConfig {
@@ -142,6 +145,7 @@ impl Default for CommunityConfig {
             members_may_invite: false,
             max_waiting: 500,
             max_posts_per_minute: 30,
+            max_members: 0,
         }
     }
 }

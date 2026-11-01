@@ -29,9 +29,9 @@ pub struct Files {
 }
 
 impl Files {
-    pub fn open(config: &FilesConfig, public_url: &str) -> anyhow::Result<Self> {
-        let location = wyvrn_service::db::Location::from_env("COMMUNITY_FILES", &config.dir.join("files.sqlite"))?;
-        let store = wyvrn_files::store::Store::open(&location, &config.dir)?;
+    /// Files whose records are at `location` and bytes in `config.dir`.
+    pub fn open(config: &FilesConfig, location: &wyvrn_service::db::Location, public_url: &str) -> anyhow::Result<Self> {
+        let store = wyvrn_files::store::Store::open(location, &config.dir)?;
         let service = wyvrn_files::config::ServiceConfig {
             max_file_bytes: config.max_file_bytes,
             quota_bytes: config.quota_bytes,

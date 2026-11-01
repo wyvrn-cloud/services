@@ -668,6 +668,69 @@ async fn an_invite_lets_in_while_it_lasts_when_admission_is_by_invite() {
 }
 
 #[tokio::test]
+async fn a_full_community_lets_nobody_more_in_and_waiting_goes_on() {
+    let server = start_server("admission = \"open\"\nmax_members = 2").await;
+    let admin = Peer::start(&server).await;
+    let (alice, bob, carol) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin]);
+    assert_eq!(kind(&alice.community("join", json!({})).await), "community");
+    let refused = bob.community("join", json!({})).await;
+    assert_eq!(refused["body"]["code"], "e.p.req.community-full", "{refused}");
+    assert!(!refused.to_string().contains("Workshop"));
+    // Someone who left is still a member: back, whatever the limit.
+    alice.community("leave", json!({})).await;
+    assert_eq!(alice.community("join", json!({})).await["body"]["joined"], true);
+
+    // Waiting for an admin still goes on, and letting someone in is refused at the limit.
+    admin.community("set-admission", json!({ "admission": "admin" })).await;
+    assert_eq!(kind(&bob.community("join", json!({})).await), "waiting");
+    let set = admin.community("set-member", json!({ "did": bob.did(), "role": "member" })).await;
+    assert_eq!(set["body"]["code"], "e.p.req.community-full", "{set}");
+    // Room again, they are let in.
+    assert!(server.state.community.store.remove_member(&alice.did()).unwrap());
+    assert_eq!(kind(&admin.community("set-member", json!({ "did": bob.did(), "role": "member" })).await), "members");
+    assert_eq!(kind(&carol.community("join", json!({})).await), "waiting");
+}
+
+#[tokio::test]
+async fn a_community_that_is_moving_is_read_and_left_and_nothing_else() {
+    let server = start_server("").await;
+    let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    let stranger = Peer::start(&server).await;
+    server.admit(&[&admin, &member]);
+    member.community("join", json!({})).await;
+    let channel = open_channel(&admin, "general").await;
+    member.next_of(&format!("{C}community")).await;
+    admin.community("post", json!({ "channel": channel, "id": "p1", "content": "before" })).await;
+    member.next_message().await;
+
+    server::set_moving(&server.state, true).unwrap();
+    // Every joined member is told, and the community says so from then on.
+    let told = member.next_of(&format!("{C}community")).await;
+    assert_eq!(told["body"]["moving"], true, "{told}");
+    for (message_type, body) in [
+        (format!("{C}post"), json!({ "channel": channel, "id": "p2", "content": "during" })),
+        (format!("{C}create-channel"), json!({ "name": "more" })),
+        (format!("{C}set-profile"), json!({ "profile": { "displayName": "Elsewhere" } })),
+        (format!("{W}discover"), json!({})),
+    ] {
+        let answer = admin.ask(&message_type, body).await;
+        assert_eq!(answer["body"]["code"], "e.p.req.moving", "{message_type}: {answer}");
+    }
+    assert_eq!(stranger.community("join", json!({})).await["body"]["code"], "e.p.req.moving");
+    // Reading goes on, and leaving.
+    let history = member.community("history-request", json!({ "channel": channel })).await;
+    assert_eq!(history["body"]["messages"][0]["content"], "before", "{history}");
+    assert_eq!(kind(&member.community("members-request", json!({})).await), "members");
+    assert_eq!(member.community("leave", json!({})).await["body"]["moving"], true);
+
+    // Called off, it is as it was.
+    server::set_moving(&server.state, false).unwrap();
+    let posted = admin.community("post", json!({ "channel": channel, "id": "p2", "content": "after" })).await;
+    assert_eq!(kind(&posted), "posted", "{posted}");
+}
+
+#[tokio::test]
 async fn members_make_invites_only_when_an_admin_allows_and_revoke_only_their_own() {
     let server = start_server("").await;
     let (admin, member, other) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);

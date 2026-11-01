@@ -1032,6 +1032,11 @@ impl Store {
         Ok(self.members()?.into_iter().filter(|member| member.joined).collect())
     }
 
+    /// How many members there are, those who left included.
+    pub fn member_count(&self) -> Result<i64> {
+        self.db.lock().query_value("SELECT COUNT(*) FROM members", params![])
+    }
+
     pub fn admin_count(&self) -> Result<i64> {
         self.db.lock().query_value("SELECT COUNT(*) FROM members WHERE role = 'admin'", params![])
     }

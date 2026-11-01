@@ -105,7 +105,16 @@ impl ProfileConfig {
     /// `<prefix>_PROFILE_BACKGROUND`), and failing both, `name` and `description`:
     /// what the service is called anyway.
     pub fn or(&self, prefix: &str, name: &str, description: &str) -> Self {
-        let env = |setting: &str| std::env::var(format!("{prefix}_PROFILE_{setting}")).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        self.or_with(|setting| std::env::var(format!("{prefix}_PROFILE_{setting}")).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()), name, description)
+    }
+
+    /// As [`Self::or`], with nothing taken from the environment: for one of many
+    /// services in one process, which the environment can't speak for one by one.
+    pub fn or_plainly(&self, name: &str, description: &str) -> Self {
+        self.or_with(|_| None, name, description)
+    }
+
+    fn or_with(&self, env: impl Fn(&str) -> Option<String>, name: &str, description: &str) -> Self {
         let said = |value: Option<String>, otherwise: &str| value.or_else(|| Some(otherwise.to_string())).filter(|v| !v.trim().is_empty());
         Self {
             name: said(env("NAME").or_else(|| self.name.clone()), name),

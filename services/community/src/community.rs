@@ -78,6 +78,15 @@ pub const PROBLEM_REPORT: &str = "https://didcomm.org/report-problem/2.0/problem
 pub const DEFAULT_HISTORY_LIMIT: usize = 30;
 pub const MAX_HISTORY_LIMIT: usize = 100;
 const MAX_NAME_LENGTH: usize = 80;
+
+/// Where a move to another server is marked (`Community::moving`).
+const MOVING_SETTING: &str = "moving";
+
+/// Whether a message of `message_type` only reads, or leaves: all a community that
+/// is moving answers.
+pub fn reads_only(message_type: &str) -> bool {
+    message_type.ends_with("-request") || message_type == LEAVE || message_type == crate::posting::WATCH
+}
 const MAX_CHANNEL_NAME: usize = 40;
 const MAX_TOPIC: usize = 200;
 /// A question's limits: how many at once, how many answers each offers, and how
@@ -421,6 +430,27 @@ impl Community {
         self.changed.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
     }
 
+    /// Whether the community is at its limit of members (`max_members`).
+    pub fn full(&self) -> anyhow::Result<bool> {
+        Ok(self.config.max_members > 0 && self.store.member_count()? >= self.config.max_members as i64)
+    }
+
+    /// Whether the community is moving to another server, and so read-only
+    /// (community/1.0's "Hosted communities, and moving").
+    pub fn moving(&self) -> anyhow::Result<bool> {
+        Ok(self.store.setting(MOVING_SETTING)?.as_deref() == Some("1"))
+    }
+
+    /// Begins a move, or calls it off: whether that changed anything. Every joined
+    /// member is then to be told (`community_notices`).
+    pub fn set_moving(&self, moving: bool) -> anyhow::Result<bool> {
+        if self.moving()? == moving {
+            return Ok(false);
+        }
+        self.store.set_setting(MOVING_SETTING, if moving { "1" } else { "0" })?;
+        Ok(true)
+    }
+
     /// The community as `member` is told of it.
     pub fn community(&self, member: &Member) -> anyhow::Result<Value> {
         let powers = self.powers(&member.did)?;
@@ -468,6 +498,9 @@ impl Community {
             }
             if powers.has("admit_members") {
                 body["waiting"] = json!(self.store.waiting_count()?);
+            }
+            if self.moving()? {
+                body["moving"] = json!(true);
             }
             if let Some(level) = self.store.notify_level(&member.did)? {
                 body["notifications"] = json!({ "level": level, "following": self.store.followed_threads(&member.did)? });
@@ -788,6 +821,15 @@ impl Community {
             Some(code) => self.store.invite(code)?.filter(|invite| invite.valid(now)),
             None => None,
         };
+        // Full, nobody more is let in; waiting still goes on.
+        let lets_in = match self.admission()? {
+            Admission::Open => true,
+            Admission::Invite => invite.is_some(),
+            Admission::Admin => false,
+        };
+        if lets_in && self.full()? {
+            return refuse(message, "e.p.req.community-full", "This community has as many members as it can.");
+        }
         let let_in = match self.admission()? {
             Admission::Open => {
                 // Used up if it was brought, though nothing needed it.
@@ -1107,6 +1149,13 @@ impl Community {
         let body = &message["body"];
         if self.store.is_superseded(sender)? {
             return refuse(message, "e.p.trust.superseded", "This DID has been replaced by another.");
+        }
+        // Moving: read, and leave, and nothing else.
+        if !reads_only(message_type) && self.moving()? {
+            if message_type == PROFILE {
+                return Ok(Outcome::default());
+            }
+            return refuse(message, "e.p.req.moving", "This community is moving to another server. It can be read, and nothing changed, until it has.");
         }
         let Some(member) = self.store.member(sender)? else {
             // Someone who isn't let in may ask to be, take back having asked, and
@@ -1786,6 +1835,9 @@ impl Community {
                             return refuse(message, "e.p.trust.superseded", "That DID has been replaced by another.");
                         }
                         if existing.is_none() {
+                            if self.full()? {
+                                return refuse(message, "e.p.req.community-full", "This community has as many members as it can.");
+                            }
                             self.store.set_member(did, Role::Member, now)?;
                         }
                         let held = self.store.member_roles(did)?;
