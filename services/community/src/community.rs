@@ -79,8 +79,9 @@ pub const DEFAULT_HISTORY_LIMIT: usize = 30;
 pub const MAX_HISTORY_LIMIT: usize = 100;
 const MAX_NAME_LENGTH: usize = 80;
 
-/// Where a move to another server is marked (`Community::moving`).
-const MOVING_SETTING: &str = "moving";
+/// Where a move to another server is marked (`Community::moving`): `1` while
+/// moving. A copy handed to the server it moves to has it cleared.
+pub const MOVING_SETTING: &str = "moving";
 
 /// Whether a message of `message_type` only reads, or leaves: all a community that
 /// is moving answers.

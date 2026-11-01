@@ -62,6 +62,8 @@ pub struct Opening {
     pub voice_tokens: String,
     /// An assistant answering in its channels.
     pub assistant: Option<Assistant>,
+    /// Pages its host adds for its owner alone (see `AppState::owner_pages`).
+    pub owner_pages: Option<Arc<dyn wyvrn_service::admin::Pages>>,
 }
 
 /// A community, opened: its state, which [`server::router`] serves, and its hold
@@ -99,6 +101,7 @@ pub async fn open(config: &Config, stores: &Stores, opening: Opening) -> anyhow:
 
     let mut state = AppState::new(agent, Default::default(), community, did_document, didcomm_quickstart::default_resolver());
     state.rooms = crate::voice::Rooms::with_token_prefix(&opening.voice_tokens);
+    state.owner_pages = opening.owner_pages;
     let state = Arc::new(match opening.assistant {
         Some(assistant) => {
             tracing::info!(name = %assistant.config.name, model = %assistant.config.model, "an assistant answers in every channel");
@@ -141,7 +144,7 @@ pub async fn serve(config: Config, assistant: Option<Assistant>) -> anyhow::Resu
     // A public address at a DID host, if it is set to hold one (COMMUNITY_PUBLIC_ADDRESS):
     // taken up once the service is serving, and kept up to date from then on.
     let address = Address::from_env("COMMUNITY")?;
-    let opening = Opening { profile_env: Some("COMMUNITY"), address, voice_tokens: String::new(), assistant };
+    let opening = Opening { profile_env: Some("COMMUNITY"), address, voice_tokens: String::new(), assistant, owner_pages: None };
     let Opened { state, holding } = open(&config, &stores, opening).await?;
     if let Some(mediator) = &config.mediator {
         wyvrn_service::mediator::register(&state.agent, mediator).await?;

@@ -25,7 +25,11 @@ tokio = { workspace = true }
 toml = { workspace = true }
 # A community's router is handed each request meant for it (tenants.rs).
 tower = { version = "0.5", features = ["util"] }
-tower-http = { workspace = true }
+# A community handed over to its owner's own server, as one .tar.gz (export.rs).
+tar = "0.4"
+flate2 = "1"
+uuid = { workspace = true }
+tower-http = { workspace = true, features = ["fs"] }
 tracing = { workspace = true }
 
 [dev-dependencies]

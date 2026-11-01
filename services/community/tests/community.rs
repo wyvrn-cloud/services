@@ -712,13 +712,14 @@ async fn a_community_that_is_moving_is_read_and_left_and_nothing_else() {
         (format!("{C}post"), json!({ "channel": channel, "id": "p2", "content": "during" })),
         (format!("{C}create-channel"), json!({ "name": "more" })),
         (format!("{C}set-profile"), json!({ "profile": { "displayName": "Elsewhere" } })),
-        (format!("{W}discover"), json!({})),
+        (format!("{W}start"), json!({ "template_id": "roles", "instance_id": "r1" })),
     ] {
         let answer = admin.ask(&message_type, body).await;
         assert_eq!(answer["body"]["code"], "e.p.req.moving", "{message_type}: {answer}");
     }
     assert_eq!(stranger.community("join", json!({})).await["body"]["code"], "e.p.req.moving");
-    // Reading goes on, and leaving.
+    // Reading goes on (forms listed too), and leaving.
+    assert_eq!(kind(&admin.ask(&format!("{W}discover"), json!({})).await), "workflows");
     let history = member.community("history-request", json!({ "channel": channel })).await;
     assert_eq!(history["body"]["messages"][0]["content"], "before", "{history}");
     assert_eq!(kind(&member.community("members-request", json!({})).await), "members");

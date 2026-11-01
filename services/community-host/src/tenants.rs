@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -76,14 +76,18 @@ impl Tenant {
 pub struct Host {
     pub config: Config,
     pub registry: Registry,
+    /// Exports made for owners moving out, waiting to be fetched (export.rs).
+    pub exports: crate::export::Exports,
+    /// Itself, for what each community is given that answers back to it.
+    me: Weak<Host>,
     open: Mutex<HashMap<String, Arc<Tenant>>>,
     /// One community opened at a time: two requests for one that isn't open open it once.
     opening: tokio::sync::Mutex<()>,
 }
 
 impl Host {
-    pub fn new(config: Config, registry: Registry) -> Self {
-        Self { config, registry, open: Mutex::default(), opening: tokio::sync::Mutex::new(()) }
+    pub fn new(config: Config, registry: Registry) -> Arc<Self> {
+        Arc::new_cyclic(|me| Self { config, registry, exports: Default::default(), me: me.clone(), open: Mutex::default(), opening: tokio::sync::Mutex::new(()) })
     }
 
     fn open_map(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Tenant>>> {
@@ -199,7 +203,8 @@ impl Host {
     async fn load(&self, record: &Record) -> anyhow::Result<Tenant> {
         let config = self.settings(record);
         let stores = self.stores(record, record.storage)?;
-        let opening = Opening { profile_env: None, address: self.address(&record.name)?, voice_tokens: format!("{}.", record.name), assistant: None };
+        let owner_pages: Arc<dyn wyvrn_service::admin::Pages> = Arc::new(crate::export::MoveOut { host: self.me.clone(), community: record.name.clone() });
+        let opening = Opening { profile_env: None, address: self.address(&record.name)?, voice_tokens: format!("{}.", record.name), assistant: None, owner_pages: Some(owner_pages) };
         let Opened { state, holding } = serve::open(&config, &stores, opening).await?;
         // What the host says of it stands over what it says of itself.
         state.community.set_moving(record.state == State::Moving)?;

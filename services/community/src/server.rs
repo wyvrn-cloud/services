@@ -70,6 +70,10 @@ pub struct AppState {
     /// The AI assistant answering in its channels, where it has one
     /// (wyvrn-claude; assistant.rs).
     pub assistant: Option<Arc<crate::assistant::Assistant>>,
+    /// Pages its host adds for the community's owner alone (wyvrn-community-host's
+    /// moving to a server of their own), as wyvrn_service::admin pages; and those open.
+    pub owner_pages: Option<Arc<dyn wyvrn_service::admin::Pages>>,
+    pub owner_admin: wyvrn_service::admin::Admin,
 }
 
 impl AppState {
@@ -89,6 +93,8 @@ impl AppState {
             watching: Mutex::new(HashSet::new()),
             next_live: AtomicU64::new(1),
             assistant: None,
+            owner_pages: None,
+            owner_admin: Default::default(),
         }
     }
 
@@ -312,17 +318,39 @@ impl Service for CommunityService {
             }
         }
 
+        // The owner's pages from the host: theirs alone, and answered while moving
+        // too (that is where a move is called off).
+        let message_type = received.message["type"].as_str().unwrap_or_default();
+        let is_owner = state.owner_pages.is_some() && state.community.owner()?.as_deref() == Some(sender.as_str());
+        if let Some(pages) = &state.owner_pages {
+            if message_type.starts_with(questions::PIURI) && !message_type.ends_with("/discover") && state.owner_admin.concerns(&received.message) {
+                return Ok(state.owner_admin.handle(pages.as_ref(), is_owner, &sender, &received.message, now()).map(|answer| match answer {
+                    Ok((kind, body)) => received.reply(&kind, body),
+                    Err(refusal) => received.reply(&format!("{}/problem-report", questions::PIURI), refusal.body()),
+                }));
+            }
+        }
         // Moving to another server: forms and files change it, and are refused as
         // everything is but reading (Community::handle). Voice changes nothing kept.
-        let message_type = received.message["type"].as_str().unwrap_or_default();
-        if (message_type.starts_with(questions::PIURI) || crate::files::is_files(&received.message)) && state.community.moving()? {
+        let reads_forms = ["/discover", "/fetch-template", "/status"].iter().any(|kind| message_type.ends_with(kind));
+        if ((message_type.starts_with(questions::PIURI) && !reads_forms) || crate::files::is_files(&received.message)) && state.community.moving()? {
             return Ok(Some(community::problem(&received.message, "e.p.req.moving", "This community is moving to another server. It can be read, and nothing changed, until it has.")));
         }
         // A question's answer, from someone let in. (Anyone else falls through, and
         // is told they aren't.)
         if received.message["type"].as_str().is_some_and(|message_type| message_type.starts_with(questions::PIURI)) {
             if let Some(member) = state.community.store.member(&sender)? {
-                let handled = state.community.handle_workflow(&member, &received.message, now());
+                let mut handled = state.community.handle_workflow(&member, &received.message, now());
+                // The owner is also listed the host's pages for them.
+                if let (Some(pages), true, Some(Ok((_, body)))) = (&state.owner_pages, is_owner, handled.answer.as_mut()) {
+                    if message_type.ends_with("/discover") {
+                        let added = state.owner_admin.listed(pages.as_ref(), true, &received.message["body"]);
+                        if let Some(workflows) = body["workflows"].as_array_mut() {
+                            workflows.extend(added);
+                            body["paging"]["total"] = json!(workflows.len());
+                        }
+                    }
+                }
                 if handled.posted {
                     state.deliver.notify_one();
                 }

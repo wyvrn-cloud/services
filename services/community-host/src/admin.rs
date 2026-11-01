@@ -65,7 +65,7 @@ impl Pages for AppState {
             id: COMMUNITIES,
             title: "Communities",
             summary: "Every community kept here; make one, set what it may hold, suspend or remove it.",
-            events: &["create", "suspend", "resume", "delete", "restore", "limits", "move"],
+            events: &["create", "suspend", "resume", "delete", "restore", "limits", "move", "handed"],
         }]
     }
 
@@ -96,9 +96,15 @@ impl Pages for AppState {
             let mut row = vec![json!({ "type": "text", "text": what })];
             let named = json!({ "name": record.name });
             match record.state {
-                State::Active | State::Moving => {
+                State::Active => {
                     row.push(button("Suspend", "suspend", named.clone()));
                     row.push(button("Remove", "delete", named.clone()));
+                }
+                // Its owner is taking it to their own server: stopped by itself once
+                // that holds its address, or here (with no DID host to tell).
+                State::Moving => {
+                    row.push(button("Handed over", "handed", named.clone()));
+                    row.push(button("Suspend", "suspend", named.clone()));
                 }
                 State::Suspended => {
                     row.push(button("Resume", "resume", named.clone()));
@@ -189,6 +195,11 @@ impl Pages for AppState {
                     tracing::error!(community = %name, error = %format!("{error:#}"), "couldn't move a community's storage");
                     format!("It couldn't be moved, and is kept where it was: {error}")
                 })?
+            }
+            "handed" if record.state == State::Moving => {
+                host.exports.forget(&name);
+                host.set_state(&name, State::Moved, Some(now + SEALED_FOR)).map_err(failed)?;
+                format!("{name} is stopped here, and kept for 30 days.")
             }
             "limits" => {
                 let limits = limits_from(input, record.limits.unwrap_or(host.config.limits))?;

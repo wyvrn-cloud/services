@@ -87,6 +87,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .merge(own)
         .route("/voice/auth", post(voice_auth))
+        // An owner's export, once (export.rs).
+        .route("/export/{token}", get(crate::export::download))
         .route("/c/{name}", any(community))
         .route("/c/{name}/", any(community))
         .route("/c/{name}/{*rest}", any(community))

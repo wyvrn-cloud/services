@@ -98,7 +98,7 @@ async fn start_host_with(idle_seconds: i64, mysql: &str) -> Running {
     .unwrap();
     config.settle();
     let (agent, did_document) = server::build_agent(&config, Identity::generate().unwrap()).unwrap();
-    let host = Arc::new(Host::new(config, Registry::scratch().unwrap()));
+    let host = Host::new(config, Registry::scratch().unwrap());
     let state = Arc::new(AppState { agent, host: host.clone(), did_document, resolver: didcomm_quickstart::default_resolver(), admin: Default::default() });
     let app = server::router(state);
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -265,4 +265,90 @@ async fn a_community_moves_between_every_kind_of_storage_and_is_the_same_communi
     // Back in SQLite, where it began: moved into the files it left, it is refused.
     let host = running.host.clone();
     assert!(tokio::task::spawn_blocking(move || host.move_storage("mover", Storage::Sqlite)).await.unwrap().is_err());
+}
+
+const W: &str = "https://didcomm.org/workflow/1.0/";
+
+/// Every bit of text a workflow's page shows, and every link, at any depth.
+fn page_text(items: &Value, into: &mut Vec<String>) {
+    for item in items.as_array().into_iter().flatten() {
+        for key in ["text", "label", "url"] {
+            if let Some(text) = item[key].as_str() {
+                into.push(text.to_string());
+            }
+        }
+        page_text(&item["children"], into);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_takes_their_community_to_a_server_of_their_own() {
+    let running = start_host(600).await;
+    let (owner, member) = (Peer::start().await, Peer::start().await);
+    running.host.registry.create("leaving", "Leaving", Storage::Sqlite, &owner.did(), "test", 1).unwrap();
+    let did = running.did_of("leaving").await;
+    owner.community(&did, "join", json!({})).await;
+    let channel = owner.community(&did, "create-channel", json!({ "name": "general" })).await["body"]["created"].as_str().unwrap().to_string();
+    owner.community(&did, "post", json!({ "channel": channel, "id": "x1", "content": "goes with it" })).await;
+    owner.community(&did, "set-member", json!({ "did": member.did(), "role": "member" })).await;
+    member.community(&did, "join", json!({})).await;
+
+    // Only the owner is shown the page.
+    let listed = |answer: &Value| answer["body"]["workflows"].as_array().unwrap().iter().any(|workflow| workflow["template_id"] == "admin-move-out");
+    assert!(listed(&owner.ask(&did, &format!("{W}discover"), json!({})).await));
+    assert!(!listed(&member.ask(&did, &format!("{W}discover"), json!({})).await));
+    assert_eq!(member.ask(&did, &format!("{W}start"), json!({ "template_id": "admin-move-out", "instance_id": "m" })).await["body"]["code"], "not_authorized");
+
+    // Begun: read-only, and everyone told.
+    owner.ask(&did, &format!("{W}start"), json!({ "template_id": "admin-move-out", "instance_id": "o" })).await;
+    let begun = owner.ask(&did, &format!("{W}advance"), json!({ "instance_id": "o", "event": "begin", "input": {} })).await;
+    assert_eq!(running.host.registry.get("leaving").unwrap().unwrap().state, Standing::Moving, "{begun}");
+    let told = loop {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(10), member.inbox.lock().await.recv()).await.expect("told it is moving").unwrap();
+        if kind(&message) == "community" && message["body"]["moving"] == true {
+            break message;
+        }
+    };
+    assert_eq!(told["body"]["name"], "Leaving");
+    assert_eq!(member.community(&did, "post", json!({ "channel": channel, "id": "x2", "content": "too late" })).await["body"]["code"], "e.p.req.moving");
+
+    // The export, at a link that works once.
+    let exported = owner.ask(&did, &format!("{W}advance"), json!({ "instance_id": "o", "event": "export", "input": {} })).await;
+    let mut shown = Vec::new();
+    page_text(&exported["body"]["ui"], &mut shown);
+    let link = shown.iter().find(|text| text.contains("/export/")).unwrap_or_else(|| panic!("a link in {exported}")).clone();
+    let bytes = reqwest::get(&link).await.unwrap().bytes().await.unwrap();
+    assert_eq!(reqwest::get(&link).await.unwrap().status(), 404);
+    let unpacked = running._dir.join("unpacked");
+    tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..])).unpack(&unpacked).unwrap();
+    let root = unpacked.join("leaving");
+    for file in ["data/identity.json", "data/community.sqlite", "data/stickers.sqlite", "data/files/files.sqlite", "config/default.toml", "README.txt"] {
+        assert!(root.join(file).exists(), "{file}");
+    }
+
+    // It opens as the single server: the same keys, members and posts, and not moving.
+    let mut config = wyvrn_community::config::Config::load(root.join("config/default.toml")).unwrap();
+    config.server.public_url = "http://127.0.0.1:1/".into();
+    config.server.did_method = wyvrn_service::address::DidMethod::Peer;
+    config.identity.path = root.join("data/identity.json");
+    let stores = wyvrn_community::serve::Stores {
+        community: wyvrn_service::db::Location::Sqlite(root.join("data/community.sqlite")),
+        stickers: Some(wyvrn_service::db::Location::Sqlite(root.join("data/stickers.sqlite"))),
+        files: Some(wyvrn_service::db::Location::Sqlite(root.join("data/files/files.sqlite"))),
+    };
+    config.files.as_mut().unwrap().dir = root.join("data/files");
+    let opened = wyvrn_community::serve::open(&config, &stores, Default::default()).await.unwrap();
+    let community = &opened.state.community;
+    assert!(!community.moving().unwrap());
+    assert_eq!(community.owner().unwrap().as_deref(), Some(owner.did().as_str()));
+    assert!(community.store.member(&member.did()).unwrap().is_some());
+    assert_eq!(community.store.post_by_id("x1").unwrap().unwrap().content, "goes with it");
+    let hosted = running.host.tenant("leaving").await.unwrap().unwrap();
+    assert_eq!(opened.state.agent.identity().to_json().unwrap(), hosted.state.agent.identity().to_json().unwrap());
+    drop(hosted);
+
+    // Handed over (here by a host admin: there is no DID host to watch), it stops.
+    running.host.set_state("leaving", Standing::Moved, Some(wyvrn_service::now() + 30 * 86_400)).unwrap();
+    assert_eq!(running.host.loaded_count(), 0);
+    assert_eq!(reqwest::get(format!("{}c/leaving/", running.url)).await.unwrap().status(), 404);
 }

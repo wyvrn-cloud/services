@@ -35,6 +35,17 @@ wyvrn-community-host limits <name> <members> <channels>
 
 A community's owner is its first admin. A removed community is kept for 30 days and can be restored until then.
 
+## Moving out to a server of its own
+
+A community's owner (its owner in community/1.0's sense, which follows them when their DID changes and when they hand the community on) has a page in the community's own admin workflows, "Move to your own server", listed to them alone:
+
+1. **Begin moving.** The community is read-only from then on (`e.p.req.moving`). Every member is told by a `community` with `moving`, sent from the community's public address with the `from_prior` that brings a member who knew it at its path to the address.
+2. **Make the export.** It is offered once, at a link good for 15 minutes (`/export/<token>`). It is a `.tar.gz` of everything, as the single `wyvrn-community` keeps it in SQLite: its keys, its store (members, posts, roles, invites, its address's log), its packs, its files, a `config/default.toml` and a README.
+3. The owner runs it at their own domain with `COMMUNITY_PUBLIC_ADDRESS` set to the same address. Holding it (with the same keys) writes the address's next log entry, which names their server, and members' apps follow.
+4. The host checks every minute. Once the address no longer names this copy, it is stopped and kept for 30 days (`moved`), and a host admin can restore it. Without a DID host, a host admin marks it handed over.
+
+Called off before then, it is open here again as it was.
+
 ## Limits
 
 `[limits]` sets what each community may hold, and an admin can change them for one community. Each limit is refused where it is met, with community/1.0's codes:

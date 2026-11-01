@@ -8,12 +8,14 @@
 //! - [`server`]: the host's own DID, each community under `/c/<name>/`, and the
 //!   voice relay's question passed to the community a token is of.
 //! - [`admin`]: the host's admin pages.
+//! - [`export`]: a community's owner moving it to a server of their own.
 //!
 //! A community that outgrows its host moves to a server of its own, the single
 //! `wyvrn-community`, keeping its keys and public address.
 
 pub mod admin;
 pub mod config;
+pub mod export;
 pub mod registry;
 pub mod server;
 pub mod tenants;

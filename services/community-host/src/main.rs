@@ -99,9 +99,11 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     if config.host.admins.is_empty() {
         tracing::warn!("nobody can make communities from the app: set COMMUNITY_HOST_ADMINS, or use `wyvrn-community-host create`");
     }
-    let host = Arc::new(Host::new(config, registry));
+    let host = Host::new(config, registry);
     tracing::info!(did = %agent.did(), url = %host.config.server.public_url, communities, "community host ready");
     tokio::spawn(host.clone().run_housekeeping());
+    // Owners' servers taking their communities over (export.rs).
+    tokio::spawn(host.clone().watch_hand_overs(Arc::from(didcomm_quickstart::default_resolver())));
     let state = Arc::new(AppState { agent, host, did_document, resolver: didcomm_quickstart::default_resolver(), admin: Default::default() });
     wyvrn_service::http::serve(&bind, server::router(state)).await
 }
