@@ -113,6 +113,12 @@ pub struct Rooms {
 }
 
 impl Rooms {
+    /// Whether anyone is in a room, or holds a live connection.
+    pub fn occupied(&self) -> bool {
+        let inner = self.lock();
+        !inner.live.is_empty() || inner.rooms.values().any(|room| !room.participants.is_empty())
+    }
+
     /// Rooms whose participants' tokens start with `prefix`.
     pub fn with_token_prefix(prefix: &str) -> Self {
         Self { token_prefix: prefix.to_string(), ..Self::default() }

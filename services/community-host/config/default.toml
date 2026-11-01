@@ -1,0 +1,52 @@
+# wyvrn-community-host: many communities, each its own DID, keys and store.
+# Settings a deployment most often changes can also be given in the environment
+# (see src/config.rs: COMMUNITY_HOST_PUBLIC_URL, COMMUNITY_HOST_ADMINS, ...).
+
+[server]
+bind = "0.0.0.0:8095"
+# A community is at <public_url>c/<name>/, and is the did:web there.
+public_url = "http://localhost:8095/"
+
+# The host's own keys, and its own store: which communities there are and where
+# each is kept (COMMUNITY_HOST_DATABASE_URL names a database instead).
+[identity]
+path = "data/identity.json"
+[store]
+path = "data/host.sqlite"
+
+[host]
+# Who may make, change and remove communities from the app (DIDs, or public addresses).
+admins = []
+# The DID host each community holds its public address at (community:<name>);
+# empty for none.
+did_host = ""
+
+[storage]
+# What a new community is kept in, unless said otherwise: "sqlite" (a folder of
+# its own), "mysql-db" (a database of its own) or "mysql-shared" (tables of its
+# own in one shared database).
+default = "sqlite"
+# Every community's folder: its SQLite files and keys, and its members' files.
+dir = "data/communities"
+# The MySQL server, without a database (COMMUNITY_HOST_MYSQL_URL).
+mysql = ""
+database_prefix = "wyvrn_c"
+shared_database = "wyvrn_communities"
+
+# What each community may hold, unless an admin sets otherwise for it.
+[limits]
+members = 1000
+channels = 50
+file_bytes = 26214400
+files_quota = 1073741824
+files_total = 5368709120
+
+# How many communities are kept open at once, and for how long after the last request.
+[loading]
+max_loaded = 200
+idle_seconds = 600
+
+# Voice channels, for every community, through one moq-relay whose auth URL is
+# <public_url>voice/auth.
+# [voice]
+# relay_url = "https://relay.example:4443"

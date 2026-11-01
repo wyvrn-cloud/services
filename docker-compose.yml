@@ -155,6 +155,42 @@ services:
       - community-data:/app/data
     restart: unless-stopped
 
+  # Many communities in one process (services/community-host): each its own DID,
+  # keys and store, at <public_url>c/<name>/. Started with
+  #   docker compose --profile communities up -d
+  # Communities are made by COMMUNITY_HOST_ADMINS from the app (the host's admin
+  # pages), or from here:
+  #   docker compose exec community-host wyvrn-community-host create <name> <owner-did>
+  community-host:
+    profiles: ["communities"]
+    build:
+      context: .
+      dockerfile: services/community-host/Dockerfile
+    ports:
+      - "${COMMUNITY_HOST_PORT:-8095}:8095"
+    environment:
+      COMMUNITY_HOST_PUBLIC_URL: "${COMMUNITY_HOST_PUBLIC_URL:-http://localhost:8095/}"
+      # "web" behind HTTPS; "peer" without it.
+      COMMUNITY_HOST_DID_METHOD: "${COMMUNITY_HOST_DID_METHOD:-peer}"
+      COMMUNITY_HOST_ADMINS: "${COMMUNITY_HOST_ADMINS:-}"
+      # The DID host communities hold their public addresses at (community:<name>).
+      COMMUNITY_HOST_DID_HOST: "${COMMUNITY_HOST_DID_HOST:-}"
+      # sqlite, mysql-db or mysql-shared, and the MySQL server (no database) for the latter two.
+      COMMUNITY_HOST_STORAGE: "${COMMUNITY_HOST_STORAGE:-sqlite}"
+      COMMUNITY_HOST_MYSQL_URL: "${COMMUNITY_HOST_MYSQL_URL:-}"
+      # The host's own store in MySQL instead of the volume: a database of its own.
+      COMMUNITY_HOST_DATABASE_URL: "${COMMUNITY_HOST_DATABASE_URL:-}"
+      COMMUNITY_HOST_VOICE_RELAY_URL: "${COMMUNITY_HOST_VOICE_RELAY_URL:-}"
+      COMMUNITY_HOST_VOICE_RELAY_FINGERPRINT: "${COMMUNITY_HOST_VOICE_RELAY_FINGERPRINT:-}"
+    # Each open community holds a few files open, and each member's live connection one.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - community-host-data:/app/data
+    restart: unless-stopped
+
   # The community's voice relay (moq-relay): forwards voice channels' media, which
   # it can't read, and asks the community who may do what. Started with
   #   docker compose --profile voice up -d
@@ -234,6 +270,7 @@ services:
 volumes:
   files-data:
   community-data:
+  community-host-data:
   stickers-data:
   did-host-data:
   announce-data:

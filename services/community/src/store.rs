@@ -2061,6 +2061,16 @@ impl Store {
         Ok(told)
     }
 
+    /// When the soonest poll still running ends, if one is.
+    pub fn next_poll_end(&self) -> Result<Option<i64>> {
+        let extras: Vec<String> = self.db.lock().query(
+            "SELECT extra FROM post_extra WHERE extra LIKE '%\"poll\"%' AND post NOT IN (SELECT post FROM polls_ended)",
+            params![],
+            |row| row.get(0),
+        )?;
+        Ok(extras.iter().filter_map(|extra| serde_json::from_str::<Value>(extra).ok()?["poll"]["ends_at"].as_i64()).min())
+    }
+
     /// Makes `channel` a forum with `tags`, or changes them.
     pub fn set_forum(&self, channel: &str, tags: &Value) -> Result<()> {
         self.db.lock().execute("INSERT OR REPLACE INTO channel_forum (channel, tags) VALUES (?1, ?2)", params![channel, tags.to_string()])?;

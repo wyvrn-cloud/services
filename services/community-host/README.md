@@ -1,0 +1,49 @@
+# wyvrn-community-host
+
+Many communities in one process, the way ACA-Py keeps many agents. Each community is `wyvrn-community`'s own server, opened from settings the host makes for it. It has its own DID (the `did:web` at `<public_url>c/<name>/`), its own keys, stores and public address (`community:<name>` at the DID host), and nothing of one reaches another. There is no shared table with a community column.
+
+The single `wyvrn-community` is still the build for one community on its own server, and is where a hosted community goes when its owner moves it to a server of their own (community/1.0, "Hosted communities, and moving").
+
+## Where a community is kept
+
+Chosen per community when it is made:
+
+| Kind | Where |
+|---|---|
+| `sqlite` | `<storage.dir>/<name>/`: `community.sqlite` (with its keys, profile and address log), `stickers.sqlite`, `files.sqlite` |
+| `mysql-db` | A database of its own on the MySQL server, `<database_prefix><id>`; its packs and files' records in tables starting `s_` and `f_` |
+| `mysql-shared` | Tables of its own in `shared_database`, starting `c<id>_` (`c<id>_s_`, `c<id>_f_`) |
+
+The files members attach are kept in `<storage.dir>/<name>/files` whatever the kind. All MySQL communities share the server's connections (`WYVRN_MYSQL_CONNECTIONS`, 64 by default).
+
+## Thousands, few open
+
+A community is opened when it is spoken to. It is closed once nobody has spoken to it for `loading.idle_seconds` and nobody holds a live connection or is in a voice room. Past `loading.max_loaded`, the least recently used are closed first. Something it still has to do unasked is noted as when to open it again, and the host opens it then: trying again a member who couldn't be reached (a minute later), or telling everyone that a poll ended.
+
+## Making and managing communities
+
+Host admins (`host.admins`, or `COMMUNITY_HOST_ADMINS`) see the host's admin page in the app, under Settings, Services you run. It lists every community, makes new ones, sets what each may hold, and suspends, removes or restores them. The same from the command line:
+
+```
+wyvrn-community-host create <name> <owner-did> [sqlite|mysql-db|mysql-shared] [<title>]
+wyvrn-community-host list
+wyvrn-community-host suspend|resume|delete|restore <name>
+wyvrn-community-host limits <name> <members> <channels>
+```
+
+A community's owner is its first admin. A removed community is kept for 30 days and can be restored until then.
+
+## Limits
+
+`[limits]` sets what each community may hold, and an admin can change them for one community. Each limit is refused where it is met, with community/1.0's codes:
+- members: `e.p.req.community-full`;
+- channels: `e.p.msg.too-many`;
+- files: files/1.0's `e.p.msg.quota`.
+
+## Voice
+
+Every community shares one moq-relay. Its `[auth] url` is `<public_url>voice/auth`. A participant's token starts with the community's name (`<name>.`), so the host passes each question to the community whose token it is.
+
+## Deploying
+
+`docker compose --profile communities up -d`, behind HTTPS with `COMMUNITY_HOST_DID_METHOD=web` (did:web resolves over HTTPS only; `peer` is for a host without it).
