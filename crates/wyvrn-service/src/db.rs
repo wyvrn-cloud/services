@@ -487,6 +487,43 @@ fn pool(server: mysql::Opts) -> Result<mysql::Pool> {
     Ok(pool)
 }
 
+/// What [`copy_store`] copied: each table, and how many rows.
+pub type Copied = Vec<(String, usize)>;
+
+/// Copies the store at `from` into the same store at `to`, whose tables have to
+/// be made already (by opening it as its service does) and be empty: every table
+/// of `from`'s own but those in `skip`, row for row. `service` is whose store it is.
+/// Text stays text and bytes bytes between kinds of database, by what each column
+/// is. One transaction at `to`: a copy that fails leaves nothing there.
+pub fn copy_store(from: &Location, to: &Location, service: &str, skip: &[&str]) -> Result<Copied> {
+    const NOTHING: Schema = Schema { sqlite: "", mysql: "" };
+    let (source, target) = (Db::open(from, &NOTHING, service)?, Db::open(to, &NOTHING, service)?);
+    let mut reading = source.lock();
+    let mut writing = target.lock();
+    let tables: Vec<String> = reading.tables()?.into_iter().filter(|table| !skip.contains(&table.as_str())).collect();
+    writing.transaction(|writing| {
+        let mut copied = Vec::new();
+        for table in &tables {
+            let quoted = format!("\"{table}\"");
+            let held: i64 = writing.query_value(&format!("SELECT COUNT(*) FROM {quoted}"), &[])?;
+            if held > 0 {
+                return Err(Error::Other(format!("{table} at {to} isn't empty: a store is copied only into one that has nothing")));
+            }
+            let (columns, rows) = reading.dump(table)?;
+            if !columns.is_empty() {
+                let names = columns.iter().map(|column| format!("\"{column}\"")).collect::<Vec<_>>().join(", ");
+                let places = (1..=columns.len()).map(|n| format!("?{n}")).collect::<Vec<_>>().join(", ");
+                let insert = format!("INSERT INTO {quoted} ({names}) VALUES ({places})");
+                for row in &rows {
+                    writing.execute(&insert, row)?;
+                }
+            }
+            copied.push((table.clone(), rows.len()));
+        }
+        Ok(copied)
+    })
+}
+
 /// Said on every new MySQL connection. `||` joins text and "…" quotes a name, as
 /// in SQLite; and a value that doesn't fit its column is refused, not cut short.
 const SESSION: [&str; 2] = ["SET SESSION sql_mode = 'STRICT_ALL_TABLES,PIPES_AS_CONCAT,ANSI_QUOTES,NO_ENGINE_SUBSTITUTION'", "SET NAMES utf8mb4 COLLATE utf8mb4_bin"];
@@ -737,6 +774,38 @@ fn say_on(connection: &mut impl Queryable, sql: &str, params: &[Value]) -> Resul
     Ok(Outcome { affected, inserted, rows })
 }
 
+/// Reading a whole table off a MySQL connection, pooled or not.
+trait MySqlReading {
+    fn dump(&mut self, sql: &str) -> Result<(Vec<String>, Vec<Vec<Value>>)>;
+}
+
+impl<T: Queryable> MySqlReading for T {
+    fn dump(&mut self, sql: &str) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+        // The binary protocol: numbers come as numbers, not written out.
+        let mut answer = self.exec_iter(sql, ())?;
+        let columns = answer.columns();
+        let names: Vec<String> = columns.as_ref().iter().map(|column| column.name_str().into_owned()).collect();
+        // Text and bytes arrive alike; a column whose character set is binary's (63)
+        // holds bytes, any other text.
+        let text: Vec<bool> = columns.as_ref().iter().map(|column| column.character_set() != 63).collect();
+        let mut rows = Vec::new();
+        for row in answer.by_ref() {
+            let Row(values) = from_mysql(row?);
+            rows.push(
+                values
+                    .into_iter()
+                    .zip(&text)
+                    .map(|(value, &text)| match value {
+                        Value::Blob(bytes) if text => String::from_utf8(bytes).map_or_else(|bytes| Value::Blob(bytes.into_bytes()), Value::Text),
+                        other => other,
+                    })
+                    .collect(),
+            );
+        }
+        Ok((names, rows))
+    }
+}
+
 /// Whether a MySQL error says the connection has gone, so that the statement can
 /// be said again on another.
 fn gone(error: &Error) -> bool {
@@ -832,6 +901,56 @@ impl Session<'_> {
             }),
             Backend::Pooled(_) => unreachable!("said above"),
         }
+    }
+
+    /// The store's own tables, by the names its statements give them: for a store
+    /// in a database of its own, every table there; for one sharing a database, those
+    /// whose names start with its prefix, without it (no store's prefix starts
+    /// another's: see [`Location::Shared`]). The services' mark is left out.
+    pub fn tables(&mut self) -> Result<Vec<String>> {
+        let naming = self.naming.cloned();
+        let listed: Vec<String> = match (&*self.backend, &naming) {
+            (Backend::Sqlite(_), _) => self.as_written("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name", &[])?,
+            (_, Some(Naming { database: Some(database), .. })) => {
+                self.as_written("SELECT table_name FROM information_schema.tables WHERE table_schema = ?1 ORDER BY table_name", &[Value::Text(database.clone())])?
+            }
+            _ => self.as_written("SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY table_name", &[])?,
+        }
+        .rows
+        .iter()
+        .map(|row| row.get::<String>(0))
+        .collect::<Result<_>>()?;
+        let prefix = naming.map(|naming| naming.prefix).unwrap_or_default();
+        Ok(listed.into_iter().filter_map(|name| name.strip_prefix(prefix.as_str()).map(str::to_string)).filter(|name| name != "wyvrn_service").collect())
+    }
+
+    /// Every row of `table`, with its columns' names: text as text and bytes as
+    /// bytes, as each column holds them.
+    pub fn dump(&mut self, table: &str) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+        let sql = match self.naming {
+            Some(naming) => renamed(&format!("SELECT * FROM \"{table}\""), naming),
+            None => format!("SELECT * FROM \"{table}\""),
+        };
+        let read = |connection: &mut dyn MySqlReading| connection.dump(&sql);
+        match &mut *self.backend {
+            Backend::Sqlite(connection) => {
+                let mut statement = connection.prepare(&sql)?;
+                let columns: Vec<String> = statement.column_names().into_iter().map(str::to_string).collect();
+                let count = columns.len();
+                let rows = statement.query_map([], |row| from_sqlite(row, count))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok((columns, rows.into_iter().map(|row| row.0).collect()))
+            }
+            Backend::MySql(mysql) => waiting(|| read(&mut mysql.connection)),
+            Backend::Pooled(_) => self.on_shared(|connection| read(connection)),
+        }
+    }
+
+    /// Says a statement as it is written, its table names untouched.
+    fn as_written(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
+        let naming = self.naming.take();
+        let said = self.say(sql, params);
+        self.naming = naming;
+        said
     }
 
     /// Runs a statement that answers with nothing. Returns how many rows it
@@ -1002,6 +1121,45 @@ mod tests {
         let connection: i64 = one.lock().query_value("SELECT CONNECTION_ID()", params![]).unwrap();
         root.query_drop(format!("KILL {connection}")).unwrap();
         assert_eq!(one.lock().query_value::<i64>("SELECT size FROM things", params![]).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_store_is_copied_whole_between_kinds_of_database_text_staying_text() {
+        let dir = std::env::temp_dir().join(format!("wyvrn-copy-test-{}", scratch_name()));
+        let (from, to) = (Location::Sqlite(dir.join("from.sqlite")), Location::Sqlite(dir.join("to.sqlite")));
+        let source = Db::open(&from, &SCHEMA, "community").unwrap();
+        source.lock().execute("INSERT INTO things (name, size, bytes) VALUES (?1, 1, ?2)", params!["ünï", [0u8, 255].as_slice()]).unwrap();
+        source.lock().execute("INSERT INTO things (name, size, note) VALUES (?1, 2, ?2)", params!["two", "a note"]).unwrap();
+        drop(source);
+        let check = |location: &Location| {
+            let db = Db::open(location, &SCHEMA, "community").unwrap();
+            let mut session = db.lock();
+            assert_eq!(session.tables().unwrap(), vec!["things".to_string()]);
+            // Found by its text, so stored as text; the bytes as bytes.
+            assert_eq!(session.query_value::<i64>("SELECT size FROM things WHERE name = ?1", params!["ünï"]).unwrap(), 1);
+            assert_eq!(session.query_value::<Vec<u8>>("SELECT bytes FROM things WHERE size = 1", params![]).unwrap(), vec![0, 255]);
+            // Numbering goes on after what was copied.
+            assert_eq!(session.insert("INSERT INTO things (name, size) VALUES ('three', 3)", params![]).unwrap(), 3);
+        };
+        Db::open(&to, &SCHEMA, "community").unwrap();
+        assert_eq!(copy_store(&from, &to, "community", &[]).unwrap(), vec![("things".to_string(), 2)]);
+        check(&to);
+        // Never over what is there.
+        assert!(copy_store(&from, &to, "community", &[]).is_err());
+
+        // Into MySQL tables of its own, and back out, where there is a server.
+        if let Some(url) = server() {
+            let server = url.trim_end_matches('/').to_string();
+            let shared = Location::Shared { server, database: format!("wyvrn_test_{}", scratch_name()), prefix: "c9_m_".into() };
+            Db::open(&shared, &SCHEMA, "community").unwrap();
+            copy_store(&from, &shared, "community", &[]).unwrap();
+            let back = Location::Sqlite(dir.join("back.sqlite"));
+            Db::open(&back, &SCHEMA, "community").unwrap();
+            copy_store(&shared, &back, "community", &[]).unwrap();
+            check(&back);
+            check(&shared);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -65,7 +65,7 @@ impl Pages for AppState {
             id: COMMUNITIES,
             title: "Communities",
             summary: "Every community kept here; make one, set what it may hold, suspend or remove it.",
-            events: &["create", "suspend", "resume", "delete", "restore", "limits"],
+            events: &["create", "suspend", "resume", "delete", "restore", "limits", "move"],
         }]
     }
 
@@ -115,8 +115,23 @@ impl Pages for AppState {
                 { "type": "text-input", "form-id": "file_bytes", "label": "Largest file", "value": bytes(limits.file_bytes) },
                 { "type": "text-input", "form-id": "files_quota", "label": "Files, a member", "value": bytes(limits.files_quota) },
                 { "type": "text-input", "form-id": "files_total", "label": "Files, in all", "value": bytes(limits.files_total) },
-                button("Set", "limits", named),
+                button("Set", "limits", named.clone()),
             ]}));
+            if record.state.served() {
+                let others: Vec<Value> = storage_options(!host.config.storage.mysql.is_empty())
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|option| option["value"] != record.storage.as_str())
+                    .cloned()
+                    .collect();
+                if !others.is_empty() {
+                    items.push(json!({ "type": "form", "children": [
+                        { "type": "drop-down", "form-id": "to", "label": format!("Move {} to", record.name), "options": others },
+                        button("Move", "move", named),
+                    ]}));
+                }
+            }
         }
         Ok(items)
     }
@@ -167,6 +182,13 @@ impl Pages for AppState {
             "restore" if matches!(record.state, State::Deleted | State::Moved) => {
                 host.set_state(&name, State::Active, None).map_err(failed)?;
                 format!("{name} is open again.")
+            }
+            "move" => {
+                let to = Storage::parse(field(input, "to")).ok_or("Move it to: choose where.")?;
+                tokio::task::block_in_place(|| host.move_storage(&name, to)).map_err(|error| {
+                    tracing::error!(community = %name, error = %format!("{error:#}"), "couldn't move a community's storage");
+                    format!("It couldn't be moved, and is kept where it was: {error}")
+                })?
             }
             "limits" => {
                 let limits = limits_from(input, record.limits.unwrap_or(host.config.limits))?;

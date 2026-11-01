@@ -120,11 +120,12 @@ impl Host {
                 stickers: Some(Location::Sqlite(folder.join("stickers.sqlite"))),
                 files: Some(Location::Sqlite(folder.join("files.sqlite"))),
             },
-            // Its own database; its packs and its files' records in tables apart.
+            // Its own database; its packs and its files' records in tables apart. No
+            // store's prefix starts another's, so each store's tables can be listed.
             Storage::MySqlDatabase => {
                 let database = format!("{}{}", self.config.storage.database_prefix, record.id);
                 Stores {
-                    community: shared(database.clone(), String::new())?,
+                    community: shared(database.clone(), "m_".into())?,
                     stickers: Some(shared(database.clone(), "s_".into())?),
                     files: Some(shared(database, "f_".into())?),
                 }
@@ -133,7 +134,7 @@ impl Host {
                 let database = self.config.storage.shared_database.clone();
                 let prefix = format!("c{}_", record.id);
                 Stores {
-                    community: shared(database.clone(), prefix.clone())?,
+                    community: shared(database.clone(), format!("{prefix}m_"))?,
                     stickers: Some(shared(database.clone(), format!("{prefix}s_"))?),
                     files: Some(shared(database, format!("{prefix}f_"))?),
                 }
@@ -282,6 +283,56 @@ impl Host {
             self.housekeeping(now()).await;
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
         }
+    }
+
+    /// Moves the community called `name` to another kind of storage: closed, every
+    /// table copied to where `to` keeps it (its keys too), and opened from there
+    /// at the next request. Requests that come meanwhile wait. What it was kept in
+    /// is left as it was, for an admin to remove; SQLite files it left before, met
+    /// again, are renamed aside (`.before-<time>`). Blocks: from async code, inside
+    /// `block_in_place`.
+    pub fn move_storage(&self, name: &str, to: Storage) -> anyhow::Result<String> {
+        let record = self.registry.get(name)?.ok_or_else(|| anyhow::anyhow!("there is no community called {name}"))?;
+        anyhow::ensure!(record.storage != to, "{name} is kept in {} already", to.as_str());
+        let _opening = self.opening.blocking_lock();
+        self.unload(name);
+        // (Whatever was under way when it closed has a moment to finish.)
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let (from, target) = (self.stores(&record, record.storage)?, self.stores(&record, to)?);
+        let folder = self.folder(name);
+        std::fs::create_dir_all(&folder)?;
+        // Coming back to SQLite: the files it left are set aside, not written over.
+        if to == Storage::Sqlite {
+            let aside = wyvrn_service::now();
+            for file in ["community.sqlite", "stickers.sqlite", "files.sqlite"] {
+                for part in ["", "-wal", "-shm"] {
+                    let path = folder.join(format!("{file}{part}"));
+                    if path.exists() {
+                        std::fs::rename(&path, folder.join(format!("{file}{part}.before-{aside}")))?;
+                    }
+                }
+            }
+        }
+        let keys = folder.join("identity.json");
+        let identity = wyvrn_service::identity::load(&from.community, &keys, "community")?.ok_or_else(|| anyhow::anyhow!("{name} has no keys where it is kept"))?;
+        wyvrn_service::identity::keep(&target.community, &keys, "community", &identity)?;
+        // Its tables made there, as each store makes its own.
+        wyvrn_community::store::Store::open(&target.community)?;
+        wyvrn_service::profile::Kept::open(&target.community, "community")?;
+        wyvrn_service::hosted_address::Kept::open(&target.community, "community")?;
+        let mut copied = wyvrn_service::db::copy_store(&from.community, &target.community, "community", &["wyvrn_identity"])?;
+        if let (Some(from), Some(target)) = (&from.stickers, &target.stickers) {
+            wyvrn_stickers::store::Store::open(target)?;
+            copied.extend(wyvrn_service::db::copy_store(from, target, "stickers", &[])?);
+        }
+        if let (Some(from), Some(target)) = (&from.files, &target.files) {
+            wyvrn_files::store::Store::open(target, &folder.join("files"))?;
+            copied.extend(wyvrn_service::db::copy_store(from, target, "files", &[])?);
+        }
+        self.registry.set_storage(name, to)?;
+        let rows: usize = copied.iter().map(|(_, rows)| rows).sum();
+        tracing::info!(community = %name, from = record.storage.as_str(), to = to.as_str(), tables = copied.len(), rows, "moved a community's storage");
+        Ok(format!("{name} is kept in {} now: {} tables, {rows} rows copied. What it was kept in is still there.", to.as_str(), copied.len()))
     }
 
     /// Sets how `name` stands, and acts on it: one no longer served is closed, one

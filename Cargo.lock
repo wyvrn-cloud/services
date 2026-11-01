@@ -5024,7 +5024,9 @@ dependencies = [
  "tower-http",
  "tracing",
  "wyvrn-community",
+ "wyvrn-files",
  "wyvrn-service",
+ "wyvrn-stickers",
 ]
 
 [[package]]

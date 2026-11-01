@@ -37,6 +37,37 @@ pub fn load_or_generate(location: &Location, path: &Path, service: &str) -> anyh
     }
 }
 
+/// The identity kept at `location` (the file at `path` for a SQLite store), if
+/// one is: nothing is made.
+pub fn load(location: &Location, path: &Path, service: &str) -> anyhow::Result<Option<Identity>> {
+    match location {
+        Location::Sqlite(_) => Ok(path.exists().then(|| Identity::load(path)).transpose().with_context(|| format!("identity file {}", path.display()))?),
+        Location::MySql(_) | Location::Shared { .. } => {
+            let db = Db::open(location, &schema(), service).with_context(|| format!("the identity in {location}"))?;
+            let held = db.lock().query_row("SELECT identity FROM wyvrn_identity WHERE id = 1", params![], |row| row.get::<String>(0))?;
+            Ok(held.map(|held| Identity::from_json(&held)).transpose()?)
+        }
+    }
+}
+
+/// Keeps `identity` at `location`, as [`load_or_generate`] would find it there:
+/// for a service moved from one store to another with its keys. Refused where
+/// other keys are kept already.
+pub fn keep(location: &Location, path: &Path, service: &str, identity: &Identity) -> anyhow::Result<()> {
+    if let Some(held) = load(location, path, service)? {
+        anyhow::ensure!(held.to_json()? == identity.to_json()?, "other keys are kept at {location} already");
+        return Ok(());
+    }
+    match location {
+        Location::Sqlite(_) => identity.save(path).with_context(|| format!("identity file {}", path.display()))?,
+        Location::MySql(_) | Location::Shared { .. } => {
+            let db = Db::open(location, &schema(), service)?;
+            db.lock().execute("INSERT INTO wyvrn_identity (id, identity) VALUES (1, ?1)", params![identity.to_json()?])?;
+        }
+    }
+    Ok(())
+}
+
 fn in_database(db: &Db, path: &Path) -> anyhow::Result<Identity> {
     const HELD: &str = "SELECT identity FROM wyvrn_identity WHERE id = 1";
     let mut session = db.lock();

@@ -10,11 +10,13 @@ Chosen per community when it is made:
 
 | Kind | Where |
 |---|---|
-| `sqlite` | `<storage.dir>/<name>/`: `community.sqlite` (with its keys, profile and address log), `stickers.sqlite`, `files.sqlite` |
-| `mysql-db` | A database of its own on the MySQL server, `<database_prefix><id>`; its packs and files' records in tables starting `s_` and `f_` |
-| `mysql-shared` | Tables of its own in `shared_database`, starting `c<id>_` (`c<id>_s_`, `c<id>_f_`) |
+| `sqlite` | `<storage.dir>/<name>/`: `identity.json` (its keys), `community.sqlite` (with its profile and address log), `stickers.sqlite`, `files.sqlite` |
+| `mysql-db` | A database of its own on the MySQL server, `<database_prefix><id>`: its own tables starting `m_`, its packs' `s_`, its files' records' `f_` |
+| `mysql-shared` | Tables of its own in `shared_database`, starting `c<id>_m_` (`c<id>_s_`, `c<id>_f_`) |
 
 The files members attach are kept in `<storage.dir>/<name>/files` whatever the kind. All MySQL communities share the server's connections (`WYVRN_MYSQL_CONNECTIONS`, 64 by default).
+
+A host admin can move a community to another kind from its admin page (Move … to). It is closed, every table and its keys are copied, and it opens from the new place at the next request; requests that come meanwhile wait. What it was kept in is left for an admin to remove, and SQLite files it left before are renamed aside if it comes back to them. A MySQL database or tables that already hold something are refused. Its DID, members and posts stay as they were.
 
 ## Thousands, few open
 

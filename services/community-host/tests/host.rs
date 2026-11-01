@@ -234,3 +234,35 @@ async fn communities_kept_in_mysql_a_database_each_or_tables_each_keep_apart() {
         assert!(!running.host.folder(name).join("community.sqlite").exists());
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_community_moves_between_every_kind_of_storage_and_is_the_same_community() {
+    let Some(url) = std::env::var("WYVRN_TEST_DATABASE_URL").ok().filter(|url| !url.is_empty()) else { return };
+    let running = start_host_with(600, url.trim_end_matches('/')).await;
+    let ann = Peer::start().await;
+    running.host.registry.create("mover", "Mover", Storage::Sqlite, &ann.did(), "test", 1).unwrap();
+    let did = running.did_of("mover").await;
+    ann.community(&did, "join", json!({})).await;
+    let channel = ann.community(&did, "create-channel", json!({ "name": "general" })).await["body"]["created"].as_str().unwrap().to_string();
+    ann.community(&did, "post", json!({ "channel": channel, "id": "m1", "content": "kept through every move" })).await;
+
+    let mut posts = 1;
+    for to in [Storage::MySqlShared, Storage::MySqlDatabase, Storage::Sqlite] {
+        let host = running.host.clone();
+        let said = tokio::task::spawn_blocking(move || host.move_storage("mover", to)).await.unwrap().unwrap();
+        assert!(said.contains(to.as_str()), "{said}");
+        assert_eq!(running.host.registry.get("mover").unwrap().unwrap().storage, to);
+        // The same keys, so the same DID; the same owner, channel and posts.
+        assert_eq!(running.did_of("mover").await, did);
+        let joined = ann.community(&did, "join", json!({})).await;
+        assert_eq!((joined["body"]["owner"].as_str(), joined["body"]["channels"][0]["id"].as_str()), (Some(ann.did().as_str()), Some(channel.as_str())), "{joined}");
+        let id = format!("m{}", posts + 1);
+        assert_eq!(kind(&ann.community(&did, "post", json!({ "channel": channel, "id": id, "content": to.as_str() })).await), "posted");
+        posts += 1;
+        let history = ann.community(&did, "history-request", json!({ "channel": channel })).await;
+        assert_eq!(history["body"]["messages"].as_array().unwrap().len(), posts, "{history}");
+    }
+    // Back in SQLite, where it began: moved into the files it left, it is refused.
+    let host = running.host.clone();
+    assert!(tokio::task::spawn_blocking(move || host.move_storage("mover", Storage::Sqlite)).await.unwrap().is_err());
+}

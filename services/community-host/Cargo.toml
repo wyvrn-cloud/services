@@ -10,6 +10,9 @@ publish.workspace = true
 [dependencies]
 # Each community is wyvrn-community's, opened from settings the host makes.
 wyvrn-community = { path = "../community" }
+# A community's packs and files' records, made where it is moved to (tenants.rs).
+wyvrn-stickers = { path = "../stickers" }
+wyvrn-files = { path = "../files" }
 wyvrn-service = { workspace = true }
 didcomm-agent = { workspace = true }
 didcomm-core = { workspace = true }
