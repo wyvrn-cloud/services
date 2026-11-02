@@ -106,9 +106,10 @@ bounds how much it can hold.
 Build the images where the source is, and carry them over:
 
 ```sh
-# From the root of this repository.
-docker build -f services/did-host/Dockerfile -t wyvrn-did-host .
-docker build -f services/stickers/Dockerfile -t wyvrn-stickers .
+# From the folder this repository is in, beside wyvrn-sign-in (the community
+# server's path dependency, which every image's build reads).
+docker build -f wyvrn-services/services/did-host/Dockerfile -t wyvrn-did-host .
+docker build -f wyvrn-services/services/stickers/Dockerfile -t wyvrn-stickers .
 docker save wyvrn-did-host wyvrn-stickers | gzip | ssh you@server 'gunzip | docker load'
 ```
 

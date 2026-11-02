@@ -24,8 +24,8 @@ services:
     <<: *service
     image: wyvrn-did-host
     build:
-      context: ../..
-      dockerfile: services/did-host/Dockerfile
+      context: ../../..
+      dockerfile: wyvrn-services/services/did-host/Dockerfile
     ports:
       - "127.0.0.1:${DID_HOST_PORT:-8181}:8080"
     environment:
@@ -44,8 +44,8 @@ services:
     <<: *service
     image: wyvrn-stickers
     build:
-      context: ../..
-      dockerfile: services/stickers/Dockerfile
+      context: ../../..
+      dockerfile: wyvrn-services/services/stickers/Dockerfile
     ports:
       - "127.0.0.1:${STICKERS_PORT:-8182}:8080"
     environment:
@@ -64,8 +64,8 @@ services:
     profiles: ["community"]
     image: wyvrn-community
     build:
-      context: ../..
-      dockerfile: services/community/Dockerfile
+      context: ../../..
+      dockerfile: wyvrn-services/services/community/Dockerfile
     ports:
       - "127.0.0.1:${COMMUNITY_PORT:-8183}:8080"
     environment:
@@ -86,8 +86,8 @@ services:
     profiles: ["announce"]
     image: wyvrn-announce
     build:
-      context: ../..
-      dockerfile: services/announce/Dockerfile
+      context: ../../..
+      dockerfile: wyvrn-services/services/announce/Dockerfile
     ports:
       - "127.0.0.1:${ANNOUNCE_PORT:-8184}:8080"
     environment:
@@ -110,8 +110,8 @@ services:
     profiles: ["files"]
     image: wyvrn-files
     build:
-      context: ../..
-      dockerfile: services/files/Dockerfile
+      context: ../../..
+      dockerfile: wyvrn-services/services/files/Dockerfile
     ports:
       - "127.0.0.1:${FILES_PORT:-8186}:8080"
     environment:
@@ -138,8 +138,8 @@ services:
     profiles: ["cards"]
     image: wyvrn-cards
     build:
-      context: ../..
-      dockerfile: services/cards/Dockerfile
+      context: ../../..
+      dockerfile: wyvrn-services/services/cards/Dockerfile
     ports:
       - "127.0.0.1:${CARDS_PORT:-8185}:8080"
     environment:
@@ -161,8 +161,8 @@ services:
     profiles: ["relay"]
     image: wyvrn-relay
     build:
-      context: ../..
-      dockerfile: services/relay/Dockerfile
+      context: ../../..
+      dockerfile: wyvrn-services/services/relay/Dockerfile
     ports:
       - "127.0.0.1:${RELAY_PORT:-8187}:8080"
     environment:

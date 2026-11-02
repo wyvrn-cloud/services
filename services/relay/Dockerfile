@@ -1,5 +1,8 @@
-# Built from the root of the repository, which is the workspace this service is a
-# member of (docker-compose.yml does: `context: .`, `dockerfile: services/relay/Dockerfile`).
+# Built from the folder wyvrn-services is in, which also holds wyvrn-sign-in: the
+# community's path dependency, which every member of the workspace needs to read
+# the lock file (docker-compose.yml does: `context: ..`,
+# `dockerfile: wyvrn-services/services/relay/Dockerfile`; Dockerfile.dockerignore
+# beside this says what of that folder is sent).
 #
 # Optional build secrets:
 #   github_token -- only if a git dependency is private (wyvrn-cloud/didcomm is public):
@@ -24,23 +27,27 @@ FROM rust:1-slim-bookworm AS chef
 RUN apt-get update && apt-get install -y --no-install-recommends git cmake gcc perl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 RUN cargo install cargo-chef --locked --version 0.1.78
-WORKDIR /build
+WORKDIR /build/wyvrn-services
 # aws-lc-rs' cmake build ignores cargo's -j; cap it so constrained builders don't OOM.
 ENV CMAKE_BUILD_PARALLEL_LEVEL=2
 
 # What the workspace's manifests say, and nothing of its code: the recipe changes
 # only when they do, and so does everything built from it.
 FROM chef AS planner
-COPY Cargo.toml Cargo.lock ./
-COPY .cargo .cargo
-COPY crates crates
-COPY services services
+COPY wyvrn-sign-in/Cargo.toml wyvrn-sign-in/Cargo.lock /build/wyvrn-sign-in/
+COPY wyvrn-sign-in/src /build/wyvrn-sign-in/src
+COPY wyvrn-services/Cargo.toml wyvrn-services/Cargo.lock ./
+COPY wyvrn-services/.cargo .cargo
+COPY wyvrn-services/crates crates
+COPY wyvrn-services/services services
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS base
-COPY --from=planner /build/recipe.json recipe.json
-COPY .cargo .cargo
-COPY deploy/docker/cargo-secrets.sh /usr/local/bin/cargo-secrets
+COPY wyvrn-sign-in/Cargo.toml wyvrn-sign-in/Cargo.lock /build/wyvrn-sign-in/
+COPY wyvrn-sign-in/src /build/wyvrn-sign-in/src
+COPY --from=planner /build/wyvrn-services/recipe.json recipe.json
+COPY wyvrn-services/.cargo .cargo
+COPY wyvrn-services/deploy/docker/cargo-secrets.sh /usr/local/bin/cargo-secrets
 RUN --mount=type=secret,id=github_token,required=false \
     --mount=type=secret,id=ca_bundle,required=false \
     --mount=type=cache,target=/usr/local/cargo/registry \
@@ -59,12 +66,12 @@ RUN --mount=type=secret,id=github_token,required=false \
     cargo-secrets cargo chef cook --release --locked -j 2 -p wyvrn-relay --recipe-path recipe.json
 
 FROM deps AS builder
-COPY Cargo.toml Cargo.lock ./
-COPY .cargo .cargo
+COPY wyvrn-services/Cargo.toml wyvrn-services/Cargo.lock ./
+COPY wyvrn-services/.cargo .cargo
 # The whole workspace: cargo needs every member's manifest to read the lock file,
 # and this service's own crates are among them.
-COPY crates crates
-COPY services services
+COPY wyvrn-services/crates crates
+COPY wyvrn-services/services services
 # Its code, on top of everything it depends on.
 RUN --mount=type=secret,id=github_token,required=false \
     --mount=type=secret,id=ca_bundle,required=false \
@@ -80,7 +87,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && useradd --system --home /app relay
 WORKDIR /app
 COPY --from=builder /usr/local/bin/wyvrn-relay /usr/local/bin/wyvrn-relay
-COPY services/relay/config config
+COPY wyvrn-services/services/relay/config config
 # The relay's own identity and who it has granted (unless they are in a database).
 RUN mkdir -p data && chown relay data
 VOLUME /app/data

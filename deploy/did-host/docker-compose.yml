@@ -7,8 +7,8 @@ services:
   did-host:
     image: wyvrn-did-host
     build:
-      context: ../..
-      dockerfile: services/did-host/Dockerfile
+      context: ../../..
+      dockerfile: wyvrn-services/services/did-host/Dockerfile
     environment:
       # The host as it appears in the DIDs it hosts, and where holders write to it.
       DID_HOST_DOMAIN: "${DID_HOST_DOMAIN:?set DID_HOST_DOMAIN in .env}"

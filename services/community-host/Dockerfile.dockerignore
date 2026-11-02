@@ -1,0 +1,15 @@
+# The build context is the folder wyvrn-services is in: send only what the build
+# copies, not everything beside it.
+*
+!wyvrn-services/Cargo.toml
+!wyvrn-services/Cargo.lock
+!wyvrn-services/.cargo
+!wyvrn-services/crates
+!wyvrn-services/services
+!wyvrn-services/deploy/docker
+!wyvrn-sign-in/Cargo.toml
+!wyvrn-sign-in/Cargo.lock
+!wyvrn-sign-in/src
+**/target
+**/data
+**/.git

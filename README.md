@@ -203,9 +203,13 @@ compiles what all the services have in common (the dependencies of
 `crates/wyvrn-service`, wyvrn-didcomm among them) as an image layer, with
 [cargo-chef](https://github.com/LukeMathWalker/cargo-chef). Because it is the same
 in each, Docker builds it once and every other service's build reuses it, however
-the images are built (`docker build -f services/<name>/Dockerfile .` one after
-another, or compose). It is made again only when a `Cargo.toml` or `Cargo.lock`
-changes. Each service then compiles what it needs beyond it as a layer of its own
+the images are built (`docker build -f wyvrn-services/services/<name>/Dockerfile .`
+one after another from the folder this repository is in, or compose). It is made again only when a `Cargo.toml` or `Cargo.lock`
+changes. The build context is that parent folder because the community server
+depends on [wyvrn-sign-in](https://github.com/wyvrn-cloud/signin) by path, from
+beside this repository (its repository is private), and cargo reads every
+member's dependencies to read the lock file: each `Dockerfile.dockerignore` sends
+only this repository's sources and wyvrn-sign-in's. Each service then compiles what it needs beyond it as a layer of its own
 (also made again only when a manifest or the lock file changes), and its code on
 top: a change to the code alone compiles the workspace's own crates, and nothing
 else.

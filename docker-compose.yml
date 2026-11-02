@@ -8,8 +8,8 @@ services:
   # services/announce/README.md).
   announce:
     build:
-      context: .
-      dockerfile: services/announce/Dockerfile
+      context: ..
+      dockerfile: wyvrn-services/services/announce/Dockerfile
     ports:
       - "${ANNOUNCE_PORT:-8080}:8080"
     environment:
@@ -35,8 +35,8 @@ services:
   # For one at a real domain, with HTTPS: deploy/did-host.
   did-host:
     build:
-      context: .
-      dockerfile: services/did-host/Dockerfile
+      context: ..
+      dockerfile: wyvrn-services/services/did-host/Dockerfile
     ports:
       - "${DID_HOST_PORT:-8081}:8080"
     environment:
@@ -62,8 +62,8 @@ services:
   # there, over HTTPS (see services/stickers/README.md).
   stickers:
     build:
-      context: .
-      dockerfile: services/stickers/Dockerfile
+      context: ..
+      dockerfile: wyvrn-services/services/stickers/Dockerfile
     ports:
       - "${STICKERS_PORT:-8082}:8080"
     environment:
@@ -84,8 +84,8 @@ services:
   # like where it is posted. Try http://localhost:8085/dl/did:web:id.wyvrn.app:<name>.
   cards:
     build:
-      context: .
-      dockerfile: services/cards/Dockerfile
+      context: ..
+      dockerfile: wyvrn-services/services/cards/Dockerfile
     ports:
       - "${CARDS_PORT:-8085}:8080"
     environment:
@@ -100,8 +100,8 @@ services:
   # address there, over HTTPS (see services/files/README.md).
   files:
     build:
-      context: .
-      dockerfile: services/files/Dockerfile
+      context: ..
+      dockerfile: wyvrn-services/services/files/Dockerfile
     ports:
       - "${FILES_PORT:-8086}:8080"
     environment:
@@ -128,8 +128,8 @@ services:
   #   docker compose exec community wyvrn-community add <did> admin
   community:
     build:
-      context: .
-      dockerfile: services/community/Dockerfile
+      context: ..
+      dockerfile: wyvrn-services/services/community/Dockerfile
     ports:
       - "${COMMUNITY_PORT:-8083}:8080"
       # community-voice's, which shares this service's network (see there).
@@ -164,8 +164,8 @@ services:
   community-host:
     profiles: ["communities"]
     build:
-      context: .
-      dockerfile: services/community-host/Dockerfile
+      context: ..
+      dockerfile: wyvrn-services/services/community-host/Dockerfile
     ports:
       - "${COMMUNITY_HOST_PORT:-8095}:8095"
     environment:
@@ -220,8 +220,8 @@ services:
   # app); CLAUDE_DAILY_REQUESTS and CLAUDE_PERIOD_TOKENS limit what is asked.
   claude:
     build:
-      context: .
-      dockerfile: services/claude/Dockerfile
+      context: ..
+      dockerfile: wyvrn-services/services/claude/Dockerfile
     profiles: ["claude"]
     ports:
       - "${CLAUDE_PORT:-8088}:8080"
@@ -247,8 +247,8 @@ services:
   # RELAY_ALLOW names it: a mediator beside it, say.
   relay:
     build:
-      context: .
-      dockerfile: services/relay/Dockerfile
+      context: ..
+      dockerfile: wyvrn-services/services/relay/Dockerfile
     ports:
       - "${RELAY_PORT:-8087}:8080"
     environment:
