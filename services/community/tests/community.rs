@@ -1925,8 +1925,10 @@ async fn a_message_request_carries_the_askers_did_to_that_one_member_once_a_day(
     assert_eq!(kind(&again), "message-request-sent");
     assert!(tokio::time::timeout(Duration::from_millis(500), bob.next_of(&format!("{C}message-request"))).await.is_err());
 
-    // Nor to someone who takes none.
+    // Nor to someone who takes none, which they are told they don't.
+    assert_eq!(admin.community("join", json!({})).await["body"]["message_requests"], true);
     admin.community("set-member-profile", json!({ "requests": false })).await;
+    assert_eq!(admin.community("join", json!({})).await["body"]["message_requests"], false);
     let to_admin = bob.community("message-request", json!({ "id": "r3", "to": server.id(&admin) })).await;
     assert_eq!(kind(&to_admin), "message-request-sent");
     assert!(tokio::time::timeout(Duration::from_millis(500), admin.next_of(&format!("{C}message-request"))).await.is_err());

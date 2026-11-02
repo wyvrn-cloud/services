@@ -494,6 +494,7 @@ impl Community {
             "joined": member.joined,
             "owner": self.owner()?,
             "you": member.did,
+            "message_requests": self.store.member_here(&member.did)?.is_none_or(|here| here.requests),
             "roles": self.roles_body()?,
             "my_roles": powers.roles,
             "permissions": powers.listed(),
