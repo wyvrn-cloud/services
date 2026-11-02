@@ -57,6 +57,10 @@ pub struct Participant {
     /// The device's own id (`join`'s `device`; empty for one that sent none). A
     /// member's devices share its DID, and each is a participant of its own.
     pub device: String,
+    /// The `did:key` this device made for its time in the room, which the others
+    /// seal their keys to: members aren't told each other's DIDs (community-voice/1.0's
+    /// room keys). Empty from an app from before them.
+    pub room_key: String,
     /// The live connection it joined over, if it did: closing that takes it out.
     pub live: Option<u64>,
     /// What their app gives the forwarding service.
@@ -257,8 +261,13 @@ impl Rooms {
                     "server_muted": p.server_muted,
                     "sharing": { "camera": p.sharing.camera, "screen": p.sharing.screen, "avatar": p.sharing.avatar },
                 });
-                if let Some(name) = community.store.member(did).ok().flatten().and_then(|m| m.name) {
+                // What they are shown as here, as members lists them: their nickname here first.
+                let nickname = community.store.member_here(did).ok().flatten().and_then(|here| here.nickname);
+                if let Some(name) = nickname.or_else(|| community.store.member(did).ok().flatten().and_then(|m| m.name)) {
                     entry["name"] = json!(name);
+                }
+                if !p.room_key.is_empty() {
+                    entry["room_key"] = json!(p.room_key);
                 }
                 entry
             })
@@ -397,6 +406,7 @@ impl Rooms {
                     return refuse(message, "e.p.msg.unsupported", "This server doesn't forward that transport yet.");
                 }
                 let device = body["device"].as_str().unwrap_or_default().to_string();
+                let room_key = body["room_key"].as_str().filter(|key| key.starts_with("did:key:") && key.len() <= 256).unwrap_or_default().to_string();
                 let mut left = Vec::new();
                 let participant = {
                     let mut inner = self.lock();
@@ -417,6 +427,9 @@ impl Rooms {
                             if live.is_some() {
                                 p.live = live;
                             }
+                            if !room_key.is_empty() {
+                                p.room_key = room_key.clone();
+                            }
                             p.clone()
                         }
                         None => {
@@ -424,6 +437,7 @@ impl Rooms {
                                 id: format!("p-{}", random_id(6)),
                                 did: sender.to_string(),
                                 device: device.clone(),
+                                room_key: room_key.clone(),
                                 live,
                                 token: format!("{}{}", self.token_prefix, random_id(24)),
                                 muted: false,

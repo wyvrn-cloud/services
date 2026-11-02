@@ -1019,7 +1019,8 @@ async fn joining_a_voice_channel_gives_a_room_a_token_and_who_else_is_there_and_
     assert_eq!(first["body"]["channels"], json!([{ "channel": lounge, "participants": [] }]));
 
     // Alice joins the empty room.
-    let joined = voice(&alice, "join", json!({ "channel": lounge })).await;
+    // (With a room key: what the others seal their keys to, since they aren't told her DID.)
+    let joined = voice(&alice, "join", json!({ "channel": lounge, "room_key": "did:key:z6LSalice" })).await;
     assert_eq!(kind(&joined), "joined", "{joined}");
     let transport = &joined["body"]["transport"];
     assert_eq!((transport["kind"].as_str(), transport["url"].as_str(), transport["fingerprint"].as_str()), (Some("moq"), Some("https://voice.example/"), Some("ab12")));
@@ -1034,6 +1035,8 @@ async fn joining_a_voice_channel_gives_a_room_a_token_and_who_else_is_there_and_
     // Bob joins and is told Alice is there; Alice's sharing reaches the watcher.
     let bobs = voice(&bob, "join", json!({ "channel": lounge })).await;
     assert_eq!(bobs["body"]["participants"][0]["participant"], alice_id);
+    assert_eq!(bobs["body"]["participants"][0]["room_key"], "did:key:z6LSalice");
+    assert!(bobs["body"]["participants"][0]["did"].is_null(), "{bobs}");
     live.next_of(&carol, "presence").await;
     tell(&alice, "state", json!({ "channel": lounge, "muted": true, "deafened": false, "sharing": { "screen": true } })).await;
     let sharing = live.next_of(&carol, "presence").await;
