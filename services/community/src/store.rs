@@ -272,7 +272,7 @@ pub struct Answering {
 }
 
 pub struct Store {
-    db: Db,
+    pub(crate) db: Db,
 }
 
 const MEMBER_COLUMNS: &str = "did, role, name, joined, since, delivered, (SELECT at FROM member_left WHERE member_left.did = members.did)";
@@ -745,6 +745,77 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         data TEXT NOT NULL,
         status TEXT NOT NULL,
         updated INTEGER NOT NULL
+    );
+    -- The web view (web/). A member's lasting key, which follows changes of DID:
+    -- what sessions, consents and the identity provider's ids are kept under.
+    CREATE TABLE IF NOT EXISTS member_keys (
+        did TEXT PRIMARY KEY,
+        mkey TEXT NOT NULL UNIQUE
+    );
+    -- The picture a member's profile carries (user-profile/1.0), shown beside
+    -- their posts on the web.
+    CREATE TABLE IF NOT EXISTS member_pictures (
+        did TEXT PRIMARY KEY,
+        media_type TEXT NOT NULL,
+        data TEXT NOT NULL,
+        at INTEGER NOT NULL
+    );
+    -- Channels made public on the web, and from when.
+    CREATE TABLE IF NOT EXISTS web_channels (
+        channel TEXT PRIMARY KEY,
+        since INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS web_sessions (
+        token TEXT PRIMARY KEY,
+        mkey TEXT NOT NULL,
+        csrf TEXT NOT NULL,
+        created INTEGER NOT NULL,
+        expires INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS web_pictures (
+        token TEXT PRIMARY KEY,
+        mkey TEXT NOT NULL
+    );
+    -- The identity provider (community-sign-in/1.0).
+    CREATE TABLE IF NOT EXISTS oidc_clients (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        name TEXT NOT NULL,
+        secret TEXT,
+        redirect_uris TEXT NOT NULL,
+        created INTEGER NOT NULL,
+        created_by TEXT
+    );
+    CREATE TABLE IF NOT EXISTS oidc_consents (
+        mkey TEXT NOT NULL,
+        client TEXT NOT NULL,
+        scopes TEXT NOT NULL,
+        at INTEGER NOT NULL,
+        PRIMARY KEY (mkey, client)
+    );
+    CREATE TABLE IF NOT EXISTS oidc_codes (
+        code TEXT PRIMARY KEY,
+        mkey TEXT NOT NULL,
+        client TEXT NOT NULL,
+        redirect_uri TEXT NOT NULL,
+        scopes TEXT NOT NULL,
+        nonce TEXT,
+        challenge TEXT NOT NULL,
+        expires INTEGER NOT NULL,
+        used INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS oidc_tokens (
+        token TEXT PRIMARY KEY,
+        mkey TEXT NOT NULL,
+        client TEXT NOT NULL,
+        scopes TEXT NOT NULL,
+        code TEXT,
+        expires INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS oidc_keys (
+        kid TEXT PRIMARY KEY,
+        jwk TEXT NOT NULL,
+        created INTEGER NOT NULL
     );";
 
 fn schema() -> Schema {
@@ -1002,6 +1073,71 @@ fn schema() -> Schema {
                 data MEDIUMTEXT NOT NULL,
                 status VARCHAR(32) NOT NULL,
                 updated BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS member_keys (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                mkey VARCHAR(64) NOT NULL UNIQUE
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS member_pictures (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                media_type VARCHAR(64) NOT NULL,
+                data MEDIUMTEXT NOT NULL,
+                at BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS web_channels (
+                channel VARCHAR(255) NOT NULL PRIMARY KEY,
+                since BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS web_sessions (
+                token VARCHAR(64) NOT NULL PRIMARY KEY,
+                mkey VARCHAR(64) NOT NULL,
+                csrf VARCHAR(64) NOT NULL,
+                created BIGINT NOT NULL,
+                expires BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS web_pictures (
+                token VARCHAR(64) NOT NULL PRIMARY KEY,
+                mkey VARCHAR(64) NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS oidc_clients (
+                id VARCHAR(255) NOT NULL PRIMARY KEY,
+                kind VARCHAR(16) NOT NULL,
+                name TEXT NOT NULL,
+                secret VARCHAR(64),
+                redirect_uris MEDIUMTEXT NOT NULL,
+                created BIGINT NOT NULL,
+                created_by {MYSQL_DID}
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS oidc_consents (
+                mkey VARCHAR(64) NOT NULL,
+                client VARCHAR(255) NOT NULL,
+                scopes TEXT NOT NULL,
+                at BIGINT NOT NULL,
+                PRIMARY KEY (mkey, client)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS oidc_codes (
+                code VARCHAR(64) NOT NULL PRIMARY KEY,
+                mkey VARCHAR(64) NOT NULL,
+                client VARCHAR(255) NOT NULL,
+                redirect_uri TEXT NOT NULL,
+                scopes TEXT NOT NULL,
+                nonce TEXT,
+                challenge VARCHAR(128) NOT NULL,
+                expires BIGINT NOT NULL,
+                used BIGINT NOT NULL DEFAULT 0
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS oidc_tokens (
+                token VARCHAR(64) NOT NULL PRIMARY KEY,
+                mkey VARCHAR(64) NOT NULL,
+                client VARCHAR(255) NOT NULL,
+                scopes TEXT NOT NULL,
+                code VARCHAR(64),
+                expires BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS oidc_keys (
+                kid VARCHAR(64) NOT NULL PRIMARY KEY,
+                jwk TEXT NOT NULL,
+                created BIGINT NOT NULL
             ) {MYSQL_TABLE}"
         )
     });
@@ -1183,6 +1319,12 @@ impl Store {
             tx.execute("UPDATE OR IGNORE bans SET did = ?2 WHERE did = ?1", params![prior, new])?;
             tx.execute("UPDATE OR IGNORE timeouts SET did = ?2 WHERE did = ?1", params![prior, new])?;
             tx.execute("UPDATE OR IGNORE join_answers SET did = ?2 WHERE did = ?1", params![prior, new])?;
+            // On the web: their lasting key (and with it their sessions, the websites
+            // they let sign them in, and the ids those know them by), and their picture.
+            tx.execute("UPDATE OR IGNORE member_keys SET did = ?2 WHERE did = ?1", params![prior, new])?;
+            tx.execute("DELETE FROM member_keys WHERE did = ?1", params![prior])?;
+            tx.execute("UPDATE OR IGNORE member_pictures SET did = ?2 WHERE did = ?1", params![prior, new])?;
+            tx.execute("DELETE FROM member_pictures WHERE did = ?1", params![prior])?;
             tx.execute("INSERT OR REPLACE INTO superseded (did, became, at) VALUES (?1, ?2, ?3)", params![prior, new, now])?;
             Ok(old.is_some())
         })
@@ -1936,6 +2078,12 @@ impl Store {
         )?;
         db.query_row(&format!("SELECT {POST_COLUMNS} FROM posts WHERE id = ?1"), params![id], post_from)?
             .ok_or_else(|| wyvrn_service::db::Error::Other("a post just written is not there".into()))
+    }
+
+    /// The post at `seq` in `channel`, in a thread or not.
+    pub fn post_at(&self, channel: &str, seq: i64) -> Result<Option<Post>> {
+        let post = self.db.lock().query_row(&format!("SELECT {POST_COLUMNS} FROM posts WHERE channel = ?1 AND seq = ?2"), params![channel, seq], post_from)?;
+        post.map(|post| self.filled(post)).transpose()
     }
 
     pub fn post_by_id(&self, id: &str) -> Result<Option<Post>> {

@@ -119,6 +119,23 @@ impl Rooms {
         !inner.live.is_empty() || inner.rooms.values().any(|room| !room.participants.is_empty())
     }
 
+    /// Who is in each room now: the members' DIDs, each once, by channel.
+    pub fn in_rooms(&self) -> HashMap<String, Vec<String>> {
+        let inner = self.lock();
+        inner
+            .rooms
+            .iter()
+            .map(|(channel, room)| {
+                let mut dids: Vec<String> = room.participants.values().map(|p| p.did.clone()).collect();
+                dids.dedup();
+                dids.sort();
+                dids.dedup();
+                (channel.clone(), dids)
+            })
+            .filter(|(_, dids)| !dids.is_empty())
+            .collect()
+    }
+
     /// Rooms whose participants' tokens start with `prefix`.
     pub fn with_token_prefix(prefix: &str) -> Self {
         Self { token_prefix: prefix.to_string(), ..Self::default() }

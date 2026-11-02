@@ -33,6 +33,39 @@ pub struct Config {
     /// The community server itself leaves it out.
     #[serde(default)]
     pub assistant: Option<crate::assistant::AssistantConfig>,
+    /// The web view (web/): the community's page and the channels its admins make
+    /// public, at `public_url` (the server's own address unless set).
+    #[serde(default)]
+    pub web: WebConfig,
+}
+
+/// The web view (community/1.0's "On the web").
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WebConfig {
+    /// Whether the server shows anything on the web at all. Whether a community's
+    /// page is on is then its admins' (`set-web`).
+    pub enabled: bool,
+    /// Where the web view is: any origin and path, ending in `/`. The server's
+    /// own `public_url` when left out. Every absolute address in its pages, and
+    /// the identity provider's issuer, is made from this and never from a request.
+    pub public_url: Option<String>,
+    /// The reverse proxies in front of it, as addresses or ranges (`10.0.0.0/8`,
+    /// `::1`): only a request from one of these is believed about whom it is for
+    /// (`X-Forwarded-For`), which rate limits go by.
+    pub trusted_proxies: Vec<String>,
+    /// Whether pages send `Strict-Transport-Security`.
+    pub hsts: bool,
+    /// The issuers of website-sign-in/1.0's credential the web view trusts.
+    pub sign_in_issuers: Vec<String>,
+    /// How many requests one address may make of the web view in a minute.
+    pub requests_per_minute: u32,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self { enabled: true, public_url: None, trusted_proxies: Vec::new(), hsts: false, sign_in_issuers: vec!["did:web:verify.wyvrn.app".to_string()], requests_per_minute: 300 }
+    }
 }
 
 /// Files members attach (community/1.0's "Files, stickers…"): where they are kept,
@@ -161,8 +194,9 @@ impl Config {
     /// `COMMUNITY_MEMBERS` (DIDs separated by commas or whitespace), and for voice
     /// channels `COMMUNITY_VOICE_RELAY_URL`, `COMMUNITY_VOICE_RELAY_FINGERPRINT` and
     /// `COMMUNITY_VOICE_TRANSPORT`; for the files members attach `COMMUNITY_FILES_DIR`
-    /// and `COMMUNITY_FILES_MAX_BYTES`, and for the community's own packs
-    /// `COMMUNITY_STICKERS_PATH`.
+    /// and `COMMUNITY_FILES_MAX_BYTES`, for the community's own packs
+    /// `COMMUNITY_STICKERS_PATH`, and for the web view `COMMUNITY_WEB` (`off`),
+    /// `COMMUNITY_WEB_URL` and `COMMUNITY_WEB_TRUSTED_PROXIES`.
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading config {}: {e}", path.display()))?;
@@ -207,6 +241,16 @@ impl Config {
         // The community's own packs, likewise.
         if let Some(path) = env("COMMUNITY_STICKERS_PATH") {
             config.stickers.get_or_insert_with(StickersConfig::default).path = path.into();
+        }
+        // The web view: COMMUNITY_WEB=off turns it off; COMMUNITY_WEB_URL says where it is.
+        if let Some(web) = env("COMMUNITY_WEB") {
+            config.web.enabled = !matches!(web.trim().to_ascii_lowercase().as_str(), "off" | "false" | "0" | "no");
+        }
+        if let Some(url) = env("COMMUNITY_WEB_URL") {
+            config.web.public_url = Some(url);
+        }
+        if let Some(proxies) = env("COMMUNITY_WEB_TRUSTED_PROXIES") {
+            config.web.trusted_proxies = dids(&proxies);
         }
         if !config.server.public_url.ends_with('/') {
             config.server.public_url.push('/');

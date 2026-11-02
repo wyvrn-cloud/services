@@ -12,6 +12,7 @@ use crate::community::{is_emoji, line, Community};
 use crate::questions::{failed, Answer, Refusal};
 use crate::roles::{Powers, CHANNEL_PERMISSIONS, COMMUNITY_PERMISSIONS, EVERYONE_ROLE};
 use crate::store::{Channel, Flow, Member, RoleDef};
+use crate::web::flows::{SITES_FLOW, WEB_FLOW};
 
 pub const ROLES: &str = "roles";
 pub const MEMBER_ROLES: &str = "member-roles";
@@ -27,7 +28,7 @@ const MAX_ROLES: usize = 100;
 const MAX_ROLE_NAME: usize = 32;
 
 /// Each template: its id, title, states and the events that move between them.
-fn templates() -> [(&'static str, &'static str, Value); 8] {
+fn templates() -> [(&'static str, &'static str, Value); 10] {
     [
         (
             ROLES,
@@ -115,6 +116,25 @@ fn templates() -> [(&'static str, &'static str, Value); 8] {
                 }
             }),
         ),
+        (
+            WEB_FLOW,
+            "On the web",
+            json!({
+                "states": [{ "name": "form", "type": "start" }, { "name": "add", "type": "normal" }, { "name": "done", "type": "final" }],
+                "transitions": {
+                    "save": { "from": "form", "to": "form" }, "add": { "from": "form", "to": "add" }, "remove": { "from": "form", "to": "form" }, "done": { "from": "form", "to": "done" },
+                    "create": { "from": "add", "to": "form" }, "back": { "from": "add", "to": "form" }
+                }
+            }),
+        ),
+        (
+            SITES_FLOW,
+            "Websites you sign in to",
+            json!({
+                "states": [{ "name": "list", "type": "start" }, { "name": "done", "type": "final" }],
+                "transitions": { "revoke": { "from": "list", "to": "list" }, "done": { "from": "list", "to": "done" } }
+            }),
+        ),
     ]
 }
 
@@ -189,6 +209,8 @@ impl Community {
                 JOIN_GATES_FLOW | ONBOARDING_SETUP_FLOW => powers.has("manage_community"),
                 CHANNELS_FLOW => powers.has("manage_channels"),
                 ONBOARDING_FLOW => true,
+                WEB_FLOW => self.web_url.is_some() && powers.has("manage_community"),
+                SITES_FLOW => self.web_url.is_some(),
                 _ => powers.has("manage_channels") || opened_one,
             })
             .map(|(id, title, _)| (id, title))
@@ -414,6 +436,8 @@ impl Community {
                 (CHANNELS_FLOW, "move") => (self.move_ui(flow).map_err(failed)?, vec!["to", "back"]),
                 (ONBOARDING_SETUP_FLOW, _) => (self.onboarding_setup_ui().map_err(failed)?, vec!["save"]),
                 (ONBOARDING_FLOW, state) => self.onboarding_ui(flow, state).map_err(failed)?,
+                (WEB_FLOW, _) => self.web_flow_ui(flow).map_err(failed)?,
+                (SITES_FLOW, _) => self.sites_flow_ui(flow).map_err(failed)?,
                 (CHANNEL_PERMISSIONS_FLOW, "role") => {
                     let channel = self.flow_channel(flow)?;
                     let held = self.channel_permissions(&flow.owner, &powers, &channel).map_err(failed)?;
@@ -499,6 +523,21 @@ impl Community {
                 json!({})
             }
             ONBOARDING_FLOW => json!({}),
+            WEB_FLOW => {
+                if self.web_url.is_none() {
+                    return Err(Refusal::new("template_not_found", "This server shows nothing on the web."));
+                }
+                if !powers.has("manage_community") {
+                    return Err(not_allowed("The community on the web takes Manage the community."));
+                }
+                json!({})
+            }
+            SITES_FLOW => {
+                if self.web_url.is_none() {
+                    return Err(Refusal::new("template_not_found", "This server shows nothing on the web."));
+                }
+                json!({})
+            }
             _ => return Err(Refusal::new("template_not_found", "This server has no such workflow.")),
         };
         let wanted = body["instance_id"].as_str().or(message["thid"].as_str()).or(message["id"].as_str()).unwrap_or_default();
@@ -514,9 +553,9 @@ impl Community {
             return Err(Refusal::new("multiplicity_violation", "That instance id has been used."));
         }
         let state = match template {
-            ROLES | AUTOMOD_FLOW | CHANNELS_FLOW => "list",
+            ROLES | AUTOMOD_FLOW | CHANNELS_FLOW | SITES_FLOW => "list",
             MEMBER_ROLES => "pick",
-            JOIN_GATES_FLOW | ONBOARDING_SETUP_FLOW => "form",
+            JOIN_GATES_FLOW | ONBOARDING_SETUP_FLOW | WEB_FLOW => "form",
             ONBOARDING_FLOW => "welcome",
             _ => "roles",
         };
@@ -558,7 +597,8 @@ impl Community {
             AUTOMOD_FLOW => powers.has("manage_automod"),
             JOIN_GATES_FLOW | ONBOARDING_SETUP_FLOW => powers.has("manage_community"),
             CHANNELS_FLOW => powers.has("manage_channels"),
-            ONBOARDING_FLOW => true,
+            ONBOARDING_FLOW | SITES_FLOW => true,
+            WEB_FLOW => powers.has("manage_community"),
             _ => powers.has("manage_roles"),
         };
         if !still {
@@ -638,6 +678,8 @@ impl Community {
             }
             (AUTOMOD_FLOW, _, _) | (JOIN_GATES_FLOW, _, _) => self.advance_moderation_flow(&mut flow, event, input, now)?,
             (CHANNELS_FLOW, _, _) | (ONBOARDING_SETUP_FLOW, _, _) | (ONBOARDING_FLOW, _, _) => self.advance_structure_flow(&mut flow, event, input, now)?,
+            (WEB_FLOW, _, _) => self.advance_web_flow(&mut flow, event, input, now)?,
+            (SITES_FLOW, _, _) => self.advance_sites_flow(&mut flow, event, input)?,
             (ROLES, "list", "done") | (CHANNEL_PERMISSIONS_FLOW, "roles", "done") => {
                 flow.status = "completed".into();
                 false

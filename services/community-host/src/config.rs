@@ -25,6 +25,10 @@ pub struct Config {
     /// Voice channels, for every community: the one relay they share.
     #[serde(default)]
     pub voice: Option<VoiceConfig>,
+    /// Every community on the web, each at its own path (`<public_url>c/<name>/`):
+    /// `public_url` is ignored here.
+    #[serde(default)]
+    pub web: wyvrn_community::config::WebConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]

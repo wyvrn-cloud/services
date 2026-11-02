@@ -107,6 +107,15 @@ async fn community(State(state): State<Arc<AppState>>, mut request: Request) -> 
         Some(at) => (&rest[..at], &rest[at..]),
         None => (rest, "/"),
     };
+    // A browser at `/c/<name>` would take the page's links from `/c/`: to the
+    // address with its `/`, which is the community's own.
+    if !rest.contains('/') && request.method() == axum::http::Method::GET && !request.headers().contains_key(axum::http::header::UPGRADE) {
+        let to = match request.uri().query() {
+            Some(query) => format!("{name}/?{query}"),
+            None => format!("{name}/"),
+        };
+        return (StatusCode::PERMANENT_REDIRECT, [(axum::http::header::LOCATION, to)]).into_response();
+    }
     let target = match request.uri().query() {
         Some(query) => format!("{inner}?{query}"),
         None => inner.to_string(),

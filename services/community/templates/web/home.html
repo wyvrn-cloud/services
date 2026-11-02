@@ -1,0 +1,24 @@
+{% extends "web/base.html" %}
+{% block content %}
+<section class="hero">
+  {% if site.has_icon %}<img class="hero-icon" src="{{ site.root }}icon" alt="" width="96" height="96">{% endif %}
+  <div>
+    <h1>{{ site.name }}</h1>
+    {% if !site.description.is_empty() %}<p class="lede">{{ site.description }}</p>{% endif %}
+    <p class="facts"><span>{{ members }} {% if members == 1 %}member{% else %}members{% endif %}</span>{% if public_count > 0 %}<span>{{ public_count }} {% if public_count == 1 %}channel{% else %}channels{% endif %} to read</span>{% endif %}</p>
+    <p class="cta"><a class="button primary" href="{{ site.in_app }}">Join in Wyvrn</a></p>
+  </div>
+</section>
+{% for group in groups %}
+  {% if !group.channels.is_empty() %}
+  <section class="cards">
+    {% if let Some(name) = group.name %}<h2>{{ name }}</h2>{% endif %}
+    <ul>
+    {% for channel in group.channels %}
+      <li><a class="card" href="{{ channel.href }}"><strong>{% if channel.forum %}☰ {% else %}# {% endif %}{{ channel.name }}</strong>{% if !channel.topic.is_empty() %}<span>{{ channel.topic }}</span>{% endif %}</a></li>
+    {% endfor %}
+    </ul>
+  </section>
+  {% endif %}
+{% endfor %}
+{% endblock %}

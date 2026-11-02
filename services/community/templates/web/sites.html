@@ -1,0 +1,17 @@
+{% extends "web/panel.html" %}
+{% block panel %}
+<h1>{{ title }}</h1>
+{% if sites.is_empty() %}
+<p class="quiet">You haven't let any website sign you in with {{ site.name }}.</p>
+{% else %}
+<ul class="sites">
+{% for (id, name, verified, what, when) in sites %}
+  <li>
+    <div><strong>{{ name }}</strong> {% if *verified %}<span class="badge verified">Verified</span>{% else %}<span class="badge unverified">Unverified</span>{% endif %}<br><span class="quiet">{{ what }} · since {{ when }}</span></div>
+    <form method="post" action="sites/revoke"><input type="hidden" name="csrf" value="{{ site.csrf }}"><input type="hidden" name="client" value="{{ id }}"><button class="button quiet" type="submit">Take back</button></form>
+  </li>
+{% endfor %}
+</ul>
+{% endif %}
+<p><a href="{{ site.root }}">Back to {{ site.name }}</a></p>
+{% endblock %}

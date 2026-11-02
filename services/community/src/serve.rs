@@ -86,7 +86,14 @@ pub async fn open(config: &Config, stores: &Stores, opening: Opening) -> anyhow:
     // the rest, and laid over the settings.
     let kept = wyvrn_service::profile::Kept::open(location, "community")?;
     let store = Store::open(location).with_context(|| format!("store {location}"))?;
+    // On the web: on for a community made now, off for one from before (until an
+    // admin turns it on). Settled before anyone is let in.
+    let web = crate::web::Web::new(config)?.map(Arc::new);
+    if web.is_some() {
+        crate::web::settle_new(&store)?;
+    }
     let mut community = Community::new(store, config.community.clone(), Some(kept))?.with_voice(config.voice.clone());
+    community.web_url = web.as_ref().map(|web| web.url.to_string());
     community.assistant = opening.assistant.as_ref().map(Assistant::listing);
     if let Some(stickers) = &stores.stickers {
         community.expressions = Some(crate::expressions::Expressions::open(stickers, &config.server.public_url).context("the community's packs")?);
@@ -102,6 +109,7 @@ pub async fn open(config: &Config, stores: &Stores, opening: Opening) -> anyhow:
     let mut state = AppState::new(agent, Default::default(), community, did_document, didcomm_quickstart::default_resolver());
     state.rooms = crate::voice::Rooms::with_token_prefix(&opening.voice_tokens);
     state.owner_pages = opening.owner_pages;
+    state.web = web;
     let state = Arc::new(match opening.assistant {
         Some(assistant) => {
             tracing::info!(name = %assistant.config.name, model = %assistant.config.model, "an assistant answers in every channel");

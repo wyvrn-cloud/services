@@ -112,6 +112,65 @@ the server can read them. A channel here is not end-to-end encrypted between its
 members; each member's messages are encrypted to the server, and the server's to
 each member.
 
+## On the web
+
+The server shows the community on the web too ([community/1.0's "On the web"](https://wyvrn-cloud.github.io/protocols/protocols/community/1.0/)):
+its page (name, picture, description, channels, who is in voice), and the posts
+of the channels its admins make public, with a link to every channel and post.
+The pages are plain HTML, light and dark, readable by search engines, and need no
+JavaScript but for the light/dark switch and signing in.
+
+- **On for a new community, off for one from before** (its members were promised
+  nothing outside it): an admin turns it on (`set-web`). A channel's posts are
+  public only once an admin makes the channel public, from then on or with its
+  history.
+- **Members sign in** with Wyvrn on their phone (website-sign-in/1.0), and then
+  see every channel, as they do in the app.
+- **Other websites can sign members in** through the community with OpenID
+  Connect ([community-sign-in/1.0](https://wyvrn-cloud.github.io/protocols/profiles/community-sign-in/1.0/)).
+  Discovery is at `<web address>.well-known/openid-configuration`. Admins add
+  websites in the app (the `web` workflow), where they also set the look:
+  colours for light and dark, corner radius, font, and CSS of their own.
+
+`[web]` in the configuration (or the environment):
+
+| Setting | Environment | Default | What |
+|---|---|---|---|
+| `enabled` | `COMMUNITY_WEB=off` | on | Whether anything is shown on the web. |
+| `public_url` | `COMMUNITY_WEB_URL` | the server's `public_url` | Where the web view is: any origin and path, ending in `/`. Every absolute address in it is made from this, never from a request. |
+| `trusted_proxies` | `COMMUNITY_WEB_TRUSTED_PROXIES` | none | Proxies whose `X-Forwarded-For` is believed, for rate limits. |
+| `hsts` | | off | Send `Strict-Transport-Security`. |
+| `sign_in_issuers` | | `did:web:verify.wyvrn.app` | Whose sign-in credential is trusted. |
+| `requests_per_minute` | | 300 | Per address. |
+
+**Behind a reverse proxy, at any path.** The web view's links are relative, so a
+proxy may forward its path with the prefix or without:
+
+```caddy
+# At the root of the community's own address: nothing to do.
+community.example {
+    reverse_proxy community:8080
+}
+
+# At a path of another site (public_url = "https://example.com/forum/"):
+example.com {
+    handle_path /forum/* {        # takes /forum off; `handle` would keep it
+        reverse_proxy community:8080
+    }
+}
+```
+
+```nginx
+location /forum/ {
+    proxy_pass http://community:8080/;          # the trailing / takes /forum off
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+```
+
+Pages can't be framed, load nothing from elsewhere, and run no script but the
+server's own; the pages that read a session send no CORS headers, and every form
+is checked for its origin and a token.
+
 ## In the app
 
 Add the server's DID as a contact. Someone on its list sees the community in

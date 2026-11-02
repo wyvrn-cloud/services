@@ -169,6 +169,8 @@ impl Host {
             stickers: Some(StickersConfig { path: folder.join("stickers.sqlite") }),
             files: Some(FilesConfig { dir: folder.join("files"), max_file_bytes: limits.file_bytes, quota_bytes: limits.files_quota, total_bytes: limits.files_total }),
             assistant: None,
+            // Each community's web view is at its own address, under the host's.
+            web: wyvrn_community::config::WebConfig { public_url: None, ..self.config.web.clone() },
         }
     }
 

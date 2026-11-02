@@ -6,6 +6,8 @@
 //! - [`voice`]: community-voice/1.0, voice channels: rooms, keys, invitations.
 //! - [`store`]: who is let in, the channels, and what was said.
 //! - [`server`]: the endpoint, and sending what is posted to everyone who joined.
+//! - [`web`]: the community on the web, signing in to it, and the community as
+//!   an identity provider.
 //!
 //! It knows nothing of who its members are or what they are for. Something that
 //! posts on a program's behalf (a bot) is a member like any other.
@@ -27,3 +29,4 @@ pub mod server;
 pub mod store;
 pub mod structure;
 pub mod voice;
+pub mod web;

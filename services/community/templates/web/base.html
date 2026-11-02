@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }}</title>
+<meta name="description" content="{{ description }}">
+<link rel="canonical" href="{{ site.canonical }}">
+{% if noindex %}<meta name="robots" content="noindex">{% endif %}
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="{{ site.name }}">
+<meta property="og:title" content="{{ title }}">
+<meta property="og:description" content="{{ description }}">
+<meta property="og:url" content="{{ site.canonical }}">
+{% if site.has_icon %}<meta property="og:image" content="{{ site.root }}icon">{% endif %}
+<meta name="twitter:card" content="summary">
+<meta name="color-scheme" content="light dark">
+<link rel="stylesheet" href="{{ site.root }}assets/web.css">
+<link rel="stylesheet" href="{{ site.root }}theme.css?v={{ site.theme }}">
+{% if site.has_icon %}<link rel="icon" href="{{ site.root }}icon">{% endif %}
+<script src="{{ site.root }}assets/web.js"></script>
+{% if !json_ld.is_empty() %}<script type="application/ld+json">{{ json_ld|safe }}</script>{% endif %}
+</head>
+<body>
+<a class="skip" href="#main">Skip to the posts</a>
+<header class="top">
+  <a class="brand" href="{{ site.root }}">
+    {% if site.has_icon %}<img class="brand-icon" src="{{ site.root }}icon" alt="" width="36" height="36">{% else %}<span class="brand-icon brand-letter" aria-hidden="true">{{ site.letter }}</span>{% endif %}
+    <span class="brand-name">{{ site.name }}</span>
+  </a>
+  <nav class="actions" aria-label="Account">
+    <a class="button primary" href="{{ site.in_app }}">Open in Wyvrn</a>
+    {% if let Some(name) = site.signed_in %}
+      <form method="post" action="{{ site.root }}sign-out" class="inline">
+        <input type="hidden" name="csrf" value="{{ site.csrf }}">
+        <span class="who" title="Signed in">{{ name }}</span>
+        <button class="button quiet" type="submit">Sign out</button>
+      </form>
+    {% else %}
+      <a class="button quiet" href="{{ site.root }}sign-in">Sign in</a>
+    {% endif %}
+    <button class="button icon theme-switch" type="button" hidden aria-label="Switch between light and dark" title="Light or dark">
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.4 5.4 0 0 1-9.54-5.18A9 9 0 0 0 12 3z"/></svg>
+    </button>
+  </nav>
+</header>
+<div class="layout">
+  <details class="side" open>
+    <summary>Channels</summary>
+    <nav aria-label="Channels">
+    {% for group in groups %}
+      <section class="group">
+        {% if let Some(name) = group.name %}<h2>{{ name }}</h2>{% endif %}
+        <ul>
+        {% for channel in group.channels %}
+          <li><a href="{{ channel.href }}"{% if channel.current %} aria-current="page"{% endif %} title="{{ channel.topic }}"><span class="mark" aria-hidden="true">{% if channel.forum %}☰{% else %}#{% endif %}</span>{{ channel.name }}{% if site.signed_in.is_some() && !channel.public %}<span class="lock" title="Members only" aria-label="members only">·</span>{% endif %}</a></li>
+        {% endfor %}
+        {% for room in group.voice %}
+          <li class="voice">
+            <span class="room"><span class="mark" aria-hidden="true">🔊</span>{{ room.name }}{% if let Some(count) = room.count %}{% if *count > 0 %}<span class="count">{{ count }} in voice</span>{% endif %}{% endif %}</span>
+            {% if !room.names.is_empty() %}<ul class="present">{% for name in room.names %}<li>{{ name }}</li>{% endfor %}</ul>{% endif %}
+          </li>
+        {% endfor %}
+        </ul>
+      </section>
+    {% else %}
+      <p class="quiet">No channels are public yet.</p>
+    {% endfor %}
+    </nav>
+  </details>
+  <main id="main">
+{% block content %}{% endblock %}
+  </main>
+</div>
+<footer class="foot"><span>A community on <a href="https://wyvrn.app/" rel="noopener">Wyvrn</a></span></footer>
+</body>
+</html>

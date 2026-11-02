@@ -1,0 +1,42 @@
+{% extends "web/base.html" %}
+{% block content %}
+<header class="channel-head">
+  {% if let Some(back) = back %}<a class="back" href="{{ back }}">← #{{ channel_name }}</a>{% endif %}
+  <h1>{{ heading }}</h1>
+  {% if !topic.is_empty() %}<p class="topic">{{ topic }}</p>{% endif %}
+</header>
+{% if let Some(older) = older %}<p class="paging"><a class="button quiet" href="{{ older }}" rel="prev">Older posts</a></p>{% endif %}
+<ol class="posts">
+{% for post in posts %}
+  <li class="post{% if post.focus %} focus{% endif %}" id="{{ post.anchor }}">
+    <div class="avatar">{% if let Some(picture) = post.picture %}<img src="{{ picture }}" alt="" width="40" height="40" loading="lazy">{% else %}<span aria-hidden="true">{{ post.initial }}</span>{% endif %}</div>
+    <article class="body">
+      <header>
+        <span class="author">{{ post.author }}</span>
+        <a class="time" href="{{ post.href }}"><time datetime="{{ post.iso }}">{{ post.when }}</time></a>
+        {% if post.edited %}<span class="note">edited</span>{% endif %}
+        {% if post.pinned %}<span class="note">pinned</span>{% endif %}
+      </header>
+      {% if let Some(snippet) = post.reply_snippet %}<blockquote class="reply">{% if let Some(who) = post.reply_author %}<span class="author">{{ who }}</span> {% endif %}{{ snippet }}</blockquote>{% endif %}
+      {% if let Some(title) = post.title %}<h2 class="title">{{ title }}</h2>{% endif %}
+      <div class="content">{{ post.html|safe }}</div>
+      {% if !post.media.is_empty() %}
+      <div class="media">
+        {% for item in post.media %}
+          {% if item.kind == "image" %}<a href="{{ item.href }}"><img src="{{ item.href }}" alt="{{ item.name }}" loading="lazy"{% if let Some(w) = item.width %} width="{{ w }}"{% endif %}{% if let Some(h) = item.height %} height="{{ h }}"{% endif %}></a>
+          {% else if item.kind == "video" %}<video src="{{ item.href }}" controls preload="metadata"></video>
+          {% else if item.kind == "audio" %}<audio src="{{ item.href }}" controls preload="none"></audio>
+          {% else %}<a class="file" href="{{ item.href }}" download><span aria-hidden="true">📄</span> {{ item.name }} <span class="quiet">{{ item.size }}</span></a>{% endif %}
+        {% endfor %}
+      </div>
+      {% endif %}
+      {% if !post.reactions.is_empty() %}<ul class="reactions" aria-label="Reactions">{% for (emoji, count) in post.reactions %}<li>{{ emoji }} <span>{{ count }}</span></li>{% endfor %}</ul>{% endif %}
+      {% if let Some(thread) = post.thread_href %}<a class="thread" href="{{ thread }}">{% if let Some(name) = post.thread_name %}{{ name }} · {% endif %}{{ post.thread_count }} {% if post.thread_count == 1 %}reply{% else %}replies{% endif %} →</a>{% endif %}
+    </article>
+  </li>
+{% else %}
+  <li class="empty">Nothing here yet.</li>
+{% endfor %}
+</ol>
+{% if let Some(newer) = newer %}<p class="paging"><a class="button quiet" href="{{ newer }}" rel="next">Newer posts</a></p>{% endif %}
+{% endblock %}

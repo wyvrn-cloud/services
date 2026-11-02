@@ -74,6 +74,8 @@ pub struct AppState {
     /// moving to a server of their own), as wyvrn_service::admin pages; and those open.
     pub owner_pages: Option<Arc<dyn wyvrn_service::admin::Pages>>,
     pub owner_admin: wyvrn_service::admin::Admin,
+    /// The community on the web, where the server shows it (web/).
+    pub web: Option<Arc<crate::web::Web>>,
 }
 
 impl AppState {
@@ -95,6 +97,7 @@ impl AppState {
             assistant: None,
             owner_pages: None,
             owner_admin: Default::default(),
+            web: None,
         }
     }
 
@@ -290,6 +293,14 @@ impl Service for CommunityService {
             if let Some(notice) = state.community.rotated(&prior, &new, now())? {
                 tracing::info!(%prior, %new, "a member changed DID");
                 send_later(state, new, notice);
+            }
+        }
+        // A ping's answer, to one the web view sent someone signing in.
+        if received.message["type"] == crate::web::sign_in::PING_RESPONSE {
+            if let (Some(web), Some(thid)) = (&state.web, received.message["thid"].as_str()) {
+                if web.sign_in.answered(thid) {
+                    return Ok(None);
+                }
             }
         }
         // What any agent answers (a ping, what it supports): it says what this is,
@@ -782,6 +793,10 @@ pub fn prune_once(state: &AppState) {
     if let Err(error) = state.community.store.prune_flows(now() - ANSWERING_KEPT_FOR) {
         tracing::warn!(%error, "pruning failed");
     }
+    // The web view's sessions, codes and tokens that have run out.
+    if let Err(error) = state.community.store.prune_web(now()) {
+        tracing::warn!(%error, "pruning failed");
+    }
 }
 
 /// Pruned every hour.
@@ -793,7 +808,7 @@ pub async fn run_pruning(state: Arc<AppState>) {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let didcomm = Router::new()
         .route("/", get(root).post(|State(state): State<Arc<AppState>>, body: Bytes| receive(Arc::new(CommunityService(state)), body)))
         .route("/voice/auth", post(voice_auth))
         // Files members attach (files.rs): a chunk is at most what the host takes in one.
@@ -813,13 +828,22 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::http::HeaderName::from_static("upload-offset"),
             axum::http::HeaderName::from_static("upload-length"),
         ]))
-        .with_state(state)
+        .with_state(state.clone());
+    // The web view, without the CORS above; and around everything, the headers
+    // its pages get (which take that CORS off the community's own page at `/`).
+    let routes = match &state.web {
+        Some(web) => didcomm.merge(crate::web::router(state.clone(), web)),
+        None => didcomm,
+    };
+    routes.layer(axum::middleware::from_fn_with_state(state, crate::web::headers))
 }
 
-/// A live connection, if the request asks for a WebSocket; otherwise what this is.
-async fn root(State(state): State<Arc<AppState>>, upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>) -> Response {
+/// A live connection, if the request asks for a WebSocket; otherwise the
+/// community's page, where it has one on, or what this is.
+async fn root(State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap, upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>) -> Response {
     match upgrade {
         Ok(upgrade) => upgrade.max_message_size(4 * 1024 * 1024).on_upgrade(move |socket| live_connection(state, socket)).into_response(),
+        Err(_) if state.web.is_some() && crate::web::page_on(&state.community.store) => crate::web::pages::home(State(state), headers).await,
         Err(_) => index(State(state)).await.into_response(),
     }
 }

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<meta name="color-scheme" content="light dark">
+<title>{{ title }} · {{ site.name }}</title>
+<link rel="stylesheet" href="{{ site.root }}assets/web.css">
+<link rel="stylesheet" href="{{ site.root }}theme.css?plain&amp;v={{ site.theme }}">
+<script src="{{ site.root }}assets/web.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="{{ site.root }}">{% if site.has_icon %}<img class="brand-icon" src="{{ site.root }}icon" alt="" width="36" height="36">{% else %}<span class="brand-icon brand-letter" aria-hidden="true">{{ site.letter }}</span>{% endif %}<span class="brand-name">{{ site.name }}</span></a>
+</header>
+<main id="main">
+  <section class="panel">
+    <h1>Sign in to {{ site.name }}</h1>
+    <p>Members sign in with Wyvrn on their phone: no password, nothing to remember. Your browser asks your phone, you choose Wyvrn, and you're in.</p>
+    <p class="row"><button class="button primary" id="signin" type="button" data-base="{{ site.root }}" data-then="{{ then }}">Sign in with Wyvrn</button></p>
+    <p id="status" class="status" role="status" aria-live="polite"><noscript>Signing in needs JavaScript.</noscript></p>
+    <p class="quiet">Not a member yet? <a href="{{ site.in_app }}">Open {{ site.name }} in Wyvrn</a> to join.</p>
+  </section>
+</main>
+</body>
+</html>

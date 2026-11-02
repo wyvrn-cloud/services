@@ -32,9 +32,24 @@ uuid = { workspace = true }
 # Unicode categories, for what a text channel may be called (community.rs).
 regex = "1"
 sha2 = { workspace = true }
+base64 = { workspace = true }
+# The web view (web/): its pages, compiled from templates/ and escaped as they are
+# written; posts' Markdown, as announcement channels render it.
+askama = "0.14"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+url = "2"
+# Signing in to the web view (website-sign-in/1.0), and the identity provider's
+# ES256 id tokens (community-sign-in/1.0).
+wyvrn-sign-in = { path = "../../../wyvrn-sign-in" }
+# The checks' lookups (DIDs resolved over HTTPS), and dates on the pages.
+wyvrn-hosted-did = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+# The files a public post carries, opened with the key the post carries.
+aes-gcm = "0.10"
 
 [dev-dependencies]
-base64 = { workspace = true }
 reqwest-websocket = "0.6"
-# The tests talk to the server as members' apps would.
-reqwest = { workspace = true }
+# The tests talk to the server as members' apps would, and as browsers and
+# websites do to its web view.
+reqwest = { workspace = true, features = ["form"] }

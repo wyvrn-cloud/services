@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<meta name="color-scheme" content="light dark">
+<title>{{ title }} · {{ site.name }}</title>
+<link rel="stylesheet" href="{{ site.root }}assets/web.css">
+<link rel="stylesheet" href="{{ site.root }}theme.css?plain&amp;v={{ site.theme }}">
+</head>
+<body>
+<header class="top">
+  <span class="brand">{% if site.has_icon %}<img class="brand-icon" src="{{ site.root }}icon" alt="" width="36" height="36">{% else %}<span class="brand-icon brand-letter" aria-hidden="true">{{ site.letter }}</span>{% endif %}<span class="brand-name">{{ site.name }}</span></span>
+</header>
+<main id="main">
+  <section class="panel">
+    <h1>{{ client_name }} wants you to sign in with {{ site.name }}</h1>
+    <p>{% if verified %}<span class="badge verified">Verified</span> An admin of {{ site.name }} added this website.{% else %}<span class="badge unverified">Unverified</span> Nobody at {{ site.name }} has checked this website: it named itself.{% if let Some(address) = client_address %} It is at <strong>{{ address }}</strong>.{% endif %}{% endif %}</p>
+    <p>Signed in as <strong>{% if let Some(name) = site.signed_in %}{{ name }}{% endif %}</strong>, it would be told:</p>
+    <ul class="scopes">{% for line in tells %}<li>{{ line }}</li>{% endfor %}</ul>
+    <form method="post" action="authorize">
+      {% for (name, value) in fields %}<input type="hidden" name="{{ name }}" value="{{ value }}">{% endfor %}
+      <p class="row">
+        <button class="button primary" type="submit" name="decision" value="allow">Allow</button>
+        <button class="button quiet" type="submit" name="decision" value="deny">Don't allow</button>
+      </p>
+    </form>
+    <p class="quiet">You can take this back at any time, here under <a href="{{ site.root }}sites">Websites you sign in to</a>, or in Wyvrn.</p>
+  </section>
+</main>
+</body>
+</html>

@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<meta name="color-scheme" content="light dark">
+<title>{{ title }} · {{ site.name }}</title>
+<link rel="stylesheet" href="{{ site.root }}assets/web.css">
+<link rel="stylesheet" href="{{ site.root }}theme.css?v={{ site.theme }}">
+<script src="{{ site.root }}assets/web.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="{{ site.root }}">{% if site.has_icon %}<img class="brand-icon" src="{{ site.root }}icon" alt="" width="36" height="36">{% else %}<span class="brand-icon brand-letter" aria-hidden="true">{{ site.letter }}</span>{% endif %}<span class="brand-name">{{ site.name }}</span></a>
+</header>
+<main id="main"><section class="panel">{% block panel %}{% endblock %}</section></main>
+</body>
+</html>

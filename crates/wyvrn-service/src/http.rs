@@ -63,7 +63,8 @@ pub async fn receive<S: Service>(service: Arc<S>, body: Bytes) -> Response {
 /// signal a container is stopped with), letting requests in flight finish.
 pub async fn serve(bind: &str, router: Router) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;
-    axum::serve(listener, router).with_graceful_shutdown(stop_signal()).await?;
+    // With who each connection is from, for whatever limits requests by address.
+    axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).with_graceful_shutdown(stop_signal()).await?;
     Ok(())
 }
 

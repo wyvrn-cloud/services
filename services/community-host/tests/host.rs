@@ -352,3 +352,29 @@ async fn an_owner_takes_their_community_to_a_server_of_their_own() {
     assert_eq!(running.host.loaded_count(), 0);
     assert_eq!(reqwest::get(format!("{}c/leaving/", running.url)).await.unwrap().status(), 404);
 }
+
+#[tokio::test]
+async fn each_community_is_on_the_web_at_its_own_path() {
+    let running = start_host(600).await;
+    let owner = Peer::start().await;
+    running.host.registry.create("gamma", "Gamma", Storage::Sqlite, &owner.did(), "test", 1).unwrap();
+    let did = running.did_of("gamma").await;
+    let joined = owner.community(&did, "join", json!({})).await;
+    assert_eq!(joined["body"]["web"]["url"], format!("{}c/gamma/", running.url), "{joined}");
+    assert_eq!(joined["body"]["web"]["page"], true, "a community made now has its page on");
+
+    let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let page = http.get(format!("{}c/gamma/", running.url)).send().await.unwrap();
+    assert_eq!(page.status(), 200);
+    assert_eq!(page.headers()["x-frame-options"], "DENY");
+    assert!(page.headers().get("access-control-allow-origin").is_none());
+    let html = page.text().await.unwrap();
+    assert!(html.contains("<h1>Gamma</h1>"));
+    assert!(html.contains(&format!("<link rel=\"canonical\" href=\"{}c/gamma/\">", running.url)));
+    // Without the `/`, to it: the page's links are relative.
+    let bare = http.get(format!("{}c/gamma", running.url)).send().await.unwrap();
+    assert_eq!(bare.status(), 308);
+    assert_eq!(bare.headers()["location"], "gamma/");
+    let discovery: Value = http.get(format!("{}c/gamma/.well-known/openid-configuration", running.url)).send().await.unwrap().json().await.unwrap();
+    assert_eq!(discovery["issuer"], format!("{}c/gamma", running.url));
+}

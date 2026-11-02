@@ -34,6 +34,7 @@ pub const REVOKE_INVITE: &str = "https://wyvrn.app/community/1.0/revoke-invite";
 pub const INVITES_REQUEST: &str = "https://wyvrn.app/community/1.0/invites-request";
 pub const INVITES: &str = "https://wyvrn.app/community/1.0/invites";
 pub const SET_VOICE: &str = "https://wyvrn.app/community/1.0/set-voice";
+pub const SET_WEB: &str = "https://wyvrn.app/community/1.0/set-web";
 pub const RULES: &str = "https://wyvrn.app/community/1.0/rules";
 pub const ACCEPT_RULES: &str = "https://wyvrn.app/community/1.0/accept-rules";
 pub const SET_RULES: &str = "https://wyvrn.app/community/1.0/set-rules";
@@ -205,6 +206,8 @@ pub struct Community {
     pub expressions: Option<crate::expressions::Expressions>,
     /// How many live connections each member has open now (who may be seen online).
     pub live: std::sync::RwLock<std::collections::HashMap<String, usize>>,
+    /// Where its web view is, where the server shows one (web/).
+    pub web_url: Option<String>,
 }
 
 /// What handling a message came to.
@@ -421,7 +424,7 @@ impl Community {
             Some(kept) => kept.load()?,
             None => Changed::default(),
         };
-        let community = Self { store, config, changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, expressions: None, live: Default::default() };
+        let community = Self { store, config, changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, expressions: None, live: Default::default(), web_url: None };
         community.ensure_roles()?;
         Ok(community)
     }
@@ -456,9 +459,20 @@ impl Community {
     pub fn community(&self, member: &Member) -> anyhow::Result<Value> {
         let powers = self.powers(&member.did)?;
         let mut channels = Vec::new();
+        let public = match &self.web_url {
+            Some(_) => self.store.web_channels()?,
+            None => Default::default(),
+        };
         for channel in self.store.channels()? {
             let mut body = Self::channel_body(&channel, &member.did);
             body["permissions"] = json!(self.channel_permissions(&member.did, &powers, &channel)?);
+            // On the web: its page's address, and from when it is public.
+            if let (Some(url), None) = (&self.web_url, &channel.voice) {
+                body["url"] = json!(format!("{url}{}", crate::web::channel_path(&channel.id, &channel.name)));
+                if let Some(since) = public.get(&channel.id) {
+                    body["web"] = json!({ "public": true, "since": since });
+                }
+            }
             if self.read_only(&channel.id)? {
                 body["read_only"] = json!(true);
             }
@@ -502,6 +516,9 @@ impl Community {
             }
             if self.moving()? {
                 body["moving"] = json!(true);
+            }
+            if let Some(url) = &self.web_url {
+                body["web"] = crate::web::community_body(url, &self.store);
             }
             if let Some(level) = self.store.notify_level(&member.did)? {
                 body["notifications"] = json!({ "level": level, "following": self.store.followed_threads(&member.did)? });
@@ -1324,6 +1341,23 @@ impl Community {
                         Err(why) => return refuse(message, "e.p.msg.invalid-tags", why),
                     }
                 }
+                if let Some(given) = body.get("web").filter(|v| !v.is_null()) {
+                    if self.web_url.is_none() {
+                        return refuse(message, "e.p.msg.no-web", "This server shows nothing on the web.");
+                    }
+                    if channel.voice.is_some() {
+                        return refuse(message, "e.p.msg.invalid-web", "A voice channel takes no posts to show.");
+                    }
+                    if !self.powers(sender)?.has("manage_channels") {
+                        return refuse(message, "e.p.trust.not-authorized", "Making a channel public takes Manage channels.");
+                    }
+                    let Some(public) = given["public"].as_bool() else {
+                        return refuse(message, "e.p.msg.invalid-web", "web is { public, history? }.");
+                    };
+                    let since = public.then(|| if given["history"].as_bool() == Some(true) { 0 } else { now });
+                    self.store.set_web_channel(&channel.id, since)?;
+                    self.audit(now, sender, "channel.web", Some(&channel.id), Some(json!({ "public": public, "history": given["history"].as_bool() == Some(true) })));
+                }
                 if let Some(given) = body.get("slow_mode").filter(|v| !v.is_null()) {
                     if channel.voice.is_some() {
                         return refuse(message, "e.p.msg.invalid-slow-mode", "A voice channel takes no posts, nor slow mode.");
@@ -1586,6 +1620,34 @@ impl Community {
             }
 
             INVITES_REQUEST => Ok(Outcome::reply(reply_to(message, INVITES, self.invites_body(&member, now)?))),
+
+            SET_WEB => {
+                if !self.powers(sender)?.has("manage_community") {
+                    return refuse(message, "e.p.trust.not-authorized", "The community on the web takes Manage the community.");
+                }
+                if self.web_url.is_none() {
+                    return refuse(message, "e.p.msg.no-web", "This server shows nothing on the web.");
+                }
+                let page = body.get("page").filter(|v| !v.is_null());
+                let voice = body.get("voice").filter(|v| !v.is_null());
+                if page.is_none() && voice.is_none() {
+                    return refuse(message, "e.p.msg.invalid-web", "Say page, voice or both.");
+                }
+                if let Some(page) = page {
+                    let Some(on) = page.as_bool() else { return refuse(message, "e.p.msg.invalid-web", "page is true or false.") };
+                    self.store.set_setting(crate::web::PAGE, if on { "1" } else { "0" })?;
+                }
+                if let Some(voice) = voice {
+                    let Some(choice) = voice.as_str().filter(|v| crate::web::VOICE_CHOICES.contains(v)) else {
+                        return refuse(message, "e.p.msg.invalid-web", "voice is off, members, counts or names.");
+                    };
+                    self.store.set_setting(crate::web::VOICE, choice)?;
+                }
+                self.audit(now, sender, "community.web", None, Some(body.clone()));
+                let mut outcome = Outcome::reply(reply_to(message, COMMUNITY, self.community(&member)?));
+                outcome.channels_changed = true;
+                Ok(outcome)
+            }
 
             SET_VOICE => {
                 if !self.powers(sender)?.has("manage_community") {
@@ -1914,6 +1976,15 @@ impl Community {
                 // Absent means no change (user-profile/1.0); present and empty clears.
                 if profile.get("displayName").is_some() {
                     self.store.set_name(sender, line(&profile["displayName"], MAX_NAME_LENGTH).as_deref())?;
+                }
+                // Their picture, shown beside their posts on the web: one the
+                // message carries, never fetched from a link.
+                if profile.get("displayPicture").is_some() {
+                    match wyvrn_service::profile::Change::read(message).map(|change| change.picture) {
+                        Ok(wyvrn_service::profile::Field::Set(picture)) => self.store.set_member_picture(sender, Some((&picture.media_type, &picture.base64)), now)?,
+                        Ok(wyvrn_service::profile::Field::Removed) => self.store.set_member_picture(sender, None, now)?,
+                        _ => {}
+                    }
                 }
                 Ok(Outcome::default())
             }
