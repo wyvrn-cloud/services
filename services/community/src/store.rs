@@ -816,6 +816,41 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         kid TEXT PRIMARY KEY,
         jwk TEXT NOT NULL,
         created INTEGER NOT NULL
+    );
+    -- Who members are to each other (community/1.0): each person's member id,
+    -- kept under the DID it was made for. A DID they have since left keeps its
+    -- row, so an id given out before still finds them (through superseded).
+    CREATE TABLE IF NOT EXISTS member_ids (
+        did TEXT PRIMARY KEY,
+        member TEXT NOT NULL UNIQUE,
+        created INTEGER NOT NULL
+    );
+    -- The rest of a member's profile, beside their name (members) and picture
+    -- (member_pictures): what everyone else in the community is told.
+    CREATE TABLE IF NOT EXISTS member_profiles (
+        did TEXT PRIMARY KEY,
+        description TEXT,
+        banner_type TEXT,
+        banner_data TEXT,
+        linked TEXT,
+        public_address TEXT,
+        at INTEGER NOT NULL
+    );
+    -- What a member is in this community alone (set-member-profile).
+    CREATE TABLE IF NOT EXISTS member_here (
+        did TEXT PRIMARY KEY,
+        nickname TEXT,
+        picture_type TEXT,
+        picture_data TEXT,
+        requests INTEGER NOT NULL DEFAULT 1,
+        at INTEGER NOT NULL
+    );
+    -- Message requests passed on, one a day from a member to the same member.
+    CREATE TABLE IF NOT EXISTS message_requests (
+        from_did TEXT NOT NULL,
+        to_did TEXT NOT NULL,
+        at INTEGER NOT NULL,
+        PRIMARY KEY (from_did, to_did)
     );";
 
 fn schema() -> Schema {
@@ -1138,6 +1173,34 @@ fn schema() -> Schema {
                 kid VARCHAR(64) NOT NULL PRIMARY KEY,
                 jwk TEXT NOT NULL,
                 created BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS member_ids (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                member VARCHAR(64) NOT NULL UNIQUE,
+                created BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS member_profiles (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                description TEXT,
+                banner_type VARCHAR(64),
+                banner_data MEDIUMTEXT,
+                linked MEDIUMTEXT,
+                public_address VARCHAR(1024),
+                at BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS member_here (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                nickname VARCHAR(255),
+                picture_type VARCHAR(64),
+                picture_data MEDIUMTEXT,
+                requests BIGINT NOT NULL DEFAULT 1,
+                at BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS message_requests (
+                from_did {MYSQL_DID} NOT NULL,
+                to_did {MYSQL_DID} NOT NULL,
+                at BIGINT NOT NULL,
+                PRIMARY KEY (from_did(255), to_did(255))
             ) {MYSQL_TABLE}"
         )
     });
@@ -1257,6 +1320,12 @@ impl Store {
     /// and `prior` is never listened to again. Returns whether `prior` was a member.
     /// Where `new` is one already, it keeps the higher role of the two.
     pub fn rotate(&self, prior: &str, new: &str, now: i64) -> Result<bool> {
+        // Heard of out of order -- `new` already left for another DID -- the move is
+        // to wherever they are now, or the two halves of one person stay apart.
+        let new = &self.current_did(new)?;
+        if new == prior {
+            return Ok(false);
+        }
         self.db.lock().transaction(|tx| {
             let old = tx.query_row(&format!("SELECT {MEMBER_COLUMNS} FROM members WHERE did = ?1"), params![prior], member_from)?;
             if let Some(old) = &old {
@@ -1325,6 +1394,33 @@ impl Store {
             tx.execute("DELETE FROM member_keys WHERE did = ?1", params![prior])?;
             tx.execute("UPDATE OR IGNORE member_pictures SET did = ?2 WHERE did = ?1", params![prior, new])?;
             tx.execute("DELETE FROM member_pictures WHERE did = ?1", params![prior])?;
+            // The rest of their profile, and what they are here (member_ids.rs):
+            // the new DID's, where it has its own already.
+            for table in ["member_profiles", "member_here"] {
+                tx.execute(&format!("UPDATE OR IGNORE {table} SET did = ?2 WHERE did = ?1"), params![prior, new])?;
+                tx.execute(&format!("DELETE FROM {table} WHERE did = ?1"), params![prior])?;
+            }
+            tx.execute("UPDATE OR IGNORE message_requests SET from_did = ?2 WHERE from_did = ?1", params![prior, new])?;
+            tx.execute("DELETE FROM message_requests WHERE from_did = ?1", params![prior])?;
+            tx.execute("UPDATE OR IGNORE message_requests SET to_did = ?2 WHERE to_did = ?1", params![prior, new])?;
+            tx.execute("DELETE FROM message_requests WHERE to_did = ?1", params![prior])?;
+            // Their member id: the one they had, unless the new DID was given one
+            // first (it wrote before the server heard of the change), in which case
+            // the older of the two -- and the other still finds them, through the
+            // prior DID's row and superseded.
+            let prior_id = tx.query_row("SELECT member, created FROM member_ids WHERE did = ?1", params![prior], |row| Ok((row.get::<String>(0)?, row.get::<i64>(1)?)))?;
+            let new_id = tx.query_row("SELECT member, created FROM member_ids WHERE did = ?1", params![new], |row| Ok((row.get::<String>(0)?, row.get::<i64>(1)?)))?;
+            match (prior_id, new_id) {
+                (Some(_), None) => {
+                    tx.execute("UPDATE member_ids SET did = ?2 WHERE did = ?1", params![prior, new])?;
+                }
+                (Some((prior_member, prior_created)), Some((new_member, new_created))) if prior_created <= new_created => {
+                    tx.execute("DELETE FROM member_ids WHERE did = ?1 OR did = ?2", params![prior, new])?;
+                    tx.execute("INSERT INTO member_ids (did, member, created) VALUES (?1, ?2, ?3)", params![new, prior_member, prior_created])?;
+                    tx.execute("INSERT INTO member_ids (did, member, created) VALUES (?1, ?2, ?3)", params![prior, new_member, new_created])?;
+                }
+                _ => {}
+            }
             tx.execute("INSERT OR REPLACE INTO superseded (did, became, at) VALUES (?1, ?2, ?3)", params![prior, new, now])?;
             Ok(old.is_some())
         })

@@ -23,6 +23,10 @@ pub const HISTORY_REQUEST: &str = "https://wyvrn.app/community/1.0/history-reque
 pub const HISTORY: &str = "https://wyvrn.app/community/1.0/history";
 pub const MEMBERS_REQUEST: &str = "https://wyvrn.app/community/1.0/members-request";
 pub const MEMBERS: &str = "https://wyvrn.app/community/1.0/members";
+pub const MEMBER_CHANGED: &str = "https://wyvrn.app/community/1.0/member-changed";
+pub const SET_MEMBER_PROFILE: &str = "https://wyvrn.app/community/1.0/set-member-profile";
+pub const MESSAGE_REQUEST: &str = "https://wyvrn.app/community/1.0/message-request";
+pub const MESSAGE_REQUEST_SENT: &str = "https://wyvrn.app/community/1.0/message-request-sent";
 pub const SET_MEMBER: &str = "https://wyvrn.app/community/1.0/set-member";
 pub const SET_PROFILE: &str = "https://wyvrn.app/community/1.0/set-profile";
 pub const WAITING: &str = "https://wyvrn.app/community/1.0/waiting";
@@ -208,6 +212,10 @@ pub struct Community {
     pub live: std::sync::RwLock<std::collections::HashMap<String, usize>>,
     /// Where its web view is, where the server shows one (web/).
     pub web_url: Option<String>,
+    /// The server's own address, where members' pictures are (member_ids.rs).
+    pub public_url: String,
+    /// The DID it speaks as, where that isn't `own` (a did:webvh): never a person's.
+    pub speaks_as: Option<String>,
 }
 
 /// What handling a message came to.
@@ -424,7 +432,7 @@ impl Community {
             Some(kept) => kept.load()?,
             None => Changed::default(),
         };
-        let community = Self { store, config, changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, expressions: None, live: Default::default(), web_url: None };
+        let community = Self { store, config, changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, expressions: None, live: Default::default(), web_url: None, public_url: String::new(), speaks_as: None };
         community.ensure_roles()?;
         Ok(community)
     }
@@ -485,6 +493,7 @@ impl Community {
             "role": powers.older_role(),
             "joined": member.joined,
             "owner": self.owner()?,
+            "you": member.did,
             "roles": self.roles_body()?,
             "my_roles": powers.roles,
             "permissions": powers.listed(),
@@ -952,23 +961,31 @@ impl Community {
             let powers = self.powers(&member.did)?;
             members.push((member, powers));
         }
-        let members: Vec<Value> = members
-            .iter()
-            .map(|(member, powers)| {
-                let mut listed = json!({ "did": member.did, "role": powers.older_role(), "roles": powers.roles, "joined": member.joined, "since": member.since });
-                if let Some(status) = online.get(&member.did) {
-                    listed["presence"] = json!(status);
-                }
-                if let Some(name) = &member.name {
-                    listed["name"] = json!(name);
-                }
-                if let Some(left_at) = member.left_at.filter(|_| !member.joined) {
-                    listed["left_at"] = json!(left_at);
-                }
-                listed
-            })
-            .collect();
+        let members = members.iter().map(|(member, powers)| self.member_entry(member, powers, &online)).collect::<anyhow::Result<Vec<Value>>>()?;
         Ok(json!({ "members": members }))
+    }
+
+    /// One member as `members` lists them: by DID here, which member_ids.rs turns
+    /// into their member id for whoever is sent it; with what their profile says.
+    pub(crate) fn member_entry(&self, member: &Member, powers: &crate::roles::Powers, online: &std::collections::HashMap<String, String>) -> anyhow::Result<Value> {
+        let mut listed = json!({ "did": member.did, "role": powers.older_role(), "roles": powers.roles, "joined": member.joined, "since": member.since });
+        if let Some(status) = online.get(&member.did) {
+            listed["presence"] = json!(status);
+        }
+        let (name, profile, here) = self.profile_entry(&member.did, member.name.as_deref())?;
+        if let Some(name) = name {
+            listed["name"] = json!(name);
+        }
+        if let Some(profile) = profile {
+            listed["profile"] = profile;
+        }
+        if let Some(here) = here {
+            listed["here"] = here;
+        }
+        if let Some(left_at) = member.left_at.filter(|_| !member.joined) {
+            listed["left_at"] = json!(left_at);
+        }
+        Ok(listed)
     }
 
     /// The answer to a message that changed the post `id`: the post as it now
@@ -1986,8 +2003,18 @@ impl Community {
                         _ => {}
                     }
                 }
-                Ok(Outcome::default())
+                // The rest of it, which everyone else in the community is told
+                // (community/1.0's Profiles), and they are told now if connected.
+                self.take_profile_rest(sender, message, now)?;
+                let mut outcome = Outcome::default();
+                if self.store.member(sender)?.is_some() {
+                    outcome.live.push(self.member_changed(sender)?);
+                }
+                Ok(outcome)
             }
+
+            SET_MEMBER_PROFILE => self.set_member_profile(sender, message, now),
+            MESSAGE_REQUEST => self.message_request(sender, message, now),
 
             other if other.starts_with(PIURI) => refuse(message, "e.p.msg.unsupported", "This server doesn't know that message."),
             // Anything else from a member (a receipt, a basic message) is not for a server to answer.

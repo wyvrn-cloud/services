@@ -94,6 +94,11 @@ struct Running {
 }
 
 impl Running {
+    /// `peer`'s member id: how the server names them to everyone else.
+    fn id(&self, peer: &Peer) -> String {
+        self.state.community.store.member_id(&peer.did(), 1).unwrap()
+    }
+
     /// Lets `peers` in: the first as an admin, the rest as members.
     fn admit(&self, peers: &[&Peer]) {
         for (n, peer) in peers.iter().enumerate() {
@@ -118,6 +123,7 @@ async fn start_server_with(settings: &str, files: bool) -> Running {
     let (agent, did_document) = server::build_agent(&config, Identity::generate().unwrap()).unwrap();
     let did = agent.did();
     let mut community = Community::new(Store::in_memory().unwrap(), config.community.clone(), Some(wyvrn_service::profile::Kept::scratch().unwrap())).unwrap().with_voice(config.voice.clone());
+    community.public_url = url.clone();
     let assistant = config.assistant.clone().map(wyvrn_community::assistant::Assistant::new);
     community.assistant = assistant.as_ref().map(wyvrn_community::assistant::Assistant::listing);
     if files {
@@ -269,9 +275,9 @@ async fn a_post_is_answered_reacted_to_changed_pinned_and_taken_back_and_everyon
     admin.next_message().await;
     let got = admin.next_message().await;
     assert_eq!(got["id"], "p2");
-    assert_eq!(got["reply_to"], json!({ "id": "p1", "author": admin.did(), "snippet": "Shall we ship?" }));
+    assert_eq!(got["reply_to"], json!({ "id": "p1", "author": server.id(&admin), "snippet": "Shall we ship?" }));
     // Someone who isn't a member is left out, and only an admin calls on everyone.
-    assert_eq!(got["mentions"], json!([{ "who": admin.did(), "name": "admin" }]));
+    assert_eq!(got["mentions"], json!([{ "who": server.id(&admin), "name": "admin" }]));
     member.next_message().await;
     member.next_message().await;
     assert_eq!(member.community("post", json!({ "channel": channel, "content": "to nothing", "reply_to": { "id": "nope", "author": admin.did() } })).await["body"]["code"], "e.p.msg.unknown-post");
@@ -281,7 +287,7 @@ async fn a_post_is_answered_reacted_to_changed_pinned_and_taken_back_and_everyon
     // A reaction is all of one member's emoji on a post; everyone is told who put what.
     let reacted = member.ask("https://wyvrn.app/message-reactions/1.0/reactions", json!({ "to": { "id": "p1" }, "emoji": ["👍", "🎉"] })).await;
     assert_eq!(kind(&reacted), "changed", "{reacted}");
-    assert_eq!(reacted["body"]["reactions"], json!([{ "emoji": "🎉", "by": [member.did()] }, { "emoji": "👍", "by": [member.did()] }]));
+    assert_eq!(reacted["body"]["reactions"], json!([{ "emoji": "🎉", "by": [server.id(&member)] }, { "emoji": "👍", "by": [server.id(&member)] }]));
     assert_eq!(admin.next_of(&changed).await["body"]["reactions"].as_array().unwrap().len(), 2);
     member.next_of(&changed).await;
     admin.ask("https://wyvrn.app/message-reactions/1.0/reactions", json!({ "to": { "id": "p1" }, "emoji": ["👍"] })).await;
@@ -292,7 +298,7 @@ async fn a_post_is_answered_reacted_to_changed_pinned_and_taken_back_and_everyon
         by.sort();
         by
     };
-    let mut both = vec![member.did(), admin.did()];
+    let mut both = vec![server.id(&member), server.id(&admin)];
     both.sort();
     assert_eq!((now["body"]["reactions"][0]["emoji"].as_str(), by(&now["body"])), (Some("👍"), both.clone()));
     assert_eq!(member.ask("https://wyvrn.app/message-reactions/1.0/reactions", json!({ "to": { "id": "p1" }, "emoji": ["thumbs up"] })).await["body"]["code"], "e.p.msg.invalid-reaction");
@@ -304,7 +310,7 @@ async fn a_post_is_answered_reacted_to_changed_pinned_and_taken_back_and_everyon
     assert_eq!(edited["body"]["content"], "Yes, on Friday");
     assert!(edited["body"]["edited_at"].is_i64());
     // (Who it calls on is as it was, said again or not.)
-    assert_eq!(edited["body"]["mentions"], json!([{ "who": admin.did(), "name": "admin" }]));
+    assert_eq!(edited["body"]["mentions"], json!([{ "who": server.id(&admin), "name": "admin" }]));
 
     // Pinned by an admin, or by whoever opened the channel.
     assert_eq!(member.ask("https://wyvrn.app/message-pins/1.0/pin", json!({ "to": { "id": "p1" } })).await["body"]["code"], "e.p.trust.not-authorized");
@@ -323,7 +329,7 @@ async fn a_post_is_answered_reacted_to_changed_pinned_and_taken_back_and_everyon
     assert_eq!(member.ask("https://wyvrn.app/message-edits/1.0/delete", json!({ "to": { "id": "p1" } })).await["body"]["code"], "e.p.trust.not-authorized");
     let removed = admin.ask("https://wyvrn.app/message-edits/1.0/delete", json!({ "to": { "id": "p3" } })).await;
     assert_eq!((removed["body"]["deleted"].as_bool(), removed["body"]["content"].as_str()), (Some(true), Some("")));
-    assert_eq!(removed["body"]["removed_by"], admin.did());
+    assert_eq!(removed["body"]["removed_by"], server.id(&admin));
     // ...and an edit is still its author's alone.
     assert_eq!(admin.ask("https://wyvrn.app/message-edits/1.0/edit", json!({ "to": { "id": "p1" }, "content": "Mine" })).await["body"]["content"], "Mine");
 
@@ -338,7 +344,7 @@ async fn a_post_is_answered_reacted_to_changed_pinned_and_taken_back_and_everyon
     assert_eq!(posts.iter().map(|post| post["id"].as_str().unwrap()).collect::<Vec<_>>(), ["p2", "p3", "p1"]);
     assert_eq!(by(&posts[2]), both);
     assert_eq!(posts[0]["deleted"], true);
-    assert_eq!(posts[1]["removed_by"], admin.did());
+    assert_eq!(posts[1]["removed_by"], server.id(&admin));
     assert_eq!((missed["body"]["rev"].as_i64(), missed["body"]["more"].as_bool()), (Some(latest), Some(false)));
     assert_eq!(away.community("changes-request", json!({ "after_rev": latest })).await["body"]["messages"], json!([]));
 }
@@ -358,7 +364,7 @@ async fn a_thread_grows_from_a_post_and_what_is_said_in_it_is_read_there() {
     assert_eq!(kind(&grown), "changed", "{grown}");
     assert_eq!(grown["body"]["grew"]["name"], "Meeting place");
     assert_eq!(grown["body"]["grew"]["count"], 0);
-    assert_eq!(grown["body"]["grew"]["created_by"], member.did());
+    assert_eq!(grown["body"]["grew"]["created_by"], server.id(&member));
 
     // Said in the thread, a post is the thread's, and the post it grew from counts it.
     let said = admin.community("post", json!({ "channel": channel, "id": "t1", "content": "By the fountain", "thread": "root" })).await;
@@ -407,7 +413,7 @@ async fn a_post_reaches_everyone_who_joined_its_author_included_and_can_be_read_
         assert_eq!(got["seq"], 1);
         assert_eq!(got["id"], "p1");
         assert_eq!(got["channel"], channel);
-        assert_eq!(got["author"]["did"], member.did());
+        assert_eq!(got["author"]["member"], server.id(&member));
     }
     // Someone let in who hasn't joined is sent nothing.
     away.nothing_more().await;
@@ -520,7 +526,7 @@ async fn a_question_is_answered_as_a_form_by_whoever_gets_there_first() {
     // read, and the answers as data for whoever asked.
     let answer = bot.next_of(&format!("{C}message")).await["body"].clone();
     let answer = if answer["id"] == "q1" { bot.next_message().await } else { answer };
-    assert_eq!(answer["author"]["did"], admin.did());
+    assert_eq!(answer["author"]["member"], server.id(&admin));
     assert_eq!(answer["content"], "**Library** Zod\n**Which checks should run?** Lint, Build, and format");
     assert_eq!(answer["answer"], json!({ "to": "q1", "answers": [ { "chosen": ["Zod"] }, { "chosen": ["Lint", "Build"], "other": "and format" } ] }));
 
@@ -530,7 +536,7 @@ async fn a_question_is_answered_as_a_form_by_whoever_gets_there_first() {
     assert_eq!(beaten["body"]["allowed_events"], json!([]));
     // Read back later, the question says who answered it.
     let history = other.community("history-request", json!({ "channel": channel })).await;
-    assert_eq!(history["body"]["messages"][0]["question"]["answered_by"], admin.did());
+    assert_eq!(history["body"]["messages"][0]["question"]["answered_by"], server.id(&admin));
     assert_eq!(history["body"]["messages"].as_array().unwrap().len(), 2);
 }
 
@@ -641,7 +647,7 @@ async fn an_invite_lets_in_while_it_lasts_when_admission_is_by_invite() {
     assert_eq!(made["body"]["invites"][0]["note"], "for Alice");
     assert_eq!(kind(&alice.community("join", json!({ "invite": code })).await), "waiting");
     let waiting = admin.community("members-request", json!({})).await["body"]["waiting"][0].clone();
-    assert_eq!((waiting["invite"]["code"].as_str(), waiting["invite"]["created_by"]["did"].as_str()), (Some(code.as_str()), Some(admin.did().as_str())));
+    assert_eq!((waiting["invite"]["code"].as_str(), waiting["invite"]["created_by"]["member"].as_str()), (Some(code.as_str()), Some(server.id(&admin).as_str())));
     assert_eq!(server.state.community.store.invite(&code).unwrap().unwrap().uses_left, Some(1));
 
     // By invite: the code lets in once, and everyone is told how admission stands.
@@ -851,8 +857,8 @@ async fn a_member_reports_a_post_or_a_member_and_only_admins_are_told() {
     // The admin is sent the open reports, with who made each and the post as it stood.
     let told = admin.next_of(&format!("{C}reports")).await;
     let report = told["body"]["reports"][0].clone();
-    assert_eq!((report["reason"].as_str(), report["note"].as_str(), report["by"]["did"].as_str()), (Some("spam"), Some("third time today"), Some(alice.did().as_str())));
-    assert_eq!((report["post"]["content"].as_str(), report["post"]["author"]["did"].as_str(), report["post"]["removed"].as_bool()), (Some("buy now"), Some(bob.did().as_str()), Some(false)));
+    assert_eq!((report["reason"].as_str(), report["note"].as_str(), report["by"]["member"].as_str()), (Some("spam"), Some("third time today"), Some(server.id(&alice).as_str())));
+    assert_eq!((report["post"]["content"].as_str(), report["post"]["author"]["member"].as_str(), report["post"]["removed"].as_bool()), (Some("buy now"), Some(server.id(&bob).as_str()), Some(false)));
 
     // Reporting it again replaces the first; a member is reported apart.
     alice.community("report", json!({ "post": "spam-1", "reason": "other" })).await;
@@ -873,7 +879,7 @@ async fn a_member_reports_a_post_or_a_member_and_only_admins_are_told() {
     assert_eq!(resolved["body"]["reports"].as_array().unwrap().len(), 1);
     let all = admin.community("reports-request", json!({ "resolved": true })).await;
     let done = all["body"]["reports"].as_array().unwrap().iter().find(|r| r["id"] == id).unwrap().clone();
-    assert_eq!(done["resolved_by"], admin.did());
+    assert_eq!(done["resolved_by"], server.id(&admin));
     assert_eq!(admin.community("resolve-report", json!({ "id": "nope" })).await["body"]["code"], "e.p.msg.unknown-report");
 }
 
@@ -1023,7 +1029,7 @@ async fn joining_a_voice_channel_gives_a_room_a_token_and_who_else_is_there_and_
     assert_eq!(joined["body"]["may"], json!({ "speak": true, "video": true, "screen": true }));
     let alice_id = joined["body"]["participant"].as_str().unwrap().to_string();
     let told = live.next_of(&carol, "presence").await;
-    assert_eq!(told["body"]["channels"][0]["participants"][0]["did"], alice.did());
+    assert_eq!(told["body"]["channels"][0]["participants"][0]["member"], server.id(&alice));
 
     // Bob joins and is told Alice is there; Alice's sharing reaches the watcher.
     let bobs = voice(&bob, "join", json!({ "channel": lounge })).await;
@@ -1031,7 +1037,7 @@ async fn joining_a_voice_channel_gives_a_room_a_token_and_who_else_is_there_and_
     live.next_of(&carol, "presence").await;
     tell(&alice, "state", json!({ "channel": lounge, "muted": true, "deafened": false, "sharing": { "screen": true } })).await;
     let sharing = live.next_of(&carol, "presence").await;
-    let entry = sharing["body"]["channels"][0]["participants"].as_array().unwrap().iter().find(|p| p["did"] == alice.did()).unwrap().clone();
+    let entry = sharing["body"]["channels"][0]["participants"].as_array().unwrap().iter().find(|p| p["member"] == server.id(&alice)).unwrap().clone();
     assert_eq!((entry["muted"].as_bool(), entry["sharing"]["screen"].as_bool()), (Some(true), Some(true)));
 
     // Leaving tells the watcher too.
@@ -1112,10 +1118,10 @@ async fn keys_are_passed_on_as_they_are_to_those_in_the_room_and_invitations_rin
     assert_eq!(tell(&carol, "invite", json!({ "channel": lounge, "to": [dave.did()] })).await.unwrap()["body"]["code"], "e.p.trust.not-authorized");
     tell(&alice, "invite", json!({ "channel": lounge, "to": [carol.did(), dave.did()] })).await;
     let ring = carol.next_of(&format!("{V}ring")).await;
-    assert_eq!((ring["body"]["channel"].as_str(), ring["body"]["from"]["did"].as_str(), ring["body"]["participants"].as_i64()), (Some(lounge.as_str()), Some(alice.did().as_str()), Some(2)));
+    assert_eq!((ring["body"]["channel"].as_str(), ring["body"]["from"]["member"].as_str(), ring["body"]["participants"].as_i64()), (Some(lounge.as_str()), Some(server.id(&alice).as_str()), Some(2)));
     let posted = dave.next_message().await;
     assert_eq!((posted["channel"].as_str(), posted["voice_invite"]["channel"].as_str()), (Some(general.as_str()), Some(lounge.as_str())));
-    assert_eq!(posted["mentions"][0]["who"], dave.did());
+    assert_eq!(posted["mentions"][0]["who"], server.id(&dave));
 }
 
 #[tokio::test]
@@ -1265,7 +1271,7 @@ async fn roles_are_made_given_and_ranked_through_workflows() {
 
     // A new community has Admin, Moderator and everyone; the first admin owns it.
     let told = owner.community("join", json!({})).await["body"].clone();
-    assert_eq!(told["owner"], owner.did());
+    assert_eq!(told["owner"], server.id(&owner));
     let names: Vec<&str> = told["roles"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
     assert_eq!(names, ["Admin", "Moderator", "everyone"]);
     assert_eq!(told["my_roles"], json!(["admin"]));
@@ -1323,7 +1329,7 @@ async fn roles_are_made_given_and_ranked_through_workflows() {
     assert_eq!(now_told["role"], "moderator");
     assert!(now_told["channels"][0]["permissions"].as_array().unwrap().contains(&json!("manage_messages")));
     let removed = artist.ask("https://wyvrn.app/message-edits/1.0/delete", json!({ "to": { "id": "p1", "author": other.did() } })).await;
-    assert_eq!(removed["body"]["removed_by"], artist.did(), "{removed}");
+    assert_eq!(removed["body"]["removed_by"], server.id(&artist), "{removed}");
     // A mentionable role may be mentioned by anyone.
     other.community("post", json!({ "channel": channel, "id": "p2", "content": "@Artist look", "mentions": [{ "who": format!("role:{artist_role}"), "name": "Artist" }, { "who": "everyone", "name": "everyone" }] })).await;
     let mentioned = other.community("history-request", json!({ "channel": channel })).await["body"]["messages"].as_array().unwrap().last().unwrap().clone();
@@ -1418,7 +1424,7 @@ async fn bans_timeouts_slow_mode_and_bulk_removal_are_kept_in_the_audit_log() {
     let bulk = moderator.community("bulk-delete", json!({ "channel": channel, "author": member.did(), "seconds": 3600 })).await;
     assert_eq!(bulk["body"]["removed"], 5, "{bulk}");
     let history = owner.community("history-request", json!({ "channel": channel })).await;
-    assert!(history["body"]["messages"].as_array().unwrap().iter().filter(|m| m["author"]["did"] == member.did()).all(|m| m["deleted"] == true));
+    assert!(history["body"]["messages"].as_array().unwrap().iter().filter(|m| m["author"]["member"] == server.id(&member)).all(|m| m["deleted"] == true));
 
     // Moderators don't ban by default; the owner bans, and the banned stay out.
     assert_eq!(moderator.community("ban", json!({ "did": member.did() })).await["body"]["code"], "e.p.trust.not-authorized");
@@ -1596,9 +1602,9 @@ async fn polls_forums_media_search_and_the_member_list() {
     let asked = owner.community("post", json!({ "channel": general, "id": "poll1", "content": "", "poll": { "question": "Lunch?", "answers": [{ "id": "a", "text": "Soup" }, { "id": "b", "text": "Salad", "emoji": "🥗" }], "ends_at": now + 7200 } })).await;
     assert_eq!(kind(&asked), "posted", "{asked}");
     let voted = member.community("vote", json!({ "to": { "id": "poll1" }, "answers": ["a"] })).await;
-    assert_eq!(voted["body"]["poll"]["results"], json!([{ "id": "a", "voters": [member.did()] }, { "id": "b", "voters": [] }]), "{voted}");
+    assert_eq!(voted["body"]["poll"]["results"], json!([{ "id": "a", "voters": [server.id(&member)] }, { "id": "b", "voters": [] }]), "{voted}");
     let changed = member.community("vote", json!({ "to": { "id": "poll1" }, "answers": ["b"] })).await;
-    assert_eq!(changed["body"]["poll"]["results"][1]["voters"], json!([member.did()]));
+    assert_eq!(changed["body"]["poll"]["results"][1]["voters"], json!([server.id(&member)]));
     assert_eq!(member.community("vote", json!({ "to": { "id": "poll1" }, "answers": ["a", "b"] })).await["body"]["code"], "e.p.msg.invalid-vote");
     assert!(changed["body"]["poll"].get("closed").is_none());
 
@@ -1819,3 +1825,125 @@ async fn a_watching_connection_is_sent_everything_and_the_mediator_nothing_of_it
     assert_eq!(ids, ["w1", "w2", "w3"]);
 }
 
+
+/// A tiny PNG, in base64: one transparent pixel.
+const PIXEL: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+
+/// Says `profile` to the server as user-profile/1.0 does, a picture and a banner
+/// (where named) going as attachments.
+async fn send_profile(peer: &Peer, profile: Value) {
+    let attachment = |id: &str| json!({ "id": id, "media_type": "image/png", "data": { "base64": PIXEL } });
+    let message = json!({
+        "type": "https://didcomm.org/user-profile/1.0/profile",
+        "body": { "profile": profile },
+        "attachments": [attachment("pfp"), attachment("banner")],
+    });
+    peer.agent.send(&peer.server, &message).await.expect("sent");
+}
+
+#[tokio::test]
+async fn members_know_each_other_by_member_id_and_only_moderators_are_told_dids() {
+    let server = start_server("").await;
+    let (admin, alice, bob) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &alice, &bob]);
+    let channel = open_channel(&admin, "general").await;
+    alice.community("join", json!({})).await;
+    bob.community("join", json!({})).await;
+
+    // A post reaches Bob naming Alice by her member id, and nowhere by her DID.
+    alice.community("post", json!({ "channel": channel, "id": "p1", "content": "hello" })).await;
+    let got = bob.next_of(&format!("{C}message")).await;
+    assert_eq!(got["body"]["author"]["member"], server.id(&alice), "{got}");
+    assert!(!got["body"].to_string().contains(&alice.did()), "{got}");
+
+    // The member list: member ids to Bob, and DIDs as well to the admin.
+    let to_bob = bob.community("members-request", json!({})).await;
+    assert!(!to_bob["body"].to_string().contains("did:"), "{to_bob}");
+    let listed: Vec<&str> = to_bob["body"]["members"].as_array().unwrap().iter().filter_map(|m| m["member"].as_str()).collect();
+    assert!(listed.contains(&server.id(&alice).as_str()));
+    let to_admin = admin.community("members-request", json!({})).await;
+    let alice_there = to_admin["body"]["members"].as_array().unwrap().iter().find(|m| m["member"] == server.id(&alice)).unwrap().clone();
+    assert_eq!(alice_there["did"], alice.did());
+
+    // Who owns it, and who the receiver is, by member id.
+    let community = bob.community("join", json!({})).await;
+    assert!(community["body"]["owner"].as_str().is_some_and(|owner| !owner.starts_with("did:")), "{community}");
+    assert_eq!(community["body"]["you"].as_str(), Some(server.id(&bob).as_str()));
+
+    // A moderator names someone by member id, and it is them.
+    let made = admin.community("set-member", json!({ "member": server.id(&bob), "role": "moderator" })).await;
+    assert_eq!(kind(&made), "members", "{made}");
+    assert_eq!(server.state.community.powers(&bob.did()).unwrap().older_role(), "moderator");
+}
+
+#[tokio::test]
+async fn a_members_profile_is_kept_and_told_to_everyone_with_pictures_at_addresses() {
+    let server = start_server("").await;
+    let (admin, alice, bob) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &alice, &bob]);
+    send_profile(&alice, json!({ "displayName": "Alice", "description": "Makes things.", "displayPicture": "#pfp", "banner": "#banner", "publicAddress": "did:webvh:Qm1:id.example:alice" })).await;
+
+    let listed = bob.community("members-request", json!({})).await;
+    let entry = listed["body"]["members"].as_array().unwrap().iter().find(|m| m["member"] == server.id(&alice)).unwrap().clone();
+    assert_eq!((entry["name"].as_str(), entry["profile"]["description"].as_str()), (Some("Alice"), Some("Makes things.")), "{entry}");
+    assert_eq!(entry["profile"]["publicAddress"], "did:webvh:Qm1:id.example:alice");
+    let picture = entry["profile"]["picture"].as_str().unwrap().to_string();
+    assert!(picture.starts_with(&server.url) && picture.contains(&server.id(&alice)), "{picture}");
+    assert!(entry["profile"]["banner"].as_str().is_some());
+
+    // The address gives the picture, kept for good; a made-up one gives nothing.
+    let fetched = reqwest::get(&picture).await.unwrap();
+    assert_eq!(fetched.status(), 200);
+    assert_eq!(fetched.headers()["content-type"], "image/png");
+    assert!(fetched.headers()["cache-control"].to_str().unwrap().contains("immutable"));
+    assert_eq!(reqwest::get(format!("{}m/{}/picture/0000", server.url, server.id(&alice))).await.unwrap().status(), 404);
+
+    // A nickname here is what she is shown as, her profile's name still told apart.
+    let answered = alice.community("set-member-profile", json!({ "nickname": "Al" })).await;
+    assert_eq!(kind(&answered), "members", "{answered}");
+    let listed = bob.community("members-request", json!({})).await;
+    let entry = listed["body"]["members"].as_array().unwrap().iter().find(|m| m["member"] == server.id(&alice)).unwrap().clone();
+    assert_eq!((entry["name"].as_str(), entry["here"]["nickname"].as_str(), entry["profile"]["displayName"].as_str()), (Some("Al"), Some("Al"), Some("Alice")));
+    assert_eq!(alice.community("set-member-profile", json!({ "nickname": "x".repeat(33) })).await["body"]["code"], "e.p.msg.too-long");
+}
+
+#[tokio::test]
+async fn a_message_request_carries_the_askers_did_to_that_one_member_once_a_day() {
+    let server = start_server("").await;
+    let (admin, alice, bob) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &alice, &bob]);
+
+    let sent = alice.community("message-request", json!({ "id": "r1", "to": server.id(&bob), "note": "about the meetup" })).await;
+    assert_eq!((kind(&sent), sent["body"]["id"].as_str()), ("message-request-sent", Some("r1")));
+    let passed = bob.next_of(&format!("{C}message-request")).await;
+    assert_eq!((passed["body"]["id"].as_str(), passed["body"]["from"]["did"].as_str(), passed["body"]["from"]["member"].as_str()), (Some("r1"), Some(alice.did().as_str()), Some(server.id(&alice).as_str())));
+    assert_eq!(passed["body"]["note"], "about the meetup");
+
+    // A second the same day is answered the same, and passed on to nobody.
+    let again = alice.community("message-request", json!({ "id": "r2", "to": server.id(&bob) })).await;
+    assert_eq!(kind(&again), "message-request-sent");
+    assert!(tokio::time::timeout(Duration::from_millis(500), bob.next_of(&format!("{C}message-request"))).await.is_err());
+
+    // Nor to someone who takes none.
+    admin.community("set-member-profile", json!({ "requests": false })).await;
+    let to_admin = bob.community("message-request", json!({ "id": "r3", "to": server.id(&admin) })).await;
+    assert_eq!(kind(&to_admin), "message-request-sent");
+    assert!(tokio::time::timeout(Duration::from_millis(500), admin.next_of(&format!("{C}message-request"))).await.is_err());
+}
+
+#[test]
+fn a_member_who_changes_did_keeps_their_member_id_and_is_one_member() {
+    let store = Store::in_memory().unwrap();
+    let (old, middle, new) = ("did:peer:2.old", "did:peer:2.middle", "did:peer:2.new");
+    store.set_member(old, wyvrn_community::store::Role::Member, 1).unwrap();
+    let id = store.member_id(old, 1).unwrap();
+
+    // Through a DID in the middle the server never saw, to one that wrote first.
+    let written_first = store.member_id(new, 5).unwrap();
+    store.rotate(middle, new, 6).unwrap();
+    store.rotate(old, middle, 7).unwrap();
+    assert_eq!(store.member_id(new, 8).unwrap(), id, "the older id stands");
+    assert_eq!(store.did_of_member(&written_first).unwrap().as_deref(), Some(new), "the other still finds them");
+    assert_eq!(store.did_of_member(&id).unwrap().as_deref(), Some(new));
+    assert_eq!(store.current_did(old).unwrap(), new);
+}

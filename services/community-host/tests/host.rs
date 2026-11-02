@@ -129,7 +129,8 @@ async fn two_communities_in_one_host_are_two_servers_that_know_nothing_of_each_o
 
     // Each owner is their own community's admin, and nobody in the other.
     let joined = ann.community(&alpha, "join", json!({})).await;
-    assert_eq!((kind(&joined), joined["body"]["name"].as_str(), joined["body"]["owner"].as_str()), ("community", Some("Alpha"), Some(ann.did().as_str())), "{joined}");
+    // (The owner by member id, as everyone in a community is named: she is it.)
+    assert_eq!((kind(&joined), joined["body"]["name"].as_str(), joined["body"]["owner"].as_str()), ("community", Some("Alpha"), joined["body"]["you"].as_str()), "{joined}");
     let made = ann.community(&alpha, "create-channel", json!({ "name": "general" })).await;
     let channel = made["body"]["created"].as_str().unwrap().to_string();
     ann.community(&alpha, "post", json!({ "channel": channel, "id": "a1", "content": "alpha only" })).await;

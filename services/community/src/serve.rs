@@ -94,6 +94,7 @@ pub async fn open(config: &Config, stores: &Stores, opening: Opening) -> anyhow:
     }
     let mut community = Community::new(store, config.community.clone(), Some(kept))?.with_voice(config.voice.clone());
     community.web_url = web.as_ref().map(|web| web.url.to_string());
+    community.public_url = config.server.public_url.clone();
     community.assistant = opening.assistant.as_ref().map(Assistant::listing);
     if let Some(stickers) = &stores.stickers {
         community.expressions = Some(crate::expressions::Expressions::open(stickers, &config.server.public_url).context("the community's packs")?);

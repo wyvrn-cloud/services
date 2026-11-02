@@ -82,6 +82,7 @@ impl AppState {
     /// The parts a new server starts with, beside what `main` builds.
     pub fn new(agent: Agent, voice: wyvrn_service::Voice, mut community: Community, did_document: Option<address::Published>, resolver: Box<dyn DIDResolver>) -> Self {
         community.own = Some(agent.did());
+        community.speaks_as = voice.speaking_as().filter(|did| *did != agent.did());
         Self {
             agent,
             voice,
@@ -249,6 +250,10 @@ fn send_changed(state: &Arc<AppState>, notice: &Value) -> anyhow::Result<()> {
 fn send_later(state: &Arc<AppState>, did: String, message: Value) {
     let state = state.clone();
     tokio::spawn(async move {
+        let message = match state.community.masked_for(&did, &message) {
+            Ok(masked) => masked,
+            Err(error) => return tracing::warn!(%did, %error, "couldn't name people as they may be named to them"),
+        };
         if let Err(error) = state.voice.send(&state.agent, &did, &message).await {
             tracing::warn!(%did, %error, "couldn't send a notice");
         }
@@ -282,7 +287,23 @@ impl Service for CommunityService {
         true
     }
 
+    /// Members name each other by member id, and are told DIDs only where they
+    /// moderate (member_ids.rs): what arrives is turned back into DIDs before
+    /// anything here reads it, and the answer into member ids for whoever asked.
     async fn answer(&self, incoming: &Incoming<'_>) -> anyhow::Result<Option<Value>> {
+        let state = &self.0;
+        let mut received = incoming.received.clone();
+        received.message = state.community.unmasked_from(&received.message)?;
+        let reply = self.answer_unmasked(&Incoming { received: &received, sender_kid: incoming.sender_kid.clone() }).await?;
+        match (reply, &received.sender) {
+            (Some(reply), Some(sender)) => Ok(Some(state.community.masked_for(sender, &reply)?)),
+            (reply, _) => Ok(reply),
+        }
+    }
+}
+
+impl CommunityService {
+    async fn answer_unmasked(&self, incoming: &Incoming<'_>) -> anyhow::Result<Option<Value>> {
         let state = &self.0;
         let received = incoming.received;
         let Some(sender) = received.sender.clone() else {
@@ -552,6 +573,13 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket) {
     let packing = tokio::spawn(async move {
         while let Some(message) = outgoing.recv().await {
             let Some(to) = pack_holder.lock().unwrap_or_else(|p| p.into_inner()).clone() else { continue };
+            let message = match writer_state.community.masked_for(&to, &message) {
+                Ok(masked) => masked,
+                Err(error) => {
+                    tracing::warn!(%error, "couldn't name people as they may be named to them");
+                    continue;
+                }
+            };
             let from = writer_state.voice.speaking_as().unwrap_or_else(|| writer_state.agent.did());
             match writer_state.agent.messaging().pack_direct(&message, &to, Some(&from)).await {
                 Ok(packed) => {
@@ -591,7 +619,7 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket) {
         if bytes.len() > 4 * 1024 * 1024 {
             continue;
         }
-        let Ok(received) = state.agent.receive(&bytes).await else { continue };
+        let Ok(mut received) = state.agent.receive(&bytes).await else { continue };
         let Ok(unpacked) = state.agent.messaging().unpack_verified(&bytes).await else { continue };
         let (Some(sender), Some(sender_kid)) = (received.sender.clone(), unpacked.sender_kid) else { continue };
         match &holder {
@@ -611,7 +639,17 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket) {
             Some(held) if held != &sender => continue,
             Some(_) => {}
         }
+        // (What `answer` turns back into DIDs itself; watching and voice, here.)
         let is_voice = received.message["type"].as_str().is_some_and(|t| t.starts_with(voice::PIURI));
+        if is_voice || received.message["type"] == WATCH {
+            match state.community.unmasked_from(&received.message) {
+                Ok(unmasked) => received.message = unmasked,
+                Err(error) => {
+                    tracing::warn!(%error, "couldn't read who a message names");
+                    continue;
+                }
+            }
+        }
         let reply = if received.message["type"] == WATCH {
             watch(&state, id, &sender, &received.message).unwrap_or_else(|error| {
                 tracing::warn!(%error, "couldn't answer watch");
@@ -628,6 +666,7 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket) {
                 None
             })
         };
+        let reply = reply.and_then(|reply| state.community.masked_for(&sender, &reply).inspect_err(|error| tracing::warn!(%error, "couldn't name people as they may be named to them")).ok());
         if let Some(reply) = reply {
             match state.agent.pack_reply(&received, &reply).await {
                 Ok(packed) => {
@@ -755,6 +794,10 @@ async fn deliver_to(state: &Arc<AppState>, member: crate::store::Member) {
             Err(error) => return tracing::error!(%error, "couldn't tell whether a post concerns a member"),
         };
         if !state.to_watching(&member.did, &message) && reaches {
+            let message = match state.community.masked_for(&member.did, &message) {
+                Ok(masked) => masked,
+                Err(error) => return tracing::error!(%error, "couldn't name people as they may be named to them"),
+            };
             if let Err(error) = state.voice.send(&state.agent, &member.did, &message).await {
                 tracing::warn!(did = %member.did, serial = post.serial, %error, "couldn't deliver a post; will try again");
                 return;
@@ -819,6 +862,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/s/{name}/pack.json", get(crate::expressions::manifest))
         .route("/s/{name}/{file}", get(crate::expressions::pack_file))
         .route("/s/drafts/{instance}/{file}", get(crate::expressions::draft_file))
+        // Members' pictures, at the addresses members are given (member_ids.rs).
+        .route("/m/{member}/{kind}/{hash}", get(member_picture))
         .route("/healthz", get(|| async { "ok" }))
         .merge(address::routes(state.agent.did(), state.did_document.clone()))
         // A browser app sends its messages, and fetches files, from another origin.
@@ -836,6 +881,28 @@ pub fn router(state: Arc<AppState>) -> Router {
         None => didcomm,
     };
     routes.layer(axum::middleware::from_fn_with_state(state, crate::web::headers))
+}
+
+/// A member's picture, banner or picture here, by the address `members` gave:
+/// a capability, the same for as long as the picture is, and so kept for good.
+async fn member_picture(State(state): State<Arc<AppState>>, axum::extract::Path((member, kind, hash)): axum::extract::Path<(String, String, String)>) -> Response {
+    use base64::Engine;
+    let Ok(Some((media_type, data))) = state.community.picture_at(&member, &kind, &hash) else {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data.trim_end_matches('=')).or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(data.trim_end_matches('='))) else {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    };
+    let media_type = if matches!(media_type.as_str(), "image/png" | "image/jpeg" | "image/webp" | "image/gif") { media_type } else { "application/octet-stream".to_string() };
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, media_type),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=31536000, immutable".to_string()),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 /// A live connection, if the request asks for a WebSocket; otherwise the
