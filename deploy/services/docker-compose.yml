@@ -8,6 +8,7 @@
 #   docker compose up -d                                         # the DID host and the sticker service
 #   docker compose --profile community --profile announce up -d  # and the two an app isn't built to expect
 #   docker compose --profile relay up -d                         # an outbound relay
+#   docker compose --profile communities --profile claude up -d  # the community host, Claude rooms
 name: wyvrn-services
 
 x-service: &service
@@ -79,6 +80,67 @@ services:
       COMMUNITY_PUBLIC_ADDRESS: "${COMMUNITY_PUBLIC_ADDRESS:-}"
       COMMUNITY_PROFILE_NAME: "${COMMUNITY_PROFILE_NAME:-}"
       COMMUNITY_PROFILE_DESCRIPTION: "${COMMUNITY_PROFILE_DESCRIPTION:-}"
+      # Its web view (WHATS-NEW.md): where it is, if not at COMMUNITY_DOMAIN, and
+      # the proxies whose X-Forwarded-* headers it believes (the Docker network).
+      COMMUNITY_WEB_URL: "${COMMUNITY_WEB_URL:-}"
+      COMMUNITY_WEB_TRUSTED_PROXIES: "${COMMUNITY_WEB_TRUSTED_PROXIES:-172.16.0.0/12}"
+
+  # Many communities in one process, each its own DID at <domain>/c/<name>/,
+  # made and managed by COMMUNITY_HOST_ADMINS from the app. Each community's
+  # tables are in MySQL; their members' files are in a volume (community-host-data).
+  community-host:
+    <<: *service
+    profiles: ["communities"]
+    image: wyvrn-community-host
+    build:
+      context: ../../..
+      dockerfile: wyvrn-services/services/community-host/Dockerfile
+    ports:
+      - "127.0.0.1:${COMMUNITY_HOST_PORT:-8189}:8095"
+    environment:
+      COMMUNITY_HOST_PUBLIC_URL: "https://${COMMUNITY_HOST_DOMAIN:?set COMMUNITY_HOST_DOMAIN in .env}/"
+      COMMUNITY_HOST_DID_METHOD: "web"
+      COMMUNITY_HOST_ADMINS: "${COMMUNITY_HOST_ADMINS:-}"
+      # The DID host each community holds its public address at (community:<name>).
+      COMMUNITY_HOST_DID_HOST: "${DID_HOST_DOMAIN:-}"
+      # Its own store (which communities there are), and the MySQL server, without a
+      # database, that each community gets a database of its own on.
+      COMMUNITY_HOST_DATABASE_URL: "${COMMUNITY_HOST_DATABASE_URL:?set COMMUNITY_HOST_DATABASE_URL in .env}"
+      COMMUNITY_HOST_STORAGE: "${COMMUNITY_HOST_STORAGE:-mysql-db}"
+      COMMUNITY_HOST_MYSQL_URL: "${COMMUNITY_HOST_MYSQL_URL:-}"
+      COMMUNITY_HOST_VOICE_RELAY_URL: "${COMMUNITY_HOST_VOICE_RELAY_URL:-}"
+      COMMUNITY_HOST_VOICE_RELAY_FINGERPRINT: "${COMMUNITY_HOST_VOICE_RELAY_FINGERPRINT:-}"
+    # Each open community holds a few files open, and each member's live connection one.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - community-host-data:/app/data
+
+  # Rooms where the people let in talk with Claude together: a community server
+  # whose posts are answered by Claude, on the operator's ANTHROPIC_API_KEY.
+  # Everything posted in a room is sent to Anthropic, and every member is told so.
+  claude:
+    <<: *service
+    profiles: ["claude"]
+    image: wyvrn-claude
+    build:
+      context: ../../..
+      dockerfile: wyvrn-services/services/claude/Dockerfile
+    ports:
+      - "127.0.0.1:${CLAUDE_PORT:-8190}:8080"
+    environment:
+      COMMUNITY_PUBLIC_URL: "https://${CLAUDE_DOMAIN:?set CLAUDE_DOMAIN in .env}/"
+      COMMUNITY_DID_METHOD: "web"
+      COMMUNITY_NAME: "${CLAUDE_NAME:-Claude rooms}"
+      COMMUNITY_ADMINS: "${CLAUDE_ADMINS:-}"
+      COMMUNITY_MEMBERS: "${CLAUDE_MEMBERS:-}"
+      COMMUNITY_DATABASE_URL: "${CLAUDE_DATABASE_URL:?set CLAUDE_DATABASE_URL in .env}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      CLAUDE_MODEL: "${CLAUDE_MODEL:-}"
+      CLAUDE_DAILY_REQUESTS: "${CLAUDE_DAILY_REQUESTS:-}"
+      CLAUDE_PERIOD_TOKENS: "${CLAUDE_PERIOD_TOKENS:-}"
 
   # An announcement channel. Likewise: people are given its DID.
   announce:
@@ -217,6 +279,8 @@ services:
       VERIFY_YOUTUBE_CLIENT_SECRET: "${VERIFY_YOUTUBE_CLIENT_SECRET:-}"
 
 volumes:
+  # The community host's files: each community's members' attachments.
+  community-host-data:
   # Every file the files service holds. The only thing this stack keeps outside
   # the databases: `docker volume inspect wyvrn-services_files-data` says where.
   files-data:

@@ -15,6 +15,11 @@ With no web server yet, [`deploy/did-host`](../did-host) brings its own Caddy.
 | `announce` | Nothing: people are given its DID | No |
 | `files` | Nothing: an uploader is given its DID | No |
 | `relay` | Nothing: people are given its DID (Settings, Developer, in the app) | No |
+| `community-host` | Nothing: many communities, each given its own DID | No |
+| `claude` | Nothing: people are given its DID | No |
+
+What a server already running some of these needs before the newest images can
+run (the compose file, `.env`, Caddy, Anubis) is in [WHATS-NEW.md](WHATS-NEW.md).
 
 ## 1. Domains
 
