@@ -418,7 +418,25 @@ impl CommunityService {
         if received.message["type"].as_str().is_some_and(|message_type| message_type.starts_with(voice::PIURI)) {
             return answer_voice(state, &sender, &received.message, None);
         }
-        let outcome = state.community.handle(&sender, &received.message, now())?;
+        // A public address a member's profile names is kept only once it is shown
+        // to be theirs -- the key they wrote with is one of its keys -- and with it
+        // the linked accounts that are about it: otherwise anyone could claim
+        // anyone's address, and the accounts its whois lists.
+        let mut checked;
+        let message = if received.message["type"] == community::PROFILE && received.message["body"]["profile"]["publicAddress"].is_string() {
+            checked = received.message.clone();
+            let address = checked["body"]["profile"]["publicAddress"].as_str().unwrap_or_default().to_string();
+            if wyvrn_service::named::holder_among(state.resolver.as_ref(), std::slice::from_ref(&address), &sender, kid).await.is_none() {
+                if let Some(profile) = checked["body"]["profile"].as_object_mut() {
+                    profile.remove("publicAddress");
+                    profile.remove("linkedAccounts");
+                }
+            }
+            &checked
+        } else {
+            &received.message
+        };
+        let outcome = state.community.handle(&sender, message, now())?;
         for (did, notice) in outcome.notices {
             send_later(state, did, notice);
         }

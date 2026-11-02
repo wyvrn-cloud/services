@@ -1886,7 +1886,8 @@ async fn a_members_profile_is_kept_and_told_to_everyone_with_pictures_at_address
     let listed = bob.community("members-request", json!({})).await;
     let entry = listed["body"]["members"].as_array().unwrap().iter().find(|m| m["member"] == server.id(&alice)).unwrap().clone();
     assert_eq!((entry["name"].as_str(), entry["profile"]["description"].as_str()), (Some("Alice"), Some("Makes things.")), "{entry}");
-    assert_eq!(entry["profile"]["publicAddress"], "did:webvh:Qm1:id.example:alice");
+    // A public address she isn't shown to hold isn't kept: anyone could name anyone's.
+    assert!(entry["profile"]["publicAddress"].is_null(), "{entry}");
     let picture = entry["profile"]["picture"].as_str().unwrap().to_string();
     assert!(picture.starts_with(&server.url) && picture.contains(&server.id(&alice)), "{picture}");
     assert!(entry["profile"]["banner"].as_str().is_some());
