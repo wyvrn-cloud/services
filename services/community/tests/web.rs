@@ -275,6 +275,7 @@ async fn permalinks_follow_renames_and_a_post_taken_back_is_gone() {
     assert!(page.contains("class=\"post focus\""));
     assert!(page.contains(&format!("<link rel=\"canonical\" href=\"{}ch/{general}/m/{seq}\">", server.url)));
     assert!(page.contains("DiscussionForumPosting"));
+    assert!(page.contains(&format!("wyvrn://community?did={}&#38;channel={general}&#38;seq={seq}", url::form_urlencoded::byte_serialize(server.did.as_bytes()).collect::<String>())), "{page}");
 
     // The short link goes there.
     let short = server.get(&format!("m/{}", posted["body"]["id"].as_str().unwrap())).await;

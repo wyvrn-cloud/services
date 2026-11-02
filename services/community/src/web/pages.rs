@@ -478,7 +478,8 @@ async fn channel(State(state): State<Arc<AppState>>, Path((id, name)): Path<(Str
     });
     let views: Vec<PostView> = shown.iter().map(|p| post_view(&state, p, &channel, root, None)).collect();
     let json_ld = render::json_ld(&json!({ "@context": "https://schema.org", "@type": "CollectionPage", "name": channel.name, "url": canonical, "hasPart": shown.iter().take(20).map(|p| discussion(p, web, &channel, &p.author_name.clone().unwrap_or_default())).collect::<Vec<_>>() }));
-    let site = site(&state, &viewer, root, canonical);
+    let mut site = site(&state, &viewer, root, canonical);
+    site.in_app.push_str(&format!("&channel={}", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>()));
     let groups = match groups(&state, &viewer, root, Some(&channel.id)) {
         Ok(groups) => groups,
         Err(error) => return internal(error),
@@ -534,7 +535,8 @@ async fn post_page(State(state): State<Arc<AppState>>, Path((id, seq)): Path<(St
     let canonical = web.absolute(&format!("ch/{}/m/{seq}", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>()));
     let mut ld = discussion(&post, web, &channel, &author);
     ld["@context"] = json!("https://schema.org");
-    let site = site(&state, &viewer, root, canonical);
+    let mut site = site(&state, &viewer, root, canonical);
+    site.in_app.push_str(&format!("&channel={}&seq={seq}", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>()));
     let groups = match groups(&state, &viewer, root, Some(&channel.id)) {
         Ok(groups) => groups,
         Err(error) => return internal(error),
