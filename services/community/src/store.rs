@@ -813,6 +813,13 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         data TEXT NOT NULL,
         at INTEGER NOT NULL
     );
+    -- What the links in public posts come to (web/preview.rs), by their address's hash.
+    CREATE TABLE IF NOT EXISTS web_previews (
+        link TEXT PRIMARY KEY,
+        url TEXT NOT NULL,
+        data TEXT NOT NULL,
+        at INTEGER NOT NULL
+    );
     -- The identity provider (community-sign-in/1.0).
     CREATE TABLE IF NOT EXISTS oidc_clients (
         id TEXT PRIMARY KEY,
@@ -1174,6 +1181,12 @@ fn schema() -> Schema {
             CREATE TABLE IF NOT EXISTS web_outside (
                 stem VARCHAR(64) NOT NULL PRIMARY KEY,
                 media_type VARCHAR(32) NOT NULL,
+                data MEDIUMTEXT NOT NULL,
+                at BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS web_previews (
+                link VARCHAR(64) NOT NULL PRIMARY KEY,
+                url TEXT NOT NULL,
                 data MEDIUMTEXT NOT NULL,
                 at BIGINT NOT NULL
             ) {MYSQL_TABLE};

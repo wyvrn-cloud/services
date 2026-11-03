@@ -626,7 +626,7 @@ async fn custom_emoji_and_stickers_are_shown_through_the_community_and_gifs_from
     // The GIF from KLIPY, as itself; emoji and the sticker at this server, never at the pack.
     assert!(page.contains("<img class=\"gif\" src=\"https://static.klipy.com/ii/abc/7a/be/t0TOtOCr.webp\""), "{page}");
     assert!(page.contains("class=\"emoji\""), "{page}");
-    assert!(page.contains("class=\"content emoji-only\""), "a post of nothing but emoji is drawn large");
+    assert!(page.contains("class=\"content giant-emoji few\""), "a post of nothing but emoji is drawn large");
     assert!(page.contains("class=\"sticker\""), "{page}");
     assert!(!page.contains(&format!("src=\"{pack}")), "nothing is fetched from the pack by a visitor");
     // (Addresses on a page are relative to it: `../../x/...` from a channel's.)
@@ -656,4 +656,56 @@ async fn custom_emoji_and_stickers_are_shown_through_the_community_and_gifs_from
     assert_eq!(server.get(forged.trim_start_matches('/')).await.status(), 404);
     let unsigned = format!("{}key=00000000000000000000000000000000", good.split("key=").next().unwrap());
     assert_eq!(server.get(unsigned.trim_start_matches('/')).await.status(), 404);
+}
+
+#[tokio::test]
+async fn links_have_previews_runs_are_cozy_and_reactions_show_custom_emoji() {
+    wyvrn_community::web::outside::allow_private_hosts();
+    // A site with a page that says what it is, and its picture.
+    let picture = b"\xFF\xD8\xFF\xE0 a small jpeg".to_vec();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let site = format!("http://{}", listener.local_addr().unwrap());
+    let page = format!(
+        "<html><head><title>Ignored</title><meta property=\"og:site_name\" content=\"The Site\"><meta property=\"og:title\" content=\"A &amp; story\"><meta property=\"og:description\" content=\"What happened.\"><meta property=\"og:image\" content=\"{site}/picture.jpg\"></head><body>…</body></html>"
+    );
+    let (page_body, picture_body) = (page.clone(), picture.clone());
+    let app = Router::new()
+        .route("/story", axum::routing::get(move || { let page = page_body.clone(); async move { ([(axum::http::header::CONTENT_TYPE, "text/html")], page) } }))
+        .route("/picture.jpg", axum::routing::get(move || { let picture = picture_body.clone(); async move { picture } }));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let server = start(Options::default()).await;
+    let (admin, member) = with_channels(&server).await;
+    let general = server.channel_id("general");
+    admin.community("update-channel", json!({ "channel": general, "web": { "public": true, "history": true } })).await;
+    // Three posts in a row by one person: one run. Then someone else.
+    say(&member, &server, "general", &format!("look at this: {site}/story")).await;
+    say(&member, &server, "general", "and another thing").await;
+    let third = say(&member, &server, "general", "a third").await;
+    say(&admin, &server, "general", "replying, as someone else").await;
+    let custom = "![party](https://pack.example/0123456789abcdef0123456789abcdef.png)";
+    let reacted = member.ask("https://wyvrn.app/message-reactions/1.0/reactions", json!({ "to": { "id": third["body"]["id"] }, "emoji": [custom, "🎉"] })).await;
+    assert!(!reacted["type"].as_str().unwrap_or_default().ends_with("problem-report"), "{reacted}");
+
+    let (_, html) = server.text(&format!("ch/{general}/general")).await;
+    // The link is a link, with its preview under it.
+    assert!(html.contains(&format!("<a href=\"{site}/story\"")), "{html}");
+    assert!(html.contains("<div class=\"link-card-site\">The Site</div>"), "{html}");
+    assert!(html.contains("A &amp; story") || html.contains("A &#38; story"), "{html}");
+    assert!(html.contains("What happened."));
+    assert!(!html.contains(&format!("src=\"{site}")), "the page's picture is shown from here, never from the site");
+    let picture_src = html.split("src=\"").skip(1).filter_map(|rest| rest.split('"').next()).find(|src| src.contains("i/u")).expect("the preview's picture").replace("&amp;", "&").replace("&#38;", "&");
+    let picture_path = picture_src.trim_start_matches("../").to_string();
+    let shown = server.get(&picture_path).await;
+    assert_eq!(shown.status(), 200);
+    assert_eq!(shown.headers()["content-type"], "image/jpeg");
+    assert_eq!(shown.bytes().await.unwrap().to_vec(), picture);
+    // A changed address isn't fetched.
+    assert_eq!(server.get(&picture_path.replace("picture.jpg", "story")).await.status(), 404);
+
+    // The run: the second and third posts carry on the first.
+    assert_eq!(html.matches("class=\"post continued\"").count(), 2, "{html}");
+    // The custom emoji reaction is its picture, through this server.
+    assert!(html.contains("<img class=\"emoji\" src=\"") && html.contains("alt=\":party:\""), "{html}");
+    assert!(!html.contains("src=\"https://pack.example"), "{html}");
 }

@@ -25,6 +25,7 @@ pub mod flows;
 pub mod oidc;
 pub mod outside;
 pub mod pages;
+pub mod preview;
 pub mod render;
 pub mod sign_in;
 pub mod store;

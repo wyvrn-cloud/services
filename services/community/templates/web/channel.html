@@ -8,10 +8,11 @@
 {% if let Some(older) = older %}<p class="paging"><a class="button quiet" href="{{ older }}" rel="prev">Older posts</a></p>{% endif %}
 <ol class="posts">
 {% for post in posts %}
-  <li class="post{% if post.focus %} focus{% endif %}" id="{{ post.anchor }}">
-    <div class="avatar">{% if let Some(picture) = post.picture %}<img src="{{ picture }}" alt="" width="40" height="40" loading="lazy">{% else %}<span aria-hidden="true">{{ post.initial }}</span>{% endif %}</div>
+  <li class="post{% if post.focus %} focus{% endif %}{% if post.continued %} continued{% endif %}" id="{{ post.anchor }}">
+    {% if post.continued %}<a class="run-time" href="{{ post.href }}"><time datetime="{{ post.iso }}" title="{{ post.when }}">{{ post.clock }}</time></a>
+    {% else %}<div class="avatar">{% if let Some(picture) = post.picture %}<img src="{{ picture }}" alt="" width="40" height="40" loading="lazy">{% else %}<span aria-hidden="true">{{ post.initial }}</span>{% endif %}</div>{% endif %}
     <article class="body">
-      <header>
+      <header{% if post.continued %} class="visually-hidden"{% endif %}>
         <span class="author">{{ post.author }}</span>
         <a class="time" href="{{ post.href }}"><time datetime="{{ post.iso }}">{{ post.when }}</time></a>
         {% if post.edited %}<span class="note">edited</span>{% endif %}
@@ -19,7 +20,7 @@
       </header>
       {% if let Some(snippet) = post.reply_snippet %}<blockquote class="reply">{% if let Some(who) = post.reply_author %}<span class="author">{{ who }}</span> {% endif %}{{ snippet }}</blockquote>{% endif %}
       {% if let Some(title) = post.title %}<h2 class="title">{{ title }}</h2>{% endif %}
-      <div class="content{% if post.emoji_only %} emoji-only{% endif %}">{{ post.html|safe }}</div>
+      <div class="content{{ post.giant }}">{{ post.html|safe }}</div>
       {% if !post.media.is_empty() %}
       <div class="media">
         {% for item in post.media %}
@@ -31,7 +32,16 @@
         {% endfor %}
       </div>
       {% endif %}
-      {% if !post.reactions.is_empty() %}<ul class="reactions" aria-label="Reactions">{% for (emoji, count) in post.reactions %}<li>{{ emoji }} <span>{{ count }}</span></li>{% endfor %}</ul>{% endif %}
+      {% for card in post.cards %}
+      <div class="link-card{% if card.kind == "youtube" %} youtube{% endif %}">
+        {% if let Some(site) = card.site %}<div class="link-card-site">{{ site }}</div>{% endif %}
+        {% if let Some(channel) = card.channel %}{% if let Some(href) = card.channel_href %}<a class="link-card-channel" href="{{ href }}" rel="nofollow ugc noopener noreferrer">{{ channel }}</a>{% else %}<span class="link-card-channel">{{ channel }}</span>{% endif %}{% endif %}
+        {% if let Some(title) = card.title %}<a class="link-card-title" href="{{ card.href }}" rel="nofollow ugc noopener noreferrer">{{ title }}</a>{% endif %}
+        {% if let Some(description) = card.description %}<p class="link-card-description">{{ description }}</p>{% endif %}
+        {% if !card.pictures.is_empty() %}<a class="link-card-pictures{% if card.pictures.len() > 1 %} several{% endif %}" href="{{ card.href }}" rel="nofollow ugc noopener noreferrer"{% if card.kind == "youtube" %} aria-label="Watch on YouTube"{% endif %}>{% for picture in card.pictures %}<img src="{{ picture }}" alt="" loading="lazy">{% endfor %}{% if card.kind == "youtube" %}<span class="link-card-play" aria-hidden="true">▶</span>{% endif %}</a>{% endif %}
+      </div>
+      {% endfor %}
+      {% if !post.reactions.is_empty() %}<ul class="reactions" aria-label="Reactions">{% for reaction in post.reactions %}<li>{% if let Some(picture) = reaction.picture %}<img class="emoji" src="{{ picture }}" alt="{{ reaction.text }}" title="{{ reaction.text }}" loading="lazy">{% else %}{{ reaction.text }}{% endif %} <span>{{ reaction.count }}</span></li>{% endfor %}</ul>{% endif %}
       {% if let Some(thread) = post.thread_href %}<a class="thread" href="{{ thread }}">{% if let Some(name) = post.thread_name %}{{ name }} · {% endif %}{{ post.thread_count }} {% if post.thread_count == 1 %}reply{% else %}replies{% endif %} →</a>{% endif %}
     </article>
   </li>

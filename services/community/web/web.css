@@ -85,6 +85,13 @@ main { min-width: 0; }
 .post { display: grid; grid-template-columns: 40px minmax(0, 1fr); gap: .85rem; padding: .85rem .6rem; border-radius: var(--radius); scroll-margin-top: 5rem; }
 .post:hover { background: color-mix(in srgb, var(--surface) 60%, transparent); }
 .post.focus, .post:target { background: color-mix(in srgb, var(--accent) 10%, transparent); box-shadow: inset 3px 0 0 var(--accent); }
+/* A run of posts by one person (as the app's cozy layout): those after the first
+   have no picture or name, sit close under it, and show their time on hover. */
+.post.continued { padding-top: .1rem; }
+.post:has(+ .post.continued) { padding-bottom: .1rem; }
+.run-time { align-self: start; padding-top: .2rem; font-size: .7rem; line-height: 1.55rem; text-align: center; color: var(--muted); text-decoration: none; visibility: hidden; white-space: nowrap; }
+.post.continued:hover .run-time, .run-time:focus { visibility: visible; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .avatar { width: 40px; height: 40px; border-radius: 50%; overflow: hidden; background: var(--surface); display: grid; place-items: center; font-weight: 700; color: var(--muted); }
 .avatar img { width: 100%; height: 100%; object-fit: cover; }
 .body header { display: flex; flex-wrap: wrap; align-items: baseline; gap: .2rem .6rem; }
@@ -101,8 +108,30 @@ main { min-width: 0; }
 .media img, .media video { max-height: 360px; width: auto; border-radius: calc(var(--radius) / 1.5); border: 1px solid var(--border); background: var(--surface); }
 /* Pictures from packs and GIFs (web/outside.rs): an emoji sits in the line, a
    sticker and a GIF stand on their own, with no frame. */
-.content img.emoji { height: 1.6em; width: auto; vertical-align: -0.4em; margin: 0 .05em; }
-.content.emoji-only img.emoji { height: 3em; }
+/* As the app draws them: a custom emoji is a character of the line (1.375em), and a
+   post of nothing but emoji is larger the fewer there are. */
+img.emoji { display: inline-block; height: 1.375em; width: auto; max-width: 4em; vertical-align: -0.3em; object-fit: contain; }
+.content.giant-emoji { line-height: 1.25; }
+.content.giant-emoji.few { font-size: 3em; }
+.content.giant-emoji.some { font-size: 2.2em; }
+.content.giant-emoji.many { font-size: 1.6em; }
+.reactions img.emoji { height: 1.2em; vertical-align: -0.25em; }
+/* A link's preview (web/preview.rs): its site, title and description, and its
+   pictures; a YouTube video's channel over its title, and its picture to play it. */
+.link-card { display: flex; flex-direction: column; gap: .2rem; max-width: 440px; margin-top: .5rem; padding: .6rem .75rem; border-left: 4px solid var(--border); border-radius: calc(var(--radius) / 2); background: var(--surface); }
+.link-card.youtube { border-left-color: #ff0033; }
+.link-card-site { font-size: .75rem; color: var(--muted); }
+.link-card-channel { font-size: .85rem; font-weight: 600; color: var(--text); text-decoration: none; overflow-wrap: anywhere; }
+a.link-card-channel:hover { text-decoration: underline; }
+.link-card-title { font-weight: 600; color: var(--accent); text-decoration: none; overflow-wrap: anywhere; }
+.link-card-title:hover { text-decoration: underline; }
+.link-card-description { margin: 0; font-size: .9rem; white-space: pre-line; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 6; -webkit-box-orient: vertical; overflow: hidden; }
+.link-card-pictures { position: relative; display: block; margin-top: .25rem; }
+.link-card-pictures img { display: block; width: 100%; height: auto; max-height: 360px; object-fit: cover; border-radius: calc(var(--radius) / 2); }
+.link-card-pictures.several { display: grid; grid-template-columns: 1fr 1fr; gap: .25rem; }
+.link-card-pictures.several img { aspect-ratio: 1; }
+.link-card.youtube .link-card-pictures img { aspect-ratio: 16 / 9; }
+.link-card-play { position: absolute; inset: 0; margin: auto; width: 3.25rem; height: 2.25rem; display: grid; place-items: center; border-radius: .75rem; background: rgb(0 0 0 / .65); color: #fff; font-size: 1.1rem; pointer-events: none; }
 .media img.sticker { max-height: 160px; max-width: 160px; height: auto; border: 0; background: none; border-radius: 0; }
 .content img.gif { display: block; max-width: min(100%, 400px); max-height: 360px; height: auto; margin-top: .25rem; border-radius: calc(var(--radius) / 1.5); }
 .file { display: inline-flex; gap: .5rem; align-items: center; padding: .55rem .8rem; border: 1px solid var(--border); border-radius: calc(var(--radius) / 1.5); background: var(--surface); color: var(--text); }

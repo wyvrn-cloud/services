@@ -135,6 +135,16 @@ impl Store {
         Ok(())
     }
 
+    /// What a link in a public post came to ([`super::preview`]), as JSON, and when it was read.
+    pub fn link_preview(&self, key: &str) -> Result<Option<(String, i64)>> {
+        self.db.lock().query_row("SELECT data, at FROM web_previews WHERE link = ?1", params![key], |row| Ok((row.get(0)?, row.get(1)?)))
+    }
+
+    pub fn keep_link_preview(&self, key: &str, url: &str, data: &str, now: i64) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO web_previews (link, url, data, at) VALUES (?1, ?2, ?3, ?4)", params![key, url, data, now])?;
+        Ok(())
+    }
+
     pub fn picture_holder(&self, token: &str) -> Result<Option<String>> {
         self.db.lock().query_row("SELECT mkey FROM web_pictures WHERE token = ?1", params![token], |row| row.get(0))
     }

@@ -78,16 +78,22 @@
     if (location.hash) return listen()
     if ('scrollRestoration' in history) history.scrollRestoration = 'manual'
     go()
-    // Until the reader moves, the place is held while pictures arrive.
+    // Pictures arriving (a pack's file fetched for the first time can take a few
+    // seconds) grow the posts. At the bottom, the page stays at the bottom, as a chat
+    // does, for as long as it is open; at a place come back to, it stays on that post
+    // until the reader moves.
+    var pinned = atBottom()
     var moved = false
-    var stop = function () { moved = true }
-    ;['wheel', 'touchstart', 'keydown', 'mousedown'].forEach(function (name) { window.addEventListener(name, stop, { passive: true, once: true }) })
-    if (window.ResizeObserver) {
-      var watching = new ResizeObserver(function () { if (!moved) go() })
-      watching.observe(posts)
-      setTimeout(function () { watching.disconnect() }, 4000)
+    ;['wheel', 'touchstart', 'keydown', 'mousedown'].forEach(function (name) {
+      window.addEventListener(name, function () { moved = true }, { passive: true })
+    })
+    window.addEventListener('scroll', function () { if (moved) pinned = atBottom() }, { passive: true })
+    function hold() {
+      if (pinned) window.scrollTo(0, bottom())
+      else if (!moved) go()
     }
-    window.addEventListener('load', function () { if (!moved) go() })
+    if (window.ResizeObserver) new ResizeObserver(hold).observe(posts)
+    window.addEventListener('load', hold)
     listen()
 
     function listen() {

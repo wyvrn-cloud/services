@@ -46,6 +46,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/p/{token}", get(picture))
         .route("/media/{post}/{n}", get(media))
         .route("/x/{file}", get(outside_file))
+        .route("/i/{name}", get(preview_picture))
 }
 
 // --- Who is looking -------------------------------------------------------------------
@@ -143,6 +144,28 @@ pub struct Media {
     pub height: Option<i64>,
 }
 
+/// One reaction to a post: the emoji (a custom emoji's picture, through this
+/// server, where it is one) and how many chose it.
+pub struct ReactionView {
+    pub text: String,
+    pub picture: Option<String>,
+    pub count: usize,
+}
+
+/// A link's preview under a post: a page's, or a YouTube video's.
+pub struct Card {
+    /// `page` or `youtube`.
+    pub kind: &'static str,
+    pub href: String,
+    pub site: Option<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub channel: Option<String>,
+    pub channel_href: Option<String>,
+    /// Its pictures, at this server.
+    pub pictures: Vec<String>,
+}
+
 pub struct PostView {
     pub id: String,
     pub anchor: String,
@@ -158,14 +181,47 @@ pub struct PostView {
     pub reply_author: Option<String>,
     pub reply_snippet: Option<String>,
     pub media: Vec<Media>,
-    /// Nothing but custom emoji: drawn large, as the app does.
-    pub emoji_only: bool,
-    pub reactions: Vec<(String, usize)>,
+    /// Nothing but emoji: the class that draws it large (larger the fewer), as the
+    /// app does; empty otherwise.
+    pub giant: &'static str,
+    pub reactions: Vec<ReactionView>,
+    /// Previews of the links it says (preview.rs).
+    pub cards: Vec<Card>,
     pub thread_href: Option<String>,
     pub thread_count: i64,
     pub thread_name: Option<String>,
     pub pinned: bool,
     pub focus: bool,
+    /// Carries on the run of posts above it (as the app's cozy layout has it): drawn
+    /// without its author's picture and name again. See [`mark_runs`].
+    pub continued: bool,
+    /// The time of day alone, shown beside a continued post.
+    pub clock: String,
+    run: Run,
+}
+
+/// What decides whether a post carries on the run above it.
+#[derive(Default)]
+struct Run {
+    author: String,
+    at: i64,
+    starts: bool,
+}
+
+/// How long after the one before a post may come and still be part of its run, as
+/// the app has it (wyvrn-chat's runs.ts).
+const RUN_GAP_SECS: i64 = 7 * 60;
+
+/// Marks each post that carries on the run of the one above it: the same author,
+/// within seven minutes, on the same day (UTC, as the page tells the time). A reply,
+/// a post with a title, and the post a link points to start a run of their own.
+fn mark_runs(views: &mut [PostView]) {
+    for n in 1..views.len() {
+        let (before, rest) = views.split_at_mut(n);
+        let (previous, post) = (&before[n - 1].run, &mut rest[0]);
+        let gap = post.run.at - previous.at;
+        post.continued = !post.run.starts && post.run.author == previous.author && (0..RUN_GAP_SECS).contains(&gap) && post.run.at.div_euclid(86_400) == previous.at.div_euclid(86_400);
+    }
 }
 
 #[derive(Template)]
@@ -309,7 +365,17 @@ fn picture_href(state: &AppState, did: &str, root: &str) -> Option<String> {
     Some(format!("{root}p/{token}"))
 }
 
-fn post_view(state: &AppState, post: &Post, channel: &Channel, root: &str, focus: Option<i64>) -> PostView {
+/// A custom emoji written as Markdown (`![name](<pack>/<hash>.png)`): its name and address.
+fn custom_emoji(written: &str) -> Option<(String, String)> {
+    let inner = written.strip_prefix("![")?;
+    let (name, rest) = inner.split_once("](")?;
+    let address = rest.strip_suffix(')')?.trim_start_matches('<').trim_end_matches('>');
+    let file = url::Url::parse(address).ok()?.path_segments()?.next_back()?.to_string();
+    super::outside::pack_file(&file)?;
+    Some((name.trim_matches(':').to_string(), address.to_string()))
+}
+
+fn post_view(state: &AppState, post: &Post, channel: &Channel, root: &str, focus: Option<i64>, previews: &HashMap<String, super::preview::Preview>) -> PostView {
     let ch = format!("{root}ch/{}", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>());
     let author = post.author_name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "A member".to_string());
     let extra = post.extra.clone().unwrap_or(Value::Null);
@@ -384,13 +450,41 @@ fn post_view(state: &AppState, post: &Post, channel: &Channel, root: &str, focus
         reply_author: post.reply_to.as_ref().and(post.reply_author.as_deref()).map(|did| name_of(state, did)),
         reply_snippet: post.reply_snippet.clone(),
         media,
-        emoji_only: render::only_pictures(&post.content, 25),
-        reactions: post.reactions.iter().map(|(emoji, who)| (if emoji.starts_with("![") { emoji.split(']').next().unwrap_or("").trim_start_matches("![").to_string() } else { emoji.clone() }, who.len())).collect(),
+        giant: render::giant_class(render::emoji_only_count(&post.content, &|address| {
+            url::Url::parse(address).ok().and_then(|u| u.path_segments()?.next_back().map(str::to_string)).is_some_and(|file| super::outside::pack_file(&file).is_some())
+        })),
+        reactions: post
+            .reactions
+            .iter()
+            .map(|(emoji, who)| match custom_emoji(emoji) {
+                Some((name, address)) => ReactionView { text: format!(":{name}:"), picture: through_here(&address), count: who.len() },
+                None => ReactionView { text: emoji.clone(), picture: None, count: who.len() },
+            })
+            .collect(),
+        cards: super::preview::links_in(&post.content)
+            .into_iter()
+            .filter_map(|address| {
+                let preview = previews.get(&address).filter(|p| p.shows_something())?;
+                Some(Card {
+                    kind: if preview.kind == "youtube" { "youtube" } else { "page" },
+                    site: preview.site.clone(),
+                    title: preview.title.clone(),
+                    description: preview.description.clone(),
+                    channel: preview.channel.clone(),
+                    channel_href: preview.channel_url.clone(),
+                    pictures: preview.pictures.iter().filter_map(|picture| secret.as_deref().and_then(|secret| super::outside::picture_href(secret, root, picture))).collect(),
+                    href: address,
+                })
+            })
+            .collect(),
         thread_href: thread.map(|t| format!("{ch}/t/{}", url::form_urlencoded::byte_serialize(t.id.as_bytes()).collect::<String>())),
         thread_count: thread.map_or(0, |t| t.count),
         thread_name: thread.and_then(|t| t.name.clone()),
         pinned: post.pinned,
         focus: focus == Some(post.seq),
+        continued: false,
+        clock: chrono::DateTime::from_timestamp(post.posted_at, 0).map(|t| t.format("%H:%M").to_string()).unwrap_or_default(),
+        run: Run { author: post.author_did.clone(), at: post.posted_at, starts: post.reply_to.is_some() || extra["title"].is_string() || focus == Some(post.seq) },
     }
 }
 
@@ -435,6 +529,36 @@ async fn outside_file(State(state): State<Arc<AppState>>, Path(file): Path<Strin
     let mut response = picture_response(&media_type, &data);
     // Named for its hash: it never changes.
     response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=31536000, immutable"));
+    response
+}
+
+/// A picture from a link's preview (or a YouTube video's), named by a page: kept
+/// here, or fetched once and kept. Only addresses this server signed are fetched.
+async fn preview_picture(State(state): State<Arc<AppState>>, Path(name): Path<String>, Query(asked): Query<OutsideQuery>) -> Response {
+    use base64::Engine;
+    let store = &state.community.store;
+    if !page_on(store) {
+        return nothing();
+    }
+    let Ok(secret) = super::secret(store) else { return nothing() };
+    if !super::outside::picture_signed(&secret, &name, &asked.from, &asked.key) {
+        return nothing();
+    }
+    let kept = match store.outside_picture(&name) {
+        Ok(Some(kept)) => Some(kept),
+        Ok(None) => match super::outside::fetch_preview_picture(&asked.from, crate::gates::now()).await {
+            Ok((media_type, bytes)) => {
+                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let _ = store.keep_outside_picture(&name, media_type, &data, crate::gates::now());
+                Some((media_type.to_string(), data))
+            }
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+    let Some((media_type, data)) = kept else { return nothing() };
+    let mut response = picture_response(&media_type, &data);
+    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=86400"));
     response
 }
 
@@ -550,7 +674,9 @@ async fn channel(State(state): State<Arc<AppState>>, Path((id, name)): Path<(Str
         Some(b) => format!("{}?before={b}", channel_path(&channel.id, &channel.name)),
         None => channel_path(&channel.id, &channel.name),
     });
-    let views: Vec<PostView> = shown.iter().map(|p| post_view(&state, p, &channel, root, None)).collect();
+    let previews = super::preview::prepare(&state, &shown).await;
+    let mut views: Vec<PostView> = shown.iter().map(|p| post_view(&state, p, &channel, root, None, &previews)).collect();
+    mark_runs(&mut views);
     let json_ld = render::json_ld(&json!({ "@context": "https://schema.org", "@type": "CollectionPage", "name": channel.name, "url": canonical, "hasPart": shown.iter().take(20).map(|p| discussion(p, web, &channel, &p.author_name.clone().unwrap_or_default())).collect::<Vec<_>>() }));
     let mut site = site(&state, &viewer, root, canonical);
     site.in_app.push_str(&format!("&channel={}", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>()));
@@ -604,7 +730,10 @@ async fn post_page(State(state): State<Arc<AppState>>, Path((id, seq)): Path<(St
         Ok(found) => found,
         Err(error) => return internal(error.into()),
     };
-    let views: Vec<PostView> = around.iter().filter(|p| !p.deleted && shows(p, since)).map(|p| post_view(&state, p, &channel, root, Some(seq))).collect();
+    let listed: Vec<&Post> = around.iter().filter(|p| !p.deleted && shows(p, since)).collect();
+    let previews = super::preview::prepare(&state, &listed).await;
+    let mut views: Vec<PostView> = listed.iter().map(|p| post_view(&state, p, &channel, root, Some(seq), &previews)).collect();
+    mark_runs(&mut views);
     let author = post.author_name.clone().unwrap_or_else(|| "A member".to_string());
     let canonical = web.absolute(&format!("ch/{}/m/{seq}", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>()));
     let mut ld = discussion(&post, web, &channel, &author);
@@ -655,8 +784,10 @@ async fn thread_page(State(state): State<Arc<AppState>>, Path((id, thread)): Pat
         Err(error) => return internal(error.into()),
     };
     posts.reverse();
-    let mut views = vec![post_view(&state, &root_post, &channel, root, None)];
-    views.extend(posts.iter().filter(|p| !p.deleted && shows(p, since)).map(|p| post_view(&state, p, &channel, root, None)));
+    let listed: Vec<&Post> = std::iter::once(&root_post).chain(posts.iter().filter(|p| !p.deleted && shows(p, since))).collect();
+    let previews = super::preview::prepare(&state, &listed).await;
+    let mut views: Vec<PostView> = listed.iter().map(|p| post_view(&state, p, &channel, root, None, &previews)).collect();
+    mark_runs(&mut views);
     let name = root_post.grew.as_ref().and_then(|t| t.name.clone()).or_else(|| root_post.extra.as_ref().and_then(|e| e["title"].as_str().map(str::to_string))).unwrap_or_else(|| render::excerpt(&root_post.content, 60));
     let canonical = web.absolute(&format!("ch/{}/t/{}", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>(), url::form_urlencoded::byte_serialize(thread.as_bytes()).collect::<String>()));
     let mut ld = discussion(&root_post, web, &channel, &root_post.author_name.clone().unwrap_or_default());

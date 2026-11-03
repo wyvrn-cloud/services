@@ -139,38 +139,124 @@ pub async fn fetch(address: &str, now: i64) -> Result<(&'static str, Vec<u8>), S
 }
 
 async fn fetch_checked(url: &url::Url, stem: &str) -> Result<(&'static str, Vec<u8>), String> {
-    let host = url.host_str().ok_or("no host")?.to_string();
-    let port = url.port_or_known_default().unwrap_or(443);
-    let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port)).await.map_err(|e| e.to_string())?.collect();
-    let private_allowed = PRIVATE_HOSTS.load(Ordering::Relaxed);
-    let public = |address: &SocketAddr| private_allowed || super::oidc::public_address(address.ip());
-    let address = addresses.iter().find(|a| public(a)).copied().ok_or("not a public address")?;
-    if addresses.iter().any(|a| !public(a)) {
-        return Err("it also names a private address".into());
-    }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .resolve(&host, address)
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut response = client.get(url.as_str()).send().await.map_err(|e| e.to_string())?;
-    if !response.status().is_success() {
-        return Err(format!("HTTP {}", response.status()));
-    }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
-        bytes.extend_from_slice(&chunk);
-        if bytes.len() > MAX_BYTES {
-            return Err("over 2 MiB".into());
-        }
-    }
-    let hash: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+    let fetched = fetch_public(url, MAX_BYTES, AGENT, 0).await?;
+    let hash: String = Sha256::digest(&fetched.bytes).iter().map(|b| format!("{b:02x}")).collect();
     if !hash.starts_with(stem) {
         return Err("not what its name says".into());
     }
-    let media_type = picture_type(&bytes).ok_or("not a PNG, GIF or WebP")?;
-    Ok((media_type, bytes))
+    let media_type = picture_type(&fetched.bytes).ok_or("not a PNG, GIF or WebP")?;
+    Ok((media_type, fetched.bytes))
+}
+
+/// How this server names itself to the sites it fetches from.
+pub const AGENT: &str = "Mozilla/5.0 (compatible; WyvrnCommunity/1.0; +https://wyvrn.app)";
+
+/// What was fetched: its bytes, what its server said it is, and where it was in the
+/// end (after redirects).
+pub struct Fetched {
+    pub bytes: Vec<u8>,
+    pub content_type: Option<String>,
+    pub url: url::Url,
+}
+
+/// `url` fetched from the public web: over HTTP(S), only from a public address
+/// (looked up once per hop and used as looked up, so a name can't change its answer
+/// in between), following at most `redirects` redirects, each checked the same way,
+/// within ten seconds a hop, and no more than `most` bytes.
+pub async fn fetch_public(url: &url::Url, most: usize, agent: &str, redirects: usize) -> Result<Fetched, String> {
+    let private_allowed = PRIVATE_HOSTS.load(Ordering::Relaxed);
+    let mut url = url.clone();
+    for _ in 0..=redirects {
+        if !matches!(url.scheme(), "https" | "http") || !url.username().is_empty() || url.password().is_some() {
+            return Err("not an address to fetch".into());
+        }
+        let host = url.host_str().ok_or("no host")?.to_string();
+        let port = url.port_or_known_default().unwrap_or(443);
+        let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port)).await.map_err(|e| e.to_string())?.collect();
+        let public = |address: &SocketAddr| private_allowed || super::oidc::public_address(address.ip());
+        let address = addresses.iter().find(|a| public(a)).copied().ok_or("not a public address")?;
+        if addresses.iter().any(|a| !public(a)) {
+            return Err("it also names a private address".into());
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve(&host, address)
+            .user_agent(agent)
+            .build()
+            .map_err(|e| e.to_string())?;
+        let mut response = client.get(url.as_str()).send().await.map_err(|e| e.to_string())?;
+        if response.status().is_redirection() {
+            let next = response.headers().get(reqwest::header::LOCATION).and_then(|l| l.to_str().ok()).ok_or("a redirect to nowhere")?;
+            url = url.join(next).map_err(|e| e.to_string())?;
+            continue;
+        }
+        if !response.status().is_success() {
+            return Err(format!("HTTP {}", response.status()));
+        }
+        let content_type = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|t| t.to_str().ok()).map(str::to_ascii_lowercase);
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() > most {
+                return Err(format!("over {most} bytes"));
+            }
+        }
+        return Ok(Fetched { bytes, content_type, url });
+    }
+    Err("too many redirects".into())
+}
+
+/// A picture from a page's preview, as its first bytes say: PNG, JPEG, GIF or WebP.
+pub fn preview_picture_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\xFF\xD8\xFF") {
+        Some("image/jpeg")
+    } else {
+        picture_type(bytes)
+    }
+}
+
+/// The most a preview's picture may be.
+pub const MAX_PREVIEW_PICTURE: usize = 5 * 1024 * 1024;
+
+/// Where a page shows a picture from a link's preview (or a YouTube thumbnail): this
+/// server's `i/<key>`, signed, fetched and kept the first time it is asked for. The
+/// key is the start of the address's SHA-256.
+pub fn picture_href(secret: &str, root: &str, address: &str) -> Option<String> {
+    let url = url::Url::parse(address).ok().filter(|u| matches!(u.scheme(), "https" | "http"))?;
+    let from: String = url::form_urlencoded::byte_serialize(url.as_str().as_bytes()).collect();
+    Some(format!("{root}i/{}?from={from}&key={}", picture_key(url.as_str()), signature(secret, url.as_str())))
+}
+
+/// The key a picture from elsewhere is kept under.
+pub fn picture_key(address: &str) -> String {
+    let hash: String = Sha256::digest(address.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+    format!("u{}", &hash[..40])
+}
+
+/// Whether `key` is this server's signature on the picture at `address`, kept as `name`.
+pub fn picture_signed(secret: &str, name: &str, address: &str, key: &str) -> bool {
+    url::Url::parse(address).is_ok() && picture_key(address) == name && signature(secret, address) == key
+}
+
+/// A preview's picture fetched: up to three redirects, at most
+/// [`MAX_PREVIEW_PICTURE`], and only a PNG, JPEG, GIF or WebP.
+pub async fn fetch_preview_picture(address: &str, now: i64) -> Result<(&'static str, Vec<u8>), String> {
+    let key = picture_key(address);
+    if failed_lately(&key, now) {
+        return Err("tried lately".into());
+    }
+    let got = async {
+        let url = url::Url::parse(address).map_err(|e| e.to_string())?;
+        let fetched = fetch_public(&url, MAX_PREVIEW_PICTURE, AGENT, 3).await?;
+        let media_type = preview_picture_type(&fetched.bytes).ok_or("not a PNG, JPEG, GIF or WebP")?;
+        Ok::<_, String>((media_type, fetched.bytes))
+    }
+    .await;
+    if got.is_err() {
+        note_failed(&key, now);
+    }
+    got
 }
 
 #[cfg(test)]
