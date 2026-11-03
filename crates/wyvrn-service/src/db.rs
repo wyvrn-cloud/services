@@ -285,6 +285,7 @@ impl<T: FromValue> FromValue for Option<T> {
 }
 
 /// One row of an answer.
+#[derive(Clone)]
 pub struct Row(Vec<Value>);
 
 impl Row {
@@ -307,10 +308,133 @@ struct MySql {
     used: Instant,
 }
 
+/// How many statements this process has said to any database, for measuring what a
+/// request costs: each is a round trip to a MySQL server, wherever that is.
+static STATEMENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many statements this process has said so far ([`STATEMENTS`]).
+pub fn statements_said() -> u64 {
+    STATEMENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static TALLYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TALLY: Mutex<std::collections::BTreeMap<String, u64>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// For measuring: from now on (`true`) each statement said is counted by its text,
+/// from nothing, until called with `false`; [`statement_tally`] reads the counts.
+pub fn tally_statements(on: bool) {
+    TALLY.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    TALLYING.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Each statement said while tallying, with how many times, most first.
+pub fn statement_tally() -> Vec<(String, u64)> {
+    let mut tally: Vec<(String, u64)> = TALLY.lock().unwrap_or_else(|p| p.into_inner()).iter().map(|(sql, n)| (sql.clone(), *n)).collect();
+    tally.sort_by(|a, b| b.1.cmp(&a.1));
+    tally
+}
+
 /// A service's database.
 pub struct Db {
     backend: Mutex<Backend>,
     naming: Option<Naming>,
+    /// What is read from the tables named in [`Db::cache_reads`], kept for a while.
+    cache: OnceLock<ReadCache>,
+}
+
+/// Answers to queries that read only small tables that seldom change, kept so that
+/// a request asking the same thing many times (a setting per member, a member's
+/// roles per channel) asks the database once. Each statement is a round trip, and a
+/// MySQL server can be far away.
+///
+/// An answer is kept under its statement and parameters, with the tables it read.
+/// Any write this process makes to one of those tables drops it at once; a write by
+/// another process (a service's own command line) is seen when it expires. Nothing is
+/// kept or read inside a transaction.
+struct ReadCache {
+    tables: std::collections::HashSet<String>,
+    lifetime: Duration,
+    answers: Mutex<std::collections::HashMap<String, Kept>>,
+}
+
+struct Kept {
+    at: Instant,
+    tables: Vec<String>,
+    outcome: Outcome,
+}
+
+/// At most this many answers are kept; past it, all are let go and kept afresh.
+const MOST_KEPT: usize = 20_000;
+
+/// The table names a statement reads (each after `FROM` or `JOIN`), lower case.
+fn tables_read(sql: &str) -> Vec<String> {
+    let words: Vec<&str> = sql.split(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == ',').filter(|w| !w.is_empty()).collect();
+    let mut tables: Vec<String> = words
+        .windows(2)
+        .filter(|pair| pair[0].eq_ignore_ascii_case("from") || pair[0].eq_ignore_ascii_case("join"))
+        .map(|pair| pair[1].trim_matches(|c| c == '"' || c == '`').to_ascii_lowercase())
+        .collect();
+    tables.sort();
+    tables.dedup();
+    tables
+}
+
+/// The table a statement that changes something changes; `None` for a query, and
+/// `Some("")` for one whose table can't be told (anything kept is let go then).
+fn table_written(sql: &str) -> Option<String> {
+    let mut words = sql.split_whitespace();
+    let first = words.next()?.to_ascii_uppercase();
+    let name = |word: Option<&str>| word.unwrap_or_default().trim_matches(|c| c == '"' || c == '`' || c == '(').to_ascii_lowercase();
+    match first.as_str() {
+        "SELECT" | "WITH" => None,
+        "UPDATE" => Some(name(words.next())),
+        "INSERT" | "REPLACE" => {
+            let mut rest = words.skip_while(|w| !w.eq_ignore_ascii_case("into"));
+            rest.next();
+            Some(name(rest.next()))
+        }
+        "DELETE" => {
+            let mut rest = words.skip_while(|w| !w.eq_ignore_ascii_case("from"));
+            rest.next();
+            Some(name(rest.next()))
+        }
+        _ => Some(String::new()),
+    }
+}
+
+impl ReadCache {
+    /// Where `sql` with `params` would be kept: only a query reading nothing but
+    /// tables this cache is for.
+    fn key(&self, sql: &str, params: &[Value]) -> Option<(String, Vec<String>)> {
+        let tables = tables_read(sql);
+        if tables.is_empty() || !tables.iter().all(|table| self.tables.contains(table)) {
+            return None;
+        }
+        Some((format!("{sql}\u{0}{params:?}"), tables))
+    }
+
+    fn get(&self, key: &str) -> Option<Outcome> {
+        let answers = self.answers.lock().unwrap_or_else(|p| p.into_inner());
+        answers.get(key).filter(|kept| kept.at.elapsed() < self.lifetime).map(|kept| kept.outcome.clone())
+    }
+
+    fn keep(&self, key: String, tables: Vec<String>, outcome: &Outcome) {
+        let mut answers = self.answers.lock().unwrap_or_else(|p| p.into_inner());
+        if answers.len() >= MOST_KEPT {
+            answers.clear();
+        }
+        answers.insert(key, Kept { at: Instant::now(), tables, outcome: outcome.clone() });
+    }
+
+    /// Lets go of whatever was read from `table` (everything, for `""`).
+    fn written(&self, table: &str) {
+        let mut answers = self.answers.lock().unwrap_or_else(|p| p.into_inner());
+        if table.is_empty() {
+            answers.clear();
+        } else if self.tables.contains(table) {
+            answers.retain(|_, kept| !kept.tables.iter().any(|read| read == table));
+        }
+    }
 }
 
 /// What a store's tables are called where it shares a database (see
@@ -326,6 +450,7 @@ struct Naming {
 pub struct Session<'a> {
     backend: MutexGuard<'a, Backend>,
     naming: Option<&'a Naming>,
+    cache: Option<&'a ReadCache>,
     /// A shared connection, taken at the first statement and given back with the session.
     pooled: Option<mysql::PooledConn>,
     in_transaction: bool,
@@ -395,12 +520,12 @@ impl Db {
             None => connection.execute_batch(schema.sqlite)?,
             Some(naming) => connection.execute_batch(&renamed(schema.sqlite, naming))?,
         }
-        Ok(Self { backend: Mutex::new(Backend::Sqlite(connection)), naming })
+        Ok(Self { backend: Mutex::new(Backend::Sqlite(connection)), naming, cache: OnceLock::new() })
     }
 
     fn mysql(options: mysql::Opts, schema: &Schema, service: &str) -> Result<Self> {
         let connection = mysql_connection(&options)?;
-        let db = Self { backend: Mutex::new(Backend::MySql(Box::new(MySql { connection, options, used: Instant::now() }))), naming: None };
+        let db = Self { backend: Mutex::new(Backend::MySql(Box::new(MySql { connection, options, used: Instant::now() }))), naming: None, cache: OnceLock::new() };
         db.made(schema, service)?;
         Ok(db)
     }
@@ -421,7 +546,7 @@ impl Db {
         let pool = pool(server)?;
         pool.get_conn()?.query_drop(format!("CREATE DATABASE IF NOT EXISTS \"{database}\""))?;
         let naming = Naming { database: Some(database.to_string()), prefix: prefix.to_string() };
-        let db = Self { backend: Mutex::new(Backend::Pooled(pool)), naming: Some(naming) };
+        let db = Self { backend: Mutex::new(Backend::Pooled(pool)), naming: Some(naming), cache: OnceLock::new() };
         db.made(schema, service)?;
         Ok(db)
     }
@@ -456,9 +581,22 @@ impl Db {
         Session {
             backend: self.backend.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
             naming: self.naming.as_ref(),
+            cache: self.cache.get(),
             pooled: None,
             in_transaction: false,
         }
+    }
+
+    /// From now on, answers to queries that read only `tables` (as the schema names
+    /// them, without a prefix) are kept for `lifetime` ([`ReadCache`]). For small
+    /// tables that seldom change: settings, roles, who is who. Said once; later calls
+    /// change nothing.
+    pub fn cache_reads(&self, tables: &[&str], lifetime: Duration) {
+        let _ = self.cache.set(ReadCache {
+            tables: tables.iter().map(|table| table.to_ascii_lowercase()).collect(),
+            lifetime,
+            answers: Mutex::new(std::collections::HashMap::new()),
+        });
     }
 }
 
@@ -755,6 +893,7 @@ fn waiting<T>(work: impl FnOnce() -> T) -> T {
 }
 
 /// What a statement did, and what it answered with.
+#[derive(Clone)]
 struct Outcome {
     affected: usize,
     inserted: i64,
@@ -862,6 +1001,29 @@ impl Session<'_> {
     }
 
     fn say(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
+        let Some(cache) = self.cache else { return self.say_to_database(sql, params) };
+        if let Some(table) = table_written(sql) {
+            let said = self.say_to_database(sql, params);
+            cache.written(&table);
+            return said;
+        }
+        if self.in_transaction {
+            return self.say_to_database(sql, params);
+        }
+        let Some((key, tables)) = cache.key(sql, params) else { return self.say_to_database(sql, params) };
+        if let Some(outcome) = cache.get(&key) {
+            return Ok(outcome);
+        }
+        let outcome = self.say_to_database(sql, params)?;
+        cache.keep(key, tables, &outcome);
+        Ok(outcome)
+    }
+
+    fn say_to_database(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
+        STATEMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if TALLYING.load(std::sync::atomic::Ordering::Relaxed) {
+            *TALLY.lock().unwrap_or_else(|p| p.into_inner()).entry(sql.to_string()).or_default() += 1;
+        }
         let renamed_sql;
         let sql = match self.naming {
             Some(naming) => {
@@ -1005,6 +1167,11 @@ impl Session<'_> {
     /// Says a statement with no parameters and no answer (its tables named as the
     /// store's are).
     fn plainly(&mut self, sql: &str) -> Result<()> {
+        if let Some(cache) = self.cache {
+            if !matches!(sql.split_whitespace().next().map(str::to_ascii_uppercase).as_deref(), Some("BEGIN" | "START" | "COMMIT" | "ROLLBACK")) {
+                cache.written("");
+            }
+        }
         let sql = match self.naming {
             Some(naming) => renamed(sql, naming),
             None => sql.to_string(),
@@ -1121,6 +1288,60 @@ mod tests {
         let connection: i64 = one.lock().query_value("SELECT CONNECTION_ID()", params![]).unwrap();
         root.query_drop(format!("KILL {connection}")).unwrap();
         assert_eq!(one.lock().query_value::<i64>("SELECT size FROM things", params![]).unwrap(), 1);
+    }
+
+    #[test]
+    fn the_tables_a_statement_reads_and_writes_are_told() {
+        assert_eq!(tables_read("SELECT a FROM things WHERE b = ?1"), vec!["things"]);
+        assert_eq!(
+            tables_read("SELECT did, (SELECT at FROM member_left WHERE member_left.did = members.did) FROM members JOIN roles r ON r.id = 1"),
+            vec!["member_left", "members", "roles"]
+        );
+        assert_eq!(table_written("SELECT 1 FROM things"), None);
+        assert_eq!(table_written("UPDATE things SET size = 1"), Some("things".into()));
+        assert_eq!(table_written("INSERT OR REPLACE INTO settings (name, value) VALUES (?1, ?2)"), Some("settings".into()));
+        assert_eq!(table_written("INSERT INTO \"things\" (name) VALUES (?1)"), Some("things".into()));
+        assert_eq!(table_written("DELETE FROM things WHERE id = ?1"), Some("things".into()));
+        // Anything else may change anything.
+        assert_eq!(table_written("CREATE TABLE x (y TEXT)"), Some(String::new()));
+    }
+
+    #[test]
+    fn answers_read_from_cached_tables_are_kept_until_this_process_writes_to_them() {
+        let dir = std::env::temp_dir().join(format!("wyvrn-cache-test-{}", scratch_name()));
+        let location = Location::Sqlite(dir.join("cache.sqlite"));
+        let cached = Db::open(&location, &SCHEMA, "test").unwrap();
+        cached.cache_reads(&["things"], Duration::from_secs(60));
+        // Another process: what it writes is seen only once the answer expires.
+        let other = Db::open(&location, &SCHEMA, "test").unwrap();
+        let size = |db: &Db| db.lock().query_value::<i64>("SELECT size FROM things WHERE name = ?1", params!["a"]).unwrap();
+
+        cached.lock().execute("INSERT INTO things (name, size) VALUES (?1, 1)", params!["a"]).unwrap();
+        assert_eq!(size(&cached), 1);
+        other.lock().execute("UPDATE things SET size = 2 WHERE name = ?1", params!["a"]).unwrap();
+        assert_eq!(size(&cached), 1, "kept");
+        assert_eq!(size(&other), 2);
+
+        // This process's own write is seen at once.
+        cached.lock().execute("UPDATE things SET size = 3 WHERE name = ?1", params!["a"]).unwrap();
+        assert_eq!(size(&cached), 3);
+
+        // Inside a transaction nothing is kept or read from what is kept, and what it
+        // wrote is seen after, whether it was kept or undone.
+        let mut session = cached.lock();
+        let _: std::result::Result<(), Error> = session.transaction(|db| {
+            db.execute("UPDATE things SET size = 4 WHERE name = ?1", params!["a"])?;
+            assert_eq!(db.query_value::<i64>("SELECT size FROM things WHERE name = ?1", params!["a"])?, 4);
+            Err(Error::Other("undone".into()))
+        });
+        drop(session);
+        assert_eq!(size(&cached), 3);
+
+        // A query reading a table not named is never kept.
+        other.lock().execute("UPDATE things SET size = 5 WHERE name = ?1", params!["a"]).unwrap();
+        assert_eq!(cached.lock().query_value::<i64>("SELECT COUNT(*) FROM sqlite_master WHERE name = ?1", params!["things"]).unwrap(), 1);
+        drop((cached, other));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
