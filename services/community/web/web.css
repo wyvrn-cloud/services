@@ -80,7 +80,8 @@ main { min-width: 0; }
 .channel-head h1 { margin: 0; font-size: 1.5rem; }
 .topic { margin: .25rem 0 0; color: var(--muted); }
 .back { font-size: .9rem; }
-.paging { text-align: center; margin: 1rem 0; }
+.paging { text-align: center; margin: 1rem 0; min-height: 1.5rem; }
+.paging-status { font-size: .85rem; color: var(--muted); }
 .posts { list-style: none; margin: 0; padding: 0; }
 .post { display: grid; grid-template-columns: 40px minmax(0, 1fr); gap: .85rem; padding: .85rem .6rem; border-radius: var(--radius); scroll-margin-top: 5rem; }
 .post:hover { background: color-mix(in srgb, var(--surface) 60%, transparent); }
