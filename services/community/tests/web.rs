@@ -308,7 +308,7 @@ async fn absolute_addresses_come_from_the_settings_never_the_request() {
         let page = response.text().await.unwrap();
         assert!(page.contains(&format!("<link rel=\"canonical\" href=\"https://example.com/forum/ch/{general}/general\">")), "{page}");
         assert!(!page.contains("evil.example"));
-        assert!(page.contains("href=\"../../assets/web.css\""), "links inside are relative");
+        assert!(page.contains("href=\"../../assets/web.css?v="), "links inside are relative");
     }
     let bare = server.get("forum").await;
     assert_eq!(bare.status(), 308);
@@ -708,4 +708,16 @@ async fn links_have_previews_runs_are_cozy_and_reactions_show_custom_emoji() {
     // The custom emoji reaction is its picture, through this server.
     assert!(html.contains("<img class=\"emoji\" src=\"") && html.contains("alt=\":party:\""), "{html}");
     assert!(!html.contains("src=\"https://pack.example"), "{html}");
+}
+
+#[tokio::test]
+async fn the_stylesheet_and_script_are_named_by_version_and_kept_for_good() {
+    let server = start(Options::default()).await;
+    let (_, home) = server.text("").await;
+    let version = home.split("assets/web.css?v=").nth(1).and_then(|rest| rest.split('"').next()).expect("a versioned stylesheet").to_string();
+    assert!(home.contains(&format!("assets/web.js?v={version}")));
+    let kept = server.get(&format!("assets/web.css?v={version}")).await;
+    assert_eq!(kept.headers()[header::CACHE_CONTROL], "public, max-age=31536000, immutable");
+    // Asked for without it (a page from before the update), for an hour only.
+    assert_eq!(server.get("assets/web.css").await.headers()[header::CACHE_CONTROL], "public, max-age=3600");
 }

@@ -15,10 +15,10 @@
 {% if site.has_icon %}<meta property="og:image" content="{{ site.root }}icon">{% endif %}
 <meta name="twitter:card" content="summary">
 <meta name="color-scheme" content="light dark">
-<link rel="stylesheet" href="{{ site.root }}assets/web.css">
+<link rel="stylesheet" href="{{ site.root }}assets/web.css?v={{ site.assets() }}">
 <link rel="stylesheet" href="{{ site.root }}theme.css?v={{ site.theme }}">
 {% if site.has_icon %}<link rel="icon" href="{{ site.root }}icon">{% endif %}
-<script src="{{ site.root }}assets/web.js"></script>
+<script src="{{ site.root }}assets/web.js?v={{ site.assets() }}"></script>
 {% if !json_ld.is_empty() %}<script type="application/ld+json">{{ json_ld|safe }}</script>{% endif %}
 </head>
 <body>

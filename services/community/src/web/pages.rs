@@ -901,13 +901,37 @@ async fn theme_css(State(state): State<Arc<AppState>>, request: Request) -> Resp
 const STYLE: &str = include_str!("../../web/web.css");
 const SCRIPT: &str = include_str!("../../web/web.js");
 
-async fn asset(Path(file): Path<String>) -> Response {
+/// The start of the hash of the stylesheet and the script together: put in their
+/// addresses, so that a browser holding an older copy fetches them again after an
+/// update, and a copy can be kept for good.
+static ASSETS_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(format!("{STYLE}\n{SCRIPT}").as_bytes());
+    hash.iter().take(6).map(|b| format!("{b:02x}")).collect()
+});
+
+impl Site {
+    /// What the stylesheet's and the script's addresses carry ([`ASSETS_VERSION`]).
+    pub fn assets(&self) -> &'static str {
+        ASSETS_VERSION.as_str()
+    }
+}
+
+#[derive(Deserialize)]
+struct Versioned {
+    v: Option<String>,
+}
+
+async fn asset(Path(file): Path<String>, Query(versioned): Query<Versioned>) -> Response {
     let (body, kind) = match file.as_str() {
         "web.css" => (STYLE, "text/css; charset=utf-8"),
         "web.js" => (SCRIPT, "text/javascript; charset=utf-8"),
         _ => return nothing(),
     };
-    as_page(([(header::CONTENT_TYPE, kind), (header::CACHE_CONTROL, "public, max-age=3600")], body).into_response())
+    // Asked for by the version they are (`?v=`), so kept for good; asked for without
+    // it (a page from before), kept for an hour.
+    let kept = if versioned.v.as_deref() == Some(ASSETS_VERSION.as_str()) { "public, max-age=31536000, immutable" } else { "public, max-age=3600" };
+    as_page(([(header::CONTENT_TYPE, kind), (header::CACHE_CONTROL, kept)], body).into_response())
 }
 
 /// The fonts an admin may choose from, served from here (nothing from elsewhere).

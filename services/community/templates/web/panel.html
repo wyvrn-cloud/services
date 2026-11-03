@@ -6,9 +6,9 @@
 <meta name="robots" content="noindex">
 <meta name="color-scheme" content="light dark">
 <title>{{ title }} · {{ site.name }}</title>
-<link rel="stylesheet" href="{{ site.root }}assets/web.css">
+<link rel="stylesheet" href="{{ site.root }}assets/web.css?v={{ site.assets() }}">
 <link rel="stylesheet" href="{{ site.root }}theme.css?v={{ site.theme }}">
-<script src="{{ site.root }}assets/web.js"></script>
+<script src="{{ site.root }}assets/web.js?v={{ site.assets() }}"></script>
 </head>
 <body>
 <header class="top">
