@@ -19,11 +19,12 @@
       </header>
       {% if let Some(snippet) = post.reply_snippet %}<blockquote class="reply">{% if let Some(who) = post.reply_author %}<span class="author">{{ who }}</span> {% endif %}{{ snippet }}</blockquote>{% endif %}
       {% if let Some(title) = post.title %}<h2 class="title">{{ title }}</h2>{% endif %}
-      <div class="content">{{ post.html|safe }}</div>
+      <div class="content{% if post.emoji_only %} emoji-only{% endif %}">{{ post.html|safe }}</div>
       {% if !post.media.is_empty() %}
       <div class="media">
         {% for item in post.media %}
-          {% if item.kind == "image" %}<a href="{{ item.href }}"><img src="{{ item.href }}" alt="{{ item.name }}" loading="lazy"{% if let Some(w) = item.width %} width="{{ w }}"{% endif %}{% if let Some(h) = item.height %} height="{{ h }}"{% endif %}></a>
+          {% if item.kind == "sticker" %}<img class="sticker" src="{{ item.href }}" alt="{{ item.name }}" title="{{ item.name }}" loading="lazy"{% if let Some(w) = item.width %} width="{{ w }}"{% endif %}{% if let Some(h) = item.height %} height="{{ h }}"{% endif %}>
+          {% else if item.kind == "image" %}<a href="{{ item.href }}"><img src="{{ item.href }}" alt="{{ item.name }}" loading="lazy"{% if let Some(w) = item.width %} width="{{ w }}"{% endif %}{% if let Some(h) = item.height %} height="{{ h }}"{% endif %}></a>
           {% else if item.kind == "video" %}<video src="{{ item.href }}" controls preload="metadata"></video>
           {% else if item.kind == "audio" %}<audio src="{{ item.href }}" controls preload="none"></audio>
           {% else %}<a class="file" href="{{ item.href }}" download><span aria-hidden="true">📄</span> {{ item.name }} <span class="quiet">{{ item.size }}</span></a>{% endif %}

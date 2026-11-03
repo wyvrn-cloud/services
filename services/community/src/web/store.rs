@@ -124,6 +124,17 @@ impl Store {
         Ok(token)
     }
 
+    /// A pack file kept for the public pages ([`super::outside`]), by the start of
+    /// its hash: its type and its bytes in base64.
+    pub fn outside_picture(&self, stem: &str) -> Result<Option<(String, String)>> {
+        self.db.lock().query_row("SELECT media_type, data FROM web_outside WHERE stem = ?1", params![stem], |row| Ok((row.get(0)?, row.get(1)?)))
+    }
+
+    pub fn keep_outside_picture(&self, stem: &str, media_type: &str, base64: &str, now: i64) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO web_outside (stem, media_type, data, at) VALUES (?1, ?2, ?3, ?4)", params![stem, media_type, base64, now])?;
+        Ok(())
+    }
+
     pub fn picture_holder(&self, token: &str) -> Result<Option<String>> {
         self.db.lock().query_row("SELECT mkey FROM web_pictures WHERE token = ?1", params![token], |row| row.get(0))
     }

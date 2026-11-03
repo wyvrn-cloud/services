@@ -99,6 +99,12 @@ main { min-width: 0; }
 .reply .author { font-weight: 600; color: var(--text); }
 .media { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .5rem; }
 .media img, .media video { max-height: 360px; width: auto; border-radius: calc(var(--radius) / 1.5); border: 1px solid var(--border); background: var(--surface); }
+/* Pictures from packs and GIFs (web/outside.rs): an emoji sits in the line, a
+   sticker and a GIF stand on their own, with no frame. */
+.content img.emoji { height: 1.6em; width: auto; vertical-align: -0.4em; margin: 0 .05em; }
+.content.emoji-only img.emoji { height: 3em; }
+.media img.sticker { max-height: 160px; max-width: 160px; height: auto; border: 0; background: none; border-radius: 0; }
+.content img.gif { display: block; max-width: min(100%, 400px); max-height: 360px; height: auto; margin-top: .25rem; border-radius: calc(var(--radius) / 1.5); }
 .file { display: inline-flex; gap: .5rem; align-items: center; padding: .55rem .8rem; border: 1px solid var(--border); border-radius: calc(var(--radius) / 1.5); background: var(--surface); color: var(--text); }
 .reactions { list-style: none; display: flex; flex-wrap: wrap; gap: .35rem; margin: .5rem 0 0; padding: 0; }
 .reactions li { border: 1px solid var(--border); border-radius: 999px; padding: .05rem .55rem; font-size: .88rem; background: var(--surface); }

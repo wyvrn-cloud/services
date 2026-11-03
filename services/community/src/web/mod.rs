@@ -23,6 +23,7 @@
 
 pub mod flows;
 pub mod oidc;
+pub mod outside;
 pub mod pages;
 pub mod render;
 pub mod sign_in;
@@ -56,8 +57,10 @@ const SECRET: &str = "web.secret";
 pub const VOICE_CHOICES: [&str; 4] = ["off", "members", "counts", "names"];
 pub const DEFAULT_VOICE: &str = "counts";
 
-/// The CSP every page gets unless it sets its own.
-pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self'; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+/// The CSP every page gets unless it sets its own. Pictures come from this
+/// server, except KLIPY's GIFs, which its terms require visitors to fetch from it
+/// ([`outside`]).
+pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: https://static.klipy.com https://static1.klipy.com https://static2.klipy.com; media-src 'self'; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 /// A response is a page of the web view, which the outer layer gives its headers
 /// (and takes CORS off).

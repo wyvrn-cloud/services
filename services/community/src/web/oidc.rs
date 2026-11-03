@@ -233,7 +233,7 @@ async fn indieauth_client(client_id: &str) -> Option<Client> {
     client
 }
 
-fn public_address(address: IpAddr) -> bool {
+pub(super) fn public_address(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(v4) => !(v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast() || v4.is_documentation() || v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]) || v4.octets()[0] >= 224),
         IpAddr::V6(v6) => {

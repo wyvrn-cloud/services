@@ -29,6 +29,12 @@ fn followable(url: &str) -> bool {
 
 /// A post's Markdown, as HTML that runs nothing and fetches nothing.
 pub fn markdown(text: &str) -> String {
+    markdown_with(text, &|_, _| None)
+}
+
+/// [`markdown`], except that a picture `shown` gives an address for (from its own
+/// address and its words) is drawn there, small, as a custom emoji is.
+pub fn markdown_with(text: &str, shown: &dyn Fn(&str, &str) -> Option<String>) -> String {
     let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
     let mut events = Vec::new();
     // Inside a picture, its words are gathered for the link that stands for it.
@@ -39,6 +45,12 @@ pub fn markdown(text: &str) -> String {
             match event {
                 Event::End(TagEnd::Image) => {
                     let (address, words) = picture.take().unwrap_or_default();
+                    if let Some(source) = shown(&address, &words) {
+                        let name = words.trim().trim_matches(':');
+                        let name = if name.is_empty() { "emoji".to_string() } else { format!(":{name}:") };
+                        events.push(Event::Html(CowStr::from(format!("<img class=\"emoji\" src=\"{}\" alt=\"{}\" title=\"{}\" loading=\"lazy\">", escape(&source), escape(&name), escape(&name)))));
+                        continue;
+                    }
                     let words = if words.trim().is_empty() { "picture".to_string() } else { words };
                     if followable(&address) {
                         events.push(Event::Html(CowStr::from(format!("<a href=\"{}\" rel=\"nofollow ugc noopener noreferrer\">{}</a>", escape(&address), escape(&words)))));
@@ -79,6 +91,26 @@ pub fn markdown(text: &str) -> String {
     let mut rendered = String::new();
     html::push_html(&mut rendered, events.into_iter());
     rendered
+}
+
+/// Whether `text` says nothing but pictures (custom emoji), up to `most` of them:
+/// a post an app draws large.
+pub fn only_pictures(text: &str, most: usize) -> bool {
+    let mut pictures = 0;
+    let mut inside = 0;
+    for event in Parser::new(text) {
+        match event {
+            Event::Start(Tag::Image { .. }) => {
+                pictures += 1;
+                inside += 1;
+            }
+            Event::End(TagEnd::Image) => inside -= 1,
+            Event::Start(Tag::Paragraph) | Event::End(TagEnd::Paragraph) | Event::SoftBreak => {}
+            Event::Text(said) if inside > 0 || said.trim().is_empty() => {}
+            _ => return false,
+        }
+    }
+    (1..=most).contains(&pictures)
 }
 
 /// Up to `most` characters of what a post says, as plain text on one line: a

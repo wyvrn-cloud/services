@@ -805,6 +805,14 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         token TEXT PRIMARY KEY,
         mkey TEXT NOT NULL
     );
+    -- Pack files (custom emoji, stickers) a public page shows, fetched once and
+    -- kept by the start of their hash (web/outside.rs).
+    CREATE TABLE IF NOT EXISTS web_outside (
+        stem TEXT PRIMARY KEY,
+        media_type TEXT NOT NULL,
+        data TEXT NOT NULL,
+        at INTEGER NOT NULL
+    );
     -- The identity provider (community-sign-in/1.0).
     CREATE TABLE IF NOT EXISTS oidc_clients (
         id TEXT PRIMARY KEY,
@@ -1162,6 +1170,12 @@ fn schema() -> Schema {
             CREATE TABLE IF NOT EXISTS web_pictures (
                 token VARCHAR(64) NOT NULL PRIMARY KEY,
                 mkey VARCHAR(64) NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS web_outside (
+                stem VARCHAR(64) NOT NULL PRIMARY KEY,
+                media_type VARCHAR(32) NOT NULL,
+                data MEDIUMTEXT NOT NULL,
+                at BIGINT NOT NULL
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS oidc_clients (
                 id VARCHAR(255) NOT NULL PRIMARY KEY,

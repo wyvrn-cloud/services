@@ -45,6 +45,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/icon", get(icon))
         .route("/p/{token}", get(picture))
         .route("/media/{post}/{n}", get(media))
+        .route("/x/{file}", get(outside_file))
 }
 
 // --- Who is looking -------------------------------------------------------------------
@@ -133,7 +134,7 @@ pub struct Group {
 }
 
 pub struct Media {
-    /// `image`, `video`, `audio` or `file`.
+    /// `image`, `video`, `audio`, `sticker` or `file`.
     pub kind: &'static str,
     pub href: String,
     pub name: String,
@@ -157,6 +158,8 @@ pub struct PostView {
     pub reply_author: Option<String>,
     pub reply_snippet: Option<String>,
     pub media: Vec<Media>,
+    /// Nothing but custom emoji: drawn large, as the app does.
+    pub emoji_only: bool,
     pub reactions: Vec<(String, usize)>,
     pub thread_href: Option<String>,
     pub thread_count: i64,
@@ -311,12 +314,30 @@ fn post_view(state: &AppState, post: &Post, channel: &Channel, root: &str, focus
     let author = post.author_name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "A member".to_string());
     let extra = post.extra.clone().unwrap_or(Value::Null);
     let attachments: HashMap<&str, &Value> = extra["attachments"].as_array().into_iter().flatten().filter_map(|a| Some((a["id"].as_str()?, a))).collect();
+    // Pack files (custom emoji, stickers) are shown through this server (outside.rs).
+    let secret = super::secret(&state.community.store).ok();
+    let through_here = |address: &str| secret.as_deref().and_then(|secret| super::outside::href(secret, root, address));
     let media = extra["media"]
         .as_array()
         .into_iter()
         .flatten()
         .enumerate()
         .filter_map(|(n, item)| {
+            if item["kind"] == "sticker" {
+                let sticker = &item["sticker"];
+                let (pack, file) = (sticker["pack"].as_str()?, sticker["file"].as_str()?);
+                // The name and the hash it was sent with have to agree, as the app has it.
+                let (stem, _) = super::outside::pack_file(file)?;
+                sticker["sha256"].as_str().filter(|hash| hash.starts_with(stem))?;
+                return Some(Media {
+                    kind: "sticker",
+                    href: through_here(&format!("{}/{file}", pack.trim_end_matches('/')))?,
+                    name: sticker["emoji"].as_str().map(|e| e.chars().take(64).collect()).unwrap_or_else(|| "Sticker".to_string()),
+                    size: String::new(),
+                    width: sticker["width"].as_i64(),
+                    height: sticker["height"].as_i64(),
+                });
+            }
             let attachment = attachments.get(item["attachment"].as_str()?)?;
             let media_type = attachment["media_type"].as_str().unwrap_or("application/octet-stream");
             let kind = if inline_type(media_type) {
@@ -349,12 +370,21 @@ fn post_view(state: &AppState, post: &Post, channel: &Channel, root: &str, focus
         author,
         when: render::when(post.posted_at),
         iso: render::iso(post.posted_at),
-        html: render::markdown(&post.content),
+        html: if super::outside::is_gif(&post.content) {
+            super::outside::gif_html(&post.content)
+        } else {
+            render::markdown_with(&post.content, &|address, _| {
+                let file = url::Url::parse(address).ok()?.path_segments()?.next_back()?.to_string();
+                super::outside::pack_file(&file)?;
+                through_here(address)
+            })
+        },
         title: extra["title"].as_str().map(str::to_string),
         edited: post.edited_at.is_some(),
         reply_author: post.reply_to.as_ref().and(post.reply_author.as_deref()).map(|did| name_of(state, did)),
         reply_snippet: post.reply_snippet.clone(),
         media,
+        emoji_only: render::only_pictures(&post.content, 25),
         reactions: post.reactions.iter().map(|(emoji, who)| (if emoji.starts_with("![") { emoji.split(']').next().unwrap_or("").trim_start_matches("![").to_string() } else { emoji.clone() }, who.len())).collect(),
         thread_href: thread.map(|t| format!("{ch}/t/{}", url::form_urlencoded::byte_serialize(t.id.as_bytes()).collect::<String>())),
         thread_count: thread.map_or(0, |t| t.count),
@@ -362,6 +392,50 @@ fn post_view(state: &AppState, post: &Post, channel: &Channel, root: &str, focus
         pinned: post.pinned,
         focus: focus == Some(post.seq),
     }
+}
+
+#[derive(Deserialize)]
+struct OutsideQuery {
+    from: String,
+    key: String,
+}
+
+/// A pack file (a custom emoji, a sticker) a page named: kept here, or fetched once
+/// and kept if it is what its name says (outside.rs). Only addresses this server
+/// signed are fetched.
+async fn outside_file(State(state): State<Arc<AppState>>, Path(file): Path<String>, Query(asked): Query<OutsideQuery>) -> Response {
+    use base64::Engine;
+    let store = &state.community.store;
+    if !page_on(store) {
+        return nothing();
+    }
+    let Some((stem, _)) = super::outside::pack_file(&file) else { return nothing() };
+    let Ok(secret) = super::secret(store) else { return nothing() };
+    if !super::outside::signed(&secret, &file, &asked.from, &asked.key) {
+        return nothing();
+    }
+    let kept = match store.outside_picture(stem) {
+        Ok(Some(kept)) => Some(kept),
+        Ok(None) => match super::outside::fetch(&asked.from, crate::gates::now()).await {
+            Ok((media_type, bytes)) => {
+                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                if let Err(error) = store.keep_outside_picture(stem, media_type, &data, crate::gates::now()) {
+                    tracing::warn!(%error, "couldn't keep a pack file for the pages");
+                }
+                Some((media_type.to_string(), data))
+            }
+            Err(why) => {
+                tracing::debug!(file = %file, %why, "a pack file a page names couldn't be had");
+                None
+            }
+        },
+        Err(_) => None,
+    };
+    let Some((media_type, data)) = kept else { return nothing() };
+    let mut response = picture_response(&media_type, &data);
+    // Named for its hash: it never changes.
+    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=31536000, immutable"));
+    response
 }
 
 /// A picture, a video or a sound a page may show where it is; anything else is

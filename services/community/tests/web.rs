@@ -570,3 +570,90 @@ async fn websites_register_themselves_only_where_an_admin_allows_and_are_unverif
     assert!(css.contains("Source Serif 4"));
     assert!(css.contains("--accent: #123456"));
 }
+
+#[tokio::test]
+async fn custom_emoji_and_stickers_are_shown_through_the_community_and_gifs_from_klipy() {
+    use sha2::{Digest, Sha256};
+    wyvrn_community::web::outside::allow_private_hosts();
+    // A pack host: one file that is what its name says, one that isn't.
+    let picture = b"\x89PNG\r\n\x1a\na very small picture".to_vec();
+    let stem: String = Sha256::digest(&picture).iter().map(|b| format!("{b:02x}")).collect::<String>()[..32].to_string();
+    let liar = "0123456789abcdef0123456789abcdef";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pack = format!("http://{}/pack", listener.local_addr().unwrap());
+    let fetched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (served, counted) = (picture.clone(), fetched.clone());
+    let app = Router::new().route(
+        "/pack/{file}",
+        axum::routing::get(move |axum::extract::Path(file): axum::extract::Path<String>| {
+            let (served, counted) = (served.clone(), counted.clone());
+            async move {
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if file.ends_with(".png") { served } else { Vec::new() }
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let server = start(Options::default()).await;
+    let (admin, _member) = with_channels(&server).await;
+    let general = server.channel_id("general");
+    admin.community("update-channel", json!({ "channel": general, "web": { "public": true, "history": true } })).await;
+    say(&admin, &server, "general", &format!("hello ![party]({pack}/{stem}.png) there")).await;
+    say(&admin, &server, "general", &format!("![party]({pack}/{stem}.png)")).await;
+    say(&admin, &server, "general", &format!("![fake]({pack}/{liar}.png)")).await;
+    say(&admin, &server, "general", "https://static.klipy.com/ii/abc/7a/be/t0TOtOCr.webp").await;
+    let sha256: String = Sha256::digest(&picture).iter().map(|b| format!("{b:02x}")).collect();
+    let sticker = json!({ "pack": pack, "id": stem, "file": format!("{stem}.png"), "media_type": "image/png", "width": 512, "height": 512, "sha256": sha256, "emoji": "🎉" });
+    let posted = admin
+        .community(
+            "post",
+            json!({
+                "channel": general,
+                "id": uuid::Uuid::new_v4().to_string(),
+                "content": "🎉",
+                "media": [{ "attachment": "s", "kind": "sticker", "sticker": sticker }],
+                "attachments": [{ "id": "s", "media_type": "image/png", "data": { "links": [format!("{pack}/{stem}.png")], "hash": "the multihash the app sends" } }],
+            }),
+        )
+        .await;
+    assert_eq!(posted["type"], format!("{C}posted"), "{posted}");
+
+    let response = server.get(&format!("ch/{general}/general")).await;
+    let policy = response.headers()["content-security-policy"].to_str().unwrap().to_string();
+    assert!(policy.contains("img-src 'self' data: https://static.klipy.com"), "{policy}");
+    let page = response.text().await.unwrap();
+    // The GIF from KLIPY, as itself; emoji and the sticker at this server, never at the pack.
+    assert!(page.contains("<img class=\"gif\" src=\"https://static.klipy.com/ii/abc/7a/be/t0TOtOCr.webp\""), "{page}");
+    assert!(page.contains("class=\"emoji\""), "{page}");
+    assert!(page.contains("class=\"content emoji-only\""), "a post of nothing but emoji is drawn large");
+    assert!(page.contains("class=\"sticker\""), "{page}");
+    assert!(!page.contains(&format!("src=\"{pack}")), "nothing is fetched from the pack by a visitor");
+    // (Addresses on a page are relative to it: `../../x/...` from a channel's.)
+    let hrefs: Vec<String> = page
+        .split("src=\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .filter_map(|src| src.find("x/").map(|at| format!("/{}", &src[at..])))
+        .map(|src| src.replace("&amp;", "&"))
+        .collect();
+    let good = hrefs.iter().find(|h| h.contains(&stem)).expect("a picture at this server").clone();
+    let bad = hrefs.iter().find(|h| h.contains(liar)).expect("the other one too").clone();
+
+    // Served from here once fetched, and fetched once.
+    let shown = server.get(good.trim_start_matches('/')).await;
+    assert_eq!(shown.status(), 200);
+    assert_eq!(shown.headers()["content-type"], "image/png");
+    assert_eq!(shown.bytes().await.unwrap().to_vec(), picture);
+    let before = fetched.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(server.get(good.trim_start_matches('/')).await.status(), 200);
+    assert_eq!(fetched.load(std::sync::atomic::Ordering::Relaxed), before, "kept, not fetched again");
+    // A file that isn't what its name says isn't shown.
+    assert_eq!(server.get(bad.trim_start_matches('/')).await.status(), 404);
+    // Only what this server signed is fetched: another address, or a made-up key, is nothing.
+    let forged = good.replace(&pack.replace(':', "%3A").replace('/', "%2F"), "http%3A%2F%2F127.0.0.1%3A1%2Fpack");
+    assert_ne!(forged, good);
+    assert_eq!(server.get(forged.trim_start_matches('/')).await.status(), 404);
+    let unsigned = format!("{}key=00000000000000000000000000000000", good.split("key=").next().unwrap());
+    assert_eq!(server.get(unsigned.trim_start_matches('/')).await.status(), 404);
+}
