@@ -246,6 +246,39 @@ fn send_changed(state: &Arc<AppState>, notice: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Tells everyone joined, but `except`, what the community now is to them -- after
+/// whoever caused it has had their answer. Making each member's account of it reads
+/// the store for every one of them, which is no reason to keep the asker waiting.
+fn tell_everyone_later(state: &Arc<AppState>, except: Option<String>) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let notices = match state.community.community_notices() {
+            Ok(notices) => notices,
+            Err(error) => return tracing::warn!(%error, "couldn't tell members what changed in the community"),
+        };
+        for (did, notice) in notices {
+            if except.as_deref() != Some(did.as_str()) {
+                send_later(&state, did, notice);
+            }
+        }
+    });
+}
+
+/// [`send_changed`] for post `id` as it stands, after whoever changed it has had
+/// their answer.
+fn send_changed_later(state: &Arc<AppState>, id: String) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let sent = state.community.store.post_by_id(&id).map_err(anyhow::Error::from).and_then(|post| match post {
+            Some(post) => send_changed(&state, &state.community.changed_notice(&post)),
+            None => Ok(()),
+        });
+        if let Err(error) = sent {
+            tracing::warn!(post = %id, %error, "couldn't send a changed post");
+        }
+    });
+}
+
 /// Sends `message` to `did` without holding up whoever caused it.
 fn send_later(state: &Arc<AppState>, did: String, message: Value) {
     let state = state.clone();
@@ -388,9 +421,7 @@ impl CommunityService {
                 }
                 // Roles or permissions changed: everyone joined is told what they may do now.
                 if handled.community_changed {
-                    for (did, notice) in state.community.community_notices()? {
-                        send_later(state, did, notice);
-                    }
+                    tell_everyone_later(state, None);
                 }
                 return Ok(match handled.answer {
                     Some(Ok((message_type, body))) => Some(received.reply(&message_type, body)),
@@ -451,19 +482,13 @@ impl CommunityService {
         }
         if outcome.channels_changed {
             // Everyone else who has joined: whoever asked has it as their answer.
-            for (did, notice) in state.community.community_notices()? {
-                if did != sender {
-                    send_later(state, did, notice);
-                }
-            }
+            tell_everyone_later(state, Some(sender.clone()));
         }
         // A post that changed is sent, as it now stands, to everyone who has joined:
         // whoever asked included, for their other devices. Not kept for anyone who
         // can't be reached now: they ask for what changed when they are back.
         for id in &outcome.changed {
-            if let Some(post) = state.community.store.post_by_id(id)? {
-                send_changed(state, &state.community.changed_notice(&post))?;
-            }
+            send_changed_later(state, id.clone());
         }
         if outcome.posted {
             if outcome.posted_id.is_some() {
