@@ -356,10 +356,19 @@ fn name_of(state: &AppState, did: &str) -> String {
     state.community.store.member(did).ok().flatten().and_then(|m| m.name).unwrap_or_else(|| "A member".to_string())
 }
 
+/// The picture a member is shown with here: the one they chose for this community
+/// (community/1.0's Profiles, `here`), else their profile's. `(media type, base64)`.
+fn shown_picture(store: &crate::store::Store, did: &str) -> Option<(String, String)> {
+    if let Some(picture) = store.member_here(did).ok().flatten().and_then(|here| here.picture) {
+        return Some(picture);
+    }
+    store.member_picture(did).ok().flatten().map(|(media_type, data, _)| (media_type, data))
+}
+
 /// A member's picture address, as the public pages show it.
 fn picture_href(state: &AppState, did: &str, root: &str) -> Option<String> {
     let store = &state.community.store;
-    store.member_picture(did).ok().flatten()?;
+    shown_picture(store, did)?;
     let secret = super::secret(store).ok()?;
     let token = store.picture_token(&store.member_key(did).ok()?, "pages", &secret).ok()?;
     Some(format!("{root}p/{token}"))
@@ -941,8 +950,8 @@ fn picture_response(media_type: &str, base64_data: &str) -> Response {
 async fn picture(State(state): State<Arc<AppState>>, Path(token): Path<String>) -> Response {
     let store = &state.community.store;
     let Some(member) = store.picture_holder(&token).ok().flatten().and_then(|mkey| store.member_by_key(&mkey).ok().flatten()) else { return nothing() };
-    match store.member_picture(&member.did).ok().flatten() {
-        Some((media_type, data, _)) => picture_response(&media_type, &data),
+    match shown_picture(store, &member.did) {
+        Some((media_type, data)) => picture_response(&media_type, &data),
         None => nothing(),
     }
 }

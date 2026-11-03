@@ -279,6 +279,36 @@ fn send_changed_later(state: &Arc<AppState>, id: String) {
     });
 }
 
+/// When each member was last asked for their profile, by DID.
+static PROFILE_ASKED: std::sync::Mutex<Option<std::collections::HashMap<String, i64>>> = std::sync::Mutex::new(None);
+
+/// Asks a member this server holds no picture or profile for to send theirs
+/// (user-profile/1.0's `request-profile`), at most once a day: a member who joined
+/// before the server kept pictures (or whose app sent only a name) is otherwise
+/// never asked again, and is shown without a picture to everyone, on the web too.
+fn ask_for_profile(state: &Arc<AppState>, did: &str) {
+    let store = &state.community.store;
+    let lacking = matches!(store.member(did), Ok(Some(_)))
+        && matches!(store.member_picture(did), Ok(None))
+        && matches!(store.member_profile(did), Ok(None));
+    if !lacking {
+        return;
+    }
+    let at = now();
+    {
+        let mut asked = PROFILE_ASKED.lock().unwrap_or_else(|p| p.into_inner());
+        let asked = asked.get_or_insert_with(std::collections::HashMap::new);
+        if asked.get(did).is_some_and(|then| at - then < 24 * 60 * 60) {
+            return;
+        }
+        if asked.len() > 100_000 {
+            asked.clear();
+        }
+        asked.insert(did.to_string(), at);
+    }
+    send_later(state, did.to_string(), json!({ "type": community::REQUEST_PROFILE, "id": uuid::Uuid::new_v4().to_string(), "body": {} }));
+}
+
 /// Sends `message` to `did` without holding up whoever caused it.
 fn send_later(state: &Arc<AppState>, did: String, message: Value) {
     let state = state.clone();
@@ -468,6 +498,9 @@ impl CommunityService {
             &received.message
         };
         let outcome = state.community.handle(&sender, message, now())?;
+        if message["type"] != community::PROFILE {
+            ask_for_profile(state, &sender);
+        }
         for (did, notice) in outcome.notices {
             send_later(state, did, notice);
         }

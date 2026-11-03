@@ -78,6 +78,7 @@ const CHANGES_BATCH: usize = 100;
 
 pub const USER_PROFILE: &str = "https://didcomm.org/user-profile/1.0";
 pub const PROFILE: &str = "https://didcomm.org/user-profile/1.0/profile";
+pub const REQUEST_PROFILE: &str = "https://didcomm.org/user-profile/1.0/request-profile";
 pub const PROBLEM_REPORT: &str = "https://didcomm.org/report-problem/2.0/problem-report";
 
 pub const DEFAULT_HISTORY_LIMIT: usize = 30;

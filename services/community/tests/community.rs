@@ -80,8 +80,12 @@ impl Peer {
         self.next_of(&format!("{C}message")).await["body"].clone()
     }
 
+    /// Nothing more arrives (but the server asking once for a profile it doesn't hold).
     async fn nothing_more(&self) {
-        if let Ok(got) = tokio::time::timeout(Duration::from_millis(400), self.inbox.lock().await.recv()).await {
+        while let Ok(got) = tokio::time::timeout(Duration::from_millis(400), self.inbox.lock().await.recv()).await {
+            if got.as_ref().is_some_and(|message| message["type"] == "https://didcomm.org/user-profile/1.0/request-profile") {
+                continue;
+            }
             panic!("expected nothing more, got {got:?}");
         }
     }
@@ -1952,4 +1956,18 @@ fn a_member_who_changes_did_keeps_their_member_id_and_is_one_member() {
     assert_eq!(store.did_of_member(&written_first).unwrap().as_deref(), Some(new), "the other still finds them");
     assert_eq!(store.did_of_member(&id).unwrap().as_deref(), Some(new));
     assert_eq!(store.current_did(old).unwrap(), new);
+}
+
+#[tokio::test]
+async fn a_member_the_server_holds_no_profile_for_is_asked_for_it() {
+    let server = start_server("").await;
+    let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member]);
+    let channel = open_channel(&admin, "general").await;
+    member.community("join", json!({})).await;
+    // Joined before the server kept pictures: nothing held for them.
+    let posted = member.community("post", json!({ "channel": channel, "content": "hello" })).await;
+    assert_eq!(kind(&posted), "posted", "{posted}");
+    let asked = member.next_of("https://didcomm.org/user-profile/1.0/request-profile").await;
+    assert_eq!(asked["body"], json!({}));
 }
