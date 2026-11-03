@@ -455,6 +455,35 @@ fn invite_from(row: &Row) -> Result<Invite> {
     Ok(Invite { code: row.get(0)?, uses_left: row.get(1)?, expires_at: row.get(2)?, note: row.get(3)?, created_at: row.get(4)?, created_by: row.get(5)? })
 }
 
+/// The tables whose answers are kept ([`Store::with_cache`]): small, and read far
+/// more often than they change.
+const CACHED_TABLES: &[&str] = &[
+    "settings",
+    "members",
+    "member_left",
+    "superseded",
+    "member_ids",
+    "member_profiles",
+    "member_pictures",
+    "member_here",
+    "roles",
+    "member_roles",
+    "channel_overrides",
+    "categories",
+    "channel_order",
+    "channel_voice",
+    "channel_slow",
+    "channel_forum",
+    "notify_prefs",
+    "web_channels",
+    "timeouts",
+    "rules_accepted",
+    "presence",
+];
+
+/// How long an answer read from [`CACHED_TABLES`] is kept.
+const CACHE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(30);
+
 const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         did TEXT PRIMARY KEY,
         role TEXT NOT NULL,
@@ -1209,11 +1238,21 @@ fn schema() -> Schema {
 
 impl Store {
     pub fn open(location: &Location) -> anyhow::Result<Self> {
-        Ok(Self { db: Db::open(location, &schema(), "community")? })
+        Ok(Self::with_cache(Db::open(location, &schema(), "community")?))
+    }
+
+    /// Who is who, what each role may do, and the community's settings are asked
+    /// for many times in one request (once per member, per channel): kept for a
+    /// while rather than asked of the database each time, which may be far away.
+    /// This process's own writes are seen at once; another's (`wyvrn-community add`
+    /// while the server runs) within [`CACHE_LIFETIME`].
+    fn with_cache(db: Db) -> Self {
+        db.cache_reads(CACHED_TABLES, CACHE_LIFETIME);
+        Self { db }
     }
 
     pub fn in_memory() -> anyhow::Result<Self> {
-        Ok(Self { db: Db::scratch(&schema())? })
+        Ok(Self::with_cache(Db::scratch(&schema())?))
     }
 
     // --- Members ---------------------------------------------------------------
@@ -1642,7 +1681,10 @@ impl Store {
 
     /// When `did`'s timeout ends, if they are timed out at `now`.
     pub fn timed_out_until(&self, did: &str, now: i64) -> Result<Option<i64>> {
-        self.db.lock().query_row("SELECT until FROM timeouts WHERE did = ?1 AND until > ?2", params![did, now], |row| row.get(0))
+        // Compared here, not in the statement, so that the answer can be kept
+        // ([`CACHED_TABLES`]): with `now` in it, it would be another question each second.
+        let until: Option<i64> = self.db.lock().query_row("SELECT until FROM timeouts WHERE did = ?1", params![did], |row| row.get(0))?;
+        Ok(until.filter(|until| *until > now))
     }
 
     pub fn set_slow_mode(&self, channel: &str, seconds: i64) -> Result<()> {
@@ -1998,8 +2040,60 @@ impl Store {
         Ok(post)
     }
 
-    fn all_filled(&self, posts: Vec<Post>) -> Result<Vec<Post>> {
-        posts.into_iter().map(|post| self.filled(post)).collect()
+    /// [`Store::filled`] for every one of `posts`, in three statements rather than
+    /// three for each: each is a round trip, and a database may be far away.
+    fn all_filled(&self, mut posts: Vec<Post>) -> Result<Vec<Post>> {
+        if posts.len() < 2 {
+            return posts.into_iter().map(|post| self.filled(post)).collect();
+        }
+        let ids: Vec<wyvrn_service::db::Value> = posts.iter().map(|post| wyvrn_service::db::ToValue::to_value(&post.id)).collect();
+        let marks = |count: usize| (1..=count).map(|n| format!("?{n}")).collect::<Vec<_>>().join(", ");
+        let place: std::collections::HashMap<String, usize> = posts.iter().enumerate().map(|(n, post)| (post.id.clone(), n)).collect();
+        let at = |id: &str| place.get(id).copied();
+        let mut db = self.db.lock();
+        let reactions = db.query(
+            &format!("SELECT post, emoji, did FROM reactions WHERE post IN ({}) ORDER BY at, emoji, did", marks(ids.len())),
+            &ids,
+            |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?, row.get::<String>(2)?)),
+        )?;
+        for (id, emoji, did) in reactions {
+            let Some(n) = at(&id) else { continue };
+            let post = &mut posts[n];
+            match post.reactions.iter_mut().find(|(known, _)| *known == emoji) {
+                Some((_, by)) => by.push(did),
+                None => post.reactions.push((emoji, vec![did])),
+            }
+        }
+        let polls: Vec<wyvrn_service::db::Value> = posts
+            .iter()
+            .filter(|post| post.extra.as_ref().is_some_and(|extra| extra.get("poll").is_some()))
+            .map(|post| wyvrn_service::db::ToValue::to_value(&post.id))
+            .collect();
+        if !polls.is_empty() {
+            let votes = db.query(&format!("SELECT post, did, answers FROM votes WHERE post IN ({}) ORDER BY at, did", marks(polls.len())), &polls, |row| {
+                Ok((row.get::<String>(0)?, row.get::<String>(1)?, list_from(row.get(2)?)))
+            })?;
+            for (id, did, answers) in votes {
+                if let Some(n) = at(&id) {
+                    posts[n].votes.push((did, answers));
+                }
+            }
+        }
+        let threads = db.query(
+            &format!(
+                "SELECT id, channel, name, created_by, created_at, (SELECT COUNT(*) FROM post_state WHERE post_state.thread = threads.id), \
+                 (SELECT MAX(posted_at) FROM posts WHERE posts.id IN (SELECT post FROM post_state WHERE post_state.thread = threads.id)) FROM threads WHERE id IN ({})",
+                marks(ids.len())
+            ),
+            &ids,
+            |row| Ok(Thread { id: row.get(0)?, channel: row.get(1)?, name: row.get(2)?, created_by: row.get(3)?, created_at: row.get(4)?, count: row.get(5)?, last_at: row.get(6)? }),
+        )?;
+        for thread in threads {
+            if let Some(n) = at(&thread.id) {
+                posts[n].grew = Some(thread);
+            }
+        }
+        Ok(posts)
     }
 
     /// Gives `post` the next place among changes, making the record of what is said
