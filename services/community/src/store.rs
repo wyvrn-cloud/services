@@ -292,6 +292,8 @@ const POST_COLUMNS: &str = "serial, channel, seq, id, content, posted_at, author
     (SELECT removed_by FROM post_removals WHERE post_removals.post = posts.id), \
     (SELECT channel FROM post_voice_invites WHERE post_voice_invites.post = posts.id), \
     (SELECT extra FROM post_extra WHERE post_extra.post = posts.id)";
+/// A channel not in the trash (`channel_trash`), said of `channels`.
+const NOT_TRASHED: &str = "NOT EXISTS (SELECT 1 FROM channel_trash WHERE channel_trash.channel = channels.id)";
 const CHANNEL_COLUMNS: &str = "id, name, topic, closed, created_at, created_by, (SELECT COALESCE(MAX(seq), 0) FROM posts WHERE posts.channel = channels.id), \
     (SELECT settings FROM channel_voice WHERE channel_voice.channel = channels.id), \
     (SELECT seconds FROM channel_slow WHERE channel_slow.channel = channels.id), \
@@ -794,6 +796,13 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         channel TEXT PRIMARY KEY,
         since INTEGER NOT NULL
     );
+    -- Channels deleted, kept 30 days before they go for good (a channel here is
+    -- listed to nobody but in the trash).
+    CREATE TABLE IF NOT EXISTS channel_trash (
+        channel TEXT PRIMARY KEY,
+        trashed_at INTEGER NOT NULL,
+        trashed_by TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS web_sessions (
         token TEXT PRIMARY KEY,
         mkey TEXT NOT NULL,
@@ -1166,6 +1175,11 @@ fn schema() -> Schema {
             CREATE TABLE IF NOT EXISTS web_channels (
                 channel VARCHAR(255) NOT NULL PRIMARY KEY,
                 since BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS channel_trash (
+                channel VARCHAR(255) NOT NULL PRIMARY KEY,
+                trashed_at BIGINT NOT NULL,
+                trashed_by {MYSQL_DID} NOT NULL
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS web_sessions (
                 token VARCHAR(64) NOT NULL PRIMARY KEY,
@@ -1937,7 +1951,7 @@ impl Store {
     /// Every channel: open ones first, then in no category, then by category, each
     /// group in the order set (a channel never placed last, oldest first).
     pub fn channels(&self) -> Result<Vec<Channel>> {
-        let mut channels = self.db.lock().query(&format!("SELECT {CHANNEL_COLUMNS} FROM channels ORDER BY closed, created_at, id"), params![], channel_from)?;
+        let mut channels = self.db.lock().query(&format!("SELECT {CHANNEL_COLUMNS} FROM channels WHERE {NOT_TRASHED} ORDER BY closed, created_at, id"), params![], channel_from)?;
         let categories = self.categories()?;
         let rank = |channel: &Channel| {
             let category = channel.category.as_ref().and_then(|id| categories.iter().find(|c| c.id == *id)).map_or(-1, |c| c.position);
@@ -2016,12 +2030,65 @@ impl Store {
     }
 
     pub fn channel(&self, id: &str) -> Result<Option<Channel>> {
-        self.db.lock().query_row(&format!("SELECT {CHANNEL_COLUMNS} FROM channels WHERE id = ?1"), params![id], channel_from)
+        self.db.lock().query_row(&format!("SELECT {CHANNEL_COLUMNS} FROM channels WHERE id = ?1 AND {NOT_TRASHED}"), params![id], channel_from)
+    }
+
+    /// Every channel in the trash, with when it was put there and by whom, newest first.
+    pub fn trashed_channels(&self) -> Result<Vec<(Channel, i64, String)>> {
+        let mut found = Vec::new();
+        let trashed: Vec<(String, i64, String)> = self.db.lock().query("SELECT channel, trashed_at, trashed_by FROM channel_trash ORDER BY trashed_at DESC", params![], |row| Ok((row.get::<String>(0)?, row.get::<i64>(1)?, row.get::<String>(2)?)))?;
+        for (id, at, by) in trashed {
+            if let Some(channel) = self.db.lock().query_row(&format!("SELECT {CHANNEL_COLUMNS} FROM channels WHERE id = ?1"), params![id], channel_from)? {
+                found.push((channel, at, by));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Puts a channel in the trash: listed to nobody, and gone for good once
+    /// [`Self::purge_trashed`] passes it.
+    pub fn trash_channel(&self, id: &str, by: &str, now: i64) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO channel_trash (channel, trashed_at, trashed_by) VALUES (?1, ?2, ?3)", params![id, now, by])?;
+        Ok(())
+    }
+
+    /// Takes a channel out of the trash, as it was.
+    pub fn restore_channel(&self, id: &str) -> Result<bool> {
+        Ok(self.db.lock().execute("DELETE FROM channel_trash WHERE channel = ?1", params![id])? > 0)
+    }
+
+    /// Deletes for good every channel put in the trash before `before`: its posts
+    /// and everything of them, and its settings. Reports and the audit log keep
+    /// what they say of it. Returns the channels deleted.
+    pub fn purge_trashed(&self, before: i64) -> Result<Vec<String>> {
+        let due: Vec<String> = self.db.lock().query("SELECT channel FROM channel_trash WHERE trashed_at < ?1", params![before], |row| row.get(0))?;
+        for id in &due {
+            self.db.lock().transaction(|tx| {
+                for table in ["post_state", "reactions", "post_removals", "post_voice_invites", "post_extra", "votes", "polls_ended", "answering"] {
+                    tx.execute(&format!("DELETE FROM {table} WHERE post IN (SELECT id FROM posts WHERE channel = ?1)"), params![id])?;
+                }
+                tx.execute("DELETE FROM thread_follows WHERE thread IN (SELECT id FROM threads WHERE channel = ?1)", params![id])?;
+                for table in ["threads", "posts", "held", "channel_voice", "channel_overrides", "channel_slow", "channel_order", "channel_forum", "web_channels"] {
+                    tx.execute(&format!("DELETE FROM {table} WHERE channel = ?1"), params![id])?;
+                }
+                tx.execute("DELETE FROM channels WHERE id = ?1", params![id])?;
+                tx.execute("DELETE FROM channel_trash WHERE channel = ?1", params![id])?;
+                Ok::<(), wyvrn_service::db::Error>(())
+            })?;
+        }
+        Ok(due)
+    }
+
+    /// The open channel called `name`, ignoring case, among the voice channels
+    /// (`voice`) or the others: a voice channel and a text one may share a name.
+    pub fn channel_named_among(&self, name: &str, voice: bool) -> Result<Option<Channel>> {
+        let found = self.db.lock().query(&format!("SELECT {CHANNEL_COLUMNS} FROM channels WHERE closed = 0 AND LOWER(name) = LOWER(?1) AND {NOT_TRASHED}"), params![name], channel_from)?;
+        Ok(found.into_iter().find(|channel| channel.voice.is_some() == voice))
     }
 
     /// The open channel called `name`, whatever its case.
     pub fn channel_named(&self, name: &str) -> Result<Option<Channel>> {
-        self.db.lock().query_row(&format!("SELECT {CHANNEL_COLUMNS} FROM channels WHERE closed = 0 AND LOWER(name) = LOWER(?1)"), params![name], channel_from)
+        self.db.lock().query_row(&format!("SELECT {CHANNEL_COLUMNS} FROM channels WHERE closed = 0 AND LOWER(name) = LOWER(?1) AND {NOT_TRASHED}"), params![name], channel_from)
     }
 
     pub fn add_channel(&self, id: &str, name: &str, topic: &str, by: &str, now: i64) -> Result<()> {

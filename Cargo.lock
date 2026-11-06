@@ -5115,6 +5115,7 @@ dependencies = [
  "didcomm-crypto-askar",
  "didcomm-quickstart",
  "futures-util",
+ "mysql",
  "pulldown-cmark",
  "regex",
  "reqwest",

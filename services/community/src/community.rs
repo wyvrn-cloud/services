@@ -1284,7 +1284,7 @@ impl Community {
                 if voice.is_none() && !text_channel_name(&name) {
                     return refuse(message, "e.p.msg.invalid-name", INVALID_NAME);
                 }
-                if self.store.channel_named(&name)?.is_some() {
+                if self.store.channel_named_among(&name, voice.is_some())?.is_some() {
                     return refuse(message, "e.p.msg.name-taken", "There is a channel called that already.");
                 }
                 if self.store.channels()?.iter().filter(|channel| !channel.closed).count() >= self.config.max_channels {
@@ -1332,7 +1332,7 @@ impl Community {
                 }
                 let closed = body["closed"].as_bool().unwrap_or(channel.closed);
                 // Renamed to, or opened again with, the name of another open channel.
-                let named = self.store.channel_named(&name)?.filter(|other| other.id != channel.id);
+                let named = self.store.channel_named_among(&name, channel.voice.is_some())?.filter(|other| other.id != channel.id);
                 if named.is_some() && (!name.eq_ignore_ascii_case(&channel.name) || (channel.closed && !closed)) {
                     return refuse(message, "e.p.msg.name-taken", "There is a channel called that already.");
                 }

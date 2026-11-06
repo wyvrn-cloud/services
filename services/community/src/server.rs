@@ -916,6 +916,12 @@ pub fn prune_once(state: &AppState) {
     if let Err(error) = state.community.store.prune_web(now()) {
         tracing::warn!(%error, "pruning failed");
     }
+    // Channels deleted 30 days ago, for good.
+    match state.community.store.purge_trashed(now() - crate::structure::TRASH_KEPT_FOR) {
+        Ok(gone) if !gone.is_empty() => tracing::info!(channels = gone.len(), "deleted channels from the trash for good"),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "emptying the trash failed"),
+    }
 }
 
 /// Pruned every hour.

@@ -2001,3 +2001,107 @@ fn every_owner_is_an_admin_too() {
     config.owners_are_admins();
     assert_eq!(config.admins, ["did:example:ana", "did:example:ben"]);
 }
+
+#[tokio::test]
+async fn a_deleted_channel_waits_in_the_trash_and_comes_back_or_goes_for_good() {
+    let server = start_server("").await;
+    let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member]);
+    let general = open_channel(&admin, "general").await;
+    admin.community("post", json!({ "channel": general, "id": "g1", "content": "kept in the trash" })).await;
+
+    // Only whoever may change it deletes it; then nobody is shown it, nor can post in it.
+    assert_eq!(member.community("delete-channel", json!({ "channel": general })).await["body"]["code"], "e.p.trust.not-authorized");
+    let deleted = admin.community("delete-channel", json!({ "channel": general })).await;
+    assert_eq!(kind(&deleted), "community", "{deleted}");
+    assert_eq!(deleted["body"]["channels"], json!([]));
+    assert_eq!(member.community("post", json!({ "channel": general, "content": "hello?" })).await["body"]["code"], "e.p.msg.unknown-channel");
+    // Its name is free while it waits.
+    let again = open_channel(&admin, "general").await;
+
+    // The trash is for those who manage channels: who put it there, and until when.
+    assert_eq!(member.community("trash-request", json!({})).await["body"]["code"], "e.p.trust.not-authorized");
+    let trash = admin.community("trash-request", json!({})).await;
+    assert_eq!(kind(&trash), "trash");
+    let listed = &trash["body"]["channels"][0];
+    assert_eq!((listed["id"].as_str(), listed["name"].as_str(), listed["kind"].as_str()), (Some(general.as_str()), Some("general"), Some("text")));
+    assert_eq!(listed["purge_at"].as_i64().unwrap() - listed["deleted_at"].as_i64().unwrap(), 30 * 86_400);
+    assert_eq!(listed["by"], trash["body"]["channels"][0]["by"]);
+    assert!(listed["by"].as_str().unwrap().starts_with('m'), "a member id: {listed}");
+
+    // Brought back only once its name is free again; then it is as it was.
+    assert_eq!(admin.community("restore-channel", json!({ "channel": general })).await["body"]["code"], "e.p.msg.name-taken");
+    admin.community("update-channel", json!({ "channel": again, "name": "general-2" })).await;
+    let restored = admin.community("restore-channel", json!({ "channel": general })).await;
+    assert_eq!((kind(&restored), restored["body"]["channels"].as_array().unwrap().len()), ("trash", 0), "{restored}");
+    assert_eq!(server.state.community.store.post_by_id("g1").unwrap().unwrap().content, "kept in the trash");
+
+    // Deleted again and past its 30 days, it goes for good, posts and all.
+    admin.community("delete-channel", json!({ "channel": general })).await;
+    assert!(server.state.community.store.purge_trashed(0).unwrap().is_empty());
+    let gone = server.state.community.store.purge_trashed(wyvrn_service::now() + 1).unwrap();
+    assert_eq!(gone, [general.clone()]);
+    assert!(server.state.community.store.post_by_id("g1").unwrap().is_none());
+    assert_eq!(admin.community("trash-request", json!({})).await["body"]["channels"], json!([]));
+}
+
+#[tokio::test]
+async fn channels_are_arranged_into_categories_all_at_once() {
+    let server = start_server("").await;
+    let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member]);
+    let (a, b, c) = (open_channel(&admin, "alpha").await, open_channel(&admin, "beta").await, open_channel(&admin, "gamma").await);
+    let order = |answer: &Value| answer["body"]["channels"].as_array().unwrap().iter().map(|c| (c["name"].as_str().unwrap().to_string(), c["category"].as_str().map(str::to_string))).collect::<Vec<_>>();
+
+    assert_eq!(member.community("arrange", json!({ "categories": [], "channels": [] })).await["body"]["code"], "e.p.trust.not-authorized");
+    // A new category, made by naming it with an id of the sender's; gamma first, in no category.
+    let arranged = admin
+        .community("arrange", json!({ "categories": [{ "id": "games", "name": "Games" }], "channels": [{ "id": c }, { "id": b, "category": "games" }, { "id": a, "category": "games" }] }))
+        .await;
+    assert_eq!(arranged["body"]["categories"], json!([{ "id": "games", "name": "Games" }]), "{arranged}");
+    assert_eq!(order(&arranged), [("gamma".into(), None), ("beta".into(), Some("games".into())), ("alpha".into(), Some("games".into()))]);
+
+    // Renamed, and a channel left out keeps its place; a category left out is gone, its channels with none.
+    let renamed = admin.community("arrange", json!({ "categories": [{ "id": "games", "name": "Play" }], "channels": [{ "id": a, "category": "games" }] })).await;
+    assert_eq!(renamed["body"]["categories"][0]["name"], "Play");
+    let emptied = admin.community("arrange", json!({ "categories": [], "channels": [] })).await;
+    assert!(order(&emptied).iter().all(|(_, category)| category.is_none()), "{emptied}");
+
+    // Nonsense is refused.
+    assert_eq!(admin.community("arrange", json!({ "categories": [], "channels": [{ "id": a, "category": "nowhere" }] })).await["body"]["code"], "e.p.msg.invalid-category");
+    assert_eq!(admin.community("arrange", json!({ "categories": [], "channels": [{ "id": "nope" }] })).await["body"]["code"], "e.p.msg.unknown-channel");
+    assert_eq!(admin.community("arrange", json!({ "categories": [{ "id": "bad id!", "name": "x" }], "channels": [] })).await["body"]["code"], "e.p.msg.invalid-category");
+}
+
+#[tokio::test]
+async fn a_voice_channel_and_a_text_channel_may_share_a_name_but_two_of_a_kind_may_not() {
+    let server = voice_server().await;
+    let admin = Peer::start(&server).await;
+    server.admit(&[&admin]);
+    open_channel(&admin, "lounge").await;
+    voice_channel(&admin, "lounge", json!({})).await;
+    assert_eq!(admin.community("create-channel", json!({ "name": "Lounge", "kind": "voice", "voice": {} })).await["body"]["code"], "e.p.msg.name-taken");
+    assert_eq!(admin.community("create-channel", json!({ "name": "lounge" })).await["body"]["code"], "e.p.msg.name-taken");
+}
+
+#[test]
+fn the_trash_is_kept_and_emptied_in_mysql_too() {
+    let Some(url) = std::env::var("WYVRN_TEST_DATABASE_URL").ok().filter(|url| !url.is_empty()) else { return };
+    let server = url.trim_end_matches('/');
+    let database = format!("wyvrn_test_trash_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    {
+        let mut admin = mysql::Conn::new(mysql::Opts::from_url(server).unwrap()).unwrap();
+        mysql::prelude::Queryable::query_drop(&mut admin, format!("CREATE DATABASE {database}")).unwrap();
+    }
+    let store = Store::open(&wyvrn_service::db::Location::MySql(format!("{server}/{database}"))).unwrap();
+    store.add_channel("c1", "general", "", "did:example:admin", 1).unwrap();
+    store.trash_channel("c1", "did:example:admin", 10).unwrap();
+    assert!(store.channel("c1").unwrap().is_none());
+    assert!(store.channel_named_among("general", false).unwrap().is_none());
+    assert_eq!(store.trashed_channels().unwrap().len(), 1);
+    assert!(store.restore_channel("c1").unwrap());
+    assert!(store.channel("c1").unwrap().is_some());
+    store.trash_channel("c1", "did:example:admin", 10).unwrap();
+    assert_eq!(store.purge_trashed(11).unwrap(), ["c1"]);
+    assert!(store.trashed_channels().unwrap().is_empty());
+}
