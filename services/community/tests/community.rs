@@ -1796,7 +1796,7 @@ async fn a_member_not_watching_is_sent_through_the_mediator_only_what_they_chose
 }
 
 #[tokio::test]
-async fn a_watching_connection_is_sent_everything_and_the_mediator_nothing_of_it() {
+async fn a_watching_connection_is_sent_everything_and_the_mediator_only_what_concerns_them() {
     let server = start_server("").await;
     let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);
     server.admit(&[&admin, &member]);
@@ -1820,6 +1820,19 @@ async fn a_watching_connection_is_sent_everything_and_the_mediator_nothing_of_it
     assert_eq!(live.next_typed(&member, &format!("{C}changed")).await["body"]["pinned"], true);
     member.nothing_more().await;
 
+    // A mention comes through the mediator as well, watching or not: every other
+    // device of theirs hears of it.
+    admin.community("post", json!({ "channel": channel, "id": "w-named", "content": "@m", "mentions": [{ "who": member.did(), "name": "m" }] })).await;
+    assert_eq!(live.next_typed(&member, &format!("{C}message")).await["body"]["id"], "w-named");
+    assert_eq!(member.next_message().await["id"], "w-named");
+    // Everything, chosen, is everything through the mediator only while nobody
+    // watches: here, it is there and not through the mediator.
+    member.community("set-notifications", json!({ "level": "all" })).await;
+    admin.community("post", json!({ "channel": channel, "id": "w-all", "content": "busy" })).await;
+    assert_eq!(live.next_typed(&member, &format!("{C}message")).await["body"]["id"], "w-all");
+    member.nothing_more().await;
+    member.community("set-notifications", json!({ "level": "mentions" })).await;
+
     // Stopped, it is as for anyone not watching: a mention comes through the mediator.
     live.send_as(&member, &format!("{C}watch"), json!({ "stop": true })).await;
     live.next_typed(&member, &format!("{C}community")).await;
@@ -1829,7 +1842,7 @@ async fn a_watching_connection_is_sent_everything_and_the_mediator_nothing_of_it
     // What wasn't sent is caught up on from the rev held.
     let caught = member.community("changes-request", json!({ "after_rev": rev })).await;
     let ids: Vec<&str> = caught["body"]["messages"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, ["w1", "w2", "w3"]);
+    assert_eq!(ids, ["w1", "w-named", "w-all", "w2", "w3"]);
 }
 
 

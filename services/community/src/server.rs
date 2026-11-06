@@ -862,14 +862,22 @@ async fn deliver_to(state: &Arc<AppState>, member: crate::store::Member) {
         Err(error) => return tracing::error!(%error, "couldn't read posts to deliver"),
     };
     for post in posts {
-        // Watching: everything, there. Otherwise only what concerns them,
-        // through the mediator; what isn't sent they catch up on.
+        // Watching: everything, there. Through the mediator, what concerns them
+        // always, and the rest as they chose while nobody is watching; what isn't
+        // sent they catch up on.
         let message = state.community.message(&post);
         let reaches = match state.community.reaches(&member, &post) {
             Ok(reaches) => reaches,
             Err(error) => return tracing::error!(%error, "couldn't tell whether a post concerns a member"),
         };
-        if !state.to_watching(&member.did, &message) && reaches {
+        // (Sent both ways, the app keeps one: a post it has is not news again.)
+        let watched = state.to_watching(&member.did, &message);
+        let through_mediator = match reaches {
+            crate::posting::Reach::Always => true,
+            crate::posting::Reach::UnlessWatching => !watched,
+            crate::posting::Reach::Never => false,
+        };
+        if through_mediator {
             let message = match state.community.masked_for(&member.did, &message) {
                 Ok(masked) => masked,
                 Err(error) => return tracing::error!(%error, "couldn't name people as they may be named to them"),

@@ -302,24 +302,40 @@ impl Community {
     }
 }
 
+/// Whether a post goes through the mediator ([`Community::reaches`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// Whether or not a connection of theirs is watching: it is for them.
+    Always,
+    /// Only while no connection of theirs is watching.
+    UnlessWatching,
+    Never,
+}
+
 impl Community {
-    /// Whether `post` goes to `member` through the mediator while no connection of
-    /// theirs is watching (community/1.0's "What reaches a member, and how"). A
-    /// member whose app has never said is sent everything, as before.
-    pub fn reaches(&self, member: &Member, post: &Post) -> anyhow::Result<bool> {
+    /// Whether `post` goes to `member` through the mediator (community/1.0's
+    /// "What reaches a member, and how"): what concerns them (a mention, an answer,
+    /// a thread they follow) always, unless they chose nothing; the rest, for one
+    /// who chose everything, only while no connection of theirs is watching -- the
+    /// one watching has it already, and every post would be a push to every device.
+    /// A member whose app has never said is sent everything, as before.
+    pub fn reaches(&self, member: &Member, post: &Post) -> anyhow::Result<Reach> {
         let level = self.store.notify_level(&member.did)?;
-        if level.is_none() {
-            return Ok(true);
-        }
         // Their own post they have from the connection they posted on.
-        if post.author_did == member.did {
-            return Ok(false);
+        if level.is_some() && post.author_did == member.did {
+            return Ok(Reach::Never);
         }
         match level.as_deref() {
-            Some("all") => return Ok(true),
-            Some("nothing") => return Ok(false),
-            _ => {}
+            Some("nothing") => return Ok(Reach::Never),
+            _ if self.concerns(member, post)? => return Ok(Reach::Always),
+            None | Some("all") => return Ok(Reach::UnlessWatching),
+            _ => return Ok(Reach::Never),
         }
+    }
+
+    /// Whether `post` is for `member` in particular: it mentions them (by member,
+    /// `everyone`, or a role they hold), answers them, or is in a thread they follow.
+    fn concerns(&self, member: &Member, post: &Post) -> anyhow::Result<bool> {
         if post.reply_author.as_deref() == Some(member.did.as_str()) {
             return Ok(true);
         }
