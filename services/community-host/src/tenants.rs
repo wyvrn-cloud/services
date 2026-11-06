@@ -151,7 +151,7 @@ impl Host {
     pub fn settings(&self, record: &Record) -> CommunityServerConfig {
         let folder = self.folder(&record.name);
         let limits = record.limits.unwrap_or(self.config.limits);
-        CommunityServerConfig {
+        let mut settings = CommunityServerConfig {
             server: ServerConfig { bind: String::new(), public_url: format!("{}c/{}/", self.config.server.public_url, record.name), did_method: self.config.server.did_method },
             identity: PathConfig { path: folder.join("identity.json") },
             store: PathConfig { path: folder.join("community.sqlite") },
@@ -159,6 +159,7 @@ impl Host {
                 name: record.title.clone(),
                 // Its owner is its first admin, and so its owner (community/1.0's endnote 3).
                 admins: vec![record.owner.clone()],
+                owners: self.owners_of(record),
                 max_members: limits.members,
                 max_channels: limits.channels,
                 ..CommunityConfig::default()
@@ -171,7 +172,22 @@ impl Host {
             assistant: None,
             // Each community's web view is at its own address, under the host's.
             web: wyvrn_community::config::WebConfig { public_url: None, ..self.config.web.clone() },
+        };
+        settings.community.owners_are_admins();
+        settings
+    }
+
+    /// `record`'s owners: the one it was made for, and those the configuration
+    /// names beside them (`[owners]`). Just the one, with none named: then it can
+    /// be handed on from the app, as a community with one owner can.
+    pub fn owners_of(&self, record: &Record) -> Vec<String> {
+        let named = self.config.owners.get(&record.name).cloned().unwrap_or_default();
+        if named.is_empty() {
+            return Vec::new();
         }
+        let mut owners = vec![record.owner.clone()];
+        owners.extend(named.into_iter().filter(|did| *did != record.owner));
+        owners
     }
 
     /// The public address `name` holds, where the host has a DID host to hold them at.

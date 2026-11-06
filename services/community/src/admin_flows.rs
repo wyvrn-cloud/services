@@ -660,6 +660,9 @@ impl Community {
                 if !powers.owner {
                     return Err(not_allowed("Only the owner hands the community on."));
                 }
+                if !self.config.owners.is_empty() {
+                    return Err(refused("This community's owners are set where it is run, not handed on from here."));
+                }
                 let given = input["member"].as_str().unwrap_or_default().trim();
                 let members = self.store.members().map_err(failed)?;
                 let found: Vec<&Member> = members.iter().filter(|m| m.did == given || m.name.as_deref().is_some_and(|name| name.eq_ignore_ascii_case(given))).collect();

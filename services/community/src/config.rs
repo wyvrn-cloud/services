@@ -142,6 +142,11 @@ pub struct CommunityConfig {
     pub name: String,
     pub description: String,
     pub admins: Vec<String>,
+    /// Its owners, all equal (`COMMUNITY_OWNERS`): every permission, and nobody
+    /// may take them out, ban them or time them out. Each is an admin too. Set
+    /// here only, never from the app; none named, the owner is the one handed it
+    /// (`Community::owners`).
+    pub owners: Vec<String>,
     pub members: Vec<String>,
     pub members_may_create_channels: bool,
     /// The longest a post may be, in characters.
@@ -164,12 +169,24 @@ pub struct CommunityConfig {
     pub max_members: usize,
 }
 
+impl CommunityConfig {
+    /// Each owner is an admin too, as named in `admins`.
+    pub fn owners_are_admins(&mut self) {
+        for owner in &self.owners {
+            if !self.admins.contains(owner) {
+                self.admins.push(owner.clone());
+            }
+        }
+    }
+}
+
 impl Default for CommunityConfig {
     fn default() -> Self {
         Self {
             name: "A community".to_string(),
             description: String::new(),
             admins: Vec::new(),
+            owners: Vec::new(),
             members: Vec::new(),
             members_may_create_channels: false,
             max_post_length: 16_000,
@@ -190,8 +207,8 @@ fn dids(list: &str) -> Vec<String> {
 impl Config {
     /// Reads `path`, then lets the environment override what a deployment most
     /// often needs to: `COMMUNITY_BIND`, `COMMUNITY_PUBLIC_URL`,
-    /// `COMMUNITY_DID_METHOD`, `COMMUNITY_NAME`, and `COMMUNITY_ADMINS` and
-    /// `COMMUNITY_MEMBERS` (DIDs separated by commas or whitespace), and for voice
+    /// `COMMUNITY_DID_METHOD`, `COMMUNITY_NAME`, and `COMMUNITY_ADMINS`,
+    /// `COMMUNITY_OWNERS` and `COMMUNITY_MEMBERS` (DIDs separated by commas or whitespace), and for voice
     /// channels `COMMUNITY_VOICE_RELAY_URL`, `COMMUNITY_VOICE_RELAY_FINGERPRINT` and
     /// `COMMUNITY_VOICE_TRANSPORT`; for the files members attach `COMMUNITY_FILES_DIR`
     /// and `COMMUNITY_FILES_MAX_BYTES`, for the community's own packs
@@ -217,6 +234,10 @@ impl Config {
         if let Some(admins) = env("COMMUNITY_ADMINS") {
             config.community.admins = dids(&admins);
         }
+        if let Some(owners) = env("COMMUNITY_OWNERS") {
+            config.community.owners = dids(&owners);
+        }
+        config.community.owners_are_admins();
         if let Some(members) = env("COMMUNITY_MEMBERS") {
             config.community.members = dids(&members);
         }

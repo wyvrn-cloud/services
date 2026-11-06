@@ -159,7 +159,7 @@ impl Community {
                 }
                 let existing = self.store.member(did)?;
                 if existing.is_some() {
-                    if self.owner()?.as_deref() == Some(did) {
+                    if self.is_owner(did)? {
                         return refuse(message, "e.p.msg.owner", "The owner can't be banned.").map(Some);
                     }
                     if !self.outranks(&powers, did)? {
@@ -226,7 +226,7 @@ impl Community {
                 let Some(target) = self.store.member(did)? else {
                     return refuse(message, "e.p.msg.invalid-member", "There is no such member.").map(Some);
                 };
-                if self.owner()?.as_deref() == Some(did) {
+                if self.is_owner(did)? {
                     return refuse(message, "e.p.msg.owner", "The owner can't be timed out.").map(Some);
                 }
                 if !self.outranks(&powers, did)? {

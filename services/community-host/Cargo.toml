@@ -33,4 +33,6 @@ tower-http = { workspace = true, features = ["fs"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+mysql = { workspace = true }
+rusqlite = { workspace = true }
 reqwest = { workspace = true }

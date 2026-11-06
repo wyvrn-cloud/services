@@ -416,7 +416,7 @@ impl CommunityService {
         // The owner's pages from the host: theirs alone, and answered while moving
         // too (that is where a move is called off).
         let message_type = received.message["type"].as_str().unwrap_or_default();
-        let is_owner = state.owner_pages.is_some() && state.community.owner()?.as_deref() == Some(sender.as_str());
+        let is_owner = state.owner_pages.is_some() && state.community.is_owner(&sender)?;
         if let Some(pages) = &state.owner_pages {
             if message_type.starts_with(questions::PIURI) && !message_type.ends_with("/discover") && state.owner_admin.concerns(&received.message) {
                 return Ok(state.owner_admin.handle(pages.as_ref(), is_owner, &sender, &received.message, now()).map(|answer| match answer {

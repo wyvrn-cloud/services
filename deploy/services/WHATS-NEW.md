@@ -207,3 +207,48 @@ CLAUDE_PERIOD_TOKENS=
 **Anubis**: as for a community (section 1). It is one.
 
 **Check**: `curl https://claude.wyvrn.app/healthz` says `ok`, and `docker compose logs claude` doesn't say "No ANTHROPIC_API_KEY".
+
+## 4. Several owners of a community (new 2026-11-06)
+
+A community can have more than one owner, all equal: each holds every permission, is an admin, and can't be taken out, banned or timed out by anyone. Owners are named only where the server is run, never from the app.
+
+**A community on its own** (`wyvrn-community`): in `.env`, and in the service's `environment` as `COMMUNITY_OWNERS: "${COMMUNITY_OWNERS:-}"`:
+
+```sh
+# DIDs, separated by commas or spaces. Empty: one owner, as before.
+COMMUNITY_OWNERS=
+```
+
+**A community on the host**: the owner it was made for, and in the host's configuration file (`community-host.toml` on the server) those beside them, by the community's name:
+
+```toml
+[owners]
+saikous = ["did:peer:2...", "did:peer:2..."]
+```
+
+Taken up when the community is next opened (restart the host to have it at once). A community with owners named here can't be handed on from the app.
+
+## 5. Bringing a community run on its own onto the host (the Niko community)
+
+`wyvrn-community-host import` copies a community run by `wyvrn-community` onto the host: its keys, everything it keeps, its sticker packs and its members' files. It keeps its public address (`community:<name>` at the DID host): once the host opens it, the address's document names the host, with the same keys, so members who hold the community by its address (`did:web:id.wyvrn.app:community:saikous`) reach it there without doing anything. A member who holds it by its own `did:web` (`did:web:saikous.community.<domain>`) doesn't: nothing answers there once the old server is stopped, and they add it again by its address. Nothing of the old server is changed, so going back is starting it again (and removing the community from the host: `wyvrn-community-host delete <name>`).
+
+For the Niko community (`community-niko`, address `community:saikous`, kept in the MySQL database `COMMUNITY_DB2` names, with its packs and files in `./community2`):
+
+1. Deploy the new `wyvrn-community-host` image first.
+2. Stop the old server, and keep it stopped: `docker compose stop community-niko`.
+3. Bring it in. The name has to be `saikous`, the name its address is held under. `<owner-did>` is the owner it is made for; add the others in step 4.
+
+   ```sh
+   cd /root/wyvrn
+   set -a; . ./.env; set +a
+   docker compose run --rm -v ./community2:/import community-host \
+     import saikous <owner-did> --community "$COMMUNITY_DB2" \
+     --stickers /import/stickers --files /import/files --title "<its name>"
+   ```
+
+   It says how many tables and rows it copied. A name already taken, or a copy that fails, leaves nothing on the host. (If `COMMUNITY_STICKERS_DIR2` or `COMMUNITY_FILES_DIR2` in `.env` name other places than `/community/stickers` and `/community/files`, use those, under `/import`.)
+4. Its other owners, in `community-host.toml`'s `[owners]` (section 4), then `docker compose restart community-host`.
+5. Check: `docker compose logs community-host | grep saikous` shows it opened, and the app opens the community as before.
+6. Once it works, remove the `community-niko` service from the compose file, and Caddy's `saikous.community` route.
+
+Before step 2, check in the app which DID the community is held by (its profile, or Settings, Developer): the address (`did:web:id.wyvrn.app:community:saikous`) moves with it; its own `did:web` doesn't, and every member holding that one adds it again by the address afterwards.

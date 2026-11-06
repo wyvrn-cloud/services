@@ -494,6 +494,7 @@ impl Community {
             "role": powers.older_role(),
             "joined": member.joined,
             "owner": self.owner()?,
+            "owners": self.owners()?,
             "you": member.did,
             "message_requests": self.store.member_here(&member.did)?.is_none_or(|here| here.requests),
             "roles": self.roles_body()?,
@@ -1869,7 +1870,7 @@ impl Community {
                 let existing = self.store.member(did)?;
                 let waiting = if existing.is_none() { self.store.waiting_one(did)? } else { None };
                 let was_waiting = waiting.is_some();
-                if existing.is_some() && self.owner()?.as_deref() == Some(did) {
+                if existing.is_some() && self.is_owner(did)? {
                     return refuse(message, "e.p.msg.owner", "The owner can't be taken out or given roles this way.");
                 }
                 let not_allowed = |why: &str| refuse(message, "e.p.trust.not-authorized", why);

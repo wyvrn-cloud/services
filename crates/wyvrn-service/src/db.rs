@@ -634,11 +634,26 @@ pub type Copied = Vec<(String, usize)>;
 /// Text stays text and bytes bytes between kinds of database, by what each column
 /// is. One transaction at `to`: a copy that fails leaves nothing there.
 pub fn copy_store(from: &Location, to: &Location, service: &str, skip: &[&str]) -> Result<Copied> {
+    copy_tables(from, to, service, skip, false)
+}
+
+/// As [`copy_store`], but only the tables `to` has: for a store `from` shares its
+/// database with others' (a service whose stores all went to one database), whose
+/// tables aren't this store's to copy.
+pub fn copy_store_held(from: &Location, to: &Location, service: &str, skip: &[&str]) -> Result<Copied> {
+    copy_tables(from, to, service, skip, true)
+}
+
+fn copy_tables(from: &Location, to: &Location, service: &str, skip: &[&str], only_held: bool) -> Result<Copied> {
     const NOTHING: Schema = Schema { sqlite: "", mysql: "" };
     let (source, target) = (Db::open(from, &NOTHING, service)?, Db::open(to, &NOTHING, service)?);
     let mut reading = source.lock();
     let mut writing = target.lock();
-    let tables: Vec<String> = reading.tables()?.into_iter().filter(|table| !skip.contains(&table.as_str())).collect();
+    let mut tables: Vec<String> = reading.tables()?.into_iter().filter(|table| !skip.contains(&table.as_str())).collect();
+    if only_held {
+        let held = writing.tables()?;
+        tables.retain(|table| held.contains(table));
+    }
     writing.transaction(|writing| {
         let mut copied = Vec::new();
         for table in &tables {

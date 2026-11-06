@@ -1971,3 +1971,33 @@ async fn a_member_the_server_holds_no_profile_for_is_asked_for_it() {
     let asked = member.next_of("https://didcomm.org/user-profile/1.0/request-profile").await;
     assert_eq!(asked["body"], json!({}));
 }
+
+#[test]
+fn owners_named_where_it_runs_are_all_owners_and_none_can_be_acted_on() {
+    let config = wyvrn_community::config::CommunityConfig {
+        owners: vec!["did:example:ana".into(), "did:example:ben".into()],
+        ..Default::default()
+    };
+    let community = Community::new(Store::in_memory().unwrap(), config, None).unwrap();
+    for did in ["did:example:ana", "did:example:ben", "did:example:cy"] {
+        community.store.set_member(did, wyvrn_community::store::Role::Admin, 1).unwrap();
+    }
+    assert_eq!(community.owners().unwrap(), ["did:example:ana", "did:example:ben"]);
+    assert_eq!(community.owner().unwrap().as_deref(), Some("did:example:ana"));
+    assert!(community.is_owner("did:example:ben").unwrap());
+    assert!(!community.is_owner("did:example:cy").unwrap());
+    let ana = community.powers("did:example:ana").unwrap();
+    let cy = community.powers("did:example:cy").unwrap();
+    assert!(ana.owner);
+    // An owner can't act on another owner, and an admin on neither.
+    assert!(!community.outranks(&ana, "did:example:ben").unwrap());
+    assert!(!community.outranks(&cy, "did:example:ana").unwrap());
+    assert!(community.outranks(&ana, "did:example:cy").unwrap());
+}
+
+#[test]
+fn every_owner_is_an_admin_too() {
+    let mut config = wyvrn_community::config::CommunityConfig { admins: vec!["did:example:ana".into()], owners: vec!["did:example:ana".into(), "did:example:ben".into()], ..Default::default() };
+    config.owners_are_admins();
+    assert_eq!(config.admins, ["did:example:ana", "did:example:ben"]);
+}

@@ -222,7 +222,8 @@ async fn communities_kept_in_mysql_a_database_each_or_tables_each_keep_apart() {
     for (peer, name) in [(&ann, "own-db"), (&bea, "shared"), (&ann, "shared-too")] {
         let did = running.did_of(name).await;
         let joined = peer.community(&did, "join", json!({})).await;
-        assert_eq!(joined["body"]["owner"], peer.did(), "{name}: {joined}");
+        // (The owner by member id, as everyone in a community is named.)
+        assert_eq!(joined["body"]["owner"], joined["body"]["you"], "{name}: {joined}");
         let channel = peer.community(&did, "create-channel", json!({ "name": format!("in-{name}") })).await["body"]["created"].as_str().unwrap().to_string();
         assert_eq!(kind(&peer.community(&did, "post", json!({ "channel": channel, "id": format!("{name}-1"), "content": name })).await), "posted");
     }
@@ -256,7 +257,7 @@ async fn a_community_moves_between_every_kind_of_storage_and_is_the_same_communi
         // The same keys, so the same DID; the same owner, channel and posts.
         assert_eq!(running.did_of("mover").await, did);
         let joined = ann.community(&did, "join", json!({})).await;
-        assert_eq!((joined["body"]["owner"].as_str(), joined["body"]["channels"][0]["id"].as_str()), (Some(ann.did().as_str()), Some(channel.as_str())), "{joined}");
+        assert_eq!((joined["body"]["owner"].as_str(), joined["body"]["channels"][0]["id"].as_str()), (joined["body"]["you"].as_str(), Some(channel.as_str())), "{joined}");
         let id = format!("m{}", posts + 1);
         assert_eq!(kind(&ann.community(&did, "post", json!({ "channel": channel, "id": id, "content": to.as_str() })).await), "posted");
         posts += 1;
@@ -378,4 +379,100 @@ async fn each_community_is_on_the_web_at_its_own_path() {
     assert_eq!(bare.headers()["location"], "gamma/");
     let discovery: Value = http.get(format!("{}c/gamma/.well-known/openid-configuration", running.url)).send().await.unwrap().json().await.unwrap();
     assert_eq!(discovery["issuer"], format!("{}c/gamma", running.url));
+}
+
+#[tokio::test]
+async fn a_community_run_on_its_own_is_brought_in_with_its_keys_and_everything_it_keeps() {
+    // Kept in SQLite as wyvrn-community keeps one, beside another service's table
+    // in the same database (as a server whose stores share one database has).
+    let elsewhere = start_host(600).await;
+    let (owner, member) = (Peer::start().await, Peer::start().await);
+    elsewhere.host.registry.create("solo", "Solo", Storage::Sqlite, &owner.did(), "test", 1).unwrap();
+    let was = elsewhere.did_of("solo").await;
+    owner.community(&was, "join", json!({})).await;
+    let channel = owner.community(&was, "create-channel", json!({ "name": "general" })).await["body"]["created"].as_str().unwrap().to_string();
+    owner.community(&was, "post", json!({ "channel": channel, "id": "s1", "content": "comes along" })).await;
+    owner.community(&was, "set-member", json!({ "did": member.did(), "role": "member" })).await;
+    let keys = elsewhere.host.tenant("solo").await.unwrap().unwrap().state.agent.identity().to_json().unwrap();
+    elsewhere.host.unload("solo");
+    let folder = elsewhere.host.folder("solo");
+    rusqlite::Connection::open(folder.join("community.sqlite")).unwrap().execute_batch("CREATE TABLE someone_elses (x TEXT); INSERT INTO someone_elses VALUES ('not ours');").unwrap();
+
+    // Brought in, with a second owner named in the host's configuration.
+    let running = start_host(600).await;
+    let host = running.host.clone();
+    let mut config = host.config.clone();
+    config.owners.insert("brought".into(), vec![member.did()]);
+    let host = Host::new(config, Registry::scratch().unwrap());
+    let source = wyvrn_community_host::import::Source {
+        community: wyvrn_service::db::Location::Sqlite(folder.join("community.sqlite")),
+        stickers: Some(wyvrn_service::db::Location::Sqlite(folder.join("stickers.sqlite"))),
+        files: Some(folder.join("files")),
+        files_records: None,
+    };
+    let (in_host, from) = (host.clone(), source);
+    let owner_did = owner.did();
+    let said = tokio::task::spawn_blocking(move || in_host.import("brought", "Brought", &owner_did, Storage::Sqlite, &from, 2)).await.unwrap().unwrap();
+    assert!(said.contains("brought is in"), "{said}");
+    assert_eq!(host.registry.get("brought").unwrap().unwrap().state, Standing::Active);
+
+    // The same keys, members and posts; and both owners are owners.
+    let tenant = host.tenant("brought").await.unwrap().unwrap();
+    assert_eq!(tenant.state.agent.identity().to_json().unwrap(), keys);
+    let community = &tenant.state.community;
+    assert_eq!(community.store.post_by_id("s1").unwrap().unwrap().content, "comes along");
+    assert!(community.store.member(&member.did()).unwrap().is_some());
+    assert_eq!(community.owners().unwrap(), [owner.did(), member.did()]);
+    assert!(!community.moving().unwrap());
+
+    // A name taken already is refused, and nothing is left of the attempt.
+    let again = wyvrn_community_host::import::Source {
+        community: wyvrn_service::db::Location::Sqlite(folder.join("community.sqlite")),
+        stickers: None,
+        files: None,
+        files_records: None,
+    };
+    let owner_did = owner.did();
+    let refused = tokio::task::spawn_blocking(move || host.import("brought", "Again", &owner_did, Storage::Sqlite, &again, 3)).await.unwrap();
+    assert!(refused.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_community_run_on_its_own_in_mysql_is_brought_into_shared_tables() {
+    let Some(url) = std::env::var("WYVRN_TEST_DATABASE_URL").ok().filter(|url| !url.is_empty()) else { return };
+    let server = url.trim_end_matches('/');
+    // A community as wyvrn-community keeps one in MySQL: its tables in a database
+    // of its own, unprefixed, and its keys there too.
+    let elsewhere = start_host(600).await;
+    let owner = Peer::start().await;
+    elsewhere.host.registry.create("solo", "Solo", Storage::Sqlite, &owner.did(), "test", 1).unwrap();
+    let was = elsewhere.did_of("solo").await;
+    owner.community(&was, "join", json!({})).await;
+    let channel = owner.community(&was, "create-channel", json!({ "name": "general" })).await["body"]["created"].as_str().unwrap().to_string();
+    owner.community(&was, "post", json!({ "channel": channel, "id": "m1", "content": "from mysql" })).await;
+    let keys = Identity::from_json(&elsewhere.host.tenant("solo").await.unwrap().unwrap().state.agent.identity().to_json().unwrap()).unwrap();
+    elsewhere.host.unload("solo");
+    let folder = elsewhere.host.folder("solo");
+    let database = format!("wyvrn_test_solo_{}", unique().replace('-', "_"));
+    {
+        let mut admin = mysql::Conn::new(mysql::Opts::from_url(server).unwrap()).unwrap();
+        mysql::prelude::Queryable::query_drop(&mut admin, format!("CREATE DATABASE {database}")).unwrap();
+    }
+    let standalone = wyvrn_service::db::Location::MySql(format!("{server}/{database}"));
+    wyvrn_service::identity::keep(&standalone, &folder.join("unused.json"), "community", &keys).unwrap();
+    wyvrn_community::store::Store::open(&standalone).unwrap();
+    wyvrn_service::profile::Kept::open(&standalone, "community").unwrap();
+    wyvrn_service::hosted_address::Kept::open(&standalone, "community").unwrap();
+    wyvrn_service::db::copy_store(&wyvrn_service::db::Location::Sqlite(folder.join("community.sqlite")), &standalone, "community", &["wyvrn_identity"]).unwrap();
+
+    let running = start_host_with(600, server).await;
+    let host = running.host.clone();
+    let source = wyvrn_community_host::import::Source { community: standalone, stickers: None, files: None, files_records: None };
+    let owner_did = owner.did();
+    let in_host = host.clone();
+    tokio::task::spawn_blocking(move || in_host.import("from-mysql", "From MySQL", &owner_did, Storage::MySqlShared, &source, 2)).await.unwrap().unwrap();
+    let tenant = host.tenant("from-mysql").await.unwrap().unwrap();
+    assert_eq!(tenant.state.agent.identity().to_json().unwrap(), keys.to_json().unwrap());
+    assert_eq!(tenant.state.community.store.post_by_id("m1").unwrap().unwrap().content, "from mysql");
+    assert!(!host.folder("from-mysql").join("community.sqlite").exists());
 }

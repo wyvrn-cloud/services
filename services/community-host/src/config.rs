@@ -29,6 +29,15 @@ pub struct Config {
     /// `public_url` is ignored here.
     #[serde(default)]
     pub web: wyvrn_community::config::WebConfig,
+    /// Each community's owners beside the one it was made for, by its name: all
+    /// equal, and admins too. Set here only, never from the app:
+    ///
+    /// ```toml
+    /// [owners]
+    /// saikous = ["did:peer:2...", "did:peer:2..."]
+    /// ```
+    #[serde(default)]
+    pub owners: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

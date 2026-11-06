@@ -9,6 +9,7 @@
 //!   voice relay's question passed to the community a token is of.
 //! - [`admin`]: the host's admin pages.
 //! - [`export`]: a community's owner moving it to a server of their own.
+//! - [`import`]: the reverse, a community run on its own brought onto the host.
 //!
 //! A community that outgrows its host moves to a server of its own, the single
 //! `wyvrn-community`, keeping its keys and public address.
@@ -16,6 +17,7 @@
 pub mod admin;
 pub mod config;
 pub mod export;
+pub mod import;
 pub mod registry;
 pub mod server;
 pub mod tenants;

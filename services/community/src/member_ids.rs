@@ -26,7 +26,7 @@ pub const MODERATING: &[&str] = &["administrator", "kick_members", "ban_members"
 
 /// Keys whose value, a string or an array of strings, names a person where it is a DID.
 const PERSON_KEYS: &[&str] = &[
-    "did", "by", "author", "answered_by", "removed_by", "created_by", "resolved_by", "who", "voters", "owner", "you", "actor", "target", "member", "participants", "speakers", "to",
+    "did", "by", "author", "answered_by", "removed_by", "created_by", "resolved_by", "who", "voters", "owner", "owners", "you", "actor", "target", "member", "participants", "speakers", "to",
     "invited_by", "holder", "from",
 ];
 
@@ -194,7 +194,7 @@ impl Community {
     /// Whether `did` is told DIDs: the owner, or one holding a moderation
     /// permission, `manage_messages` in any channel included.
     pub fn told_dids(&self, did: &str) -> anyhow::Result<bool> {
-        if self.owner()?.as_deref() == Some(did) {
+        if self.is_owner(did)? {
             return Ok(true);
         }
         let powers = self.powers(did)?;

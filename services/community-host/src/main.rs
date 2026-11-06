@@ -19,6 +19,13 @@ wyvrn-community-host [--config <path>] suspend|resume <name>      stop answering
 wyvrn-community-host [--config <path>] delete|restore <name>      remove one (kept 30 days), or bring it back
 wyvrn-community-host [--config <path>] limits <name> <members> <channels>
                                                                   what one may hold
+wyvrn-community-host [--config <path>] import <name> <owner-did> --community <database>
+                     [--stickers <database>] [--files <folder>] [--title <title>] [--storage <storage>]
+                                                                  bring in a community run on its own
+                                                                  (wyvrn-community), with its keys, its
+                                                                  address and everything it keeps. A
+                                                                  database is a mysql:// URL or a SQLite file.
+                                                                  Stop its own server first.
 
 The config path is --config, else $COMMUNITY_HOST_CONFIG, else config/default.toml.
 A change made here while the host runs is taken up when the community is next opened.";
@@ -78,6 +85,34 @@ async fn main() -> anyhow::Result<()> {
             let limits = Limits { members: members.parse()?, channels: channels.parse()?, ..record.limits.unwrap_or(config.limits) };
             registry.set_limits(name, Some(&limits))?;
             println!("{name} may hold {members} members and {channels} channels");
+            Ok(())
+        }
+        ["import", name, owner, rest @ ..] => {
+            anyhow::ensure!(owner.starts_with("did:"), "{owner} isn't a DID");
+            let option = |flag: &str| -> anyhow::Result<Option<String>> {
+                match rest.iter().position(|arg| *arg == flag) {
+                    Some(at) => rest.get(at + 1).map(|value| Some(value.to_string())).with_context(|| format!("{flag} needs a value")),
+                    None => Ok(None),
+                }
+            };
+            for (at, arg) in rest.iter().enumerate() {
+                let value_of_flag = at > 0 && rest[at - 1].starts_with("--");
+                anyhow::ensure!(value_of_flag || ["--community", "--stickers", "--files", "--title", "--storage"].contains(arg), "{arg}: unrecognized\n\n{USAGE}");
+            }
+            let database = |given: String| -> anyhow::Result<wyvrn_service::db::Location> {
+                if given.contains("://") { Ok(wyvrn_service::db::Location::parse(&given)?) } else { Ok(wyvrn_service::db::Location::Sqlite(given.into())) }
+            };
+            let community = database(option("--community")?.context("--community: where the community keeps what it keeps")?)?;
+            let stickers = option("--stickers")?.map(database).transpose()?;
+            let files = option("--files")?.map(std::path::PathBuf::from);
+            let storage = match option("--storage")? {
+                Some(kind) => Storage::parse(&kind).with_context(|| format!("{kind}: sqlite, mysql-db or mysql-shared"))?,
+                None => Storage::parse(&config.storage.default).context("storage.default: sqlite, mysql-db or mysql-shared")?,
+            };
+            let title = option("--title")?.unwrap_or_else(|| name.to_string());
+            let host = Host::new(config.clone(), registry(&config)?);
+            let source = wyvrn_community_host::import::Source { community, stickers, files, files_records: None };
+            println!("{}", tokio::task::block_in_place(|| host.import(name, &title, owner, storage, &source, now()))?);
             Ok(())
         }
         ["help" | "--help" | "-h"] => {

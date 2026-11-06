@@ -156,9 +156,29 @@ impl Community {
         Ok(())
     }
 
-    /// The owner's DID: as handed on, else the first member let in who holds
-    /// `administrator`, from then on.
+    /// The owners' DIDs, all equal: those the configuration names (`owners`),
+    /// else the one owner there is ([`Self::owner`]).
+    pub fn owners(&self) -> anyhow::Result<Vec<String>> {
+        if !self.config.owners.is_empty() {
+            return Ok(self.config.owners.clone());
+        }
+        Ok(self.owner()?.into_iter().collect())
+    }
+
+    /// Whether `did` is one of the owners.
+    pub fn is_owner(&self, did: &str) -> anyhow::Result<bool> {
+        if !self.config.owners.is_empty() {
+            return Ok(self.config.owners.iter().any(|owner| owner == did));
+        }
+        Ok(self.owner()?.as_deref() == Some(did))
+    }
+
+    /// The owner's DID: the first the configuration names, else as handed on, else
+    /// the first member let in who holds `administrator`, from then on.
     pub fn owner(&self) -> anyhow::Result<Option<String>> {
+        if let Some(first) = self.config.owners.first() {
+            return Ok(Some(first.clone()));
+        }
         if let Some(owner) = self.store.setting("owner")? {
             if self.store.member(&owner)?.is_some() {
                 return Ok(Some(owner));
@@ -188,7 +208,7 @@ impl Community {
                 rank = rank.max(role.position);
             }
         }
-        let owner = self.owner()?.as_deref() == Some(did);
+        let owner = self.is_owner(did)?;
         let roles = held.into_iter().filter(|id| roles.iter().any(|role| role.id == *id)).collect();
         Ok(Powers { owner, roles, permissions, rank })
     }
