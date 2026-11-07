@@ -640,6 +640,11 @@ fn watch(state: &Arc<AppState>, live: u64, sender: &str, message: &Value) -> any
     Ok(Some(community::reply_to(message, community::COMMUNITY, state.community.community(&member)?)))
 }
 
+/// How often a live connection is pinged, and how long one may say nothing at all
+/// (a ping's answer included) before it is taken to have gone.
+const LIVE_PING_EVERY: Duration = Duration::from_secs(20);
+const LIVE_SILENT_FOR: Duration = Duration::from_secs(60);
+
 /// A member's live connection (community-voice/1.0's Connectivity): DIDComm over a
 /// WebSocket. What they send is answered on it, and presence and keys are pushed
 /// on it. It is one member's: the first authenticated message says whose.
@@ -676,10 +681,21 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket) {
     });
     let (reply_tx, mut reply_rx) = mpsc::channel::<Vec<u8>>(64);
     let writing = tokio::spawn(async move {
+        // A ping now and then: what tells a connection that has died without
+        // closing (a device asleep, its network changed) from a quiet one. Its
+        // answer, or anything else, keeps the reading below going.
+        let mut pings = tokio::time::interval(LIVE_PING_EVERY);
+        pings.tick().await;
         loop {
             let packed = tokio::select! {
                 Some(p) = packed_rx.recv() => p,
                 Some(p) = reply_rx.recv() => p,
+                _ = pings.tick() => {
+                    if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 else => break,
             };
             let frame = match String::from_utf8(packed) {
@@ -692,7 +708,9 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket) {
         }
     });
     let service = CommunityService(state.clone());
-    while let Some(Ok(frame)) = stream.next().await {
+    // Nothing heard for this long, not even the answer to a ping: gone, and out of
+    // any room it was in, rather than listed there until TCP gives up on it.
+    while let Ok(Some(Ok(frame))) = tokio::time::timeout(LIVE_SILENT_FOR, stream.next()).await {
         let bytes: Vec<u8> = match frame {
             Message::Text(text) => text.as_bytes().to_vec(),
             Message::Binary(bytes) => bytes.to_vec(),
