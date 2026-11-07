@@ -6,6 +6,15 @@ The images themselves arrive with each run: `wyvrn-did-host`, `wyvrn-stickers`, 
 
 The full compose blocks are in `docker-compose.yml` beside this file in wyvrn-services. Below, each is given as it goes in a compose file of the server's own (images carried over, `image:` and no `build:`).
 
+## Restarting a community: its voice relay too
+
+`community-voice` and `community-host-voice` run in the network of `community` and `community-host` (`network_mode: service:...`). Recreating either community container (a new image) leaves its relay in the old container's network, where nothing reaches it: voice channels say "Can't reach the voice server" (seen 2026-11-07). Recreate the relay with it:
+
+```sh
+docker-compose -f compose.yml up -d --no-deps community community-host
+docker-compose -f compose.yml up -d --no-deps --force-recreate community-voice community-host-voice
+```
+
 ## 1. The community web view (in `wyvrn-community`, no new image)
 
 Each community server now answers a browser at its own address with its web view: its page, its public channels, and signing in. The web view of a community that existed before this release stays off until an admin turns it on in the app (Admin, On the web).
