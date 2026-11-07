@@ -2009,6 +2009,46 @@ fn owners_named_where_it_runs_are_all_owners_and_none_can_be_acted_on() {
 }
 
 #[test]
+fn an_owner_named_where_it_runs_stays_one_when_they_move() {
+    let config = wyvrn_community::config::CommunityConfig { owners: vec!["did:peer:2.ana-old".into(), "did:peer:2.ben".into()], ..Default::default() };
+    let community = Community::new(Store::in_memory().unwrap(), config, None).unwrap();
+    community.store.set_member("did:peer:2.ana-old", wyvrn_community::store::Role::Admin, 1).unwrap();
+    community.store.rotate("did:peer:2.ana-old", "did:peer:2.ana-mid", 2).unwrap();
+    community.store.rotate("did:peer:2.ana-mid", "did:peer:2.ana-new", 3).unwrap();
+    assert!(community.is_owner("did:peer:2.ana-new").unwrap());
+    assert!(!community.is_owner("did:peer:2.ana-old").unwrap(), "a DID left behind is nobody's");
+    assert_eq!(community.owners().unwrap(), ["did:peer:2.ana-new", "did:peer:2.ben"]);
+    assert_eq!(community.owner().unwrap().as_deref(), Some("did:peer:2.ana-new"));
+    assert!(community.powers("did:peer:2.ana-new").unwrap().owner);
+}
+
+#[test]
+fn an_owner_named_by_a_public_address_is_one_under_the_did_they_write_from() {
+    let named = "did:web:id.example:ana";
+    let config = wyvrn_community::config::CommunityConfig { owners: vec!["did:peer:2.first".into(), named.into()], ..Default::default() };
+    let community = Community::new(Store::in_memory().unwrap(), config, None).unwrap();
+    // Before they have written, the address is listed as named, and nobody is it.
+    assert_eq!(community.owners().unwrap(), ["did:peer:2.first", named]);
+    assert!(!community.is_owner("did:peer:2.ana").unwrap());
+    assert_eq!(community.owners_named_by_address_besides("did:peer:2.ana").unwrap(), [named]);
+
+    community.note_owner_holder(named, "did:peer:2.ana").unwrap();
+    assert!(community.is_owner("did:peer:2.ana").unwrap());
+    assert!(!community.is_owner(named).unwrap());
+    assert_eq!(community.owners().unwrap(), ["did:peer:2.first", "did:peer:2.ana"]);
+    assert!(community.owners_named_by_address_besides("did:peer:2.ana").unwrap().is_empty(), "not looked up again");
+
+    // It follows them when they move, and someone else shown to hold it takes it over.
+    community.store.set_member("did:peer:2.ana", wyvrn_community::store::Role::Admin, 1).unwrap();
+    community.store.rotate("did:peer:2.ana", "did:peer:2.ana-new", 2).unwrap();
+    assert!(community.is_owner("did:peer:2.ana-new").unwrap());
+    assert_eq!(community.owners_named_by_address_besides("did:peer:2.other").unwrap(), [named]);
+    community.note_owner_holder(named, "did:peer:2.other").unwrap();
+    assert!(community.is_owner("did:peer:2.other").unwrap());
+    assert!(!community.is_owner("did:peer:2.ana-new").unwrap());
+}
+
+#[test]
 fn every_owner_is_an_admin_too() {
     let mut config = wyvrn_community::config::CommunityConfig { admins: vec!["did:example:ana".into()], owners: vec!["did:example:ana".into(), "did:example:ben".into()], ..Default::default() };
     config.owners_are_admins();

@@ -20,6 +20,10 @@ pub const EVERYONE_ROLE: &str = "everyone";
 pub const ADMIN_ROLE: &str = "admin";
 pub const MODERATOR_ROLE: &str = "moderator";
 
+/// The setting that keeps, as JSON, the DID each owner named by a public address
+/// was seen writing from (a setting's name is too short for a DID).
+pub const OWNER_HOLDERS_SETTING: &str = "owner_holders";
+
 /// The permissions that are the community's alone, each with what an app shows it as.
 pub const COMMUNITY_PERMISSIONS: &[(&str, &str)] = &[
     ("administrator", "Administrator: everything, everywhere"),
@@ -157,10 +161,11 @@ impl Community {
     }
 
     /// The owners' DIDs, all equal: those the configuration names (`owners`),
-    /// else the one owner there is ([`Self::owner`]).
+    /// each where it is now ([`Self::configured_owners`]), else the one owner
+    /// there is ([`Self::owner`]).
     pub fn owners(&self) -> anyhow::Result<Vec<String>> {
         if !self.config.owners.is_empty() {
-            return Ok(self.config.owners.clone());
+            return self.configured_owners();
         }
         Ok(self.owner()?.into_iter().collect())
     }
@@ -168,16 +173,71 @@ impl Community {
     /// Whether `did` is one of the owners.
     pub fn is_owner(&self, did: &str) -> anyhow::Result<bool> {
         if !self.config.owners.is_empty() {
-            return Ok(self.config.owners.iter().any(|owner| owner == did));
+            return Ok(self.configured_owners()?.iter().any(|owner| owner == did));
         }
         Ok(self.owner()?.as_deref() == Some(did))
     }
 
-    /// The owner's DID: the first the configuration names, else as handed on, else
-    /// the first member let in who holds `administrator`, from then on.
+    /// The owners the configuration names, at the DIDs they write from now. One
+    /// named by a public address is at the DID its holder was seen writing from
+    /// ([`OWNER_HOLDERS_SETTING`]); and a DID its member has since moved from
+    /// is the one they moved to, however many moves on, as their roles follow
+    /// them. A public address nobody has written from yet stays as it is named.
+    pub fn configured_owners(&self) -> anyhow::Result<Vec<String>> {
+        let holders = self.owner_holders()?;
+        let mut owners = Vec::new();
+        for named in &self.config.owners {
+            let written_from = holders.get(named).map(String::as_str).unwrap_or(named);
+            let now = self.store.current_did(written_from)?;
+            if !owners.contains(&now) {
+                owners.push(now);
+            }
+        }
+        Ok(owners)
+    }
+
+    /// For each owner named by a public address, the DID its holder was seen
+    /// writing from.
+    pub fn owner_holders(&self) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+        Ok(match self.store.setting(OWNER_HOLDERS_SETTING)? {
+            Some(kept) => serde_json::from_str(&kept).unwrap_or_default(),
+            None => Default::default(),
+        })
+    }
+
+    /// `holder` wrote as the owner named by the public address `named`.
+    pub fn note_owner_holder(&self, named: &str, holder: &str) -> anyhow::Result<()> {
+        let mut holders = self.owner_holders()?;
+        if holders.get(named).map(String::as_str) == Some(holder) {
+            return Ok(());
+        }
+        holders.insert(named.to_string(), holder.to_string());
+        Ok(self.store.set_setting(OWNER_HOLDERS_SETTING, &serde_json::to_string(&holders)?)?)
+    }
+
+    /// The owners named by a public address that `sender` isn't already the
+    /// holder of: those a message from them may show they hold.
+    pub fn owners_named_by_address_besides(&self, sender: &str) -> anyhow::Result<Vec<String>> {
+        let holders = self.owner_holders()?;
+        let mut besides = Vec::new();
+        for named in self.config.owners.iter().filter(|did| wyvrn_service::named::is_hosted(did)) {
+            let current = match holders.get(named) {
+                Some(holder) => Some(self.store.current_did(holder)?),
+                None => None,
+            };
+            if current.as_deref() != Some(sender) {
+                besides.push(named.clone());
+            }
+        }
+        Ok(besides)
+    }
+
+    /// The owner's DID: the first the configuration names (where it is now),
+    /// else as handed on, else the first member let in who holds
+    /// `administrator`, from then on.
     pub fn owner(&self) -> anyhow::Result<Option<String>> {
-        if let Some(first) = self.config.owners.first() {
-            return Ok(Some(first.clone()));
+        if let Some(first) = self.configured_owners()?.into_iter().next() {
+            return Ok(Some(first));
         }
         if let Some(owner) = self.store.setting("owner")? {
             if self.store.member(&owner)?.is_some() {

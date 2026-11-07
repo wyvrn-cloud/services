@@ -223,10 +223,12 @@ COMMUNITY_OWNERS=
 
 ```toml
 [owners]
-saikous = ["did:peer:2...", "did:peer:2..."]
+saikous = ["did:web:id.wyvrn.app:...", "did:peer:2..."]
 ```
 
 Taken up when the community is next opened (restart the host to have it at once). A community with owners named here can't be handed on from the app.
+
+Name an owner by their public address (`did:web:id.wyvrn.app:...`) where they have one: they are an owner under the DID they write from once they next write to the community, and stay one when their app moves to a new DID. One named by a `did:peer` stays one when they move too (from the version of 2026-11-07; before it, a move lost them it).
 
 ## 5. Bringing a community run on its own onto the host (the Niko community)
 

@@ -411,6 +411,13 @@ impl CommunityService {
                     }
                 }
             }
+            // An owner named by their public address: owner under the DID they
+            // write from, kept so that it follows them when they move.
+            let others = state.community.owners_named_by_address_besides(&sender)?;
+            if let Some(named) = wyvrn_service::named::holder_among(state.resolver.as_ref(), &others, &sender, kid).await {
+                state.community.note_owner_holder(named, &sender)?;
+                tracing::info!(%sender, %named, "an owner named by their public address wrote, and is one under the DID they write from");
+            }
         }
 
         // The owner's pages from the host: theirs alone, and answered while moving
