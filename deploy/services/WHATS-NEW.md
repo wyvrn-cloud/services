@@ -240,7 +240,8 @@ For the Niko community (`community-niko`, address `community:saikous`, kept in t
 
    ```sh
    cd /root/wyvrn
-   set -a; . ./.env; set +a
+   # Just the one value: .env is written for Compose, not the shell, and a line in it can break `.`
+   COMMUNITY_DB2=$(sed -n 's/^COMMUNITY_DB2=//p' .env | tail -1 | sed "s/^[\"']//; s/[\"']\$//")
    docker compose run --rm -v ./community2:/import community-host \
      import saikous <owner-did> --community "$COMMUNITY_DB2" \
      --stickers /import/stickers --files /import/files --title "<its name>"
