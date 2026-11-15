@@ -9,7 +9,7 @@ use axum::{
     extract::{Request, State},
     http::{header, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::{any, get, post},
+    routing::{get, post},
     Json, Router,
 };
 use didcomm_agent::{Agent, Features, Identity};
@@ -89,9 +89,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/voice/auth", post(voice_auth))
         // An owner's export, once (export.rs).
         .route("/export/{token}", get(crate::export::download))
-        .route("/c/{name}", any(community))
-        .route("/c/{name}/", any(community))
-        .route("/c/{name}/{*rest}", any(community))
+        // Everything under /c/<name> is the community's, by the fallback rather
+        // than a route: a route's `{name}` and `{*rest}` would stay with the
+        // request, and every route of the community's own that reads its path
+        // (a member's picture, a pack's file, a post's page) would be handed
+        // those as well as its own, and fail.
+        .fallback(community)
         .with_state(state)
 }
 
@@ -102,7 +105,9 @@ async fn index(State(state): State<Arc<AppState>>) -> String {
 /// A request for one community: handed to it with `/c/<name>` taken off its path.
 async fn community(State(state): State<Arc<AppState>>, mut request: Request) -> Response {
     let path = request.uri().path().to_string();
-    let rest = path.strip_prefix("/c/").unwrap_or_default();
+    let Some(rest) = path.strip_prefix("/c/").filter(|rest| !rest.is_empty() && !rest.starts_with('/')) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let (name, inner) = match rest.find('/') {
         Some(at) => (&rest[..at], &rest[at..]),
         None => (rest, "/"),

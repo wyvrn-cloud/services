@@ -379,7 +379,28 @@ async fn each_community_is_on_the_web_at_its_own_path() {
     assert_eq!(bare.headers()["location"], "gamma/");
     let discovery: Value = http.get(format!("{}c/gamma/.well-known/openid-configuration", running.url)).send().await.unwrap().json().await.unwrap();
     assert_eq!(discovery["issuer"], format!("{}c/gamma", running.url));
+
+    // A member's picture, at the address the member list gives: a route of the
+    // community's own with a path of its own, which once failed under the host.
+    let message = json!({
+        "type": "https://didcomm.org/user-profile/1.0/profile",
+        "body": { "profile": { "displayName": "Owner", "displayPicture": "#pfp" } },
+        "attachments": [{ "id": "pfp", "media_type": "image/png", "data": { "base64": PIXEL } }],
+    });
+    owner.agent.send(&did, &message).await.expect("sent");
+    let listed = owner.community(&did, "members-request", json!({})).await;
+    let picture = listed["body"]["members"][0]["profile"]["picture"].as_str().expect("a picture's address").to_string();
+    assert!(picture.starts_with(&format!("{}c/gamma/m/", running.url)), "{picture}");
+    let fetched = http.get(&picture).send().await.unwrap();
+    assert_eq!(fetched.status(), 200);
+    assert_eq!(fetched.headers()["content-type"], "image/png");
+    assert_eq!(http.get(format!("{}c/gamma/m/nobody/picture/nothing", running.url)).send().await.unwrap().status(), 404);
+    assert_eq!(http.get(format!("{}c/", running.url)).send().await.unwrap().status(), 404);
+    assert_eq!(http.get(format!("{}nothing-here", running.url)).send().await.unwrap().status(), 404);
 }
+
+/// A one-pixel PNG.
+const PIXEL: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
 
 #[tokio::test]
 async fn a_community_run_on_its_own_is_brought_in_with_its_keys_and_everything_it_keeps() {
