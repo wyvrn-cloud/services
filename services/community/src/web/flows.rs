@@ -192,7 +192,7 @@ impl Community {
         let css = self.store.setting(super::CSS)?.unwrap_or_default();
         let url = self.web_url.clone().unwrap_or_default();
         items.push(json!({ "type": "text", "text": format!("The community's page is at {url}. Whether it is on, and who sees who is in voice, are in the community's settings; this is how it looks, and the websites members sign in to with it.") }));
-        let colour_input = |id: &str, label: &str, value: &str| json!({ "type": "text-input", "form-id": id, "label": label, "value": value });
+        let colour_input = |id: &str, label: &str, value: &str| json!({ "type": "text-input", "form-id": id, "format": "color", "label": label, "value": value });
         let fonts: Vec<Value> = FONTS.iter().map(|(id, label, _)| json!({ "value": id, "label": label })).collect();
         items.push(json!({ "type": "form", "children": [
             { "type": "title", "text": "Light" },
