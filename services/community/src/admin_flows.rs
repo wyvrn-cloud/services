@@ -70,6 +70,7 @@ fn templates() -> [(&'static str, &'static str, Value); 10] {
                 "states": [{ "name": "list", "type": "start" }, { "name": "edit", "type": "normal" }, { "name": "done", "type": "final" }],
                 "transitions": {
                     "edit": { "from": "list", "to": "edit" }, "create": { "from": "list", "to": "edit" },
+                    "preset": { "from": "list", "to": "edit" },
                     "toggle": { "from": "list", "to": "list" }, "done": { "from": "list", "to": "done" },
                     "save": { "from": "edit", "to": "list" }, "delete": { "from": "edit", "to": "list" }, "back": { "from": "edit", "to": "list" }
                 }
@@ -428,7 +429,7 @@ impl Community {
                 }
                 (MEMBER_ROLES, _) => (self.member_roles_ui(flow, &powers)?, vec!["save"]),
                 (CHANNEL_PERMISSIONS_FLOW, "roles") => (self.channel_roles_ui(flow, &powers)?, vec!["read_only", "unlock", "edit", "done"]),
-                (AUTOMOD_FLOW, "list") => (self.automod_list_ui(flow).map_err(failed)?, vec!["edit", "create", "toggle", "done"]),
+                (AUTOMOD_FLOW, "list") => (self.automod_list_ui(flow).map_err(failed)?, vec!["edit", "create", "preset", "toggle", "done"]),
                 (AUTOMOD_FLOW, "edit") => (self.automod_edit_ui(flow).map_err(failed)?, vec!["save", "delete", "back"]),
                 (JOIN_GATES_FLOW, _) => (self.join_gates_ui().map_err(failed)?, vec!["save"]),
                 (CHANNELS_FLOW, "list") => (self.channels_list_ui().map_err(failed)?, vec!["up", "down", "create_category", "edit_category", "category_up", "category_down", "move", "done"]),
@@ -834,7 +835,7 @@ impl Community {
 
     fn automod_list_ui(&self, flow: &Flow) -> anyhow::Result<Value> {
         let mut items = vec![json!({ "type": "title", "text": "AutoMod" })];
-        items.push(json!({ "type": "text", "text": "Rules that check each post before it is placed. The first rule a post triggers decides. Whoever manages posts in a channel isn't checked there." }));
+        items.push(json!({ "type": "text", "text": "Rules that check each post, and each edit, before it is placed, in order. A rule that refuses or holds a post is the last to check it; one that censors it passes what is left to the next. Whoever manages posts in a channel isn't checked there." }));
         if let Some(note) = flow.data["note"].as_str() {
             items.push(json!({ "type": "pass", "text": note }));
         }
@@ -846,14 +847,22 @@ impl Community {
             let on = rule["enabled"] == true;
             let id = rule["id"].as_str().unwrap_or_default();
             items.push(json!({ "type": "row", "children": [
-                { "type": "text", "text": format!("{} ({})", rule["name"].as_str().unwrap_or("A rule"), if on { "on" } else { "off" }) },
+                { "type": "text", "text": format!("{} ({}, {})", rule["name"].as_str().unwrap_or("A rule"), if on { "on" } else { "off" }, crate::automod::action_label(rule)) },
                 button("Edit", "edit", json!({ "rule": id })),
                 button(if on { "Turn off" } else { "Turn on" }, "toggle", json!({ "rule": id }))
             ] }));
         }
         items.push(json!({ "type": "divider" }));
+        items.push(json!({ "type": "title", "text": "Start from a ready-made rule" }));
+        for (key, name, about, _) in crate::automod::PRESETS {
+            items.push(json!({ "type": "row", "children": [
+                { "type": "text", "text": format!("{name}: {about}") },
+                button("Add", "preset", json!({ "preset": key }))
+            ] }));
+        }
+        items.push(json!({ "type": "divider" }));
         items.push(json!({ "type": "form", "children": [
-            { "type": "text-input", "form-id": "name", "label": "New rule", "placeholder": "Spam links", "required": true },
+            { "type": "text-input", "form-id": "name", "label": "Or a new rule of your own", "placeholder": "Spam links", "required": true },
             button("Add rule", "create", json!({}))
         ] }));
         items.push(button("Done", "done", json!({})));
@@ -871,19 +880,36 @@ impl Community {
         let mut fields = vec![
             json!({ "type": "text-input", "form-id": "name", "label": "Name", "value": rule["name"], "required": true }),
             json!({ "type": "check-box", "form-id": "enabled", "label": "On", "value": rule["enabled"] == true }),
-            json!({ "type": "title", "text": "What triggers it" }),
-            json!({ "type": "text-area", "form-id": "words", "label": "Words, one a line (* stands for any letters)", "value": lines("words").join("\n") }),
+            json!({ "type": "title", "text": "What it looks for" }),
+            json!({ "type": "text", "text": "The filters know words however they are disguised: Sh#t, $hit, s h i t, sh1t, letters from other alphabets." }),
+        ];
+        for (key, label, _) in crate::filters::FILTERS {
+            let mut options = vec![json!({ "value": "off", "label": "Off" })];
+            options.extend(crate::filters::STRICTNESS.iter().map(|(value, label)| json!({ "value": value, "label": label })));
+            fields.push(json!({ "type": "drop-down", "form-id": format!("filter-{key}"), "label": label, "options": options, "value": rule["filters"][key].as_str().unwrap_or("off") }));
+        }
+        fields.extend([
+            json!({ "type": "text-area", "form-id": "words", "label": "Words of your own, one a line (* stands for any letters). They're found disguised too.", "value": lines("words").join("\n") }),
+            json!({ "type": "text-area", "form-id": "allowed_words", "label": "Words never to act on, one a line: a town, a name, a word a filter takes wrongly (shiitake)", "value": lines("allowed_words").join("\n") }),
             json!({ "type": "text-area", "form-id": "patterns", "label": "Patterns, one a line (regular expressions)", "value": lines("patterns").join("\n") }),
-            json!({ "type": "check-box", "form-id": "links", "label": "Links", "value": rule["links"] == true }),
-            json!({ "type": "text-input", "form-id": "allowed_domains", "label": "Links allowed to (domains, separated by commas)", "value": lines("allowed_domains").join(", ") }),
+            json!({ "type": "title", "text": "Links" }),
+            json!({ "type": "check-box", "form-id": "links", "label": "Any link", "value": rule["links"] == true }),
+        ]);
+        let lists = lines("domain_lists");
+        for (key, label, _) in crate::filters::DOMAIN_LISTS {
+            fields.push(json!({ "type": "check-box", "form-id": format!("list-{key}"), "label": label, "value": lists.contains(&key) }));
+        }
+        fields.extend([
+            json!({ "type": "text-input", "form-id": "blocked_domains", "label": "Links never allowed to (domains, separated by commas)", "value": lines("blocked_domains").join(", ") }),
+            json!({ "type": "text-input", "form-id": "allowed_domains", "label": "Links always allowed to (domains, separated by commas)", "value": lines("allowed_domains").join(", ") }),
             json!({ "type": "text-input", "form-id": "max_mentions", "label": "Most mentions in one post (empty: no limit)", "value": rule["max_mentions"].as_u64().map(|n| n.to_string()).unwrap_or_default() }),
             json!({ "type": "title", "text": "What it does" }),
-            json!({ "type": "check-box", "form-id": "block", "label": "Refuse the post", "value": rule["block"] == true }),
-            json!({ "type": "check-box", "form-id": "hold", "label": "Hold it for a moderator", "value": rule["hold"] == true }),
+            json!({ "type": "drop-down", "form-id": "action", "label": "With a post it finds something in", "value": crate::automod::action_of(&rule), "options": crate::automod::ACTIONS.iter().map(|(value, label)| json!({ "value": value, "label": label })).collect::<Vec<_>>() }),
+            json!({ "type": "text", "text": "Censored, words become dots and links <UNSAFE URL BLOCKED>. Whoever manages posts in the channel can still see what it said." }),
             json!({ "type": "text-input", "form-id": "alert_channel", "label": "Tell a channel of it (the channel's name)", "placeholder": "mod-log", "value": alert }),
             json!({ "type": "text-input", "form-id": "timeout_minutes", "label": "Time its author out for (minutes; empty: no)", "value": rule["timeout_seconds"].as_i64().map(|s| (s / 60).to_string()).unwrap_or_default() }),
             json!({ "type": "title", "text": "Who and where it doesn't check" }),
-        ];
+        ]);
         let exempt_roles = lines("exempt_roles");
         for role in self.store.roles()?.iter().filter(|role| role.id != EVERYONE_ROLE) {
             fields.push(json!({ "type": "check-box", "form-id": format!("exempt-role-{}", role.id), "label": format!("Role: {}", role.name), "value": exempt_roles.contains(&role.id.as_str()) }));
@@ -939,6 +965,25 @@ impl Community {
                 flow.state = "edit".into();
                 Ok(false)
             }
+            (AUTOMOD_FLOW, "list", "preset") => {
+                let Some((_, name, _, rule)) = crate::automod::PRESETS.iter().find(|(key, ..)| input["preset"] == *key) else {
+                    return Err(refused("There is no such ready-made rule."));
+                };
+                let rules = self.store.automod_rules().map_err(failed)?;
+                if rules.len() >= 50 {
+                    return Err(refused("That is as many rules as AutoMod holds."));
+                }
+                let id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+                let mut rule = rule();
+                rule["id"] = json!(id);
+                rule["name"] = json!(name);
+                rule["enabled"] = json!(true);
+                self.store.save_automod_rule(&id, rules.len() as i64, &rule).map_err(failed)?;
+                self.audit(now, &flow.owner, "community.automod", None, Some(rule.clone()));
+                flow.data["rule"] = json!(id);
+                flow.state = "edit".into();
+                Ok(false)
+            }
             (AUTOMOD_FLOW, "list", "edit") => {
                 let rule = self.automod_rule(input["rule"].as_str().unwrap_or_default())?;
                 flow.data["rule"] = rule["id"].clone();
@@ -980,11 +1025,27 @@ impl Community {
                 };
                 let roles: Vec<String> = self.store.roles().map_err(failed)?.into_iter().filter(|role| ticked(&input[format!("exempt-role-{}", role.id)])).map(|role| role.id).collect();
                 let channels: Vec<String> = self.store.channels().map_err(failed)?.into_iter().filter(|c| ticked(&input[format!("exempt-channel-{}", c.id)])).map(|c| c.id).collect();
+                let mut filters = serde_json::Map::new();
+                for (key, _, _) in crate::filters::FILTERS {
+                    if let Some(level) = input[format!("filter-{key}")].as_str().filter(|level| crate::filters::STRICTNESS.iter().any(|(known, _)| known == level)) {
+                        filters.insert(key.to_string(), json!(level));
+                    }
+                }
+                let lists: Vec<&str> = crate::filters::DOMAIN_LISTS.iter().map(|(key, _, _)| *key).filter(|key| ticked(&input[format!("list-{key}")])).collect();
+                // (A form from before the drop-down says it in check-boxes.)
+                let action = match input["action"].as_str().filter(|action| crate::automod::ACTIONS.iter().any(|(known, _)| known == action)) {
+                    Some(action) => action,
+                    None if ticked(&input["block"]) => "block",
+                    None if ticked(&input["hold"]) => "hold",
+                    None if ticked(&input["censor"]) => "censor",
+                    None => "note",
+                };
                 let rule = json!({
                     "id": id, "name": name, "enabled": ticked(&input["enabled"]),
-                    "words": words("words", &['\n', ',']), "patterns": patterns,
-                    "links": ticked(&input["links"]), "allowed_domains": words("allowed_domains", &[',', ' ']),
-                    "max_mentions": mentions, "block": ticked(&input["block"]), "hold": ticked(&input["hold"]),
+                    "filters": filters, "words": words("words", &['\n', ',']), "allowed_words": words("allowed_words", &['\n', ',']), "patterns": patterns,
+                    "links": ticked(&input["links"]), "domain_lists": lists,
+                    "allowed_domains": words("allowed_domains", &[',', ' ']), "blocked_domains": words("blocked_domains", &[',', ' ']),
+                    "max_mentions": mentions, "block": action == "block", "hold": action == "hold", "censor": action == "censor",
                     "alert_channel": alert, "timeout_seconds": timeout, "exempt_roles": roles, "exempt_channels": channels,
                 });
                 let position = self.store.automod_rules().map_err(failed)?.iter().position(|r| r["id"] == id.as_str()).unwrap_or(0) as i64;

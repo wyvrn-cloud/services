@@ -1532,6 +1532,59 @@ async fn automod_refuses_holds_and_alerts_and_join_gates_ask_before_letting_in()
 }
 
 #[tokio::test]
+async fn automod_censors_disguised_words_and_unsafe_links_and_moderators_see_the_original() {
+    let server = start_server("").await;
+    let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member]);
+    let channel = open_channel(&owner, "general").await;
+    for peer in [&owner, &member] {
+        peer.community("join", json!({})).await;
+    }
+    // The ready-made "Family friendly" rule, and one of our own after it that refuses a word.
+    owner.workflow("start", json!({ "template_id": "automod", "instance_id": "a1" })).await;
+    let preset = advance(&owner, "a1", "preset", json!({ "preset": "family" })).await;
+    let ui = preset["body"]["ui"].to_string();
+    assert!(ui.contains("filter-profanity") && ui.contains("Censor the post"), "{preset}");
+    advance(&owner, "a1", "back", json!({})).await;
+    advance(&owner, "a1", "create", json!({ "name": "Pineapple" })).await;
+    advance(&owner, "a1", "save", json!({ "name": "Pineapple", "enabled": true, "words": "pineapple", "action": "block" })).await;
+    advance(&owner, "a1", "done", json!({})).await;
+
+    // Censored: the disguised swear as dots, the adult link blocked, "ship" left be.
+    let posted = member.community("post", json!({ "channel": channel, "id": "c1", "content": "Ship it, sh#t, see pornhub[.]com" })).await;
+    assert_eq!(kind(&posted), "posted", "{posted}");
+    assert_eq!(posted["body"]["content"], "Ship it, ••••, see <UNSAFE URL BLOCKED>");
+    assert_eq!(posted["body"]["censored"]["by"], json!(["Family friendly"]));
+    let seen = member.community("history-request", json!({ "channel": channel })).await["body"]["messages"][0].clone();
+    assert_eq!(seen["content"], "Ship it, ••••, see <UNSAFE URL BLOCKED>");
+    assert_eq!(seen["censored"]["by"], json!(["Family friendly"]));
+    // What it said is for whoever manages posts, and nobody else.
+    let original = owner.community("original-request", json!({ "to": { "id": "c1" } })).await;
+    assert_eq!(original["body"]["content"], "Ship it, sh#t, see pornhub[.]com", "{original}");
+    assert_eq!(member.community("original-request", json!({ "to": { "id": "c1" } })).await["body"]["code"], "e.p.trust.not-authorized");
+
+    // A later rule still checks what is left: refused, though the first censored.
+    let refused = member.community("post", json!({ "channel": channel, "content": "shit, pineapple" })).await;
+    assert_eq!(refused["body"]["code"], "e.p.msg.automod", "{refused}");
+
+    // An edit is checked too: written back, it is censored again; made clean, it isn't.
+    let edited = member.ask("https://wyvrn.app/message-edits/1.0/edit", json!({ "to": { "id": "c1" }, "content": "what the f#ck" })).await;
+    assert_eq!(edited["body"]["content"], "what the ••••", "{edited}");
+    assert_eq!(owner.community("original-request", json!({ "to": { "id": "c1" } })).await["body"]["content"], "what the f#ck");
+    let clean = member.ask("https://wyvrn.app/message-edits/1.0/edit", json!({ "to": { "id": "c1" }, "content": "all good" })).await;
+    assert_eq!(clean["body"]["content"], "all good");
+    assert!(clean["body"].get("censored").is_none(), "{clean}");
+    assert_eq!(owner.community("original-request", json!({ "to": { "id": "c1" } })).await["body"]["code"], "e.p.msg.not-censored");
+    let refused_edit = member.ask("https://wyvrn.app/message-edits/1.0/edit", json!({ "to": { "id": "c1" }, "content": "pineapple" })).await;
+    assert_eq!(refused_edit["body"]["code"], "e.p.msg.automod");
+
+    // Whoever manages posts isn't checked.
+    assert_eq!(owner.community("post", json!({ "channel": channel, "content": "sh#t" })).await["body"].get("censored"), None);
+    let audit = owner.community("audit-request", json!({})).await.to_string();
+    assert!(audit.contains("automod.censor"));
+}
+
+#[tokio::test]
 async fn channels_are_ordered_in_categories_newcomers_are_onboarded_and_insights_count_totals() {
     let server = start_server("").await;
     let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);
@@ -2157,4 +2210,28 @@ fn the_trash_is_kept_and_emptied_in_mysql_too() {
     store.trash_channel("c1", "did:example:admin", 10).unwrap();
     assert_eq!(store.purge_trashed(11).unwrap(), ["c1"]);
     assert!(store.trashed_channels().unwrap().is_empty());
+}
+
+#[test]
+fn what_automod_censored_is_kept_in_mysql_too() {
+    let Some(url) = std::env::var("WYVRN_TEST_DATABASE_URL").ok().filter(|url| !url.is_empty()) else { return };
+    let server = url.trim_end_matches('/');
+    let database = format!("wyvrn_test_censored_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    {
+        let mut admin = mysql::Conn::new(mysql::Opts::from_url(server).unwrap()).unwrap();
+        mysql::prelude::Queryable::query_drop(&mut admin, format!("CREATE DATABASE {database}")).unwrap();
+    }
+    let store = Store::open(&wyvrn_service::db::Location::MySql(format!("{server}/{database}"))).unwrap();
+    store.add_channel("c1", "general", "", "did:example:admin", 1).unwrap();
+    store.admit("did:example:member", wyvrn_community::store::Role::Member, 1).unwrap();
+    let member = store.member("did:example:member").unwrap().unwrap();
+    store.add_post("c1", "p1", "oh ••••", &member, None, None, 2).unwrap();
+    store.set_censored("p1", Some(("oh sh#t", &["Family friendly".to_string()]))).unwrap();
+    assert_eq!(store.post_by_id("p1").unwrap().unwrap().censored, Some(vec!["Family friendly".to_string()]));
+    assert_eq!(store.censored_original("p1").unwrap().as_deref(), Some("oh sh#t"));
+    store.set_censored("p1", Some(("oh sh!t", &["Again".to_string()]))).unwrap();
+    assert_eq!(store.censored_original("p1").unwrap().as_deref(), Some("oh sh!t"));
+    store.delete_post("p1", None).unwrap();
+    assert_eq!(store.censored_original("p1").unwrap(), None);
+    assert_eq!(store.post_by_id("p1").unwrap().unwrap().censored, None);
 }

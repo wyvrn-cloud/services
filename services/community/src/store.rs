@@ -116,6 +116,9 @@ pub struct Post {
     /// What else it carries, as JSON: `media` and `attachments`, a `poll`, a
     /// forum thread's `title` and `tags`.
     pub extra: Option<Value>,
+    /// The AutoMod rules that censored it, where any did (its original is kept
+    /// apart, for moderators: `Store::censored_original`).
+    pub censored: Option<Vec<String>>,
     /// Each member's vote, where it is a poll: `(did, answer ids)`.
     pub votes: Vec<(String, Vec<String>)>,
 }
@@ -291,7 +294,8 @@ const POST_COLUMNS: &str = "serial, channel, seq, id, content, posted_at, author
     (SELECT reply_snippet FROM post_state WHERE post_state.post = posts.id), \
     (SELECT removed_by FROM post_removals WHERE post_removals.post = posts.id), \
     (SELECT channel FROM post_voice_invites WHERE post_voice_invites.post = posts.id), \
-    (SELECT extra FROM post_extra WHERE post_extra.post = posts.id)";
+    (SELECT extra FROM post_extra WHERE post_extra.post = posts.id), \
+    (SELECT rules FROM post_censored WHERE post_censored.post = posts.id)";
 /// A channel not in the trash (`channel_trash`), said of `channels`.
 const NOT_TRASHED: &str = "NOT EXISTS (SELECT 1 FROM channel_trash WHERE channel_trash.channel = channels.id)";
 const CHANNEL_COLUMNS: &str = "id, name, topic, closed, created_at, created_by, (SELECT COALESCE(MAX(seq), 0) FROM posts WHERE posts.channel = channels.id), \
@@ -343,6 +347,7 @@ fn post_from(row: &Row) -> Result<Post> {
         removed_by: row.get(20)?,
         voice_invite: row.get(21)?,
         extra: json_from(row.get(22)?),
+        censored: json_from(row.get(23)?).and_then(|rules| serde_json::from_value(rules).ok()),
         votes: Vec::new(),
         // Read after, each by a query of its own (`Store::filled`).
         reactions: Vec::new(),
@@ -721,6 +726,13 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         channel TEXT PRIMARY KEY,
         position INTEGER NOT NULL,
         category TEXT
+    );
+    -- What AutoMod censored: a post's text as its author wrote it, for moderators,
+    -- and the rules (as JSON) that censored it.
+    CREATE TABLE IF NOT EXISTS post_censored (
+        post TEXT PRIMARY KEY,
+        original TEXT NOT NULL,
+        rules TEXT NOT NULL
     );
     -- What a post carries beyond its text, as JSON (media, a poll, a forum title and tags).
     CREATE TABLE IF NOT EXISTS post_extra (
@@ -1118,6 +1130,11 @@ fn schema() -> Schema {
             CREATE TABLE IF NOT EXISTS post_extra (
                 post VARCHAR(255) NOT NULL PRIMARY KEY,
                 extra MEDIUMTEXT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS post_censored (
+                post VARCHAR(255) NOT NULL PRIMARY KEY,
+                original MEDIUMTEXT NOT NULL,
+                rules TEXT NOT NULL
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS votes (
                 post VARCHAR(255) NOT NULL,
@@ -2064,7 +2081,7 @@ impl Store {
         let due: Vec<String> = self.db.lock().query("SELECT channel FROM channel_trash WHERE trashed_at < ?1", params![before], |row| row.get(0))?;
         for id in &due {
             self.db.lock().transaction(|tx| {
-                for table in ["post_state", "reactions", "post_removals", "post_voice_invites", "post_extra", "votes", "polls_ended", "answering"] {
+                for table in ["post_state", "reactions", "post_removals", "post_voice_invites", "post_extra", "post_censored", "votes", "polls_ended", "answering"] {
                     tx.execute(&format!("DELETE FROM {table} WHERE post IN (SELECT id FROM posts WHERE channel = ?1)"), params![id])?;
                 }
                 tx.execute("DELETE FROM thread_follows WHERE thread IN (SELECT id FROM threads WHERE channel = ?1)", params![id])?;
@@ -2251,6 +2268,7 @@ impl Store {
         db.execute("UPDATE posts SET content = '', question = NULL, answer = NULL WHERE id = ?1", params![id])?;
         db.execute("DELETE FROM reactions WHERE post = ?1", params![id])?;
         db.execute("DELETE FROM post_extra WHERE post = ?1", params![id])?;
+        db.execute("DELETE FROM post_censored WHERE post = ?1", params![id])?;
         db.execute("DELETE FROM votes WHERE post = ?1", params![id])?;
         Self::touch(&mut db, id)?;
         db.execute("UPDATE post_state SET deleted = 1, pinned = 0, mentions = NULL WHERE post = ?1", params![id])?;
@@ -2452,6 +2470,27 @@ impl Store {
         sql.push_str(" ORDER BY serial DESC LIMIT ?4");
         let posts = self.db.lock().query(&sql, &values, post_from)?;
         self.all_filled(posts)
+    }
+
+    /// Records what AutoMod censored of a post: what its author wrote, and the
+    /// rules that censored it. `None` says it wasn't censored (an edit AutoMod let be).
+    pub fn set_censored(&self, id: &str, censored: Option<(&str, &[String])>) -> Result<()> {
+        let mut db = self.db.lock();
+        match censored {
+            Some((original, rules)) => {
+                let rules = serde_json::to_string(rules).unwrap_or_default();
+                db.execute("INSERT OR REPLACE INTO post_censored (post, original, rules) VALUES (?1, ?2, ?3)", params![id, original, rules])?;
+            }
+            None => {
+                db.execute("DELETE FROM post_censored WHERE post = ?1", params![id])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// What a post said before AutoMod censored it, if it did.
+    pub fn censored_original(&self, id: &str) -> Result<Option<String>> {
+        Ok(self.db.lock().query("SELECT original FROM post_censored WHERE post = ?1", params![id], |row| row.get(0))?.into_iter().next())
     }
 
     pub fn set_post_extra(&self, id: &str, extra: &Value) -> Result<()> {

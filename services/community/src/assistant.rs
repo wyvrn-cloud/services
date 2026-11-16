@@ -203,6 +203,7 @@ mod tests {
             reactions: vec![],
             grew: None,
             voice_invite: None,
+            censored: None,
             extra: None,
             votes: Vec::new(),
         }

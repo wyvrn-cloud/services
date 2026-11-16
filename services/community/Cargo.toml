@@ -31,6 +31,10 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 # Unicode categories, for what a text channel may be called (community.rs).
 regex = "1"
+# AutoMod's filters (automod.rs): profanity, slurs, sexual words and insults by
+# how bad they are, found however they are disguised (l33t, s p a c e d, ѕwapped
+# letters), and censored.
+rustrict = { version = "0.7.39", default-features = false, features = ["censor"] }
 sha2 = { workspace = true }
 base64 = { workspace = true }
 # The web view (web/): its pages, compiled from templates/ and escaped as they are

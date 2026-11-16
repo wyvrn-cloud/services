@@ -708,6 +708,11 @@ impl Community {
         if let Some(removed_by) = &post.removed_by {
             body["removed_by"] = json!(removed_by);
         }
+        // What AutoMod censored of it is gone for everyone; whoever manages posts
+        // in the channel may ask what it said (`original-request`).
+        if let Some(rules) = post.censored.as_ref().filter(|_| !post.deleted) {
+            body["censored"] = json!({ "by": rules });
+        }
         if let Some(voice) = &post.voice_invite {
             body["voice_invite"] = json!({ "channel": voice });
         }
@@ -1106,16 +1111,20 @@ impl Community {
             return refuse(message, "e.p.trust.not-authorized", "You can't post files in this channel.");
         }
         let mentions = self.mentions_of(body, member, &channel)?;
-        let noted = if checked {
-            match self.automod(member, &channel, message, mentions.len(), now)? {
-                crate::automod::Verdict::Placed => None,
-                crate::automod::Verdict::PlacedNoted(noted) => Some(noted),
+        let (noted, censored) = if checked {
+            match self.automod(member, &channel, message, content, mentions.len(), now, false)? {
+                crate::automod::Verdict::Placed { noted, censored } => (noted, censored),
                 crate::automod::Verdict::Stopped(stopped) => return Ok(stopped),
             }
         } else {
-            None
+            (None, None)
         };
+        let written = content;
+        let content = censored.as_ref().map_or(content, |censored| censored.content.as_str());
         let post = self.store.add_post(&channel.id, &id, content, member, question.as_ref(), None, now)?;
+        if let Some(censored) = &censored {
+            self.store.set_censored(&post.id, Some((written, &censored.rules)))?;
+        }
         let reply = answered.as_ref().map(|post| (post.id.as_str(), post.author_did.as_str(), snippet.as_deref()));
         self.store.set_written_with(&post.id, reply, thread.as_deref(), &mentions)?;
         if let Some(extra) = &extra {
@@ -1132,7 +1141,15 @@ impl Community {
             self.store.follow_thread(sender, followed, true)?;
         }
         let mut outcome = Outcome {
-            reply: Some(reply_to(message, POSTED, json!({ "channel": post.channel, "seq": post.seq, "id": post.id }))),
+            reply: Some(reply_to(message, POSTED, {
+                let mut placed = json!({ "channel": post.channel, "seq": post.seq, "id": post.id });
+                // Censored, its author's app shows it as everyone sees it.
+                if let Some(censored) = &censored {
+                    placed["content"] = json!(censored.content);
+                    placed["censored"] = json!({ "by": censored.rules });
+                }
+                placed
+            })),
             posted: true,
             posted_id: Some(post.id.clone()),
             ..Outcome::default()
@@ -1224,6 +1241,9 @@ impl Community {
 
         if let Some(outcome) = self.handle_moderation(&member, message_type, message, now)? {
             return Ok(outcome);
+        }
+        if message_type == crate::automod::ORIGINAL_REQUEST {
+            return self.handle_original(&member, message);
         }
         if let Some(outcome) = self.handle_held(&member, message_type, message, now)? {
             return Ok(outcome);
@@ -1441,8 +1461,27 @@ impl Community {
                     }
                     // Who it calls on is said again with it; left out, it is as it was.
                     let mentions = if body.get("mentions").is_some() { self.mentions_of(body, &member, &channel)? } else { post.mentions.clone() };
-                    if content != post.content || mentions != post.mentions {
-                        self.store.edit_post(&post.id, content, &mentions, now)?;
+                    if content == post.content {
+                        // (What AutoMod censored stays as it was, the original with it.)
+                        if mentions != post.mentions {
+                            self.store.edit_post(&post.id, content, &mentions, now)?;
+                        }
+                    } else {
+                        // An edit is checked as a post is, so a censored post isn't
+                        // written back as it was.
+                        let (noted, censored) = match self.automod(&member, &channel, message, content, mentions.len(), now, true)? {
+                            crate::automod::Verdict::Placed { noted, censored } => (noted, censored),
+                            crate::automod::Verdict::Stopped(stopped) => return Ok(stopped),
+                        };
+                        let placed = censored.as_ref().map_or(content, |censored| censored.content.as_str());
+                        self.store.edit_post(&post.id, placed, &mentions, now)?;
+                        self.store.set_censored(&post.id, censored.as_ref().map(|censored| (content, censored.rules.as_slice())))?;
+                        let mut outcome = self.changed_answer(message, &post.id)?;
+                        if let Some(noted) = noted {
+                            outcome.posted |= noted.posted;
+                            outcome.notices.extend(noted.notices);
+                        }
+                        return Ok(outcome);
                     }
                 }
                 self.changed_answer(message, &post.id)
