@@ -2910,3 +2910,34 @@ async fn a_categorys_permissions_are_followed_by_its_synced_channels_and_not_by_
     let overrides = server.state.community.store.overrides(&sketches).unwrap();
     assert!(overrides.iter().all(|o| !o.deny.iter().any(|p| p == "post")), "{overrides:?}");
 }
+
+#[tokio::test]
+async fn an_app_that_draws_a_list_beside_its_editor_is_given_the_roles_so() {
+    let server = start_server("").await;
+    let owner = Peer::start(&server).await;
+    server.admit(&[&owner]);
+    owner.community("join", json!({})).await;
+    let caps = json!(["ui:sortable-list", "ui:list-detail", "ui:save-bar"]);
+    let page = owner.workflow("start", json!({ "template_id": "roles", "instance_id": "l1", "capabilities": caps })).await;
+    let ui = page["body"]["ui"].clone();
+    let beside = ui.as_array().unwrap().iter().find(|i| i["type"] == "list-detail").cloned().unwrap_or_else(|| panic!("{ui}"));
+    let values: Vec<&str> = beside["list"]["items"].as_array().unwrap().iter().map(|i| i["value"].as_str().unwrap()).collect();
+    assert_eq!(values, ["admin", "moderator", "everyone"], "highest first, everyone last: {beside}");
+    assert_eq!(beside["list"]["items"][2]["locked"], true);
+    assert_eq!(beside["list"]["sortable"]["event"], "reorder");
+    assert!(beside["list"].get("selected").is_none());
+
+    // Chosen, Moderator's editor is beside the list, its form with a save bar.
+    let chosen = advance(&owner, "l1", "edit", json!({ "role": "moderator" })).await;
+    let beside = chosen["body"]["ui"].as_array().unwrap().iter().find(|i| i["type"] == "list-detail").cloned().unwrap();
+    assert_eq!(beside["list"]["selected"], "moderator");
+    let form = beside["detail"].as_array().unwrap().iter().find(|i| i["type"] == "form").cloned().unwrap();
+    assert_eq!(form["save-bar"]["event"], "save");
+    assert!(!beside["detail"].to_string().contains(r#""event":"back""#));
+
+    // Saved from beside the list, it stays chosen; the order, everyone and all, is taken.
+    let saved = advance(&owner, "l1", "save", json!({ "name": "Mods", "perm-manage_messages": true })).await;
+    assert!(saved["body"]["ui"].to_string().contains("Saved Mods."), "{saved}");
+    let reordered = advance(&owner, "l1", "reorder", json!({ "order": ["moderator", "admin", "everyone"] })).await;
+    assert!(reordered["body"]["ui"].to_string().contains("Saved the order."), "{reordered}");
+}

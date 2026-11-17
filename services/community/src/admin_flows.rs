@@ -187,6 +187,9 @@ pub const SORTABLE_LIST: &str = "ui:sortable-list";
 /// Whether the app running `flow` said it can draw `capability`.
 /// Workflow UI Layout's tabs (wyvrn-protocols' profiles/workflow-ui-layout/1.0).
 pub const TABS: &str = "ui:tabs";
+/// Workflow UI Layout's list beside its editor, and its bar for unsaved changes.
+pub const LIST_DETAIL: &str = "ui:list-detail";
+pub const SAVE_BAR: &str = "ui:save-bar";
 
 fn can_draw(flow: &Flow, capability: &str) -> bool {
     flow.data["capabilities"].as_array().is_some_and(|all| all.iter().any(|c| c == capability))
@@ -308,6 +311,76 @@ impl Community {
 
     // --- What each step shows ------------------------------------------------------
 
+    /// The roles beside the one chosen (Workflow UI Layout's `list-detail`), for an
+    /// app that draws it: the list highest first, dragged into order where this
+    /// person may, a new one added at its foot, and the chosen one's editor beside.
+    fn roles_beside_ui(&self, flow: &Flow, powers: &Powers) -> anyhow::Result<(Value, Vec<&'static str>)> {
+        let roles = self.store.roles()?;
+        let held = self.store.all_member_roles()?;
+        let chosen = flow.data["role"].as_str().and_then(|id| roles.iter().find(|r| r.id == id));
+        let may_edit = |role: &RoleDef| powers.above(role.position) || (role.id == EVERYONE_ROLE && powers.has("manage_roles") && (powers.owner || powers.rank > 0));
+        let entries: Vec<Value> = roles
+            .iter()
+            .map(|role| {
+                let mut entry = json!({ "value": role.id, "label": role.name });
+                if role.id == EVERYONE_ROLE {
+                    entry["hint"] = json!("every member");
+                } else {
+                    entry["hint"] = json!(held.iter().filter(|(_, id)| *id == role.id).count().to_string());
+                }
+                if let Some(color) = &role.color {
+                    entry["color"] = json!(color);
+                }
+                if let Some(icon) = &role.icon {
+                    entry["icon"] = json!(icon);
+                }
+                // Not moved: everyone (always last), and those it doesn't outrank.
+                if role.id == EVERYONE_ROLE || !powers.above(role.position) {
+                    entry["locked"] = json!(true);
+                }
+                if !may_edit(role) {
+                    entry["disabled"] = json!(true);
+                }
+                entry
+            })
+            .collect();
+        let mut list = json!({ "items": entries, "event": "edit", "input-key": "role", "add": { "event": "create", "form-id": "name", "label": "New role", "placeholder": "Artist" } });
+        if let Some(role) = chosen {
+            list["selected"] = json!(role.id);
+        }
+        if roles.iter().any(|r| r.id != EVERYONE_ROLE && powers.above(r.position)) {
+            list["sortable"] = json!({ "event": "reorder", "form-id": "order" });
+        }
+        let detail: Vec<Value> = match chosen {
+            Some(role) => self.role_edit_ui(role, powers, can_draw(flow, SAVE_BAR)).as_array().cloned().unwrap_or_default().into_iter().filter(|item| item["event"] != "back").collect(),
+            None => vec![json!({ "type": "text", "text": "Choose a role to see and change what it may do." })],
+        };
+        let mut items = vec![json!({ "type": "title", "text": "Roles" })];
+        items.push(json!({ "type": "text", "text": "Members hold every permission of every role they have. Higher roles outrank lower ones: you can change only the roles ranked below your own, and act only on members ranked below you." }));
+        if let Some(note) = flow.data["note"].as_str() {
+            items.push(json!({ "type": "pass", "text": note }));
+        }
+        items.push(json!({ "type": "list-detail", "label": "Roles", "list": list, "detail": detail }));
+        let mut events = vec!["edit", "create", "reorder", "done"];
+        if chosen.is_some_and(may_edit) {
+            events.push("save");
+            if chosen.is_some_and(|r| r.id != EVERYONE_ROLE) {
+                events.push("delete");
+            }
+        }
+        if powers.owner {
+            items.push(json!({ "type": "divider" }));
+            items.push(json!({ "type": "form", "children": [
+                { "type": "text", "text": "You own this community. Handing it on makes someone else its owner, who can then do anything here, including take you out." },
+                { "type": "text-input", "form-id": "member", "label": "Hand the community to", "placeholder": "Their name, or their DID", "required": true },
+                button("Hand it on", "hand_over", json!({}))
+            ] }));
+            events.push("hand_over");
+        }
+        items.push(button("Done", "done", json!({})));
+        Ok((Value::Array(items), events))
+    }
+
     fn roles_list_ui(&self, flow: &Flow, powers: &Powers) -> anyhow::Result<(Value, Vec<&'static str>)> {
         let roles = self.store.roles()?;
         let held = self.store.all_member_roles()?;
@@ -382,7 +455,7 @@ impl Community {
         Ok((Value::Array(items), events))
     }
 
-    fn role_edit_ui(&self, role: &RoleDef, powers: &Powers) -> Value {
+    fn role_edit_ui(&self, role: &RoleDef, powers: &Powers, save_bar: bool) -> Value {
         let everyone = role.id == EVERYONE_ROLE;
         let mut fields = Vec::new();
         if !everyone {
@@ -410,7 +483,12 @@ impl Community {
         }
         fields.push(button("Save", "save", json!({})));
         let title = if everyone { "Every member (everyone)".to_string() } else { format!("Role: {}", role.name) };
-        let mut items = vec![json!({ "type": "title", "text": title }), json!({ "type": "form", "children": fields })];
+        let mut form = json!({ "type": "form", "children": fields });
+        if save_bar {
+            // Saved, or put back, from a bar at the top while it is changed.
+            form["save-bar"] = json!({ "event": "save" });
+        }
+        let mut items = vec![json!({ "type": "title", "text": title }), form];
         if !everyone {
             items.push(button("Delete role", "delete", json!({})));
         }
@@ -436,7 +514,11 @@ impl Community {
             fields.push(json!({ "type": "text", "text": format!("Also: {} (ranked as high as yours, or higher).", fixed.join(", ")) }));
         }
         fields.push(button("Save", "save", json!({})));
-        Ok(json!([{ "type": "title", "text": format!("Roles for {name}") }, { "type": "form", "children": fields }]))
+        let mut form = json!({ "type": "form", "children": fields });
+        if can_draw(flow, SAVE_BAR) {
+            form["save-bar"] = json!({ "event": "save" });
+        }
+        Ok(json!([{ "type": "title", "text": format!("Roles for {name}") }, form]))
     }
 
     fn channel_roles_ui(&self, flow: &Flow, powers: &Powers) -> Result<Value, Refusal> {
@@ -524,6 +606,7 @@ impl Community {
             (json!([{ "type": "pass", "text": said.unwrap_or(if flow.status == "completed" { "Done." } else { "Closed." }) }]), Vec::new())
         } else {
             match (flow.template.as_str(), flow.state.as_str()) {
+                (ROLES, "list" | "edit") if can_draw(flow, LIST_DETAIL) => self.roles_beside_ui(flow, &powers).map_err(failed)?,
                 (ROLES, "list") => self.roles_list_ui(flow, &powers).map_err(failed)?,
                 (ROLES, "edit") => {
                     let role = self.store.role(flow.data["role"].as_str().unwrap_or_default()).map_err(failed)?.ok_or_else(|| refused("That role is gone."))?;
@@ -531,7 +614,7 @@ impl Community {
                     if role.id != EVERYONE_ROLE {
                         events.push("delete");
                     }
-                    (self.role_edit_ui(&role, &powers), events)
+                    (self.role_edit_ui(&role, &powers, can_draw(flow, SAVE_BAR)), events)
                 }
                 (MEMBER_ROLES, _) => (self.member_roles_ui(flow, &powers)?, vec!["save"]),
                 (CHANNEL_PERMISSIONS_FLOW, "roles") => (self.channel_roles_ui(flow, &powers)?, vec!["read_only", "unlock", "private", "public", "edit", "sync", "done"]),
@@ -751,13 +834,13 @@ impl Community {
             flow.data = json!({});
         }
         let changed = match (flow.template.as_str(), flow.state.as_str(), event) {
-            (ROLES, "list", "edit") => {
+            (ROLES, "list" | "edit", "edit") => {
                 let role = self.editable_role(&powers, input["role"].as_str().unwrap_or_default())?;
                 flow.data["role"] = json!(role.id);
                 flow.state = "edit".into();
                 false
             }
-            (ROLES, "list", "create") => {
+            (ROLES, "list" | "edit", "create") => {
                 let name = line(&input["name"], MAX_ROLE_NAME).ok_or_else(|| refused("A role needs a name."))?;
                 let roles = self.store.roles().map_err(failed)?;
                 if roles.len() >= MAX_ROLES {
@@ -779,7 +862,7 @@ impl Community {
                 flow.state = "edit".into();
                 true
             }
-            (ROLES, "list", "raise" | "lower") => {
+            (ROLES, "list" | "edit", "raise" | "lower") => {
                 let role = self.editable_role(&powers, input["role"].as_str().unwrap_or_default())?;
                 if role.id == EVERYONE_ROLE {
                     return Err(refused("Every member's role is always lowest."));
@@ -798,11 +881,12 @@ impl Community {
                 self.audit(now, &flow.owner, "role.rank", Some(&role.id), Some(json!({ "moved": event })));
                 true
             }
-            (ROLES, "list", "reorder") => {
+            (ROLES, "list" | "edit", "reorder") => {
                 // Highest first, every role but everyone, each once; one this person
                 // doesn't outrank where it was.
                 let held: Vec<RoleDef> = self.store.roles().map_err(failed)?.into_iter().filter(|r| r.id != EVERYONE_ROLE).collect();
-                let given: Vec<String> = input["order"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+                // (everyone, which a list beside its editor shows last and locked, is left out.)
+                let given: Vec<String> = input["order"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|id| *id != EVERYONE_ROLE).map(str::to_string).collect();
                 let mut sorted_given = given.clone();
                 sorted_given.sort();
                 let mut sorted_held: Vec<String> = held.iter().map(|r| r.id.clone()).collect();
@@ -821,7 +905,7 @@ impl Community {
                 flow.data["note"] = json!("Saved the order.");
                 true
             }
-            (ROLES, "list", "hand_over") => {
+            (ROLES, "list" | "edit", "hand_over") => {
                 if !powers.owner {
                     return Err(not_allowed("Only the owner hands the community on."));
                 }
@@ -850,11 +934,11 @@ impl Community {
             (SITES_FLOW, _, _) => self.advance_sites_flow(&mut flow, event, input)?,
             (DISCORD_IMPORT_FLOW, _, _) => self.advance_discord_import(&mut flow, event, input, now)?,
             (WEBHOOKS_FLOW, _, _) => self.advance_webhooks(&mut flow, event, input, now)?,
-            (ROLES, "list", "done") | (CHANNEL_PERMISSIONS_FLOW, "roles", "done") => {
+            (ROLES, "list" | "edit", "done") | (CHANNEL_PERMISSIONS_FLOW, "roles", "done") => {
                 flow.status = "completed".into();
                 false
             }
-            (ROLES, "edit", "save") => {
+            (ROLES, "list" | "edit", "save") => {
                 let mut role = self.editable_role(&powers, flow.data["role"].as_str().unwrap_or_default())?;
                 if role.id != EVERYONE_ROLE {
                     let name = line(&input["name"], MAX_ROLE_NAME).ok_or_else(|| refused("A role needs a name."))?;
@@ -887,7 +971,7 @@ impl Community {
                 flow.state = "list".into();
                 true
             }
-            (ROLES, "edit", "delete") => {
+            (ROLES, "list" | "edit", "delete") => {
                 let role = self.editable_role(&powers, flow.data["role"].as_str().unwrap_or_default())?;
                 if role.id == EVERYONE_ROLE {
                     return Err(refused("Every member's role can't be deleted."));
