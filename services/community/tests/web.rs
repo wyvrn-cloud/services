@@ -104,11 +104,13 @@ struct Options<'a> {
     web_url: Option<&'a str>,
     fresh: bool,
     limit: u32,
+    /// Which channels are public (`web.public`): these tests choose, but for one.
+    public: &'a str,
 }
 
 impl Default for Options<'_> {
     fn default() -> Self {
-        Self { name: "The Workshop", web_url: None, fresh: true, limit: 10_000 }
+        Self { name: "The Workshop", web_url: None, fresh: true, limit: 10_000, public: "chosen" }
     }
 }
 
@@ -130,6 +132,12 @@ async fn start(options: Options<'_>) -> Running {
     }
     let web = Web::new(&config).unwrap().map(Arc::new);
     web::settle_new(&store).unwrap();
+    if options.fresh {
+        // (A new community shows every channel everyone may see: the tests that
+        // choose say so.)
+        assert_eq!(store.setting(web::PUBLIC).unwrap().as_deref(), Some("everyone"));
+        store.set_setting(web::PUBLIC, options.public).unwrap();
+    }
     let mut community = Community::new(store, config.community.clone(), Some(wyvrn_service::profile::Kept::scratch().unwrap())).unwrap();
     community.web_url = web.as_ref().map(|w| w.url.to_string());
     let mut state = AppState::new(agent, Default::default(), community, did_document, didcomm_quickstart::default_resolver());
@@ -259,6 +267,36 @@ async fn only_public_channels_show_and_what_is_said_is_only_ever_text() {
     assert!(response.headers()[header::CACHE_CONTROL].to_str().unwrap().contains("private"));
     assert_eq!(response.headers()["x-robots-tag"], "noindex");
     assert!(response.text().await.unwrap().contains("nobody outside sees this"));
+}
+
+#[tokio::test]
+async fn every_channel_everyone_may_see_is_public_while_they_may() {
+    let server = start(Options { public: "everyone", ..Options::default() }).await;
+    let (admin, member) = with_channels(&server).await;
+    say(&member, &server, "general", "said before anything was chosen").await;
+    let (general, secret) = (server.channel_id("general"), server.channel_id("secret"));
+
+    // Both are public, with everything said in them, and the community says why.
+    let told = member.community("join", json!({})).await["body"].clone();
+    assert_eq!(told["web"]["public_channels"], "everyone");
+    let (status, page) = server.text(&format!("ch/{general}/general")).await;
+    assert_eq!(status, 200);
+    assert!(page.contains("said before anything was chosen"));
+    assert_eq!(server.text(&format!("ch/{secret}/secret")).await.0, 200);
+
+    // Made private, it is off the web at once; open again, back on it.
+    // (As "Make private" in its permissions does.)
+    server.state.community.store.set_override(&secret, "everyone", &[], &["view_channel".to_string()]).unwrap();
+    assert_eq!(server.text(&format!("ch/{secret}/secret")).await.0, 404);
+    let (_, home) = server.text("").await;
+    assert!(home.contains(&general) && !home.contains(&secret), "{home}");
+
+    // Only those chosen, when an admin says so: none, then.
+    let refused = member.community("set-web", json!({ "public_channels": "chosen" })).await;
+    assert_eq!(refused["body"]["code"], "e.p.trust.not-authorized");
+    admin.community("set-web", json!({ "public_channels": "chosen" })).await;
+    assert_eq!(server.text(&format!("ch/{general}/general")).await.0, 404);
+    assert_eq!(admin.community("set-web", json!({ "public_channels": "all" })).await["body"]["code"], "e.p.msg.invalid-web");
 }
 
 #[tokio::test]

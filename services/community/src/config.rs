@@ -183,6 +183,9 @@ impl CommunityConfig {
     }
 }
 
+/// Who a `join` lets in where nobody has said: whoever brings an invite.
+pub const DEFAULT_ADMISSION: &str = "invite";
+
 impl Default for CommunityConfig {
     fn default() -> Self {
         Self {
@@ -194,7 +197,7 @@ impl Default for CommunityConfig {
             members_may_create_channels: false,
             max_post_length: 16_000,
             max_channels: 500,
-            admission: "admin".to_string(),
+            admission: DEFAULT_ADMISSION.to_string(),
             members_may_invite: false,
             max_waiting: 500,
             max_posts_per_minute: 30,

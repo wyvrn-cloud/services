@@ -491,7 +491,7 @@ impl Community {
         let powers = self.powers(&member.did)?;
         let mut channels = Vec::new();
         let public = match &self.web_url {
-            Some(_) => self.store.web_channels()?,
+            Some(_) => crate::web::public_channels(self)?,
             None => Default::default(),
         };
         let mut seen = std::collections::HashSet::new();
@@ -1734,8 +1734,15 @@ impl Community {
                 }
                 let page = body.get("page").filter(|v| !v.is_null());
                 let voice = body.get("voice").filter(|v| !v.is_null());
-                if page.is_none() && voice.is_none() {
-                    return refuse(message, "e.p.msg.invalid-web", "Say page, voice or both.");
+                let public = body.get("public_channels").filter(|v| !v.is_null());
+                if page.is_none() && voice.is_none() && public.is_none() {
+                    return refuse(message, "e.p.msg.invalid-web", "Say page, voice or public_channels.");
+                }
+                if let Some(public) = public {
+                    let Some(choice) = public.as_str().filter(|v| crate::web::PUBLIC_CHOICES.contains(v)) else {
+                        return refuse(message, "e.p.msg.invalid-web", "public_channels is everyone or chosen.");
+                    };
+                    self.store.set_setting(crate::web::PUBLIC, choice)?;
                 }
                 if let Some(page) = page {
                     let Some(on) = page.as_bool() else { return refuse(message, "e.p.msg.invalid-web", "page is true or false.") };

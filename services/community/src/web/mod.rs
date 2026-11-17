@@ -48,6 +48,10 @@ use crate::store::Store;
 /// Settings, in the community's store.
 pub const PAGE: &str = "web.page";
 pub const VOICE: &str = "web.voice";
+/// Which channels are public: `everyone`, every channel everyone may see (as
+/// long as they may), or `chosen`, those an admin chose (`web_channels`).
+pub const PUBLIC: &str = "web.public";
+pub const PUBLIC_CHOICES: [&str; 2] = ["everyone", "chosen"];
 pub const THEME: &str = "web.theme";
 pub const CSS: &str = "web.css";
 pub const DYNAMIC: &str = "oidc.dynamic";
@@ -210,11 +214,35 @@ pub fn keyed(key: &str, message: &str) -> String {
 /// that existed before the web view did, off until an admin turns it on. Called
 /// once at opening, before anyone is let in.
 pub fn settle_new(store: &Store) -> anyhow::Result<()> {
+    let fresh = store.member_count()? == 0 && store.channels()?.is_empty();
     if store.setting(PAGE)?.is_none() {
-        let fresh = store.member_count()? == 0 && store.channels()?.is_empty();
         store.set_setting(PAGE, if fresh { "1" } else { "0" })?;
     }
+    // Every channel everyone may see is public, for a community made now (asked
+    // 2026-11-17); one from before shows those its admins chose, until told.
+    if store.setting(PUBLIC)?.is_none() {
+        store.set_setting(PUBLIC, if fresh { "everyone" } else { "chosen" })?;
+    }
     Ok(())
+}
+
+pub fn public_choice(store: &Store) -> String {
+    store.setting(PUBLIC).ok().flatten().filter(|v| PUBLIC_CHOICES.contains(&v.as_str())).unwrap_or_else(|| "chosen".to_string())
+}
+
+/// The channels public on the web, each with when from (0 for its whole
+/// history): those an admin chose, and with `everyone`, every open text channel
+/// everyone may see -- each for as long as they may.
+pub fn public_channels(community: &crate::community::Community) -> anyhow::Result<std::collections::HashMap<String, i64>> {
+    let mut public = community.store.web_channels()?;
+    if public_choice(&community.store) == "everyone" {
+        for channel in community.store.channels()? {
+            if !channel.closed && channel.voice.is_none() && community.everyone_sees(&channel)? {
+                public.entry(channel.id).or_insert(0);
+            }
+        }
+    }
+    Ok(public)
 }
 
 pub fn page_on(store: &Store) -> bool {
@@ -236,7 +264,7 @@ pub fn secret(store: &Store) -> anyhow::Result<String> {
 
 /// `community`'s `web`, for a server with a web view.
 pub fn community_body(web_url: &str, store: &Store) -> serde_json::Value {
-    let mut body = serde_json::json!({ "url": web_url, "page": page_on(store), "voice": voice_choice(store) });
+    let mut body = serde_json::json!({ "url": web_url, "page": page_on(store), "voice": voice_choice(store), "public_channels": public_choice(store) });
     if page_on(store) {
         body["sign_in"] = serde_json::json!(web_url.trim_end_matches('/'));
     }

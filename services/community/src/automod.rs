@@ -67,12 +67,13 @@ pub fn action_label(rule: &Value) -> &'static str {
 /// and whether it is on).
 pub type Preset = (&'static str, &'static str, &'static str, fn() -> Value);
 pub const PRESETS: [Preset; 4] = [
-    ("family", "Family friendly", "censors swearing, sexual words, slurs, insults and links to adult sites", || {
+    // Refused outright (asked 2026-11-17): censoring is a choice on the rule.
+    ("family", "Family friendly", "refuses a post with swearing, sexual words, slurs, insults or links to adult sites", || {
         json!({
             "filters": { "profanity": "mild", "sexual": "mild", "slurs": "mild", "insults": "moderate" },
             "words": [], "allowed_words": ["shiitake"], "patterns": [],
             "links": false, "domain_lists": ["adult"], "allowed_domains": [], "blocked_domains": [],
-            "block": false, "hold": false, "censor": true, "exempt_roles": [], "exempt_channels": [],
+            "block": true, "hold": false, "censor": false, "exempt_roles": [], "exempt_channels": [],
         })
     }),
     ("hate", "No slurs or hate", "refuses a post with a slur in it", || {

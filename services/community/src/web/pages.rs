@@ -72,7 +72,7 @@ impl Viewer {
 
 /// The channels a viewer may read, each with when from (`None`: all of it).
 fn readable(state: &AppState, viewer: &Viewer) -> anyhow::Result<HashMap<String, Option<i64>>> {
-    let public = state.community.store.web_channels()?;
+    let public = crate::web::public_channels(&state.community)?;
     Ok(state
         .community
         .store
@@ -327,7 +327,7 @@ pub fn site(state: &AppState, viewer: &Viewer, root: &str, canonical: String) ->
 fn groups(state: &AppState, viewer: &Viewer, root: &str, current: Option<&str>) -> anyhow::Result<Vec<Group>> {
     let store = &state.community.store;
     let readable = readable(state, viewer)?;
-    let public = store.web_channels()?;
+    let public = crate::web::public_channels(&state.community)?;
     let voice_choice = voice_choice(store);
     let rooms = state.rooms.in_rooms();
     let mut by_category: Vec<Group> = Vec::new();
@@ -718,7 +718,7 @@ async fn channel(State(state): State<Arc<AppState>>, Path((id, name)): Path<(Str
 }
 
 fn is_public(state: &AppState, channel: &str) -> bool {
-    state.community.store.web_channels().map(|c| c.contains_key(channel)).unwrap_or(false)
+    crate::web::public_channels(&state.community).map(|c| c.contains_key(channel)).unwrap_or(false)
 }
 
 fn shows_any_before(state: &AppState, channel: &Channel, seq: i64, since: Option<i64>) -> bool {
@@ -868,7 +868,7 @@ async fn sitemap(State(state): State<Arc<AppState>>) -> Response {
         return nothing();
     }
     let store = &state.community.store;
-    let public = store.web_channels().unwrap_or_default();
+    let public = crate::web::public_channels(&state.community).unwrap_or_default();
     let mut urls = vec![(web.absolute(""), None::<i64>)];
     for channel in store.channels().unwrap_or_default().into_iter().filter(|c| !c.closed && public.contains_key(&c.id)) {
         let latest = store.channel_posts_before(&channel.id, None, None, 1).ok().and_then(|p| p.into_iter().next()).map(|p| p.posted_at);

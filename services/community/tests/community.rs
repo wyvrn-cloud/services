@@ -637,6 +637,17 @@ async fn whoever_asks_waits_for_an_admin_who_lets_them_in_or_turns_them_away() {
     assert_eq!(admin.next_of(&format!("{C}community")).await["body"]["waiting"], 0);
 }
 
+#[test]
+fn a_community_from_before_goes_on_letting_an_admin_decide_who_gets_in() {
+    let config = wyvrn_community::config::CommunityConfig::default();
+    let fresh = Community::new(Store::in_memory().unwrap(), config.clone(), None).unwrap();
+    assert_eq!(fresh.admission().unwrap().as_str(), "invite");
+    let store = Store::in_memory().unwrap();
+    store.set_member("did:example:someone", wyvrn_community::store::Role::Member, 1).unwrap();
+    let old = Community::new(store, config, None).unwrap();
+    assert_eq!(old.admission().unwrap().as_str(), "admin");
+}
+
 #[tokio::test]
 async fn an_invite_lets_in_while_it_lasts_when_admission_is_by_invite() {
     let server = start_server("").await;
@@ -644,7 +655,10 @@ async fn an_invite_lets_in_while_it_lasts_when_admission_is_by_invite() {
     let (alice, bob, carol) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
     server.admit(&[&admin]);
 
-    // By default an admin lets people in: a code is noted beside them, not used.
+    // A new community lets in whoever brings an invite; this one is set so that an
+    // admin lets people in, and then a code is noted beside them, not used.
+    assert_eq!(admin.community("join", json!({})).await["body"]["admission"], "invite");
+    admin.community("set-admission", json!({ "admission": "admin" })).await;
     let made = admin.community("create-invite", json!({ "uses": 1, "note": "for Alice" })).await;
     assert_eq!(kind(&made), "invites", "{made}");
     let code = made["body"]["created"].as_str().unwrap().to_string();
@@ -1545,7 +1559,15 @@ async fn automod_censors_disguised_words_and_unsafe_links_and_moderators_see_the
     let preset = advance(&owner, "a1", "preset", json!({ "preset": "family" })).await;
     let ui = preset["body"]["ui"].to_string();
     assert!(ui.contains("filter-profanity") && ui.contains("Censor the post"), "{preset}");
-    advance(&owner, "a1", "back", json!({})).await;
+    // It refuses to begin with; set to censor instead, as an admin may.
+    assert!(ui.contains(r#""form-id":"action""#) && ui.contains(r#""value":"block""#), "{preset}");
+    advance(
+        &owner,
+        "a1",
+        "save",
+        json!({ "name": "Family friendly", "enabled": true, "filter-profanity": "mild", "filter-sexual": "mild", "filter-slurs": "mild", "filter-insults": "moderate", "allowed_words": "shiitake", "list-adult": true, "action": "censor" }),
+    )
+    .await;
     advance(&owner, "a1", "create", json!({ "name": "Pineapple" })).await;
     advance(&owner, "a1", "save", json!({ "name": "Pineapple", "enabled": true, "words": "pineapple", "action": "block" })).await;
     advance(&owner, "a1", "done", json!({})).await;

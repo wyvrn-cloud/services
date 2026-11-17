@@ -128,6 +128,13 @@ impl Community {
     /// Gives a store from before roles its roles, once: `everyone` with what
     /// members could do, then Moderator and Admin, and `admin` to every admin.
     pub fn ensure_roles(&self) -> anyhow::Result<()> {
+        // A community from before invites let people in by default: it goes on
+        // letting an admin decide, unless an admin or its configuration said
+        // otherwise. (A new one starts at `invite`, the default since 2026-11-17.)
+        let existing = self.store.role(EVERYONE_ROLE)?.is_some() || self.store.member_count()? > 0;
+        if existing && self.store.setting("admission")?.is_none() && self.config.admission == crate::config::DEFAULT_ADMISSION {
+            self.store.set_setting("admission", "admin")?;
+        }
         if self.store.role(EVERYONE_ROLE)?.is_some() {
             // A store from before `view_channel`: everyone saw every channel, and
             // still does.
