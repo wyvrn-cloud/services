@@ -55,6 +55,20 @@ impl Files {
         Ok(Self { host: Host::new(wyvrn_files::store::Store::scratch()?, service, public_url), config: config.clone(), uploads: Mutex::default() })
     }
 
+    /// Keeps `bytes` here as a stored file of `owner`'s (a webhook's upload): its
+    /// id, where it is fetched from, and its hash.
+    pub fn keep_bytes(&self, owner: &str, name: &str, media_type: &str, bytes: &[u8], now: i64) -> anyhow::Result<(String, String, String)> {
+        if bytes.len() as u64 > self.config.max_file_bytes {
+            anyhow::bail!("a file here is at most {} bytes", self.config.max_file_bytes);
+        }
+        let hash = wyvrn_files::hash::of_bytes(bytes);
+        let store = &self.host.store;
+        let record = store.create(wyvrn_files::store::NewFile { owner, name, media_type, byte_count: bytes.len() as u64, hash: &hash, created: now, upload_expires: now + 3600, expires: now + KEEP })?;
+        store.append(&record.id, bytes)?;
+        store.mark_stored(&record.id)?;
+        Ok((record.id.clone(), self.host.download_url(&record.id), hash))
+    }
+
     pub fn max_file_bytes(&self) -> u64 {
         self.config.max_file_bytes
     }

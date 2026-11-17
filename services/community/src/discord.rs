@@ -60,7 +60,7 @@ pub const PERMISSIONS: &[(u32, &str, &[&str])] = &[
     (26, "Change Nickname", &[]),
     (27, "Manage Nicknames", &[]),
     (28, "Manage Roles", &["manage_roles"]),
-    (29, "Manage Webhooks", &[]),
+    (29, "Manage Webhooks", &["manage_webhooks"]),
     (30, "Manage Expressions", &["manage_expressions"]),
     (31, "Use Application Commands", &[]),
     (32, "Request to Speak", &[]),

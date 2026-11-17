@@ -246,7 +246,7 @@ async fn an_admin_opens_channels_and_everyone_who_joined_is_told() {
     let changed = admin.community("update-channel", json!({ "channel": channel, "name": "design", "topic": "What we are building", "closed": true })).await;
     let mut held = changed["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == channel.as_str()).unwrap().clone();
     // An admin may do everything a channel gives.
-    assert_eq!(held["permissions"].as_array().unwrap().len(), 12);
+    assert_eq!(held["permissions"].as_array().unwrap().len(), 13);
     held.as_object_mut().unwrap().remove("permissions");
     assert_eq!(held, json!({ "id": channel, "name": "design", "topic": "What we are building", "closed": true, "latest_seq": 0, "yours": true }));
     let late = admin.community("post", json!({ "channel": channel, "content": "too late" })).await;
@@ -2481,6 +2481,14 @@ fn what_came_from_a_discord_template_is_kept_in_mysql_too() {
     store.add_post("c2", "p1", "the plan", &member, None, None, 2).unwrap();
     assert_eq!(store.search(&["plan".into()], None, None, Some(&["c3".to_string()]), None, 10).unwrap().len(), 0);
     assert_eq!(store.search(&["plan".into()], None, None, Some(&["c2".to_string(), "c3".to_string()]), None, 10).unwrap().len(), 1);
+    // Webhooks.
+    let hook = wyvrn_community::store::Webhook { id: "h1".into(), channel: "c2".into(), name: "CI".into(), avatar: None, token: "t".repeat(64), created_by: "did:example:admin".into(), created_at: 5 };
+    store.save_webhook(&hook).unwrap();
+    store.save_webhook(&wyvrn_community::store::Webhook { name: "CI bot".into(), ..hook.clone() }).unwrap();
+    assert_eq!(store.webhook("h1").unwrap().unwrap().name, "CI bot");
+    assert_eq!(store.webhooks().unwrap().len(), 1);
+    store.delete_webhook("h1").unwrap();
+    assert!(store.webhook("h1").unwrap().is_none());
 }
 
 #[tokio::test]
@@ -2567,4 +2575,106 @@ async fn roles_are_dragged_into_order_where_the_app_draws_a_sortable_list() {
     let theirs = moderator.workflow("start", json!({ "template_id": "roles", "instance_id": "r2", "capabilities": ["ui:sortable-list"] })).await;
     assert!(theirs["body"]["ui"].to_string().contains("\"locked\":true"), "{theirs}");
     assert_eq!(advance(&moderator, "r2", "reorder", json!({ "order": [moderator_role, admin, artist] })).await["body"]["code"], "not_authorized");
+}
+
+/// A webhook's URL, made through the `webhooks` workflow by `owner` for `channel`.
+async fn make_webhook(owner: &Peer, instance: &str, name: &str, channel: &str) -> String {
+    owner.workflow("start", json!({ "template_id": "webhooks", "instance_id": instance })).await;
+    let made = advance(owner, instance, "create", json!({ "name": name, "channel": channel })).await;
+    let ui = made["body"]["ui"].to_string();
+    assert!(ui.contains(&format!("Made {name}.")), "{ui}");
+    let start = ui.find("/api/webhooks/").expect("its URL");
+    let tail = &ui[start..];
+    let url_end = tail.find('"').unwrap();
+    // (The URL as given, with the server's address before it.)
+    let before = &ui[..start];
+    let from = before.rfind("http").unwrap();
+    format!("{}{}", &ui[from..start], &tail[..url_end])
+}
+
+#[tokio::test]
+async fn a_webhook_posts_as_discords_do_and_changes_and_takes_back_its_own_posts() {
+    let server = start_server_with("", true).await;
+    let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member]);
+    let general = open_channel(&owner, "general").await;
+    for peer in [&owner, &member] {
+        peer.community("join", json!({})).await;
+    }
+    // Only whoever manages webhooks makes them.
+    assert_eq!(member.workflow("start", json!({ "template_id": "webhooks", "instance_id": "w0" })).await["body"]["code"], "not_authorized");
+    let url = make_webhook(&owner, "w1", "CI", &general).await;
+    let http = reqwest::Client::new();
+
+    // JSON, as a CI posts it: content, a name of its own, and an embed.
+    let sent = http
+        .post(&url)
+        .json(&json!({ "content": "Build finished", "username": "Build bot", "embeds": [{ "title": "Build #42", "color": 3066993, "fields": [{ "name": "Tests", "value": "1203 passed", "inline": true }] }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sent.status(), 204);
+    let got = member.next_message().await;
+    assert_eq!(got["content"], "Build finished");
+    assert_eq!(got["webhook"]["name"], "Build bot");
+    assert_eq!(got["author"]["name"], "Build bot");
+    assert_eq!(got["embeds"][0]["fields"][0]["value"], "1203 passed");
+
+    // Waited for, it is answered as Discord's message; changed and taken back by id.
+    let waited: Value = http.post(format!("{url}?wait=true")).json(&json!({ "content": "Deploying…" })).send().await.unwrap().json().await.unwrap();
+    let id = waited["id"].as_str().unwrap().to_string();
+    assert_eq!((waited["content"].as_str(), waited["channel_id"].as_str(), waited["author"]["bot"].as_bool()), (Some("Deploying…"), Some(general.as_str()), Some(true)));
+    member.next_message().await;
+    let patched: Value = http.patch(format!("{url}/messages/{id}")).json(&json!({ "content": "Deployed" })).send().await.unwrap().json().await.unwrap();
+    assert_eq!(patched["content"], "Deployed");
+    assert!(patched["edited_timestamp"].is_string(), "{patched}");
+    let changed = member.next_of(&format!("{C}changed")).await;
+    assert_eq!(changed["body"]["content"], "Deployed");
+    assert_eq!(http.get(format!("{url}/messages/{id}")).send().await.unwrap().status(), 200);
+    assert_eq!(http.delete(format!("{url}/messages/{id}")).send().await.unwrap().status(), 204);
+    assert_eq!(http.get(format!("{url}/messages/{id}")).send().await.unwrap().status(), 404);
+    // A member's post is no webhook's to change.
+    owner.community("post", json!({ "channel": general, "id": "mine", "content": "hi" })).await;
+    assert_eq!(http.patch(format!("{url}/messages/mine")).json(&json!({ "content": "x" })).send().await.unwrap().status(), 404);
+
+    // Refused as Discord refuses: an empty message, a wrong token, no such webhook.
+    let empty = http.post(&url).json(&json!({ "content": "  " })).send().await.unwrap();
+    assert_eq!(empty.status(), 400);
+    assert_eq!(empty.json::<Value>().await.unwrap()["code"], 50006);
+    let wrong = url.rsplit_once('/').unwrap().0.to_string() + "/nottheone";
+    assert_eq!(http.post(&wrong).json(&json!({ "content": "x" })).send().await.unwrap().status(), 401);
+    assert_eq!(http.post(url.replace("/api/webhooks/", "/api/webhooks/x")).json(&json!({ "content": "x" })).send().await.unwrap().status(), 404);
+
+    // Files, as a form: kept here, posted as attachments, an embed's image naming one.
+    let form = reqwest::multipart::Form::new()
+        .text("payload_json", json!({ "content": "Chart", "embeds": [{ "image": { "url": "attachment://chart.png" } }], "attachments": [{ "id": 0, "description": "This week" }] }).to_string())
+        .part("files[0]", reqwest::multipart::Part::bytes(b"PNGDATA".to_vec()).file_name("chart.png").mime_str("image/png").unwrap());
+    // (Spaced past the rate limit: five a webhook in two seconds.)
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let posted: Value = http.post(format!("{url}?wait=true")).multipart(form).send().await.unwrap().json().await.unwrap();
+    let link = posted["attachments"][0]["url"].as_str().unwrap().to_string();
+    assert_eq!(posted["embeds"][0]["image"]["url"], link.as_str());
+    let fetched = http.get(&link).send().await.unwrap().bytes().await.unwrap();
+    assert_eq!(&fetched[..], b"PNGDATA");
+    let got = loop {
+        let got = member.next_message().await;
+        if got["content"] == "Chart" {
+            break got;
+        }
+    };
+    assert_eq!(got["attachments"][0]["description"], "This week");
+    assert_eq!(got["media"][0]["attachment"], got["attachments"][0]["id"]);
+
+    // Five in two seconds, then told to wait.
+    let mut statuses = Vec::new();
+    for n in 0..6 {
+        statuses.push(http.post(&url).json(&json!({ "content": format!("ping {n}") })).send().await.unwrap().status().as_u16());
+    }
+    assert_eq!(statuses.last(), Some(&429), "{statuses:?}");
+
+    // A new URL, and the old one no longer posts.
+    let old = url.clone();
+    advance(&owner, "w1", "new_url", json!({})).await;
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert_eq!(http.post(&old).json(&json!({ "content": "x" })).send().await.unwrap().status(), 401);
 }

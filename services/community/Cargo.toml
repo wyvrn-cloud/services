@@ -20,7 +20,7 @@ didcomm-core = { workspace = true }
 didcomm-crypto-askar = { workspace = true }
 didcomm-quickstart = { workspace = true }
 anyhow = { workspace = true }
-axum = { workspace = true, features = ["ws"] }
+axum = { workspace = true, features = ["ws", "multipart"] }
 futures-util = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -57,4 +57,4 @@ mysql = { workspace = true }
 reqwest-websocket = "0.6"
 # The tests talk to the server as members' apps would, and as browsers and
 # websites do to its web view.
-reqwest = { workspace = true, features = ["form"] }
+reqwest = { workspace = true, features = ["form", "multipart"] }

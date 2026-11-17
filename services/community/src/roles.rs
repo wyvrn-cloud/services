@@ -57,6 +57,7 @@ pub const CHANNEL_PERMISSIONS: &[(&str, &str)] = &[
     ("speak", "Speak in voice channels"),
     ("video", "Share a camera, screen or avatar"),
     ("moderate_voice", "Mute and remove people in voice channels"),
+    ("manage_webhooks", "Manage webhooks: what posts here from other services"),
 ];
 
 /// Holding any of these makes someone a `moderator` in older terms.

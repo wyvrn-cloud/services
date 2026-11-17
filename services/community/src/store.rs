@@ -64,6 +64,19 @@ pub struct Channel {
     pub category: Option<String>,
 }
 
+/// A webhook (`webhooks`): what posts into `channel` as `name`, from whoever
+/// holds its id and `token`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Webhook {
+    pub id: String,
+    pub channel: String,
+    pub name: String,
+    pub avatar: Option<String>,
+    pub token: String,
+    pub created_by: String,
+    pub created_at: i64,
+}
+
 /// Something made or taken over from a Discord template (`imported`).
 #[derive(Debug, Clone)]
 pub struct Imported {
@@ -736,6 +749,17 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         position INTEGER NOT NULL,
         category TEXT
     );
+    -- Webhooks (webhooks.rs): each posts into its channel, as its name, from
+    -- whatever holds its URL (its id and token).
+    CREATE TABLE IF NOT EXISTS webhooks (
+        id TEXT PRIMARY KEY,
+        channel TEXT NOT NULL,
+        name TEXT NOT NULL,
+        avatar TEXT,
+        token TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
     -- What came from a Discord server template (discord.rs): each role, category
     -- and channel made or taken over from one, what the template said of it (its
     -- JSON) and what was set here from that (JSON), to tell on importing again
@@ -1151,6 +1175,15 @@ fn schema() -> Schema {
             CREATE TABLE IF NOT EXISTS post_extra (
                 post VARCHAR(255) NOT NULL PRIMARY KEY,
                 extra MEDIUMTEXT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS webhooks (
+                id VARCHAR(64) NOT NULL PRIMARY KEY,
+                channel VARCHAR(255) NOT NULL,
+                name VARCHAR(255) NOT NULL,
+                avatar TEXT,
+                token VARCHAR(128) NOT NULL,
+                created_by VARCHAR(3000) NOT NULL,
+                created_at BIGINT NOT NULL
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS imported (
                 kind VARCHAR(32) NOT NULL,
@@ -2114,7 +2147,7 @@ impl Store {
                     tx.execute(&format!("DELETE FROM {table} WHERE post IN (SELECT id FROM posts WHERE channel = ?1)"), params![id])?;
                 }
                 tx.execute("DELETE FROM thread_follows WHERE thread IN (SELECT id FROM threads WHERE channel = ?1)", params![id])?;
-                for table in ["threads", "posts", "held", "channel_voice", "channel_overrides", "channel_slow", "channel_order", "channel_forum", "web_channels"] {
+                for table in ["threads", "posts", "held", "channel_voice", "channel_overrides", "channel_slow", "channel_order", "channel_forum", "web_channels", "webhooks"] {
                     tx.execute(&format!("DELETE FROM {table} WHERE channel = ?1"), params![id])?;
                 }
                 tx.execute("DELETE FROM channels WHERE id = ?1", params![id])?;
@@ -2530,6 +2563,27 @@ impl Store {
     }
 
     /// What a post said before AutoMod censored it, if it did.
+    pub fn webhooks(&self) -> Result<Vec<Webhook>> {
+        self.db.lock().query("SELECT id, channel, name, avatar, token, created_by, created_at FROM webhooks ORDER BY created_at, id", params![], webhook_from)
+    }
+
+    pub fn webhook(&self, id: &str) -> Result<Option<Webhook>> {
+        self.db.lock().query_row("SELECT id, channel, name, avatar, token, created_by, created_at FROM webhooks WHERE id = ?1", params![id], webhook_from)
+    }
+
+    pub fn save_webhook(&self, hook: &Webhook) -> Result<()> {
+        self.db.lock().execute(
+            "INSERT OR REPLACE INTO webhooks (id, channel, name, avatar, token, created_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![hook.id, hook.channel, hook.name, hook.avatar, hook.token, hook.created_by, hook.created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_webhook(&self, id: &str) -> Result<()> {
+        self.db.lock().execute("DELETE FROM webhooks WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     /// What came from a Discord template, of `kind` (`role`, `category`,
     /// `channel`, `community`).
     pub fn imported(&self, kind: &str) -> Result<Vec<Imported>> {
@@ -2656,4 +2710,8 @@ impl Store {
     pub fn prune_answering(&self, before: i64) -> Result<usize> {
         self.db.lock().execute("DELETE FROM answering WHERE updated < ?1 AND status != 'completed'", params![before])
     }
+}
+
+fn webhook_from(row: &Row) -> Result<Webhook> {
+    Ok(Webhook { id: row.get(0)?, channel: row.get(1)?, name: row.get(2)?, avatar: row.get(3)?, token: row.get(4)?, created_by: row.get(5)?, created_at: row.get(6)? })
 }

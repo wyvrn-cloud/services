@@ -271,7 +271,7 @@ fn tell_everyone_later(state: &Arc<AppState>, except: Option<String>) {
 
 /// [`send_changed`] for post `id` as it stands, after whoever changed it has had
 /// their answer.
-fn send_changed_later(state: &Arc<AppState>, id: String) {
+pub(crate) fn send_changed_later(state: &Arc<AppState>, id: String) {
     let state = state.clone();
     tokio::spawn(async move {
         let sent = state.community.store.post_by_id(&id).map_err(anyhow::Error::from).and_then(|post| match post {
@@ -1004,6 +1004,18 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Members' pictures, at the addresses members are given (member_ids.rs).
         .route("/m/{member}/{kind}/{hash}", get(member_picture))
         .route("/healthz", get(|| async { "ok" }))
+        // Webhooks, as Discord's are reached (webhooks.rs).
+        .route(
+            "/api/webhooks/{id}/{token}",
+            post(crate::webhooks::execute).get(crate::webhooks::describe).layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
+        .route(
+            "/api/webhooks/{id}/{token}/messages/{message}",
+            get(crate::webhooks::read_message)
+                .patch(crate::webhooks::edit_message)
+                .delete(crate::webhooks::delete_message)
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
         .merge(address::routes(state.agent.did(), state.did_document.clone()))
         // A browser app sends its messages, and fetches files, from another origin.
         .layer(CorsLayer::permissive().expose_headers([
