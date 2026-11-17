@@ -36,7 +36,7 @@ shared_database = "wyvrn_communities"
 # What each community may hold, unless an admin sets otherwise for it.
 [limits]
 members = 1000
-channels = 50
+channels = 500
 file_bytes = 26214400
 files_quota = 1073741824
 files_total = 5368709120

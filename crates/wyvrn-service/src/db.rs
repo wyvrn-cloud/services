@@ -340,6 +340,21 @@ pub struct Db {
     naming: Option<Naming>,
     /// What is read from the tables named in [`Db::cache_reads`], kept for a while.
     cache: OnceLock<ReadCache>,
+    /// A [`Db::grouped`] going on: everything said is said in its one transaction.
+    group: Mutex<Option<Group>>,
+    /// Held by whoever is grouping, so that only one does at a time.
+    grouping: Mutex<()>,
+}
+
+/// A [`Db::grouped`] going on.
+struct Group {
+    /// The thread doing it: grouped again there, it is the same group.
+    thread: std::thread::ThreadId,
+    /// On a shared server, the connection the group's transaction is on, while no
+    /// session holds it.
+    pinned: Option<mysql::PooledConn>,
+    /// For naming savepoints.
+    savepoints: u64,
 }
 
 /// Answers to queries that read only small tables that seldom change, kept so that
@@ -454,6 +469,20 @@ pub struct Session<'a> {
     /// A shared connection, taken at the first statement and given back with the session.
     pooled: Option<mysql::PooledConn>,
     in_transaction: bool,
+    /// The group going on, if one is ([`Db::grouped`]).
+    group: Option<&'a Mutex<Option<Group>>>,
+}
+
+impl Drop for Session<'_> {
+    /// A grouped session's shared connection goes back to the group, not the pool.
+    fn drop(&mut self) {
+        if let (Some(group), Some(connection)) = (self.group, self.pooled.take()) {
+            match group.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+                Some(group) => group.pinned = Some(connection),
+                None => drop(connection),
+            }
+        }
+    }
 }
 
 /// How long a MySQL connection is left before it is asked whether it is still there.
@@ -520,12 +549,12 @@ impl Db {
             None => connection.execute_batch(schema.sqlite)?,
             Some(naming) => connection.execute_batch(&renamed(schema.sqlite, naming))?,
         }
-        Ok(Self { backend: Mutex::new(Backend::Sqlite(connection)), naming, cache: OnceLock::new() })
+        Ok(Self { backend: Mutex::new(Backend::Sqlite(connection)), naming, cache: OnceLock::new(), group: Mutex::new(None), grouping: Mutex::new(()) })
     }
 
     fn mysql(options: mysql::Opts, schema: &Schema, service: &str) -> Result<Self> {
         let connection = mysql_connection(&options)?;
-        let db = Self { backend: Mutex::new(Backend::MySql(Box::new(MySql { connection, options, used: Instant::now() }))), naming: None, cache: OnceLock::new() };
+        let db = Self { backend: Mutex::new(Backend::MySql(Box::new(MySql { connection, options, used: Instant::now() }))), naming: None, cache: OnceLock::new(), group: Mutex::new(None), grouping: Mutex::new(()) };
         db.made(schema, service)?;
         Ok(db)
     }
@@ -544,9 +573,17 @@ impl Db {
             return Err(Error::Other(format!("a database and a table prefix are letters, digits and _ ({database:?}, {prefix:?})")));
         }
         let pool = pool(server)?;
-        pool.get_conn()?.query_drop(format!("CREATE DATABASE IF NOT EXISTS \"{database}\""))?;
+        // Said again on another connection if the one taken has gone (after the
+        // server restarted, every one kept has), as any statement is.
+        let mut tries = 0;
+        loop {
+            match pool.get_conn().and_then(|mut connection| connection.query_drop(format!("CREATE DATABASE IF NOT EXISTS \"{database}\""))).map_err(Error::from) {
+                Err(error) if gone(&error) && tries + 1 < TRIES => tries += 1,
+                done => break done?,
+            }
+        }
         let naming = Naming { database: Some(database.to_string()), prefix: prefix.to_string() };
-        let db = Self { backend: Mutex::new(Backend::Pooled(pool)), naming: Some(naming), cache: OnceLock::new() };
+        let db = Self { backend: Mutex::new(Backend::Pooled(pool)), naming: Some(naming), cache: OnceLock::new(), group: Mutex::new(None), grouping: Mutex::new(()) };
         db.made(schema, service)?;
         Ok(db)
     }
@@ -578,13 +615,56 @@ impl Db {
     /// Holds the database: what is said through the session is said with nothing
     /// from anywhere else in this process between.
     pub fn lock(&self) -> Session<'_> {
+        let backend = self.backend.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let grouped = self.group.lock().unwrap_or_else(|p| p.into_inner()).is_some();
         Session {
-            backend: self.backend.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            backend,
             naming: self.naming.as_ref(),
             cache: self.cache.get(),
             pooled: None,
-            in_transaction: false,
+            in_transaction: grouped,
+            group: grouped.then_some(&self.group),
         }
+    }
+
+    /// Does `work`, everything it says to the database (and anything else in this
+    /// process says meanwhile) in one transaction, committed at the end: one write
+    /// to disk, not one a statement. For work saying many hundreds of statements,
+    /// each of which would otherwise be committed, and so written to disk, by
+    /// itself. A [`Session::transaction`] in it is a savepoint, still all or
+    /// nothing. Not all or nothing itself: should `work` fail, what it said until
+    /// then is kept, as it would have been without grouping. Grouped again within
+    /// `work`, it is the same group; meanwhile, another thread grouping waits.
+    pub fn grouped<T, E: From<Error>>(&self, work: impl FnOnce() -> std::result::Result<T, E>) -> std::result::Result<T, E> {
+        let me = std::thread::current().id();
+        if self.group.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|group| group.thread == me) {
+            return work();
+        }
+        let _gate = self.grouping.lock().unwrap_or_else(|p| p.into_inner());
+        {
+            let mut session = self.lock();
+            session.plainly(match &*session.backend {
+                Backend::Sqlite(_) => "BEGIN IMMEDIATE",
+                Backend::MySql(_) | Backend::Pooled(_) => "START TRANSACTION",
+            })?;
+            // Made while the database is held: whoever holds it next is in the group.
+            *self.group.lock().unwrap_or_else(|p| p.into_inner()) = Some(Group { thread: me, pinned: session.pooled.take(), savepoints: 0 });
+        }
+        let done = work();
+        let mut session = self.lock();
+        let ended = session.plainly("COMMIT");
+        // Ended: its connection goes back to the pool with the session.
+        session.group = None;
+        if let Some(group) = self.group.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            if session.pooled.is_none() {
+                session.pooled = group.pinned;
+            }
+        }
+        session.in_transaction = false;
+        drop(session);
+        let value = done?;
+        ended?;
+        Ok(value)
     }
 
     /// From now on, answers to queries that read only `tables` (as the schema names
@@ -998,7 +1078,11 @@ impl Session<'_> {
             let mut tries = 0;
             loop {
                 if self.pooled.is_none() {
-                    self.pooled = Some(pool.get_conn()?);
+                    let pinned = self.group.and_then(|group| group.lock().unwrap_or_else(|p| p.into_inner()).as_mut().and_then(|group| group.pinned.take()));
+                    self.pooled = Some(match pinned {
+                        Some(connection) => connection,
+                        None => pool.get_conn()?,
+                    });
                 }
                 let connection = self.pooled.as_mut().expect("just taken");
                 match work(connection) {
@@ -1160,6 +1244,26 @@ impl Session<'_> {
 
     /// Does all of `work` or none of it: what it changed is undone if it fails.
     pub fn transaction<T, E: From<Error>>(&mut self, work: impl FnOnce(&mut Self) -> std::result::Result<T, E>) -> std::result::Result<T, E> {
+        if let Some(group) = self.group {
+            // In a group's transaction: a savepoint in it.
+            let name = {
+                let mut group = group.lock().unwrap_or_else(|p| p.into_inner());
+                let group = group.as_mut().expect("a session in a group has one");
+                group.savepoints += 1;
+                format!("grouped_{}", group.savepoints)
+            };
+            self.plainly(&format!("SAVEPOINT {name}"))?;
+            return match work(self) {
+                Ok(value) => {
+                    self.plainly(&format!("RELEASE SAVEPOINT {name}"))?;
+                    Ok(value)
+                }
+                Err(err) => {
+                    let _ = self.plainly(&format!("ROLLBACK TO SAVEPOINT {name}"));
+                    Err(err)
+                }
+            };
+        }
         self.plainly(match &*self.backend {
             Backend::Sqlite(_) => "BEGIN IMMEDIATE",
             Backend::MySql(_) | Backend::Pooled(_) => "START TRANSACTION",
@@ -1183,7 +1287,7 @@ impl Session<'_> {
     /// store's are).
     fn plainly(&mut self, sql: &str) -> Result<()> {
         if let Some(cache) = self.cache {
-            if !matches!(sql.split_whitespace().next().map(str::to_ascii_uppercase).as_deref(), Some("BEGIN" | "START" | "COMMIT" | "ROLLBACK")) {
+            if !matches!(sql.split_whitespace().next().map(str::to_ascii_uppercase).as_deref(), Some("BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE")) {
                 cache.written("");
             }
         }
@@ -1473,5 +1577,85 @@ mod tests {
         root.query_drop(format!("KILL {connection}")).unwrap();
         assert_eq!(session.query_value::<i64>("SELECT size FROM things WHERE name = ?1", params!["kept"]).unwrap(), 1);
         assert_ne!(session.query_value::<i64>("SELECT CONNECTION_ID()", params![]).unwrap(), connection);
+    }
+
+    /// What `grouped` holds to, on `db`; `apart`, if given, is the same tables
+    /// over a connection of its own.
+    fn grouped_on(db: &Db, apart: Option<&Db>) {
+        let count = |db: &Db| db.lock().query_value::<i64>("SELECT COUNT(*) FROM things", params![]).unwrap();
+        let size = |db: &Db, name: &str| db.lock().query_row("SELECT size FROM things WHERE name = ?1", params![name], |row| row.get::<i64>(0)).unwrap();
+        let done: Result<&str> = db.grouped(|| {
+            for n in 0..50i64 {
+                db.lock().execute("INSERT INTO things (name, size) VALUES (?1, ?2)", params![format!("g{n}"), n])?;
+            }
+            // Not yet committed: seen here, not over another connection.
+            assert_eq!(count(db), 50);
+            if let Some(apart) = apart {
+                assert_eq!(count(apart), 0);
+            }
+            // A transaction in it is still all or nothing.
+            let failed: Result<()> = db.lock().transaction(|session| {
+                session.execute("UPDATE things SET size = 100", params![])?;
+                Err(Error::Other("no".into()))
+            });
+            assert!(failed.is_err());
+            assert_eq!(size(db, "g7"), Some(7));
+            db.lock().transaction(|session| session.execute("UPDATE things SET size = 70 WHERE name = 'g7'", params![]))?;
+            // Grouped again, the same group.
+            db.grouped(|| db.lock().execute("INSERT INTO things (name, size) VALUES ('inner', 1)", params![]))?;
+            Ok("done")
+        });
+        assert_eq!(done.unwrap(), "done");
+        assert_eq!(count(db), 51);
+        assert_eq!(size(db, "g7"), Some(70));
+        if let Some(apart) = apart {
+            assert_eq!(count(apart), 51);
+        }
+        // Failed: what it said is kept, as without grouping; and afterwards it's as
+        // before, each statement committed by itself.
+        let failed: Result<()> = db.grouped(|| {
+            db.lock().execute("INSERT INTO things (name, size) VALUES ('before failing', 1)", params![])?;
+            Err(Error::Other("no".into()))
+        });
+        assert!(failed.is_err());
+        db.lock().execute("INSERT INTO things (name, size) VALUES ('after', 1)", params![]).unwrap();
+        if let Some(apart) = apart {
+            assert_eq!(size(apart, "before failing"), Some(1));
+            assert_eq!(size(apart, "after"), Some(1));
+        }
+        // Another thread grouping meanwhile waits for this one, then has its own.
+        std::thread::scope(|scope| {
+            db.grouped(|| {
+                let other = scope.spawn(|| db.grouped(|| db.lock().execute("INSERT INTO things (name, size) VALUES ('other thread', 1)", params![])));
+                std::thread::sleep(Duration::from_millis(100));
+                db.lock().execute("INSERT INTO things (name, size) VALUES ('this thread', 1)", params![])?;
+                Ok::<_, Error>(other)
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+        });
+        assert_eq!(size(db, "other thread"), Some(1));
+        assert_eq!(size(db, "this thread"), Some(1));
+    }
+
+    #[test]
+    fn grouped_statements_are_committed_together_a_transaction_in_them_still_all_or_nothing() {
+        grouped_on(&Db::scratch(&SCHEMA).unwrap(), None);
+        let Some(url) = server() else { return };
+        let Location::MySql(url) = Location::parse(&url).unwrap() else { panic!("WYVRN_TEST_DATABASE_URL is for a MySQL server") };
+        // A database of its own, over one connection.
+        let name = format!("wyvrn_test_{}", scratch_name());
+        mysql::Conn::new(mysql_options(&url).unwrap()).unwrap().query_drop(format!("CREATE DATABASE {name}")).unwrap();
+        let options: mysql::Opts = mysql::OptsBuilder::from_opts(mysql_options(&url).unwrap()).db_name(Some(name)).into();
+        let (db, apart) = (Db::mysql(options.clone(), &SCHEMA, "community").unwrap(), Db::mysql(options, &SCHEMA, "community").unwrap());
+        grouped_on(&db, Some(&apart));
+        // A shared server, over a pool.
+        let server: mysql::Opts = mysql::OptsBuilder::from_opts(mysql_options(&url).unwrap()).db_name(None::<String>).into();
+        let database = format!("wyvrn_test_{}", scratch_name());
+        let db = Db::shared_with(server.clone(), &database, "c1_", &SCHEMA, "community").unwrap();
+        let apart = Db::shared_with(server, &database, "c1_", &SCHEMA, "community").unwrap();
+        grouped_on(&db, Some(&apart));
     }
 }

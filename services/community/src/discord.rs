@@ -677,7 +677,7 @@ impl Community {
     /// 250. Those are left out, and come over on importing again once there's room.
     fn room_warning(&self, plan: &Plan) -> Option<String> {
         let new = |kind: &str| plan.items.iter().filter(|i| i.kind == kind && (i.is_new() || i.deleted_here)).count();
-        let open = self.store.channels().ok()?.iter().filter(|c| !c.closed).count();
+        let open = self.store.open_channel_count().ok()?;
         let room = self.config.max_channels.saturating_sub(open);
         let roles_room = crate::admin_flows::MAX_ROLES.saturating_sub(self.store.roles().ok()?.len());
         let mut said = Vec::new();
@@ -727,7 +727,8 @@ impl Community {
                         _ => return Err(Refusal::new("guard_failed", "Choose, for each thing changed both here and in the template, which stays.")),
                     };
                 }
-                let report = self.import(&flow.owner, &template, &plan, &choice, input, now).map_err(failed)?;
+                // Hundreds of writes: committed together, not each by itself.
+                let report = self.store.db.grouped(|| self.import(&flow.owner, &template, &plan, &choice, input, now)).map_err(failed)?;
                 flow.data["report"] = json!(report);
                 flow.data.as_object_mut().map(|data| data.remove("template"));
                 flow.state = "done".into();
@@ -910,7 +911,7 @@ impl Community {
                 Ok(Some(id))
             }
             "channel" => {
-                if self.store.channels()?.iter().filter(|c| !c.closed).count() >= self.config.max_channels {
+                if self.store.open_channel_count()? >= self.config.max_channels {
                     return Ok(None);
                 }
                 let voice = want["kind"] == "voice";
@@ -1003,12 +1004,8 @@ impl Community {
                     }
                 }
                 if has("category") {
-                    let category = want["category"].as_str().filter(|c| !c.is_empty()).map(str::to_string);
-                    let mut order: Vec<(String, Option<String>)> = self.store.channels()?.into_iter().map(|c| (c.id, c.category)).collect();
-                    for entry in order.iter_mut().filter(|(id, _)| id == local) {
-                        entry.1 = category.clone();
-                    }
-                    self.store.order_channels(&order)?;
+                    // Only its category: `order_as_template` places every channel after.
+                    self.store.set_channel_category(local, want["category"].as_str().filter(|c| !c.is_empty()))?;
                 }
             }
         }

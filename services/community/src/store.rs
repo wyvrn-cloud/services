@@ -2061,6 +2061,20 @@ impl Store {
         })
     }
 
+    /// Puts one channel in `category` (none: in none), keeping its place; one
+    /// without a place yet goes last.
+    pub fn set_channel_category(&self, channel: &str, category: Option<&str>) -> Result<()> {
+        self.db.lock().transaction(|tx| {
+            if tx.query_row("SELECT 1 FROM channel_order WHERE channel = ?1", params![channel], |_| Ok(()))?.is_some() {
+                tx.execute("UPDATE channel_order SET category = ?2 WHERE channel = ?1", params![channel, category])?;
+            } else {
+                let last: i64 = tx.query_value("SELECT COALESCE(MAX(position), -1) FROM channel_order", params![])?;
+                tx.execute("INSERT INTO channel_order (channel, position, category) VALUES (?1, ?2, ?3)", params![channel, last + 1, category])?;
+            }
+            Ok(())
+        })
+    }
+
     /// Places every channel as `order` lists them, each with its category.
     pub fn order_channels(&self, order: &[(String, Option<String>)]) -> Result<()> {
         self.db.lock().transaction(|tx| {
@@ -2106,6 +2120,12 @@ impl Store {
             params![since],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
+    }
+
+    /// How many channels there are that aren't closed (nor in the trash).
+    pub fn open_channel_count(&self) -> Result<usize> {
+        let count: i64 = self.db.lock().query_value(&format!("SELECT COUNT(*) FROM channels WHERE closed = 0 AND {NOT_TRASHED}"), params![])?;
+        Ok(count as usize)
     }
 
     pub fn channel(&self, id: &str) -> Result<Option<Channel>> {

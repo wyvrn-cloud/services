@@ -115,7 +115,7 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { members: 1000, channels: 50, file_bytes: 25 * 1024 * 1024, files_quota: 1024 * 1024 * 1024, files_total: 5 * 1024 * 1024 * 1024 }
+        Self { members: 1000, channels: 500, file_bytes: 25 * 1024 * 1024, files_quota: 1024 * 1024 * 1024, files_total: 5 * 1024 * 1024 * 1024 }
     }
 }
 
