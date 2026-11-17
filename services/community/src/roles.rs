@@ -124,6 +124,53 @@ impl Powers {
     }
 }
 
+/// What a category's permissions are kept under, beside the channels': its own
+/// channel_overrides rows, never read for a channel (community/1.0's "Category
+/// permissions").
+pub fn category_key(category: &str) -> String {
+    format!("category:{category}")
+}
+
+/// Overrides as a set to compare: role -> (allowed, denied), sorted, none empty.
+fn as_set(overrides: &[crate::store::Override]) -> std::collections::BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)> {
+    overrides.iter().filter(|o| !o.allow.is_empty() || !o.deny.is_empty()).map(|o| (o.role.clone(), (o.allow.iter().cloned().collect(), o.deny.iter().cloned().collect()))).collect()
+}
+
+impl Community {
+    /// Whether `channel` has its category's permissions, exactly (Discord's
+    /// "synced"); a channel in no category isn't.
+    pub fn synced(&self, channel: &Channel) -> anyhow::Result<bool> {
+        let Some(category) = &channel.category else { return Ok(false) };
+        Ok(as_set(&self.store.overrides(&category_key(category))?) == as_set(&self.store.overrides(&channel.id)?))
+    }
+
+    /// Gives `channel` its category's permissions, all of them and only them.
+    pub fn sync_with_category(&self, channel: &Channel) -> anyhow::Result<()> {
+        let Some(category) = &channel.category else { return Ok(()) };
+        let wanted = self.store.overrides(&category_key(category))?;
+        for held in self.store.overrides(&channel.id)? {
+            if !wanted.iter().any(|o| o.role == held.role) {
+                self.store.set_override(&channel.id, &held.role, &[], &[])?;
+            }
+        }
+        for o in wanted {
+            self.store.set_override(&channel.id, &o.role, &o.allow, &o.deny)?;
+        }
+        Ok(())
+    }
+
+    /// Sets what `role` is allowed and denied in `category`, and in every channel
+    /// of it that was synced with it: they follow; one changed on its own doesn't.
+    pub fn set_category_override(&self, category: &str, role: &str, allow: &[String], deny: &[String]) -> anyhow::Result<()> {
+        let synced: Vec<Channel> = self.store.channels()?.into_iter().filter(|c| c.category.as_deref() == Some(category)).filter(|c| self.synced(c).unwrap_or(false)).collect();
+        self.store.set_override(&category_key(category), role, allow, deny)?;
+        for channel in synced {
+            self.sync_with_category(&channel)?;
+        }
+        Ok(())
+    }
+}
+
 impl Community {
     /// Gives a store from before roles its roles, once: `everyone` with what
     /// members could do, then Moderator and Admin, and `admin` to every admin.

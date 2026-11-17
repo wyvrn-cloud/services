@@ -261,6 +261,38 @@ impl Community {
         powers.has("manage_channels") || channel.created_by == did
     }
 
+    /// What the permissions workflow sets: a channel's, or (with `category` in its
+    /// context) a category's, which its synced channels follow.
+    fn flow_target(&self, flow: &Flow) -> Result<Target, Refusal> {
+        if let Some(id) = flow.context["category"].as_str() {
+            let category = self.store.categories().map_err(failed)?.into_iter().find(|c| c.id == id).ok_or_else(|| Refusal::new("instance_not_found", "That category is gone."))?;
+            return Ok(Target { key: crate::roles::category_key(&category.id), title: format!("the category {}", category.name), voice: false, channel: None, category: Some(category) });
+        }
+        let channel = self.flow_channel(flow)?;
+        let category = match &channel.category {
+            Some(id) => self.store.categories().map_err(failed)?.into_iter().find(|c| c.id == *id),
+            None => None,
+        };
+        let title = if channel.voice.is_some() { format!("🔊{}", channel.name) } else { format!("#{}", channel.name) };
+        Ok(Target { key: channel.id.clone(), title, voice: channel.voice.is_some(), channel: Some(channel), category })
+    }
+
+    /// What `owner` may set others' permissions to on `target`: what they hold there.
+    fn target_held(&self, owner: &str, powers: &Powers, target: &Target) -> Result<std::collections::BTreeSet<String>, Refusal> {
+        match &target.channel {
+            Some(channel) => self.channel_permissions(owner, powers, channel).map_err(failed),
+            None => Ok(CHANNEL_PERMISSIONS.iter().map(|(name, _)| name.to_string()).filter(|name| powers.has(name)).collect()),
+        }
+    }
+
+    /// Sets `role`'s permissions on `target`; on a category, its synced channels too.
+    fn set_target_override(&self, target: &Target, role: &str, allow: &[String], deny: &[String]) -> Result<(), Refusal> {
+        match (&target.channel, &target.category) {
+            (None, Some(category)) => self.set_category_override(&category.id, role, allow, deny).map_err(failed),
+            _ => self.store.set_override(&target.key, role, allow, deny).map_err(failed),
+        }
+    }
+
     fn flow_channel(&self, flow: &Flow) -> Result<Channel, Refusal> {
         let id = flow.context["channel"].as_str().unwrap_or_default();
         self.store.channel(id).map_err(failed)?.ok_or_else(|| Refusal::new("instance_not_found", "That channel is gone."))
@@ -405,12 +437,22 @@ impl Community {
     }
 
     fn channel_roles_ui(&self, flow: &Flow, powers: &Powers) -> Result<Value, Refusal> {
-        let channel = self.flow_channel(flow)?;
-        let overrides = self.store.overrides(&channel.id).map_err(failed)?;
-        let read_only = self.read_only(&channel.id).map_err(failed)?;
-        let mut items = vec![json!({ "type": "title", "text": format!("Permissions in #{}", channel.name) })];
+        let target = self.flow_target(flow)?;
+        let overrides = self.store.overrides(&target.key).map_err(failed)?;
+        let read_only = overrides.iter().any(|o| o.role == EVERYONE_ROLE && o.deny.iter().any(|p| p == "post"));
+        let mut items = vec![json!({ "type": "title", "text": format!("Permissions in {}", target.title) })];
         items.push(json!({ "type": "text", "text": "A channel can allow or deny each role what members do in channels. Allowing wins over denying, a role's own over everyone's. Without See the channel, a role finds it isn't there: nothing of it reaches them." }));
-        if channel.voice.is_none() {
+        match (&target.channel, &target.category) {
+            // A category's: what its synced channels have.
+            (None, Some(_)) => items.push(json!({ "type": "text", "text": "Its channels that are synced with it follow what is set here; one whose permissions were changed on its own keeps them, until it is synced again." })),
+            (Some(channel), Some(category)) => items.push(if self.synced(channel).map_err(failed)? {
+                json!({ "type": "text", "text": format!("Synced with {}: it has the category's permissions, and follows them.", category.name) })
+            } else {
+                json!({ "type": "row", "children": [{ "type": "text", "text": format!("Not synced with {}: its permissions are its own.", category.name) }, button(&format!("Sync with {}", category.name), "sync", json!({}))] })
+            }),
+            _ => {}
+        }
+        if !target.voice {
             items.push(if read_only {
                 json!({ "type": "row", "children": [{ "type": "text", "text": "Read-only: only roles allowed to post here can." }, button("Let everyone post", "unlock", json!({}))] })
             } else {
@@ -443,10 +485,10 @@ impl Community {
     }
 
     fn channel_role_ui(&self, flow: &Flow, held: &std::collections::BTreeSet<String>) -> Result<Value, Refusal> {
-        let channel = self.flow_channel(flow)?;
+        let target = self.flow_target(flow)?;
         let role_id = flow.data["role"].as_str().unwrap_or_default();
         let role = self.store.role(role_id).map_err(failed)?.ok_or_else(|| refused("That role is gone."))?;
-        let said = self.store.overrides(&channel.id).map_err(failed)?.into_iter().find(|o| o.role == role.id);
+        let said = self.store.overrides(&target.key).map_err(failed)?.into_iter().find(|o| o.role == role.id);
         let mut fields = Vec::new();
         for (name, label) in CHANNEL_PERMISSIONS {
             let allowed = said.as_ref().is_some_and(|o| o.allow.iter().any(|p| p == name));
@@ -463,7 +505,7 @@ impl Community {
         }
         fields.push(button("Save", "save", json!({})));
         Ok(json!([
-            { "type": "title", "text": format!("{} in #{}", role.name, channel.name) },
+            { "type": "title", "text": format!("{} in {}", role.name, target.title) },
             { "type": "text", "text": "Neither ticked: as the role has it everywhere." },
             { "type": "form", "children": fields },
             button("Back", "back", json!({}))
@@ -489,7 +531,7 @@ impl Community {
                     (self.role_edit_ui(&role, &powers), events)
                 }
                 (MEMBER_ROLES, _) => (self.member_roles_ui(flow, &powers)?, vec!["save"]),
-                (CHANNEL_PERMISSIONS_FLOW, "roles") => (self.channel_roles_ui(flow, &powers)?, vec!["read_only", "unlock", "private", "public", "edit", "done"]),
+                (CHANNEL_PERMISSIONS_FLOW, "roles") => (self.channel_roles_ui(flow, &powers)?, vec!["read_only", "unlock", "private", "public", "edit", "sync", "done"]),
                 (AUTOMOD_FLOW, "list") => (self.automod_list_ui(flow).map_err(failed)?, vec!["edit", "create", "preset", "toggle", "done"]),
                 (AUTOMOD_FLOW, "edit") => (self.automod_edit_ui(flow).map_err(failed)?, vec!["save", "delete", "back"]),
                 (JOIN_GATES_FLOW, _) => (self.join_gates_ui().map_err(failed)?, vec!["save"]),
@@ -503,8 +545,8 @@ impl Community {
                 (DISCORD_IMPORT_FLOW, _) => self.discord_import_ui(flow).map_err(failed)?,
                 (WEBHOOKS_FLOW, _) => self.webhooks_ui(flow).map_err(failed)?,
                 (CHANNEL_PERMISSIONS_FLOW, "role") => {
-                    let channel = self.flow_channel(flow)?;
-                    let held = self.channel_permissions(&flow.owner, &powers, &channel).map_err(failed)?;
+                    let target = self.flow_target(flow)?;
+                    let held = self.target_held(&flow.owner, &powers, &target)?;
                     (self.channel_role_ui(flow, &held)?, vec!["save", "back"])
                 }
                 _ => (json!([]), Vec::new()),
@@ -561,6 +603,16 @@ impl Community {
                     return Err(not_allowed("You can only give roles to someone ranked below you."));
                 }
                 json!({ "member": did })
+            }
+            CHANNEL_PERMISSIONS_FLOW if body["context"]["category"].is_string() => {
+                let id = body["context"]["category"].as_str().unwrap_or_default();
+                if !self.store.categories().map_err(failed)?.iter().any(|c| c.id == id) {
+                    return Err(refused("There is no such category."));
+                }
+                if !powers.has("manage_channels") {
+                    return Err(not_allowed("A category's permissions take Manage channels."));
+                }
+                json!({ "category": id })
             }
             CHANNEL_PERMISSIONS_FLOW => {
                 let id = body["context"]["channel"].as_str().unwrap_or_default();
@@ -677,6 +729,7 @@ impl Community {
         let powers = self.powers(&flow.owner).map_err(failed)?;
         // Someone who no longer may is shown so, not let go on.
         let still = match flow.template.as_str() {
+            CHANNEL_PERMISSIONS_FLOW if flow.context["category"].is_string() => powers.has("manage_channels"),
             CHANNEL_PERMISSIONS_FLOW => self.may_manage_channel(&flow.owner, &powers, &self.flow_channel(&flow)?),
             AUTOMOD_FLOW => powers.has("manage_automod"),
             JOIN_GATES_FLOW | ONBOARDING_SETUP_FLOW => powers.has("manage_community"),
@@ -873,9 +926,16 @@ impl Community {
                 flow.status = "completed".into();
                 true
             }
+            (CHANNEL_PERMISSIONS_FLOW, "roles", "sync") => {
+                let target = self.flow_target(&flow)?;
+                let Some(channel) = &target.channel else { return Err(refused("A category is what channels sync with.")) };
+                self.sync_with_category(channel).map_err(failed)?;
+                self.audit(now, &flow.owner, "channel.permissions", Some(&channel.id), Some(json!({ "synced": true })));
+                true
+            }
             (CHANNEL_PERMISSIONS_FLOW, "roles", "read_only" | "unlock" | "private" | "public") => {
-                let channel = self.flow_channel(&flow)?;
-                let said = self.store.overrides(&channel.id).map_err(failed)?.into_iter().find(|o| o.role == EVERYONE_ROLE);
+                let target = self.flow_target(&flow)?;
+                let said = self.store.overrides(&target.key).map_err(failed)?.into_iter().find(|o| o.role == EVERYONE_ROLE);
                 let (mut allow, mut deny) = said.map(|o| (o.allow, o.deny)).unwrap_or_default();
                 let (permission, on, said) = match event {
                     "read_only" | "unlock" => ("post", event == "read_only", "read_only"),
@@ -886,8 +946,8 @@ impl Community {
                 if on {
                     deny.push(permission.into());
                 }
-                self.store.set_override(&channel.id, EVERYONE_ROLE, &allow, &deny).map_err(failed)?;
-                self.audit(now, &flow.owner, "channel.permissions", Some(&channel.id), Some(json!({ "role": EVERYONE_ROLE, said: on })));
+                self.set_target_override(&target, EVERYONE_ROLE, &allow, &deny)?;
+                self.audit(now, &flow.owner, "channel.permissions", Some(&target.key), Some(json!({ "role": EVERYONE_ROLE, said: on })));
                 true
             }
             (CHANNEL_PERMISSIONS_FLOW, "roles", "edit") => {
@@ -901,10 +961,10 @@ impl Community {
                 false
             }
             (CHANNEL_PERMISSIONS_FLOW, "role", "save") => {
-                let channel = self.flow_channel(&flow)?;
+                let target = self.flow_target(&flow)?;
                 let role_id = flow.data["role"].as_str().unwrap_or_default().to_string();
-                let held = self.channel_permissions(&flow.owner, &powers, &channel).map_err(failed)?;
-                let said = self.store.overrides(&channel.id).map_err(failed)?.into_iter().find(|o| o.role == role_id);
+                let held = self.target_held(&flow.owner, &powers, &target)?;
+                let said = self.store.overrides(&target.key).map_err(failed)?.into_iter().find(|o| o.role == role_id);
                 let (mut allow, mut deny) = said.map(|o| (o.allow, o.deny)).unwrap_or_default();
                 for (name, label) in CHANNEL_PERMISSIONS.iter().filter(|(name, _)| held.contains(*name)) {
                     let (allowing, denying) = (ticked(&input[format!("allow-{name}")]), ticked(&input[format!("deny-{name}")]));
@@ -920,8 +980,8 @@ impl Community {
                         deny.push(name.to_string());
                     }
                 }
-                self.store.set_override(&channel.id, &role_id, &allow, &deny).map_err(failed)?;
-                self.audit(now, &flow.owner, "channel.permissions", Some(&channel.id), Some(json!({ "role": role_id, "allow": allow, "deny": deny })));
+                self.set_target_override(&target, &role_id, &allow, &deny)?;
+                self.audit(now, &flow.owner, "channel.permissions", Some(&target.key), Some(json!({ "role": role_id, "allow": allow, "deny": deny })));
                 flow.state = "roles".into();
                 true
             }
@@ -1493,4 +1553,17 @@ impl Community {
             _ => Err(refused("That can't be done here.")),
         }
     }
+}
+
+/// What the permissions workflow sets (`flow_target`).
+struct Target {
+    /// Its overrides' key: a channel's id, or `category:<id>`.
+    key: String,
+    /// "#general", "🔊lounge" or "the category Art".
+    title: String,
+    voice: bool,
+    /// The channel, where it is one.
+    channel: Option<Channel>,
+    /// The category: the one set, or the channel's.
+    category: Option<crate::store::Category>,
 }

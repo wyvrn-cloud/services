@@ -2062,6 +2062,8 @@ impl Store {
         self.db.lock().transaction(|tx| {
             tx.execute("UPDATE channel_order SET category = NULL WHERE category = ?1", params![id])?;
             tx.execute("DELETE FROM categories WHERE id = ?1", params![id])?;
+            // Its permissions, kept as a channel's are, under `category:<id>`.
+            tx.execute("DELETE FROM channel_overrides WHERE channel = ?1", params![format!("category:{id}")])?;
             Ok(())
         })
     }

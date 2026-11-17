@@ -454,7 +454,25 @@ impl Community {
         for category in channels.iter().filter(|c| kind_of(c).0 == "category") {
             let source_id = category["id"].to_string();
             let name = line(&category["name"], 100).unwrap_or_else(|| "Channels".into());
-            let want = json!({ "name": name });
+            // Its permissions, which its synced channels have here too (community/1.0's
+            // "Category permissions"), as a channel's are read.
+            let mut overrides = Map::new();
+            for o in category["permission_overwrites"].as_array().into_iter().flatten() {
+                if o["type"] != 0 {
+                    miss("Permissions a channel gives one person, not a role".into());
+                    continue;
+                }
+                let Some(role) = role_ids.get(&o["id"].to_string()) else { continue };
+                let (allow_bits, deny_bits) = (bits(&o["allow"]), bits(&o["deny"]));
+                unmapped_permissions.extend(unmapped(allow_bits));
+                unmapped_permissions.extend(unmapped(deny_bits));
+                let allow: BTreeSet<String> = mapped(allow_bits).into_iter().filter(|p| is_channel_permission(p)).collect();
+                let deny: BTreeSet<String> = mapped(deny_bits).into_iter().filter(|p| is_channel_permission(p) && !allow.contains(p)).collect();
+                if !allow.is_empty() || !deny.is_empty() {
+                    overrides.insert(role.clone(), json!({ "allow": sorted(allow), "deny": sorted(deny) }));
+                }
+            }
+            let want = json!({ "name": name, "overrides": overrides });
             let at = records.iter().position(|r| r.source["name"] == category["name"] && r.source_id == source_id && !used.contains(&r.local)).or_else(|| records.iter().position(|r| r.source["name"] == category["name"] && !used.contains(&r.local))).or_else(|| records.iter().position(|r| r.source_id == source_id && !used.contains(&r.local)));
             let record = at.map(|at| records.remove(at));
             let local = match &record {
@@ -464,16 +482,30 @@ impl Community {
             if let Some(local) = &local {
                 used.insert(local.clone());
             }
-            let here = local.as_ref().and_then(|id| categories_here.iter().find(|c| c.id == *id)).map(|c| json!({ "name": c.name }));
+            let here = match local.as_ref().and_then(|id| categories_here.iter().find(|c| c.id == *id)) {
+                Some(c) => {
+                    let mut overrides = Map::new();
+                    for o in self.store.overrides(&crate::roles::category_key(&c.id))?.into_iter().filter(|o| managed.contains(&o.role)) {
+                        overrides.insert(o.role.clone(), json!({ "allow": sorted(o.allow), "deny": sorted(o.deny) }));
+                    }
+                    Some(json!({ "name": c.name, "overrides": overrides }))
+                }
+                None => None,
+            };
+            // Imported before categories had permissions: what is here is as it was.
+            let applied = record.as_ref().map(|r| {
+                let mut applied = r.applied.clone();
+                if applied.get("overrides").is_none() {
+                    applied["overrides"] = here.as_ref().map(|h| h["overrides"].clone()).unwrap_or_else(|| json!({}));
+                }
+                applied
+            });
             let (take, conflicts) = match &here {
-                Some(here) => compare(&want, here, record.as_ref().map(|r| &r.applied), &[]),
+                Some(here) => compare(&want, here, applied.as_ref(), &[]),
                 None => (Vec::new(), Vec::new()),
             };
             let deleted_here = record.is_some() && local.is_none();
             category_ids.insert(source_id.clone(), local.clone().unwrap_or_else(|| format!("new:category:{source_id}")));
-            if category["permission_overwrites"].as_array().is_some_and(|o| !o.is_empty()) {
-                miss("Permissions set on a category: here each channel has its own, and the template's channels brought theirs".into());
-            }
             plan.items.push(Planned { kind: "category", source_id, source: (*category).clone(), label: format!("The category {name}"), local, record, want, here, take, conflicts, deleted_here });
         }
         for gone in records {
@@ -1040,6 +1072,7 @@ impl Community {
                 let id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
                 let position = self.store.categories()?.len() as i64;
                 self.store.save_category(&Category { id: id.clone(), name: want["name"].as_str().unwrap_or("Channels").to_string(), position })?;
+                self.apply_fields("category", &id, want, &["overrides".to_string()], owner, now)?;
                 Ok(Some(id))
             }
             "channel" => {
@@ -1102,6 +1135,19 @@ impl Community {
                     if has("name") {
                         category.name = want["name"].as_str().unwrap_or(&category.name).to_string();
                         self.store.save_category(&category)?;
+                    }
+                    // Its own permissions only: the template's channels bring theirs.
+                    if has("overrides") {
+                        let key = crate::roles::category_key(&category.id);
+                        let managed: HashSet<String> = self.store.imported("role")?.into_iter().map(|r| r.local).chain(std::iter::once(EVERYONE_ROLE.to_string())).chain(want["overrides"].as_object().into_iter().flatten().map(|(k, _)| k.clone())).collect();
+                        for o in self.store.overrides(&key)?.into_iter().filter(|o| managed.contains(&o.role)) {
+                            if want["overrides"].get(&o.role).is_none() {
+                                self.store.set_override(&key, &o.role, &[], &[])?;
+                            }
+                        }
+                        for (role, said) in want["overrides"].as_object().into_iter().flatten() {
+                            self.store.set_override(&key, role, &strings(&said["allow"]), &strings(&said["deny"]))?;
+                        }
                     }
                 }
             }

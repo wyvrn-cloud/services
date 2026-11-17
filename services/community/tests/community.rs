@@ -2864,3 +2864,49 @@ async fn a_newcomer_is_welcomed_in_the_channel_an_admin_chose_in_lines_of_their_
     owner.community("set-welcome", json!({ "channel": null })).await;
     assert!(owner.community("join", json!({})).await["body"]["welcome"]["channel"].is_null());
 }
+
+#[tokio::test]
+async fn a_categorys_permissions_are_followed_by_its_synced_channels_and_not_by_one_changed_on_its_own() {
+    let server = start_server("").await;
+    let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member]);
+    let (art, sketches) = (open_channel(&owner, "art").await, open_channel(&owner, "sketches").await);
+    member.community("join", json!({})).await;
+    owner.workflow("start", json!({ "template_id": "channels", "instance_id": "c1" })).await;
+    advance(&owner, "c1", "create_category", json!({ "name": "Studio" })).await;
+    let studio = owner.community("join", json!({})).await["body"]["categories"][0]["id"].as_str().unwrap().to_string();
+    let arranged = json!({ "categories": [{ "id": studio, "name": "Studio" }], "channels": [{ "id": art, "category": studio }, { "id": sketches, "category": studio }] });
+    assert_eq!(kind(&owner.community("arrange", arranged).await), "community");
+    let listed = |body: &Value| body["channels"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+
+    // Only someone who manages channels sets a category's.
+    assert_eq!(member.workflow("start", json!({ "template_id": "channel-permissions", "instance_id": "m", "context": { "category": studio } })).await["body"]["code"], "not_authorized");
+    // Both channels are synced with Studio (neither has anything of its own yet).
+    let page = owner.workflow("start", json!({ "template_id": "channel-permissions", "instance_id": "p1", "context": { "channel": art } })).await;
+    assert!(page["body"]["ui"].to_string().contains("Synced with Studio"), "{page}");
+
+    // #sketches is changed on its own: no longer synced, and keeps it.
+    owner.workflow("start", json!({ "template_id": "channel-permissions", "instance_id": "p2", "context": { "channel": sketches } })).await;
+    let page = advance(&owner, "p2", "read_only", json!({})).await;
+    assert!(page["body"]["ui"].to_string().contains("Not synced with Studio"), "{page}");
+
+    // Studio made private: #art (synced) follows; #sketches doesn't.
+    let category = owner.workflow("start", json!({ "template_id": "channel-permissions", "instance_id": "k1", "context": { "category": studio } })).await;
+    assert!(category["body"]["ui"].to_string().contains("Permissions in the category Studio"), "{category}");
+    advance(&owner, "k1", "private", json!({})).await;
+    let seen = listed(&member.community("join", json!({})).await["body"]);
+    assert!(!seen.contains(&art) && seen.contains(&sketches), "{seen:?}");
+
+    // A new channel arranged into Studio follows it: private too.
+    let late = open_channel(&owner, "late").await;
+    let arranged = json!({ "categories": [{ "id": studio, "name": "Studio" }], "channels": [{ "id": art, "category": studio }, { "id": sketches, "category": studio }, { "id": late, "category": studio }] });
+    owner.community("arrange", arranged).await;
+    assert!(!listed(&member.community("join", json!({})).await["body"]).contains(&late));
+
+    // Synced again, #sketches is Studio's: private, and no longer read-only.
+    advance(&owner, "p2", "sync", json!({})).await;
+    let seen = listed(&member.community("join", json!({})).await["body"]);
+    assert!(!seen.contains(&sketches), "{seen:?}");
+    let overrides = server.state.community.store.overrides(&sketches).unwrap();
+    assert!(overrides.iter().all(|o| !o.deny.iter().any(|p| p == "post")), "{overrides:?}");
+}

@@ -202,6 +202,15 @@ impl Community {
                 order.push((channel.id.clone(), channel.category.clone().filter(|id| categories.iter().any(|c| c.id == *id))));
             }
         }
+        // A channel moved into a category follows it, as Discord's do, where it had
+        // nothing of its own or had the permissions of the one it left: worked out
+        // before anything moves.
+        let follows: Vec<String> = held
+            .iter()
+            .filter(|channel| order.iter().any(|(id, to)| *id == channel.id && to.is_some() && *to != channel.category))
+            .filter(|channel| self.store.overrides(&channel.id).map(|o| o.iter().all(|o| o.allow.is_empty() && o.deny.is_empty())).unwrap_or(false) || self.synced(channel).unwrap_or(false))
+            .map(|channel| channel.id.clone())
+            .collect();
         for gone in self.store.categories()?.into_iter().filter(|old| !categories.iter().any(|c| c.id == old.id)) {
             self.store.delete_category(&gone.id)?;
         }
@@ -209,6 +218,11 @@ impl Community {
             self.store.save_category(category)?;
         }
         self.store.order_channels(&order)?;
+        for id in follows {
+            if let Some(channel) = self.store.channel(&id)? {
+                self.sync_with_category(&channel)?;
+            }
+        }
         self.audit(now, sender, "channel.update", None, Some(json!({ "arranged": true })));
         Ok(Outcome { reply: Some(reply_to(message, crate::community::COMMUNITY, self.community(member)?)), channels_changed: true, ..Outcome::default() })
     }
