@@ -185,6 +185,9 @@ pub fn is_template(id: &str) -> bool {
 pub const SORTABLE_LIST: &str = "ui:sortable-list";
 
 /// Whether the app running `flow` said it can draw `capability`.
+/// Workflow UI Layout's tabs (wyvrn-protocols' profiles/workflow-ui-layout/1.0).
+pub const TABS: &str = "ui:tabs";
+
 fn can_draw(flow: &Flow, capability: &str) -> bool {
     flow.data["capabilities"].as_array().is_some_and(|all| all.iter().any(|c| c == capability))
 }
@@ -1081,17 +1084,38 @@ impl Community {
             json!({ "type": "title", "text": "What it does" }),
             json!({ "type": "drop-down", "form-id": "action", "label": "With a post it finds something in", "value": crate::automod::action_of(&rule), "options": crate::automod::ACTIONS.iter().map(|(value, label)| json!({ "value": value, "label": label })).collect::<Vec<_>>() }),
             json!({ "type": "text", "text": "Censored, words become dots and links <UNSAFE URL BLOCKED>. Whoever manages posts in the channel can still see what it said." }),
-            json!({ "type": "text-input", "form-id": "alert_channel", "label": "Tell a channel of it (the channel's name)", "placeholder": "mod-log", "value": alert }),
+            // (Its suggestions are the text channels, for an app to offer as it is
+            // typed: Workflow UI Layout's `suggestions`; any other shows the box.)
+            json!({ "type": "text-input", "form-id": "alert_channel", "label": "Tell a channel of it (the channel's name)", "placeholder": "mod-log", "value": alert,
+                "suggestions": self.store.channels()?.iter().filter(|c| c.voice.is_none() && !c.closed).map(|c| c.name.clone()).collect::<Vec<_>>() }),
             json!({ "type": "text-input", "form-id": "timeout_minutes", "label": "Time its author out for (minutes; empty: no)", "value": rule["timeout_seconds"].as_i64().map(|s| (s / 60).to_string()).unwrap_or_default() }),
             json!({ "type": "title", "text": "Who and where it doesn't check" }),
         ]);
         let exempt_roles = lines("exempt_roles");
-        for role in self.store.roles()?.iter().filter(|role| role.id != EVERYONE_ROLE) {
-            fields.push(json!({ "type": "check-box", "form-id": format!("exempt-role-{}", role.id), "label": format!("Role: {}", role.name), "value": exempt_roles.contains(&role.id.as_str()) }));
-        }
+        let roles: Vec<Value> = self
+            .store
+            .roles()?
+            .iter()
+            .filter(|role| role.id != EVERYONE_ROLE)
+            .map(|role| json!({ "type": "check-box", "form-id": format!("exempt-role-{}", role.id), "label": role.name, "value": exempt_roles.contains(&role.id.as_str()) }))
+            .collect();
         let exempt_channels = lines("exempt_channels");
-        for channel in self.store.channels()?.iter().filter(|c| c.voice.is_none() && !c.closed) {
-            fields.push(json!({ "type": "check-box", "form-id": format!("exempt-channel-{}", channel.id), "label": format!("#{}", channel.name), "value": exempt_channels.contains(&channel.id.as_str()) }));
+        let channels: Vec<Value> = self
+            .store
+            .channels()?
+            .iter()
+            .filter(|c| c.voice.is_none() && !c.closed)
+            .map(|channel| json!({ "type": "check-box", "form-id": format!("exempt-channel-{}", channel.id), "label": format!("#{}", channel.name), "value": exempt_channels.contains(&channel.id.as_str()) }))
+            .collect();
+        // In tabs, roles and channels, where the app draws them (Workflow UI
+        // Layout's `tabs`); as two lists under their names otherwise.
+        if can_draw(flow, TABS) {
+            fields.push(json!({ "type": "tabs", "tabs": [{ "label": "Roles", "children": roles }, { "label": "Channels", "children": channels }] }));
+        } else {
+            fields.push(json!({ "type": "text", "text": "Roles" }));
+            fields.extend(roles);
+            fields.push(json!({ "type": "text", "text": "Channels" }));
+            fields.extend(channels);
         }
         fields.push(button("Save", "save", json!({})));
         Ok(json!([
