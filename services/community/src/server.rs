@@ -447,7 +447,10 @@ impl CommunityService {
         // is told they aren't.)
         if received.message["type"].as_str().is_some_and(|message_type| message_type.starts_with(questions::PIURI)) {
             if let Some(member) = state.community.store.member(&sender)? {
-                let mut handled = state.community.handle_workflow(&member, &received.message, now());
+                // A Discord template to import is read from Discord first (discord.rs).
+                let mut message = received.message.clone();
+                crate::discord::prefetch(&state.community, &member.did, &mut message).await;
+                let mut handled = state.community.handle_workflow(&member, &message, now());
                 // The owner is also listed the host's pages for them.
                 if let (Some(pages), true, Some(Ok((_, body)))) = (&state.owner_pages, is_owner, handled.answer.as_mut()) {
                     if message_type.ends_with("/discover") {
@@ -464,6 +467,10 @@ impl CommunityService {
                 // Roles or permissions changed: everyone joined is told what they may do now.
                 if handled.community_changed {
                     tell_everyone_later(state, None);
+                    // (Its name may have changed: a Discord template's, imported.)
+                    if let Some(document) = &state.did_document {
+                        document.changed(&state.community.changed());
+                    }
                 }
                 return Ok(match handled.answer {
                     Some(Ok((message_type, body))) => Some(received.reply(&message_type, body)),

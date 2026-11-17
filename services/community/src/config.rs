@@ -167,6 +167,9 @@ pub struct CommunityConfig {
     /// As many members as there may be, those who left included; 0 for no limit.
     /// Past it nobody more is let in (`e.p.req.community-full`).
     pub max_members: usize,
+    /// Where Discord's API is, for reading a server template to import
+    /// (discord.rs). A test points it elsewhere.
+    pub discord_api: String,
 }
 
 impl CommunityConfig {
@@ -190,12 +193,13 @@ impl Default for CommunityConfig {
             members: Vec::new(),
             members_may_create_channels: false,
             max_post_length: 16_000,
-            max_channels: 200,
+            max_channels: 500,
             admission: "admin".to_string(),
             members_may_invite: false,
             max_waiting: 500,
             max_posts_per_minute: 30,
             max_members: 0,
+            discord_api: "https://discord.com/api/v10".to_string(),
         }
     }
 }

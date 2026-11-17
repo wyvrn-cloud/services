@@ -19,7 +19,7 @@ pub const ARRANGE: &str = "https://wyvrn.app/community/1.0/arrange";
 pub const TRASH_KEPT_FOR: i64 = 30 * DAY;
 /// As many categories as a community holds, and the longest a category's name is.
 const MAX_CATEGORIES: usize = 50;
-const MAX_CATEGORY_NAME: usize = 40;
+const MAX_CATEGORY_NAME: usize = 100;
 pub const INSIGHTS_REQUEST: &str = "https://wyvrn.app/community/1.0/insights-request";
 pub const INSIGHTS: &str = "https://wyvrn.app/community/1.0/insights";
 /// How far back insights go.

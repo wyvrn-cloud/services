@@ -64,6 +64,15 @@ pub struct Channel {
     pub category: Option<String>,
 }
 
+/// Something made or taken over from a Discord template (`imported`).
+#[derive(Debug, Clone)]
+pub struct Imported {
+    pub local: String,
+    pub source_id: String,
+    pub source: Value,
+    pub applied: Value,
+}
+
 /// A named group of channels, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Category {
@@ -727,6 +736,18 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         position INTEGER NOT NULL,
         category TEXT
     );
+    -- What came from a Discord server template (discord.rs): each role, category
+    -- and channel made or taken over from one, what the template said of it (its
+    -- JSON) and what was set here from that (JSON), to tell on importing again
+    -- what changed where.
+    CREATE TABLE IF NOT EXISTS imported (
+        kind TEXT NOT NULL,
+        local TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        source TEXT NOT NULL,
+        applied TEXT NOT NULL,
+        PRIMARY KEY (kind, local)
+    );
     -- What AutoMod censored: a post's text as its author wrote it, for moderators,
     -- and the rules (as JSON) that censored it.
     CREATE TABLE IF NOT EXISTS post_censored (
@@ -1130,6 +1151,14 @@ fn schema() -> Schema {
             CREATE TABLE IF NOT EXISTS post_extra (
                 post VARCHAR(255) NOT NULL PRIMARY KEY,
                 extra MEDIUMTEXT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS imported (
+                kind VARCHAR(32) NOT NULL,
+                local VARCHAR(255) NOT NULL,
+                source_id VARCHAR(64) NOT NULL,
+                source MEDIUMTEXT NOT NULL,
+                applied MEDIUMTEXT NOT NULL,
+                PRIMARY KEY (kind, local)
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS post_censored (
                 post VARCHAR(255) NOT NULL PRIMARY KEY,
@@ -2501,6 +2530,28 @@ impl Store {
     }
 
     /// What a post said before AutoMod censored it, if it did.
+    /// What came from a Discord template, of `kind` (`role`, `category`,
+    /// `channel`, `community`).
+    pub fn imported(&self, kind: &str) -> Result<Vec<Imported>> {
+        self.db.lock().query("SELECT local, source_id, source, applied FROM imported WHERE kind = ?1", params![kind], |row| {
+            let (local, source_id, source, applied): (String, String, String, String) = (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?);
+            Ok(Imported { local, source_id, source: serde_json::from_str(&source).unwrap_or_default(), applied: serde_json::from_str(&applied).unwrap_or_default() })
+        })
+    }
+
+    pub fn set_imported(&self, kind: &str, local: &str, source_id: &str, source: &Value, applied: &Value) -> Result<()> {
+        self.db.lock().execute(
+            "INSERT OR REPLACE INTO imported (kind, local, source_id, source, applied) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![kind, local, source_id, source.to_string(), applied.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn forget_imported(&self, kind: &str, local: &str) -> Result<()> {
+        self.db.lock().execute("DELETE FROM imported WHERE kind = ?1 AND local = ?2", params![kind, local])?;
+        Ok(())
+    }
+
     pub fn censored_original(&self, id: &str) -> Result<Option<String>> {
         Ok(self.db.lock().query("SELECT original FROM post_censored WHERE post = ?1", params![id], |row| row.get(0))?.into_iter().next())
     }

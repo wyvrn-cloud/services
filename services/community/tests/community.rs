@@ -2304,3 +2304,181 @@ async fn a_private_channel_is_not_there_for_whoever_may_not_see_it() {
     assert!(listed(&member.community("join", json!({})).await["body"]).contains(&staff));
     assert_eq!(member.community("history-request", json!({ "channel": staff })).await["body"]["messages"].as_array().unwrap().len(), 2);
 }
+
+/// A Discord server template, as Discord's API has one: made up, but shaped as a
+/// real one is (placeholder ids, permission bits as strings).
+fn discord_template(general_topic: &str, announcements: &str, with_old: bool) -> Value {
+    let (view, send, react, embed, manage_messages, kick) = (1u64 << 10, 1u64 << 11, 1u64 << 6, 1u64 << 14, 1u64 << 13, 1u64 << 1);
+    let mut channels = vec![
+        json!({ "id": 1, "type": 4, "name": "Info", "position": 0, "parent_id": null, "permission_overwrites": [] }),
+        json!({ "id": 2, "type": 0, "name": "📜rules", "position": 0, "parent_id": 1, "topic": "Read me", "nsfw": false, "rate_limit_per_user": 0,
+                "permission_overwrites": [{ "id": 0, "type": 0, "allow": "0", "deny": send.to_string() }] }),
+        json!({ "id": 3, "type": 5, "name": announcements, "position": 1, "parent_id": 1, "topic": "", "nsfw": false, "rate_limit_per_user": 0, "permission_overwrites": [] }),
+        json!({ "id": 4, "type": 0, "name": "general", "position": 2, "parent_id": 1, "topic": general_topic, "nsfw": false, "rate_limit_per_user": 30, "permission_overwrites": [] }),
+        json!({ "id": 5, "type": 4, "name": "Hideout", "position": 1, "parent_id": null, "permission_overwrites": [] }),
+        json!({ "id": 6, "type": 0, "name": "staff-chat", "position": 3, "parent_id": 5, "topic": "x".repeat(1500), "nsfw": true, "rate_limit_per_user": 0,
+                "permission_overwrites": [{ "id": 0, "type": 0, "allow": "0", "deny": view.to_string() }, { "id": 11, "type": 0, "allow": view.to_string(), "deny": "0" }] }),
+        json!({ "id": 7, "type": 2, "name": "Private Bunker", "position": 0, "parent_id": 5, "user_limit": 5, "bitrate": 64000, "nsfw": false, "rate_limit_per_user": 0,
+                "permission_overwrites": [{ "id": 0, "type": 0, "allow": "0", "deny": view.to_string() }, { "id": 11, "type": 0, "allow": view.to_string(), "deny": "0" }] }),
+        json!({ "id": 8, "type": 13, "name": "Town Hall", "position": 1, "parent_id": null, "user_limit": 0, "bitrate": 64000, "nsfw": false, "rate_limit_per_user": 0, "permission_overwrites": [] }),
+        json!({ "id": 9, "type": 15, "name": "help", "position": 4, "parent_id": null, "topic": "", "nsfw": false, "rate_limit_per_user": 0, "permission_overwrites": [],
+                "available_tags": [{ "id": 1, "name": "Bug", "moderated": false, "emoji_id": null, "emoji_name": "🐛" }, { "id": 2, "name": "Idea", "moderated": false, "emoji_id": null, "emoji_name": null }] }),
+    ];
+    if with_old {
+        channels.push(json!({ "id": 10, "type": 0, "name": "old-stuff", "position": 5, "parent_id": null, "topic": "", "nsfw": false, "rate_limit_per_user": 0, "permission_overwrites": [] }));
+    }
+    json!({
+        "code": "TESTCODE1234", "name": "Test Fort", "description": "",
+        "serialized_source_guild": {
+            "name": "Test Fort", "description": "Pillows, mostly", "verification_level": 2, "explicit_content_filter": 0, "default_message_notifications": 1, "afk_channel_id": null, "system_channel_id": 4,
+            "roles": [
+                { "id": 0, "name": "@everyone", "permissions": (view | send | react | embed).to_string(), "color": 0, "hoist": false, "mentionable": false },
+                { "id": 11, "name": "Mods", "permissions": (manage_messages | kick).to_string(), "color": 3447003, "hoist": true, "mentionable": true },
+                { "id": 12, "name": "Twitter", "permissions": "0", "color": 2308985, "hoist": false, "mentionable": false }
+            ],
+            "channels": channels
+        }
+    })
+}
+
+/// Discord's API, for templates: `/guilds/templates/TESTCODE1234` is `template`.
+async fn fake_discord(template: Arc<std::sync::Mutex<Value>>) -> String {
+    use axum::{extract::Path, response::IntoResponse, routing::get};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new().route(
+        "/guilds/templates/{code}",
+        get(move |Path(code): Path<String>| {
+            let template = template.clone();
+            async move {
+                if code == "TESTCODE1234" {
+                    axum::Json(template.lock().unwrap().clone()).into_response()
+                } else {
+                    (axum::http::StatusCode::NOT_FOUND, "{}").into_response()
+                }
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    url
+}
+
+#[tokio::test]
+async fn an_owner_imports_a_discord_template_and_again_once_it_has_changed() {
+    let template = Arc::new(std::sync::Mutex::new(discord_template("Say hi", "announcements", true)));
+    let discord = fake_discord(template.clone()).await;
+    let server = start_server(&format!("discord_api = \"{discord}\"\n[voice]\nrelay_url = \"https://voice.example/\"")).await;
+    let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member]);
+    // Something already here of the same name is taken over, not made again.
+    let general = open_channel(&owner, "general").await;
+    for peer in [&owner, &member] {
+        peer.community("join", json!({})).await;
+    }
+    // Only an owner imports.
+    assert_eq!(member.workflow("start", json!({ "template_id": "discord-import", "instance_id": "m1" })).await["body"]["code"], "not_authorized");
+
+    let started = owner.workflow("start", json!({ "template_id": "discord-import", "instance_id": "d1" })).await;
+    assert_eq!(started["body"]["state"], "link", "{started}");
+    let wrong = advance(&owner, "d1", "read", json!({ "link": "https://discord.new/NOTACODE99" })).await;
+    assert!(wrong["body"]["ui"].to_string().contains("no template by that link"), "{wrong}");
+    let read = advance(&owner, "d1", "read", json!({ "link": "https://discord.new/TESTCODE1234" })).await;
+    assert_eq!(read["body"]["state"], "review", "{read}");
+    let review = read["body"]["ui"].to_string();
+    for said in ["Import “Test Fort”", "To be made: 2 roles, 2 categories, 7 channels", "which stays", "#general", "stage on Discord", "announcement channel on Discord", "age-restricted", "Embed Links", "Verification level"] {
+        assert!(review.contains(said), "{said} in {review}");
+    }
+    // Asked, the first time, of what was here already: the community's name, what
+    // everyone may do, and #general's topic.
+    assert_eq!(asked_about(&review), ["choose-community-guild", "choose-role-0", "choose-channel-4"]);
+    // Asked about #general (its topic here is none, the template's “Say hi”): chosen for, or refused.
+    assert_eq!(advance(&owner, "d1", "import", json!({})).await["body"]["code"], "guard_failed");
+    let done = advance(&owner, "d1", "import", json!({ "choose-community-guild": "template", "choose-role-0": "template", "choose-channel-4": "template" })).await;
+    assert_eq!(done["body"]["state"], "done", "{done}");
+    assert!(done["body"]["ui"].to_string().contains("11 made, 3 changed"), "{done}");
+
+    // As the template has it: the member sees what everyone may, and not the Hideout's.
+    let told = member.community("join", json!({})).await["body"].clone();
+    assert_eq!(told["name"], "Test Fort");
+    let names: Vec<&str> = told["channels"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+    // In Discord's order: those in no category first, text before voice; then by category.
+    assert_eq!(names, ["help", "old-stuff", "Town Hall", "📜rules", "announcements", "general"], "{told}");
+    let channel = |body: &Value, name: &str| body["channels"].as_array().unwrap().iter().find(|c| c["name"] == name).unwrap().clone();
+    assert_eq!(channel(&told, "general")["id"], general.as_str());
+    assert_eq!(channel(&told, "general")["topic"], "Say hi");
+    assert_eq!(channel(&told, "general")["slow_mode"], 30);
+    assert_eq!(channel(&told, "📜rules")["read_only"], true);
+    assert_eq!(channel(&told, "Town Hall")["kind"], "voice");
+    assert_eq!(channel(&told, "help")["tags"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect::<Vec<_>>(), ["Bug", "Idea"]);
+    assert_eq!(told["categories"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect::<Vec<_>>(), ["Info"]);
+    let roles: Vec<&str> = told["roles"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert!(roles.contains(&"Mods") && roles.contains(&"Twitter"), "{roles:?}");
+    let mods = told["roles"].as_array().unwrap().iter().find(|r| r["name"] == "Mods").unwrap()["id"].as_str().unwrap().to_string();
+    // Given Mods, the Hideout is there for them, its voice channel as Discord limits it.
+    owner.workflow("start", json!({ "template_id": "member-roles", "instance_id": "mr", "context": { "member": member.did() } })).await;
+    advance(&owner, "mr", "save", json!({ format!("role-{mods}"): true })).await;
+    let told = member.community("join", json!({})).await["body"].clone();
+    assert_eq!(channel(&told, "staff-chat")["topic"].as_str().unwrap().chars().count(), 1024);
+    assert_eq!(channel(&told, "Private Bunker")["voice"]["limit"], 5);
+    assert!(channel(&told, "staff-chat")["permissions"].as_array().unwrap().contains(&json!("view_channel")));
+
+    // Changed here since: #general's topic. Changed in the template: #general's
+    // topic too, #announcements called #news, #old-stuff gone.
+    owner.community("update-channel", json!({ "channel": general, "topic": "Ours now" })).await;
+    *template.lock().unwrap() = discord_template("Say hello", "news", false);
+    owner.workflow("start", json!({ "template_id": "discord-import", "instance_id": "d2" })).await;
+    let read = advance(&owner, "d2", "read", json!({ "link": "discord.new/TESTCODE1234" })).await;
+    let review = read["body"]["ui"].to_string();
+    for said in ["To be made: 0 roles, 0 categories, 0 channels", "#general", "What's here: topic “Ours now”", "The template's: topic “Say hello”", "Remove #old-stuff", "name to “news”"] {
+        assert!(review.contains(said), "{said} in {review}");
+    }
+    let old = channel(&told, "old-stuff")["id"].as_str().unwrap().to_string();
+    let done = advance(&owner, "d2", "import", json!({ "choose-channel-4": "here", format!("remove-channel-{old}"): true })).await;
+    assert_eq!(done["body"]["state"], "done", "{done}");
+    let told = member.community("join", json!({})).await["body"].clone();
+    assert_eq!(channel(&told, "general")["topic"], "Ours now");
+    assert!(told["channels"].as_array().unwrap().iter().any(|c| c["name"] == "news"));
+    assert!(!told["channels"].as_array().unwrap().iter().any(|c| c["name"] == "old-stuff" || c["name"] == "announcements"));
+
+    // Again, with nothing changed in the template: nothing to ask, what's here kept.
+    owner.workflow("start", json!({ "template_id": "discord-import", "instance_id": "d3" })).await;
+    let read = advance(&owner, "d3", "read", json!({ "link": "TESTCODE1234" })).await;
+    assert!(!read["body"]["ui"].to_string().contains("which stays"), "{read}");
+    assert_eq!(advance(&owner, "d3", "import", json!({})).await["body"]["state"], "done");
+    assert_eq!(channel(&member.community("join", json!({})).await["body"], "general")["topic"], "Ours now");
+}
+
+/// The things a review asks which stays of, by form id.
+fn asked_about(text: &str) -> Vec<String> {
+    text.split("\"form-id\":\"").skip(1).map(|rest| rest.split('"').next().unwrap().to_string()).filter(|id| id.starts_with("choose-")).collect()
+}
+
+#[test]
+fn what_came_from_a_discord_template_is_kept_in_mysql_too() {
+    let Some(url) = std::env::var("WYVRN_TEST_DATABASE_URL").ok().filter(|url| !url.is_empty()) else { return };
+    let server = url.trim_end_matches('/');
+    let database = format!("wyvrn_test_imported_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    {
+        let mut admin = mysql::Conn::new(mysql::Opts::from_url(server).unwrap()).unwrap();
+        mysql::prelude::Queryable::query_drop(&mut admin, format!("CREATE DATABASE {database}")).unwrap();
+    }
+    let store = Store::open(&wyvrn_service::db::Location::MySql(format!("{server}/{database}"))).unwrap();
+    let source = json!({ "id": 4, "name": "general", "topic": "x".repeat(5000) });
+    store.set_imported("channel", "c1", "4", &source, &json!({ "name": "general" })).unwrap();
+    store.set_imported("channel", "c1", "4", &source, &json!({ "name": "general", "topic": "again" })).unwrap();
+    store.set_imported("role", "c1", "4", &json!({}), &json!({})).unwrap();
+    let held = store.imported("channel").unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].applied["topic"], "again");
+    assert_eq!(held[0].source["topic"].as_str().unwrap().len(), 5000);
+    store.forget_imported("channel", "c1").unwrap();
+    assert!(store.imported("channel").unwrap().is_empty());
+    assert_eq!(store.imported("role").unwrap().len(), 1);
+    // Searching only some channels.
+    store.add_channel("c2", "staff", "", "did:example:admin", 1).unwrap();
+    store.admit("did:example:member", wyvrn_community::store::Role::Member, 1).unwrap();
+    let member = store.member("did:example:member").unwrap().unwrap();
+    store.add_post("c2", "p1", "the plan", &member, None, None, 2).unwrap();
+    assert_eq!(store.search(&["plan".into()], None, None, Some(&["c3".to_string()]), None, 10).unwrap().len(), 0);
+    assert_eq!(store.search(&["plan".into()], None, None, Some(&["c2".to_string(), "c3".to_string()]), None, 10).unwrap().len(), 1);
+}

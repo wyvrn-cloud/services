@@ -94,8 +94,8 @@ pub const MOVING_SETTING: &str = "moving";
 pub fn reads_only(message_type: &str) -> bool {
     message_type.ends_with("-request") || message_type == LEAVE || message_type == crate::posting::WATCH
 }
-const MAX_CHANNEL_NAME: usize = 40;
-const MAX_TOPIC: usize = 200;
+pub(crate) const MAX_CHANNEL_NAME: usize = 100;
+pub(crate) const MAX_TOPIC: usize = 1024;
 /// A question's limits: how many at once, how many answers each offers, and how
 /// long any of it may be.
 const MAX_QUESTIONS: usize = 4;
@@ -136,11 +136,11 @@ pub fn clean_voice(given: &Value, held: Option<&Value>) -> Result<Value, &'stati
         Some(Value::Null) => {
             out.remove("limit");
         }
-        Some(value) => match value.as_i64().filter(|n| (2..=MAX_VOICE_LIMIT).contains(n)) {
+        Some(value) => match value.as_i64().filter(|n| (1..=MAX_VOICE_LIMIT).contains(n)) {
             Some(n) => {
                 out.insert("limit".into(), json!(n));
             }
-            None => return Err("A voice channel holds between 2 and 500."),
+            None => return Err("A voice channel holds between 1 and 500."),
         },
     }
     Ok(Value::Object(out))
@@ -295,16 +295,21 @@ pub(crate) fn refuse(message: &Value, code: &str, comment: &str) -> anyhow::Resu
 
 /// Text someone typed for a name or a label: trimmed, on one line, and not longer
 /// than `max` characters. `None` if that leaves nothing.
+/// What a text channel's name is made of (a regex class's inside): see
+/// [`text_channel_name`].
+pub(crate) const NAME_CHARACTERS: &str = r"\p{Ll}\p{Lo}\p{Lm}\p{Mn}\p{Mc}\p{Me}\p{Nd}_.\-\p{Extended_Pictographic}\p{Emoji_Modifier}\p{Regional_Indicator}\x{200D}\x{FE0F}";
+
 /// Whether a name is one a text channel may be given (community/1.0, "A text
 /// channel's name is one word"): lowercase letters of any script, letters of
-/// scripts without case, their marks, digits, `_`, `.` and `-`.
-fn text_channel_name(name: &str) -> bool {
-    static WORD: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"^[\p{Ll}\p{Lo}\p{Lm}\p{Mn}\p{Mc}\p{Nd}_.\-]+$").expect("a valid pattern"));
+/// scripts without case, their marks, digits, `_`, `.` and `-`, and emoji (📜rules).
+pub(crate) fn text_channel_name(name: &str) -> bool {
+    static WORD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(&format!("^[{NAME_CHARACTERS}]+$")).expect("a valid pattern")
+    });
     WORD.is_match(name)
 }
 
-const INVALID_NAME: &str = "A text channel's name is one word in lowercase: letters, digits, _, . and -, as in design-review.";
+const INVALID_NAME: &str = "A text channel's name is one word in lowercase: letters, digits, _, . and -, and emoji, as in design-review or 📜rules.";
 
 pub(crate) fn line(value: &Value, max: usize) -> Option<String> {
     let text: String = value.as_str()?.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -436,6 +441,21 @@ impl Community {
         let community = Self { store, config, changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, expressions: None, live: Default::default(), web_url: None, public_url: String::new(), speaks_as: None };
         community.ensure_roles()?;
         Ok(community)
+    }
+
+    /// Sets what the community is called and says of itself, as `set-profile`
+    /// would (a Discord template's name and description, discord.rs).
+    pub(crate) fn set_name_and_description(&self, name: &str, description: &str) -> anyhow::Result<()> {
+        let changed = {
+            let mut changed = self.changed.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+            changed.name = Some(name.to_string());
+            changed.description = Some(description.to_string());
+            changed.clone()
+        };
+        if let Some(kept) = &self.kept {
+            kept.save(&changed)?;
+        }
+        Ok(())
     }
 
     /// What an admin has changed of the community's name, description and picture.
@@ -2084,6 +2104,19 @@ impl Community {
             other if other.starts_with(PIURI) => refuse(message, "e.p.msg.unsupported", "This server doesn't know that message."),
             // Anything else from a member (a receipt, a basic message) is not for a server to answer.
             _ => Ok(Outcome::default()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    #[test]
+    fn text_channel_names_take_emoji_as_discord_names_do() {
+        for name in ["📜rules", "subbies🌟", "❄contest-entries❄", "gen3r4-ル", "👩‍💻-devs", "🇺🇸-chat", "1️⃣-first", "design-review"] {
+            assert!(super::text_channel_name(name), "{name}");
+        }
+        for name in ["Design", "two words", "a#b", "😀 x"] {
+            assert!(!super::text_channel_name(name), "{name}");
         }
     }
 }

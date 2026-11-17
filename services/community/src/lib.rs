@@ -15,6 +15,7 @@
 pub mod admin_flows;
 pub mod assistant;
 pub mod automod;
+pub mod discord;
 pub mod filters;
 pub mod community;
 pub mod config;

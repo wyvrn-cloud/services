@@ -12,6 +12,7 @@ use crate::community::{is_emoji, line, Community};
 use crate::questions::{failed, Answer, Refusal};
 use crate::roles::{Powers, CHANNEL_PERMISSIONS, COMMUNITY_PERMISSIONS, EVERYONE_ROLE};
 use crate::store::{Channel, Flow, Member, RoleDef};
+use crate::discord::DISCORD_IMPORT_FLOW;
 use crate::web::flows::{SITES_FLOW, WEB_FLOW};
 
 pub const ROLES: &str = "roles";
@@ -24,11 +25,11 @@ pub const ONBOARDING_SETUP_FLOW: &str = "onboarding-setup";
 pub const ONBOARDING_FLOW: &str = "onboarding";
 pub const VERSION: &str = "1.0";
 const P: &str = "https://didcomm.org/workflow/1.0/";
-const MAX_ROLES: usize = 100;
-const MAX_ROLE_NAME: usize = 32;
+const MAX_ROLES: usize = 250;
+const MAX_ROLE_NAME: usize = 100;
 
 /// Each template: its id, title, states and the events that move between them.
-fn templates() -> [(&'static str, &'static str, Value); 10] {
+fn templates() -> [(&'static str, &'static str, Value); 11] {
     [
         (
             ROLES,
@@ -136,6 +137,14 @@ fn templates() -> [(&'static str, &'static str, Value); 10] {
                 "transitions": { "revoke": { "from": "list", "to": "list" }, "done": { "from": "list", "to": "done" } }
             }),
         ),
+        (
+            DISCORD_IMPORT_FLOW,
+            "Import a Discord template",
+            json!({
+                "states": [{ "name": "link", "type": "start" }, { "name": "review", "type": "normal" }, { "name": "done", "type": "final" }],
+                "transitions": { "read": { "from": "link", "to": "review" }, "back": { "from": "review", "to": "link" }, "import": { "from": "review", "to": "done" } }
+            }),
+        ),
     ]
 }
 
@@ -212,6 +221,7 @@ impl Community {
                 ONBOARDING_FLOW => true,
                 WEB_FLOW => self.web_url.is_some() && powers.has("manage_community"),
                 SITES_FLOW => self.web_url.is_some(),
+                DISCORD_IMPORT_FLOW => self.may_import(did).unwrap_or(false),
                 _ => powers.has("manage_channels") || opened_one,
             })
             .map(|(id, title, _)| (id, title))
@@ -421,7 +431,9 @@ impl Community {
     fn flow_status(&self, flow: &Flow) -> Result<Value, Refusal> {
         let powers = self.powers(&flow.owner).map_err(failed)?;
         let (ui, events): (Value, Vec<&str>) = if flow.status != "active" {
-            (json!([{ "type": "pass", "text": if flow.status == "completed" { "Done." } else { "Closed." } }]), Vec::new())
+            // (What was done, where the workflow says: a template imported.)
+            let said = flow.data["report"].as_str().filter(|_| flow.status == "completed");
+            (json!([{ "type": "pass", "text": said.unwrap_or(if flow.status == "completed" { "Done." } else { "Closed." }) }]), Vec::new())
         } else {
             match (flow.template.as_str(), flow.state.as_str()) {
                 (ROLES, "list") => self.roles_list_ui(flow, &powers).map_err(failed)?,
@@ -445,6 +457,7 @@ impl Community {
                 (ONBOARDING_FLOW, state) => self.onboarding_ui(flow, state).map_err(failed)?,
                 (WEB_FLOW, _) => self.web_flow_ui(flow).map_err(failed)?,
                 (SITES_FLOW, _) => self.sites_flow_ui(flow).map_err(failed)?,
+                (DISCORD_IMPORT_FLOW, _) => self.discord_import_ui(flow).map_err(failed)?,
                 (CHANNEL_PERMISSIONS_FLOW, "role") => {
                     let channel = self.flow_channel(flow)?;
                     let held = self.channel_permissions(&flow.owner, &powers, &channel).map_err(failed)?;
@@ -547,6 +560,12 @@ impl Community {
                 }
                 json!({})
             }
+            DISCORD_IMPORT_FLOW => {
+                if !self.may_import(&member.did).map_err(failed)? {
+                    return Err(not_allowed("Only an owner imports a Discord template."));
+                }
+                json!({})
+            }
             _ => return Err(Refusal::new("template_not_found", "This server has no such workflow.")),
         };
         let wanted = body["instance_id"].as_str().or(message["thid"].as_str()).or(message["id"].as_str()).unwrap_or_default();
@@ -566,6 +585,7 @@ impl Community {
             MEMBER_ROLES => "pick",
             JOIN_GATES_FLOW | ONBOARDING_SETUP_FLOW | WEB_FLOW => "form",
             ONBOARDING_FLOW => "welcome",
+            DISCORD_IMPORT_FLOW => "link",
             _ => "roles",
         };
         let flow = Flow { id: wanted.into(), owner: member.did.clone(), template: template.into(), context, state: state.into(), data: json!({}), status: "active".into(), updated: now };
@@ -608,6 +628,7 @@ impl Community {
             CHANNELS_FLOW => powers.has("manage_channels"),
             ONBOARDING_FLOW | SITES_FLOW => true,
             WEB_FLOW => powers.has("manage_community"),
+            DISCORD_IMPORT_FLOW => self.may_import(&flow.owner).map_err(failed)?,
             _ => powers.has("manage_roles"),
         };
         if !still {
@@ -692,6 +713,7 @@ impl Community {
             (CHANNELS_FLOW, _, _) | (ONBOARDING_SETUP_FLOW, _, _) | (ONBOARDING_FLOW, _, _) => self.advance_structure_flow(&mut flow, event, input, now)?,
             (WEB_FLOW, _, _) => self.advance_web_flow(&mut flow, event, input, now)?,
             (SITES_FLOW, _, _) => self.advance_sites_flow(&mut flow, event, input)?,
+            (DISCORD_IMPORT_FLOW, _, _) => self.advance_discord_import(&mut flow, event, input, now)?,
             (ROLES, "list", "done") | (CHANNEL_PERMISSIONS_FLOW, "roles", "done") => {
                 flow.status = "completed".into();
                 false
