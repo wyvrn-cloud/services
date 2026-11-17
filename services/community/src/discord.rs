@@ -929,7 +929,7 @@ impl Community {
             let mut want = item.want.clone();
             for field in ["category"] {
                 if want.get(field).is_some() {
-                    want[field] = resolve(&want[field], &ids);
+                    want[field] = resolve(&want[field], ids);
                 }
             }
             if let Some(overrides) = want.get("overrides").and_then(Value::as_object).cloned() {
