@@ -2455,7 +2455,8 @@ impl Store {
     /// Posts whose text has each of `words`, whatever its case, not taken back:
     /// newest first, older than `before` (a serial), in `channel` and by `author`
     /// where given.
-    pub fn search(&self, words: &[String], channel: Option<&str>, author: Option<&str>, before: Option<i64>, limit: usize) -> Result<Vec<Post>> {
+    /// `within`, if given, the channels to search (and no others).
+    pub fn search(&self, words: &[String], channel: Option<&str>, author: Option<&str>, within: Option<&[String]>, before: Option<i64>, limit: usize) -> Result<Vec<Post>> {
         let mut sql = format!(
             "SELECT {POST_COLUMNS} FROM posts WHERE serial < ?1 AND (?2 IS NULL OR channel = ?2) AND (?3 IS NULL OR author_did = ?3) \
              AND NOT EXISTS (SELECT 1 FROM post_state WHERE post_state.post = posts.id AND deleted = 1)"
@@ -2466,6 +2467,17 @@ impl Store {
             let pattern = format!("%{}%", word.to_lowercase().replace('!', "!!").replace('%', "!%").replace('_', "!_"));
             values.push(wyvrn_service::db::ToValue::to_value(&pattern));
             sql.push_str(&format!(" AND LOWER(content) LIKE ?{} ESCAPE '!'", values.len()));
+        }
+        if let Some(within) = within {
+            if within.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut marks = Vec::new();
+            for channel in within {
+                values.push(wyvrn_service::db::ToValue::to_value(channel));
+                marks.push(format!("?{}", values.len()));
+            }
+            sql.push_str(&format!(" AND channel IN ({})", marks.join(", ")));
         }
         sql.push_str(" ORDER BY serial DESC LIMIT ?4");
         let posts = self.db.lock().query(&sql, &values, post_from)?;

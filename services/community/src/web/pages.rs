@@ -79,6 +79,7 @@ fn readable(state: &AppState, viewer: &Viewer) -> anyhow::Result<HashMap<String,
         .channels()?
         .into_iter()
         .filter(|c| !c.closed && c.voice.is_none())
+        .filter(|c| web_sees(state, viewer, c))
         .filter_map(|c| {
             if viewer.signed_in() {
                 Some((c.id.clone(), None))
@@ -87,6 +88,16 @@ fn readable(state: &AppState, viewer: &Viewer) -> anyhow::Result<HashMap<String,
             }
         })
         .collect())
+}
+
+/// Whether a viewer may see a channel at all: a member, as in the app; anyone
+/// else, if `everyone` may (a public channel `everyone` may not see isn't public).
+fn web_sees(state: &AppState, viewer: &Viewer, channel: &crate::store::Channel) -> bool {
+    let community = &state.community;
+    match &viewer.member {
+        Some(member) => community.powers(&member.did).and_then(|powers| community.sees(&member.did, &powers, channel)).unwrap_or(false),
+        None => community.everyone_sees(channel).unwrap_or(false),
+    }
 }
 
 fn shows(post: &Post, since: Option<i64>) -> bool {
@@ -329,6 +340,9 @@ fn groups(state: &AppState, viewer: &Viewer, root: &str, current: Option<&str>) 
             by_category.len() - 1
         });
         if channel.voice.is_some() {
+            if !web_sees(state, viewer, &channel) {
+                continue;
+            }
             let present = rooms.get(&channel.id).cloned().unwrap_or_default();
             let (count, names) = match (voice_choice.as_str(), viewer.signed_in()) {
                 ("off", _) => continue,
@@ -637,9 +651,10 @@ pub async fn home(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
 }
 
 /// `/ch/<id>`: to the channel's page under its name.
-async fn channel_bare(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+async fn channel_bare(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    let viewer = Viewer::of(&state, &headers);
     match state.community.store.channel(&id) {
-        Ok(Some(channel)) => as_page(Redirect::permanent(&format!("../{}", channel_path(&channel.id, &channel.name))).into_response()),
+        Ok(Some(channel)) if readable(&state, &viewer).is_ok_and(|readable| readable.contains_key(&channel.id)) => as_page(Redirect::permanent(&format!("../{}", channel_path(&channel.id, &channel.name))).into_response()),
         _ => nothing(),
     }
 }

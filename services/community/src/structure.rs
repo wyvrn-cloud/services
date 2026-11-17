@@ -109,7 +109,7 @@ impl Community {
         let id = message["body"]["channel"].as_str().unwrap_or_default();
         match message_type {
             DELETE_CHANNEL => {
-                let Some(channel) = self.store.channel(id)? else {
+                let Some(channel) = self.channel_for(sender, id)? else {
                     return refuse(message, "e.p.msg.unknown-channel", "There is no such channel.");
                 };
                 if channel.created_by != sender && !manages {

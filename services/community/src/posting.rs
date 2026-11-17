@@ -202,7 +202,7 @@ impl Community {
         let outcome = match message_type {
             VOTE => {
                 let id = body["to"]["id"].as_str().unwrap_or_default();
-                let Some(post) = self.store.post_by_id(id)?.filter(|post| body["to"]["author"].as_str().is_none_or(|author| author == post.author_did)) else {
+                let Some(post) = self.store.post_by_id(id)?.filter(|post| body["to"]["author"].as_str().is_none_or(|author| author == post.author_did)).filter(|post| self.sees_id(sender, &post.channel).unwrap_or(false)) else {
                     return refuse(message, "e.p.msg.unknown-post", "There is no such post.").map(Some);
                 };
                 let Some(poll) = post.extra.as_ref().and_then(|extra| extra.get("poll")).filter(|_| !post.deleted) else {
@@ -239,7 +239,14 @@ impl Community {
                 }
                 let limit = body["limit"].as_u64().map_or(20, |limit| (limit as usize).clamp(1, 50));
                 let before = body["before"].as_i64().or_else(|| body["before"].as_str().and_then(|b| b.parse().ok()));
-                let mut found = self.store.search(&words, body["channel"].as_str(), body["author"].as_str(), before, limit + 1)?;
+                // Only in channels they may see: a channel they may not is unknown.
+                let seen = self.seen_by(sender)?;
+                if body["channel"].as_str().is_some_and(|channel| !seen.contains(channel)) {
+                    return refuse(message, "e.p.msg.unknown-channel", "There is no such channel.").map(Some);
+                }
+                let every = self.store.channels()?.iter().all(|channel| seen.contains(&channel.id));
+                let within: Option<Vec<String>> = (!every).then(|| seen.into_iter().collect());
+                let mut found = self.store.search(&words, body["channel"].as_str(), body["author"].as_str(), within.as_deref(), before, limit + 1)?;
                 let more = found.len() > limit;
                 found.truncate(limit);
                 let next = found.last().map(|post| post.serial);
@@ -286,7 +293,7 @@ impl Community {
             WATCH => return refuse(message, "e.p.req.live-only", "Watching is asked for on a live connection.").map(Some),
 
             crate::community::HISTORY_REQUEST if body.get("at").is_some_and(Value::is_i64) => {
-                let Some(channel) = self.store.channel(body["channel"].as_str().unwrap_or_default())? else {
+                let Some(channel) = self.channel_for(sender, body["channel"].as_str().unwrap_or_default())? else {
                     return refuse(message, "e.p.msg.unknown-channel", "There is no such channel.").map(Some);
                 };
                 let limit = body["limit"].as_u64().map_or(crate::community::DEFAULT_HISTORY_LIMIT, |l| (l as usize).clamp(2, crate::community::MAX_HISTORY_LIMIT));

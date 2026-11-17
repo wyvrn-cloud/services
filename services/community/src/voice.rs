@@ -278,7 +278,8 @@ impl Rooms {
     fn presence_for_watchers(&self, community: &Community, channel: &str) -> Vec<(u64, Value)> {
         let inner = self.lock();
         let body = json!({ "channels": [{ "channel": channel, "participants": self.participants_body(community, &inner, channel) }] });
-        inner.live.iter().filter(|(_, live)| live.watching).map(|(id, _)| (*id, json!({ "type": PRESENCE, "body": body.clone() }))).collect()
+        // Not to anyone who may not see the channel.
+        inner.live.iter().filter(|(_, live)| live.watching && community.sees_id(&live.did, channel).unwrap_or(false)).map(|(id, _)| (*id, json!({ "type": PRESENCE, "body": body.clone() }))).collect()
     }
 
     /// Those who have said nothing for too long, taken out. Returns the presence
@@ -361,7 +362,8 @@ impl Rooms {
             }
         }
         let voice_channel = |id: &str| -> anyhow::Result<Option<(crate::store::Channel, Value)>> {
-            Ok(community.store.channel(id)?.and_then(|channel| channel.voice.clone().map(|settings| (channel, settings))))
+            // (One they may not see is no voice channel to them.)
+            Ok(community.channel_for(sender, id)?.and_then(|channel| channel.voice.clone().map(|settings| (channel, settings))))
         };
 
         match message_type {
@@ -382,6 +384,7 @@ impl Rooms {
                     .channels()?
                     .iter()
                     .filter(|channel| channel.voice.is_some() && !channel.closed)
+                    .filter(|channel| community.sees_id(sender, &channel.id).unwrap_or(false))
                     .map(|channel| json!({ "channel": channel.id, "participants": self.participants_body(community, &inner, &channel.id) }))
                     .collect();
                 Ok(VoiceOutcome::reply(reply_to(message, PRESENCE, json!({ "channels": channels }))))
@@ -576,7 +579,7 @@ impl Rooms {
                 let mut outcome = VoiceOutcome::default();
                 let mut not_rung = Vec::new();
                 for did in invitees {
-                    if did == sender || community.store.member(did)?.is_none() {
+                    if did == sender || community.store.member(did)?.is_none() || !community.sees_id(did, &channel.id)? {
                         continue;
                     }
                     if community.store.voice_rings(did)? {

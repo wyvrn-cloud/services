@@ -472,7 +472,13 @@ impl Community {
             Some(_) => self.store.web_channels()?,
             None => Default::default(),
         };
+        let mut seen = std::collections::HashSet::new();
         for channel in self.store.channels()? {
+            // A channel they may not see isn't there for them.
+            if !self.sees(&member.did, &powers, &channel)? {
+                continue;
+            }
+            seen.insert(channel.id.clone());
             let mut body = Self::channel_body(&channel, &member.did);
             body["permissions"] = json!(self.channel_permissions(&member.did, &powers, &channel)?);
             // On the web: its page's address, and from when it is public.
@@ -517,7 +523,10 @@ impl Community {
             if let Some(accepted) = self.store.rules_accepted(&member.did)? {
                 body["rules_accepted"] = json!(accepted);
             }
-            if let Some(voice) = self.voice_defaults()? {
+            if let Some(mut voice) = self.voice_defaults()? {
+                if voice["invites_to"].as_str().is_some_and(|id| !seen.contains(id)) {
+                    voice.as_object_mut().map(|v| v.remove("invites_to"));
+                }
                 body["voice"] = voice;
             }
             if let Some(assistant) = &self.assistant {
@@ -533,7 +542,8 @@ impl Community {
                 body["web"] = crate::web::community_body(url, &self.store);
             }
             if let Some(level) = self.store.notify_level(&member.did)? {
-                body["notifications"] = json!({ "level": level, "following": self.store.followed_threads(&member.did)? });
+                let following: Vec<String> = self.store.followed_threads(&member.did)?.into_iter().filter(|thread| self.store.post_by_id(thread).ok().flatten().is_some_and(|post| seen.contains(&post.channel))).collect();
+                body["notifications"] = json!({ "level": level, "following": following });
             }
             if let Some(until) = self.store.timed_out_until(&member.did, crate::gates::now())? {
                 body["timed_out_until"] = json!(until);
@@ -541,7 +551,13 @@ impl Community {
             if let Some(wait) = self.post_wait()? {
                 body["gates"] = json!({ "post_wait": wait });
             }
-            let categories = self.store.categories()?;
+            // A category with nothing in it they may see isn't there for them either,
+            // unless they arrange channels.
+            let mut categories = self.store.categories()?;
+            if !powers.has("manage_channels") {
+                let holding: std::collections::HashSet<String> = self.store.channels()?.into_iter().filter(|c| seen.contains(&c.id)).filter_map(|c| c.category).collect();
+                categories.retain(|c| holding.contains(&c.id));
+            }
             if !categories.is_empty() {
                 body["categories"] = json!(categories.iter().map(|c| json!({ "id": c.id, "name": c.name })).collect::<Vec<_>>());
             }
@@ -786,8 +802,13 @@ impl Community {
         })
     }
 
-    fn named_post(&self, body: &Value) -> anyhow::Result<Option<Post>> {
-        self.referred(&body["to"])
+    /// The post a request names (`to`), if `viewer` may see its channel: one they
+    /// may not is no post, as unknown as one that isn't.
+    fn named_post(&self, body: &Value, viewer: &str) -> anyhow::Result<Option<Post>> {
+        Ok(match self.referred(&body["to"])? {
+            Some(post) if self.sees_id(viewer, &post.channel)? => Some(post),
+            _ => None,
+        })
     }
 
     /// A post, as it is sent to everyone who has joined.
@@ -1041,7 +1062,7 @@ impl Community {
     pub(crate) fn post(&self, member: &Member, message: &Value, now: i64, checked: bool) -> anyhow::Result<Outcome> {
         let sender = member.did.as_str();
         let body = &message["body"];
-        let Some(channel) = self.store.channel(body["channel"].as_str().unwrap_or_default())? else {
+        let Some(channel) = self.channel_for(sender, body["channel"].as_str().unwrap_or_default())? else {
             return refuse(message, "e.p.msg.unknown-channel", "There is no such channel.");
         };
         if channel.closed {
@@ -1332,7 +1353,7 @@ impl Community {
             }
 
             UPDATE_CHANNEL => {
-                let Some(channel) = self.store.channel(body["channel"].as_str().unwrap_or_default())? else {
+                let Some(channel) = self.channel_for(sender, body["channel"].as_str().unwrap_or_default())? else {
                     return refuse(message, "e.p.msg.unknown-channel", "There is no such channel.");
                 };
                 // Whoever opened it may change it, as may whoever manages channels.
@@ -1428,7 +1449,7 @@ impl Community {
             POST => self.post(&member, message, now, true),
 
             EDIT | DELETE => {
-                let Some(post) = self.named_post(body)? else {
+                let Some(post) = self.named_post(body, sender)? else {
                     return refuse(message, "e.p.msg.unknown-post", "There is no such post.");
                 };
                 // A post is its author's to change, and nobody else's. Someone
@@ -1488,7 +1509,7 @@ impl Community {
             }
 
             PIN | UNPIN => {
-                let Some(post) = self.named_post(body)? else {
+                let Some(post) = self.named_post(body, sender)? else {
                     return refuse(message, "e.p.msg.unknown-post", "There is no such post.");
                 };
                 // Whoever manages posts in the channel says what is pinned in it.
@@ -1510,7 +1531,7 @@ impl Community {
             }
 
             REACT => {
-                let Some(post) = self.named_post(body)? else {
+                let Some(post) = self.named_post(body, sender)? else {
                     return refuse(message, "e.p.msg.unknown-post", "There is no such post.");
                 };
                 if post.deleted {
@@ -1540,7 +1561,7 @@ impl Community {
             }
 
             CREATE_THREAD => {
-                let Some(post) = self.named_post(body)? else {
+                let Some(post) = self.named_post(body, sender)? else {
                     return refuse(message, "e.p.msg.unknown-post", "There is no such post.");
                 };
                 if post.thread.is_some() {
@@ -1573,12 +1594,14 @@ impl Community {
                 let more = posts.len() > CHANGES_BATCH;
                 posts.truncate(CHANGES_BATCH);
                 let upto = posts.last().map_or(after, |post| post.rev);
-                let messages: Vec<Value> = posts.iter().map(Self::message_body).collect();
+                // (What they may not see is passed over, `rev` past it all the same.)
+                let seen = self.seen_by(sender)?;
+                let messages: Vec<Value> = posts.iter().filter(|post| seen.contains(&post.channel)).map(Self::message_body).collect();
                 Ok(Outcome::reply(reply_to(message, CHANGES, json!({ "messages": messages, "rev": upto, "more": more }))))
             }
 
             HISTORY_REQUEST => {
-                let Some(channel) = self.store.channel(body["channel"].as_str().unwrap_or_default())? else {
+                let Some(channel) = self.channel_for(sender, body["channel"].as_str().unwrap_or_default())? else {
                     return refuse(message, "e.p.msg.unknown-channel", "There is no such channel.");
                 };
                 let limit = body["limit"].as_u64().map_or(DEFAULT_HISTORY_LIMIT, |limit| (limit as usize).clamp(1, MAX_HISTORY_LIMIT));
@@ -1824,7 +1847,7 @@ impl Community {
                 };
                 match (post_id, reported_member) {
                     (Some(id), None) => {
-                        let Some(post) = self.store.post_by_id(id)?.filter(|post| body["channel"].as_str().is_none_or(|channel| channel == post.channel)) else {
+                        let Some(post) = self.store.post_by_id(id)?.filter(|post| body["channel"].as_str().is_none_or(|channel| channel == post.channel)).filter(|post| self.sees_id(sender, &post.channel).unwrap_or(false)) else {
                             return refuse(message, "e.p.msg.unknown-post", "There is no such post.");
                         };
                         if post.author_did == sender {

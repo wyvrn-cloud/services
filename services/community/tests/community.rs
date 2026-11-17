@@ -246,7 +246,7 @@ async fn an_admin_opens_channels_and_everyone_who_joined_is_told() {
     let changed = admin.community("update-channel", json!({ "channel": channel, "name": "design", "topic": "What we are building", "closed": true })).await;
     let mut held = changed["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == channel.as_str()).unwrap().clone();
     // An admin may do everything a channel gives.
-    assert_eq!(held["permissions"].as_array().unwrap().len(), 11);
+    assert_eq!(held["permissions"].as_array().unwrap().len(), 12);
     held.as_object_mut().unwrap().remove("permissions");
     assert_eq!(held, json!({ "id": channel, "name": "design", "topic": "What we are building", "closed": true, "latest_seq": 0, "yours": true }));
     let late = admin.community("post", json!({ "channel": channel, "content": "too late" })).await;
@@ -2234,4 +2234,73 @@ fn what_automod_censored_is_kept_in_mysql_too() {
     store.delete_post("p1", None).unwrap();
     assert_eq!(store.censored_original("p1").unwrap(), None);
     assert_eq!(store.post_by_id("p1").unwrap().unwrap().censored, None);
+}
+
+#[tokio::test]
+async fn a_private_channel_is_not_there_for_whoever_may_not_see_it() {
+    let server = start_server("").await;
+    let (owner, moderator, member) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &moderator, &member]);
+    let general = open_channel(&owner, "general").await;
+    let staff = open_channel(&owner, "staff").await;
+    for peer in [&owner, &moderator, &member] {
+        peer.community("join", json!({})).await;
+    }
+    owner.community("set-member", json!({ "did": moderator.did(), "role": "moderator" })).await;
+    owner.community("post", json!({ "channel": staff, "id": "s0", "content": "before it was private: the plan" })).await;
+
+    // Made private, and the moderators let see it.
+    owner.workflow("start", json!({ "template_id": "channel-permissions", "instance_id": "cp", "context": { "channel": staff } })).await;
+    let made = advance(&owner, "cp", "private", json!({})).await;
+    assert!(made["body"]["ui"].to_string().contains("Let everyone see it"), "{made}");
+    advance(&owner, "cp", "edit", json!({ "role": "moderator" })).await;
+    advance(&owner, "cp", "save", json!({ "allow-view_channel": true })).await;
+
+    let listed = |body: &Value| body["channels"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!(listed(&member.community("join", json!({})).await["body"]), std::slice::from_ref(&general));
+    assert!(listed(&moderator.community("join", json!({})).await["body"]).contains(&staff));
+    assert!(listed(&owner.community("join", json!({})).await["body"]).contains(&staff));
+
+    // Nothing of it reaches the member: not as it is posted...
+    owner.community("post", json!({ "channel": staff, "id": "s1", "content": "staff only plan" })).await;
+    owner.community("post", json!({ "channel": general, "id": "g1", "content": "hello all plan" })).await;
+    let mut got = Vec::new();
+    while got.last().is_none_or(|id: &String| id != "g1") {
+        got.push(member.next_message().await["id"].as_str().unwrap().to_string());
+    }
+    assert!(!got.contains(&"s1".to_string()), "{got:?}");
+    while moderator.next_message().await["id"] != "s1" {}
+    // ...nor asked for by channel, by id, in a search or a sync.
+    for (kind, body) in [
+        ("history-request", json!({ "channel": staff })),
+        ("history-request", json!({ "channel": staff, "at": 1 })),
+        ("post", json!({ "channel": staff, "content": "let me in" })),
+        ("search-request", json!({ "query": "plan", "channel": staff })),
+        ("bulk-delete", json!({ "channel": staff, "posts": ["s1"] })),
+    ] {
+        assert_eq!(member.community(kind, body.clone()).await["body"]["code"], "e.p.msg.unknown-channel", "{kind} {body}");
+    }
+    for (kind, body) in [
+        ("https://wyvrn.app/message-reactions/1.0/reactions", json!({ "to": { "id": "s1" }, "emoji": ["👍"] })),
+        ("https://wyvrn.app/community/1.0/create-thread", json!({ "to": { "id": "s1" }, "name": "Ideas" })),
+        ("https://wyvrn.app/community/1.0/report", json!({ "post": "s1", "reason": "spam" })),
+        ("https://wyvrn.app/community/1.0/original-request", json!({ "to": { "id": "s1" } })),
+    ] {
+        assert_eq!(member.ask(kind, body.clone()).await["body"]["code"], "e.p.msg.unknown-post", "{kind} {body}");
+    }
+    let found = member.community("search-request", json!({ "query": "plan" })).await;
+    let ids: Vec<&str> = found["body"]["messages"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["g1"], "{found}");
+    let synced = member.community("changes-request", json!({ "after_rev": 0 })).await;
+    assert!(synced["body"]["messages"].as_array().unwrap().iter().all(|m| m["channel"] == general.as_str()), "{synced}");
+    assert!(synced["body"]["rev"].as_i64().unwrap() > 0);
+    // The moderator finds it all.
+    assert_eq!(moderator.community("history-request", json!({ "channel": staff })).await["body"]["messages"].as_array().unwrap().len(), 2);
+
+    // Let everyone see it again, and it is there for the member, all of it.
+    advance(&owner, "cp", "done", json!({})).await;
+    owner.workflow("start", json!({ "template_id": "channel-permissions", "instance_id": "cp2", "context": { "channel": staff } })).await;
+    advance(&owner, "cp2", "public", json!({})).await;
+    assert!(listed(&member.community("join", json!({})).await["body"]).contains(&staff));
+    assert_eq!(member.community("history-request", json!({ "channel": staff })).await["body"]["messages"].as_array().unwrap().len(), 2);
 }

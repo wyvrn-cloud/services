@@ -238,7 +238,12 @@ async fn rotation(state: &AppState, received: &Received, sender: &str) -> Option
 /// or through the mediator to whoever chose to be sent changes. Anyone else asks
 /// for what changed when they next watch.
 fn send_changed(state: &Arc<AppState>, notice: &Value) -> anyhow::Result<()> {
+    let channel = notice["body"]["channel"].as_str().unwrap_or_default();
     for member in state.community.store.joined()? {
+        // Not to anyone who may not see the channel.
+        if !state.community.sees_id(&member.did, channel)? {
+            continue;
+        }
         if !state.to_watching(&member.did, notice) && state.community.changes_reach(&member)? {
             send_later(state, member.did, notice.clone());
         }
@@ -886,7 +891,19 @@ async fn deliver_to(state: &Arc<AppState>, member: crate::store::Member) {
         Ok(posts) => posts,
         Err(error) => return tracing::error!(%error, "couldn't read posts to deliver"),
     };
+    let seen = match state.community.seen_by(&member.did) {
+        Ok(seen) => seen,
+        Err(error) => return tracing::error!(%error, "couldn't tell which channels a member sees"),
+    };
     for post in posts {
+        // A post in a channel they may not see is passed over, for good: seeing it
+        // later, they read back in it.
+        if !seen.contains(&post.channel) {
+            if let Err(error) = state.community.store.set_delivered(&member.did, post.serial) {
+                return tracing::error!(%error, "couldn't record a delivery");
+            }
+            continue;
+        }
         // Watching: everything, there. Through the mediator, what concerns them
         // always, and the rest as they chose while nobody is watching; what isn't
         // sent they catch up on.

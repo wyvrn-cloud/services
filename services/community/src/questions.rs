@@ -198,7 +198,7 @@ impl Community {
             return Err(Refusal::new("template_not_found", "This server has no such workflow."));
         }
         let asked = body["context"]["question"].as_str().unwrap_or_default();
-        let post = self.store.post_by_id(asked).map_err(failed)?.filter(|post| post.question.is_some()).ok_or_else(|| Refusal::new("guard_failed", "There is no such question."))?;
+        let post = self.store.post_by_id(asked).map_err(failed)?.filter(|post| post.question.is_some()).filter(|post| self.sees_id(&member.did, &post.channel).unwrap_or(false)).ok_or_else(|| Refusal::new("guard_failed", "There is no such question."))?;
         let wanted = body["instance_id"].as_str().or(message["thid"].as_str()).or(message["id"].as_str()).unwrap_or_default();
         // One at a time for each member and question: starting again finds it.
         if let Some(existing) = self.store.answering_of(&member.did, &post.id).map_err(failed)? {

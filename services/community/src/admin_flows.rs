@@ -57,7 +57,7 @@ fn templates() -> [(&'static str, &'static str, Value); 10] {
             json!({
                 "states": [{ "name": "roles", "type": "start" }, { "name": "role", "type": "normal" }, { "name": "done", "type": "final" }],
                 "transitions": {
-                    "read_only": { "from": "roles", "to": "roles" }, "unlock": { "from": "roles", "to": "roles" },
+                    "read_only": { "from": "roles", "to": "roles" }, "unlock": { "from": "roles", "to": "roles" }, "private": { "from": "roles", "to": "roles" }, "public": { "from": "roles", "to": "roles" },
                     "edit": { "from": "roles", "to": "role" }, "done": { "from": "roles", "to": "done" },
                     "save": { "from": "role", "to": "roles" }, "back": { "from": "role", "to": "roles" }
                 }
@@ -356,7 +356,7 @@ impl Community {
         let overrides = self.store.overrides(&channel.id).map_err(failed)?;
         let read_only = self.read_only(&channel.id).map_err(failed)?;
         let mut items = vec![json!({ "type": "title", "text": format!("Permissions in #{}", channel.name) })];
-        items.push(json!({ "type": "text", "text": "A channel can allow or deny each role what members do in channels. Allowing wins over denying, a role's own over everyone's. It never hides the channel: every member can read it." }));
+        items.push(json!({ "type": "text", "text": "A channel can allow or deny each role what members do in channels. Allowing wins over denying, a role's own over everyone's. Without See the channel, a role finds it isn't there: nothing of it reaches them." }));
         if channel.voice.is_none() {
             items.push(if read_only {
                 json!({ "type": "row", "children": [{ "type": "text", "text": "Read-only: only roles allowed to post here can." }, button("Let everyone post", "unlock", json!({}))] })
@@ -364,6 +364,12 @@ impl Community {
                 button("Make read-only", "read_only", json!({}))
             });
         }
+        let private = overrides.iter().any(|o| o.role == EVERYONE_ROLE && o.deny.iter().any(|p| p == "view_channel"));
+        items.push(if private {
+            json!({ "type": "row", "children": [{ "type": "text", "text": "Private: only roles allowed to see it can." }, button("Let everyone see it", "public", json!({}))] })
+        } else {
+            button("Make private", "private", json!({}))
+        });
         for role in self.store.roles().map_err(failed)? {
             let said = overrides.iter().find(|o| o.role == role.id);
             let describe = |list: &[String]| list.iter().map(|p| label_of(p)).collect::<Vec<_>>().join(", ");
@@ -428,7 +434,7 @@ impl Community {
                     (self.role_edit_ui(&role, &powers), events)
                 }
                 (MEMBER_ROLES, _) => (self.member_roles_ui(flow, &powers)?, vec!["save"]),
-                (CHANNEL_PERMISSIONS_FLOW, "roles") => (self.channel_roles_ui(flow, &powers)?, vec!["read_only", "unlock", "edit", "done"]),
+                (CHANNEL_PERMISSIONS_FLOW, "roles") => (self.channel_roles_ui(flow, &powers)?, vec!["read_only", "unlock", "private", "public", "edit", "done"]),
                 (AUTOMOD_FLOW, "list") => (self.automod_list_ui(flow).map_err(failed)?, vec!["edit", "create", "preset", "toggle", "done"]),
                 (AUTOMOD_FLOW, "edit") => (self.automod_edit_ui(flow).map_err(failed)?, vec!["save", "delete", "back"]),
                 (JOIN_GATES_FLOW, _) => (self.join_gates_ui().map_err(failed)?, vec!["save"]),
@@ -455,7 +461,9 @@ impl Community {
         }
         // The channels onboarding suggests, for an app to offer as it finishes.
         if flow.template == ONBOARDING_FLOW {
-            artifacts["suggested"] = self.onboarding().map_err(failed)?["suggested"].clone();
+            let seen = self.seen_by(&flow.owner).map_err(failed)?;
+            let suggested: Vec<Value> = self.onboarding().map_err(failed)?["suggested"].as_array().into_iter().flatten().filter(|id| id.as_str().is_some_and(|id| seen.contains(id))).cloned().collect();
+            artifacts["suggested"] = json!(suggested);
         }
         Ok(json!({
             "instance_id": flow.id,
@@ -763,17 +771,21 @@ impl Community {
                 flow.status = "completed".into();
                 true
             }
-            (CHANNEL_PERMISSIONS_FLOW, "roles", "read_only" | "unlock") => {
+            (CHANNEL_PERMISSIONS_FLOW, "roles", "read_only" | "unlock" | "private" | "public") => {
                 let channel = self.flow_channel(&flow)?;
                 let said = self.store.overrides(&channel.id).map_err(failed)?.into_iter().find(|o| o.role == EVERYONE_ROLE);
                 let (mut allow, mut deny) = said.map(|o| (o.allow, o.deny)).unwrap_or_default();
-                allow.retain(|p| p != "post");
-                deny.retain(|p| p != "post");
-                if event == "read_only" {
-                    deny.push("post".into());
+                let (permission, on, said) = match event {
+                    "read_only" | "unlock" => ("post", event == "read_only", "read_only"),
+                    _ => ("view_channel", event == "private", "private"),
+                };
+                allow.retain(|p| p != permission);
+                deny.retain(|p| p != permission);
+                if on {
+                    deny.push(permission.into());
                 }
                 self.store.set_override(&channel.id, EVERYONE_ROLE, &allow, &deny).map_err(failed)?;
-                self.audit(now, &flow.owner, "channel.permissions", Some(&channel.id), Some(json!({ "role": EVERYONE_ROLE, "read_only": event == "read_only" })));
+                self.audit(now, &flow.owner, "channel.permissions", Some(&channel.id), Some(json!({ "role": EVERYONE_ROLE, said: on })));
                 true
             }
             (CHANNEL_PERMISSIONS_FLOW, "roles", "edit") => {
@@ -1223,7 +1235,8 @@ impl Community {
             _ => {
                 let suggested: Vec<String> = set["suggested"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
                 let mut items = vec![json!({ "type": "title", "text": "Where to start" })];
-                for channel in self.store.channels()?.into_iter().filter(|c| suggested.contains(&c.id) && !c.closed) {
+                let seen = self.seen_by(&flow.owner)?;
+                for channel in self.store.channels()?.into_iter().filter(|c| suggested.contains(&c.id) && !c.closed && seen.contains(&c.id)) {
                     let kind = if channel.voice.is_some() { "🔊 " } else { "#" };
                     let topic = if channel.topic.is_empty() { String::new() } else { format!(" — {}", channel.topic) };
                     items.push(json!({ "type": "text", "text": format!("{kind}{}{topic}", channel.name) }));

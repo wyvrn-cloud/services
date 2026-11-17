@@ -253,7 +253,7 @@ impl Community {
             }
 
             BULK_DELETE => {
-                let Some(channel) = self.store.channel(body["channel"].as_str().unwrap_or_default())? else {
+                let Some(channel) = self.channel_for(sender, body["channel"].as_str().unwrap_or_default())? else {
                     return refuse(message, "e.p.msg.unknown-channel", "There is no such channel.").map(Some);
                 };
                 if !self.may_in(sender, &channel, "manage_messages")? {

@@ -45,6 +45,7 @@ pub const COMMUNITY_PERMISSIONS: &[(&str, &str)] = &[
 
 /// The permissions a channel can also give or withhold.
 pub const CHANNEL_PERMISSIONS: &[(&str, &str)] = &[
+    ("view_channel", "See the channel: without it, it isn't there"),
     ("post", "Post"),
     ("react", "React"),
     ("create_threads", "Start threads"),
@@ -61,7 +62,7 @@ pub const CHANNEL_PERMISSIONS: &[(&str, &str)] = &[
 /// Holding any of these makes someone a `moderator` in older terms.
 const MODERATING: &[&str] = &["manage_messages", "admit_members", "kick_members", "ban_members", "timeout_members", "manage_reports"];
 
-const EVERYONE_DEFAULT: &[&str] = &["post", "react", "create_threads", "attach_files", "connect", "speak", "video"];
+const EVERYONE_DEFAULT: &[&str] = &["view_channel", "post", "react", "create_threads", "attach_files", "connect", "speak", "video"];
 const MODERATOR_DEFAULT: &[&str] =
     &["admit_members", "kick_members", "timeout_members", "manage_reports", "view_audit_log", "manage_messages", "bypass_slow_mode", "moderate_voice"];
 
@@ -127,8 +128,15 @@ impl Community {
     /// members could do, then Moderator and Admin, and `admin` to every admin.
     pub fn ensure_roles(&self) -> anyhow::Result<()> {
         if self.store.role(EVERYONE_ROLE)?.is_some() {
+            // A store from before `view_channel`: everyone saw every channel, and
+            // still does.
+            if self.store.setting("view_channel_given")?.is_none() {
+                self.set_everyone("view_channel", true)?;
+                self.store.set_setting("view_channel_given", "true")?;
+            }
             return Ok(());
         }
+        self.store.set_setting("view_channel_given", "true")?;
         let mut everyone = strings(EVERYONE_DEFAULT);
         if self.config.members_may_create_channels {
             everyone.push("create_channels".into());
@@ -307,6 +315,55 @@ impl Community {
         Ok(have)
     }
 
+    /// Whether someone with `powers` (`did`) may see `channel` at all: without
+    /// `view_channel` there, it isn't there for them (nothing of it reaches them,
+    /// and asked of by id it is unknown). Whoever opened it sees it.
+    pub fn sees(&self, did: &str, powers: &Powers, channel: &Channel) -> anyhow::Result<bool> {
+        Ok(powers.all() || channel.created_by == did || self.channel_permissions(did, powers, channel)?.contains("view_channel"))
+    }
+
+    /// Whether `did` may see the channel `id` (an unknown one, no).
+    pub fn sees_id(&self, did: &str, id: &str) -> anyhow::Result<bool> {
+        let Some(channel) = self.store.channel(id)? else { return Ok(false) };
+        let powers = self.powers(did)?;
+        self.sees(did, &powers, &channel)
+    }
+
+    /// The channel `id`, if `did` may see it: one they may not is as unknown as one
+    /// that isn't.
+    pub fn channel_for(&self, did: &str, id: &str) -> anyhow::Result<Option<Channel>> {
+        let Some(channel) = self.store.channel(id)? else { return Ok(None) };
+        let powers = self.powers(did)?;
+        Ok(self.sees(did, &powers, &channel)?.then_some(channel))
+    }
+
+    /// Whether `everyone` may see `channel`: what someone not signed in to the web
+    /// view may see of it, public or not, rests on this.
+    pub fn everyone_sees(&self, channel: &Channel) -> anyhow::Result<bool> {
+        let mut sees = self.everyone_has("view_channel")?;
+        if let Some(everyone) = self.store.overrides(&channel.id)?.into_iter().find(|o| o.role == EVERYONE_ROLE) {
+            if everyone.deny.iter().any(|p| p == "view_channel") {
+                sees = false;
+            }
+            if everyone.allow.iter().any(|p| p == "view_channel") {
+                sees = true;
+            }
+        }
+        Ok(sees)
+    }
+
+    /// The channels `did` may see, by id.
+    pub fn seen_by(&self, did: &str) -> anyhow::Result<std::collections::HashSet<String>> {
+        let powers = self.powers(did)?;
+        let mut seen = std::collections::HashSet::new();
+        for channel in self.store.channels()? {
+            if self.sees(did, &powers, &channel)? {
+                seen.insert(channel.id);
+            }
+        }
+        Ok(seen)
+    }
+
     /// Whether `did` holds `permission` in `channel`.
     pub fn may_in(&self, did: &str, channel: &Channel, permission: &str) -> anyhow::Result<bool> {
         let powers = self.powers(did)?;
@@ -382,5 +439,30 @@ mod tests {
             assert!(seen.insert(*name), "{name} twice");
         }
         assert!(EVERYONE_DEFAULT.iter().chain(MODERATOR_DEFAULT).all(|p| is_permission(p)));
+    }
+}
+
+#[cfg(test)]
+mod view_channel_tests {
+    use super::*;
+    use crate::config::CommunityConfig;
+    use crate::store::Store;
+
+    #[test]
+    fn a_store_from_before_view_channel_lets_everyone_see_every_channel_still() {
+        // Its `everyone` as it was: no `view_channel`, and nothing said of it.
+        let store = Store::in_memory().unwrap();
+        let mut everyone = RoleDef { id: EVERYONE_ROLE.into(), name: "everyone".into(), color: None, icon: None, position: 0, permissions: strings(&["post", "react"]), mentionable: false, hoist: false, self_assignable: false };
+        store.save_role(&everyone).unwrap();
+        let community = Community::new(store, CommunityConfig::default(), None).unwrap();
+        assert!(community.everyone_has("view_channel").unwrap());
+        // Once: taken away after, it stays away.
+        everyone.permissions = strings(&["post"]);
+        community.store.save_role(&everyone).unwrap();
+        community.ensure_roles().unwrap();
+        assert!(!community.everyone_has("view_channel").unwrap());
+        // A new store's `everyone` has it from the start.
+        let fresh = Community::new(Store::in_memory().unwrap(), CommunityConfig::default(), None).unwrap();
+        assert!(fresh.everyone_has("view_channel").unwrap());
     }
 }

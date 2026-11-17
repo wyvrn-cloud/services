@@ -201,7 +201,7 @@ impl Community {
     /// posts in its channel.
     pub fn handle_original(&self, member: &Member, message: &Value) -> anyhow::Result<Outcome> {
         let id = message["body"]["to"]["id"].as_str().or(message["body"]["id"].as_str()).unwrap_or_default();
-        let Some(post) = self.store.post_by_id(id)? else {
+        let Some(post) = self.store.post_by_id(id)?.filter(|post| self.sees_id(&member.did, &post.channel).unwrap_or(false)) else {
             return refuse(message, "e.p.msg.unknown-post", "There is no such post.");
         };
         let Some(channel) = self.store.channel(&post.channel)? else {
@@ -235,7 +235,7 @@ impl Community {
         let mut posts = Vec::new();
         for held in self.store.held()? {
             let Some(channel) = self.store.channel(&held.channel)? else { continue };
-            if !self.channel_permissions(did, &powers, &channel)?.contains("manage_messages") {
+            if !self.sees(did, &powers, &channel)? || !self.channel_permissions(did, &powers, &channel)?.contains("manage_messages") {
                 continue;
             }
             posts.push(json!({
@@ -278,7 +278,7 @@ impl Community {
         let Some(held) = self.store.held()?.into_iter().find(|held| held.id == id) else {
             return refuse(message, "e.p.msg.unknown-post", "Nothing is held by that id.").map(Some);
         };
-        let Some(channel) = self.store.channel(&held.channel)? else {
+        let Some(channel) = self.channel_for(sender, &held.channel)? else {
             return refuse(message, "e.p.msg.unknown-channel", "That channel is gone.").map(Some);
         };
         if !self.may_in(sender, &channel, "manage_messages")? {
