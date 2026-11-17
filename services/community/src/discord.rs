@@ -238,6 +238,16 @@ impl Planned {
     }
 }
 
+/// What an import did, as it goes.
+#[derive(Default)]
+struct Counts {
+    made: usize,
+    changed: usize,
+    removed: usize,
+    no_room_channels: usize,
+    no_room_roles: usize,
+}
+
 /// Everything importing would do.
 #[derive(Debug, Default)]
 pub struct Plan {
@@ -825,8 +835,7 @@ impl Community {
                         };
                     }
                 }
-                // Hundreds of writes: committed together, not each by itself.
-                let report = self.store.db.grouped(|| self.import(&flow.owner, &template, &plan, &choice, input, now)).map_err(failed)?;
+                let report = self.import(&flow.owner, &template, &plan, &choice, input, now).map_err(failed)?;
                 flow.data["report"] = json!(report);
                 flow.data.as_object_mut().map(|data| data.remove("template"));
                 flow.state = "done".into();
@@ -841,102 +850,39 @@ impl Community {
     /// What was done, in a sentence or two.
     fn import(&self, owner: &str, template: &Value, plan: &Plan, choice: &HashMap<String, bool>, input: &Value, now: i64) -> anyhow::Result<String> {
         let mut ids: HashMap<String, String> = HashMap::new();
-        let (mut made, mut changed, mut removed) = (0, 0, 0);
-        let (mut no_room_channels, mut no_room_roles) = (0, 0);
-        let resolve = |value: &Value, ids: &HashMap<String, String>| -> Value {
-            match value {
-                Value::String(text) if text.starts_with("new:") => json!(ids.get(text).cloned().unwrap_or_default()),
-                other => other.clone(),
-            }
-        };
+        let mut counts = Counts::default();
 
-        // Removals first: what goes frees its name.
-        for (kind, local, _) in &plan.removed {
-            let wanted = matches!(&input[format!("remove-{kind}-{local}")], Value::Bool(true)) || matches!(input[format!("remove-{kind}-{local}")].as_str(), Some("true" | "on" | "1"));
-            if wanted {
-                match *kind {
-                    "channel" => self.store.trash_channel(local, owner, now)?,
-                    "role" => {
-                        self.store.delete_role(local)?;
-                    }
-                    _ => self.store.delete_category(local)?,
-                }
-                removed += 1;
-            }
-            self.store.forget_imported(kind, local)?;
-        }
+        // The community's own name and description first, by themselves: they are
+        // kept apart (profile::Kept, over a connection of its own), whose write
+        // would wait on the transaction below until the database gave up.
+        self.import_items(owner, plan, choice, &["community"], &mut ids, &mut counts, now)?;
 
-        // Then the community, roles and categories, and then channels, which
-        // name roles and categories by the ids they now have.
-        for pass in ["community", "role", "category", "channel"] {
-            for item in plan.items.iter().filter(|i| i.kind == pass) {
-                let chosen = choice.get(&item.key()).copied();
-                if item.deleted_here {
-                    // Left deleted, unless the owner brings it back.
-                    if chosen != Some(true) {
-                        if let Some(record) = &item.record {
-                            self.store.set_imported(item.kind, &record.local, &item.source_id, &item.source, &record.applied)?;
+        // The rest in one transaction: hundreds of writes, committed together
+        // rather than each by itself (a phone's import timed out otherwise).
+        self.store.db.grouped(|| -> anyhow::Result<()> {
+            // Removals first: what goes frees its name.
+            for (kind, local, _) in &plan.removed {
+                let wanted = matches!(&input[format!("remove-{kind}-{local}")], Value::Bool(true)) || matches!(input[format!("remove-{kind}-{local}")].as_str(), Some("true" | "on" | "1"));
+                if wanted {
+                    match *kind {
+                        "channel" => self.store.trash_channel(local, owner, now)?,
+                        "role" => {
+                            self.store.delete_role(local)?;
                         }
-                        continue;
+                        _ => self.store.delete_category(local)?,
                     }
-                    if let Some(record) = &item.record {
-                        self.store.forget_imported(item.kind, &record.local)?;
-                    }
+                    counts.removed += 1;
                 }
-                let mut want = item.want.clone();
-                for field in ["category"] {
-                    if want.get(field).is_some() {
-                        want[field] = resolve(&want[field], &ids);
-                    }
-                }
-                if let Some(overrides) = want.get("overrides").and_then(Value::as_object).cloned() {
-                    let resolved: Map<String, Value> = overrides.into_iter().filter_map(|(role, said)| {
-                        let id = if role.starts_with("new:") { ids.get(&role).cloned()? } else { role };
-                        Some((id, said))
-                    }).collect();
-                    want["overrides"] = Value::Object(resolved);
-                }
-                let fields: Vec<String> = match (&item.local, item.deleted_here) {
-                    (Some(_), false) => {
-                        let mut fields = item.take.clone();
-                        if chosen == Some(true) {
-                            fields.extend(item.conflicts.iter().cloned());
-                        }
-                        fields
-                    }
-                    _ => want.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default(),
-                };
-                let local = match (&item.local, item.deleted_here) {
-                    (Some(local), false) => {
-                        if !fields.is_empty() {
-                            changed += 1;
-                        }
-                        self.apply_fields(item.kind, local, &want, &fields, owner, now)?;
-                        local.clone()
-                    }
-                    _ => match self.make(item.kind, &want, owner, now)? {
-                        Some(local) => {
-                            made += 1;
-                            local
-                        }
-                        None => {
-                            match item.kind {
-                                "channel" => no_room_channels += 1,
-                                "role" => no_room_roles += 1,
-                                _ => {}
-                            }
-                            continue;
-                        }
-                    },
-                };
-                ids.insert(format!("new:{}:{}", item.kind, item.source_id), local.clone());
-                // What is kept to compare with next time is the template's, as it
-                // would be here, whatever was kept here instead: unchanged in the
-                // template since, what's here is left as it is.
-                self.store.set_imported(item.kind, &local, &item.source_id, &item.source, &want)?;
+                self.store.forget_imported(kind, local)?;
             }
-        }
-        self.order_as_template(plan, &ids)?;
+
+            // Then roles and categories, and then channels, which name roles and
+            // categories by the ids they now have.
+            self.import_items(owner, plan, choice, &["role", "category", "channel"], &mut ids, &mut counts, now)?;
+            self.order_as_template(plan, &ids)?;
+            Ok(())
+        })?;
+        let Counts { made, changed, removed, no_room_channels, no_room_roles } = counts;
         let code = template["code"].as_str().unwrap_or_default();
         let name = template["name"].as_str().unwrap_or_default();
         self.store.set_setting("discord_template", &json!({ "code": code, "name": name, "imported_at": now, "guild": template["serialized_source_guild"].as_object().map(|g| g.iter().filter(|(k, _)| *k != "roles" && *k != "channels").map(|(k, v)| (k.clone(), v.clone())).collect::<Map<_, _>>()) }).to_string())?;
@@ -954,6 +900,87 @@ impl Community {
         Ok(report)
     }
 
+
+    /// Imports the plan's things of `passes`' kinds, in that order, as the owner
+    /// chose: `ids` gains what each is here, `counts` what was done.
+    #[allow(clippy::too_many_arguments)]
+    fn import_items(&self, owner: &str, plan: &Plan, choice: &HashMap<String, bool>, passes: &[&str], ids: &mut HashMap<String, String>, counts: &mut Counts, now: i64) -> anyhow::Result<()> {
+        let resolve = |value: &Value, ids: &HashMap<String, String>| -> Value {
+            match value {
+                Value::String(text) if text.starts_with("new:") => json!(ids.get(text).cloned().unwrap_or_default()),
+                other => other.clone(),
+            }
+        };
+        for pass in passes {
+        for item in plan.items.iter().filter(|i| i.kind == *pass) {
+            let chosen = choice.get(&item.key()).copied();
+            if item.deleted_here {
+                // Left deleted, unless the owner brings it back.
+                if chosen != Some(true) {
+                    if let Some(record) = &item.record {
+                        self.store.set_imported(item.kind, &record.local, &item.source_id, &item.source, &record.applied)?;
+                    }
+                    continue;
+                }
+                if let Some(record) = &item.record {
+                    self.store.forget_imported(item.kind, &record.local)?;
+                }
+            }
+            let mut want = item.want.clone();
+            for field in ["category"] {
+                if want.get(field).is_some() {
+                    want[field] = resolve(&want[field], &ids);
+                }
+            }
+            if let Some(overrides) = want.get("overrides").and_then(Value::as_object).cloned() {
+                let resolved: Map<String, Value> = overrides.into_iter().filter_map(|(role, said)| {
+                    let id = if role.starts_with("new:") { ids.get(&role).cloned()? } else { role };
+                    Some((id, said))
+                }).collect();
+                want["overrides"] = Value::Object(resolved);
+            }
+            let fields: Vec<String> = match (&item.local, item.deleted_here) {
+                (Some(_), false) => {
+                    let mut fields = item.take.clone();
+                    if chosen == Some(true) {
+                        fields.extend(item.conflicts.iter().cloned());
+                    }
+                    fields
+                }
+                _ => want.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default(),
+            };
+            let local = match (&item.local, item.deleted_here) {
+                (Some(local), false) => {
+                    if !fields.is_empty() {
+                        counts.changed += 1;
+                    }
+                    self.apply_fields(item.kind, local, &want, &fields, owner, now)?;
+                    local.clone()
+                }
+                _ => match self.make(item.kind, &want, owner, now)? {
+                    Some(local) => {
+                        counts.made += 1;
+                        local
+                    }
+                    None => {
+                        match item.kind {
+                            "channel" => counts.no_room_channels += 1,
+                            "role" => counts.no_room_roles += 1,
+                            _ => {}
+                        }
+                        continue;
+                    }
+                },
+            };
+            ids.insert(format!("new:{}:{}", item.kind, item.source_id), local.clone());
+            // What is kept to compare with next time is the template's, as it
+            // would be here, whatever was kept here instead: unchanged in the
+            // template since, what's here is left as it is.
+            self.store.set_imported(item.kind, &local, &item.source_id, &item.source, &want)?;
+        }
+        }
+        Ok(())
+    }
     /// A channel name not yet taken (`name`, else `name-2`, ...), but by `except`.
     fn free_channel_name(&self, name: &str, voice: bool, except: Option<&str>) -> anyhow::Result<String> {
         let mut candidate = name.to_string();
