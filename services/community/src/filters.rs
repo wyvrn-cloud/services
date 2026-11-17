@@ -307,18 +307,29 @@ pub fn inspect(rule: &Value, content: &str, mentions: usize) -> Option<Found> {
         note(format!("a link to {host}"));
         spans.push((range, Cover::Link));
     }
-    let mut text: Vec<Range<usize>> = find_words(&strings(&rule["words"]), content);
-    if let Some(threshold) = threshold(rule) {
-        text.extend(find_filtered(threshold, content));
-    }
-    for pattern in strings(&rule["patterns"]) {
-        if let Ok(re) = compile(&pattern) {
-            text.extend(re.find_iter(content).filter(|m| !m.is_empty()).map(|m| m.range()));
+    // A link's address is never dotted: that would only break it (a GIF on
+    // tenor.com/…/oh-shit-cat.gif no longer loads), and an address is full of
+    // letters that are no word (Xw9a55QkDicK). A rule may instead cover the whole
+    // link when the words in its address are what it looks for.
+    let links: Vec<Range<usize>> = LINK.find_iter(content).map(|link| trimmed(content, link.range())).collect();
+    if rule["link_words"] == true {
+        for link in &links {
+            if spans.iter().any(|(s, _)| s.start < link.end && link.start < s.end) {
+                continue;
+            }
+            let readable = address_words(&content[link.clone()]);
+            let allowed_here = find_words(&strings(&rule["allowed_words"]).into_iter().map(|w| w.replace('*', "")).collect::<Vec<_>>(), &readable);
+            if let Some(word) = find_text(rule, &readable).into_iter().find(|range| !allowed_here.iter().any(|a| a.start <= range.start && range.end <= a.end)) {
+                note(format!("a link with “{}” in it", &readable[word]));
+                spans.push((link.clone(), Cover::Link));
+            }
         }
     }
+    let mut text = find_text(rule, content);
     text.sort_by_key(|range| range.start);
     for range in text.into_iter().filter(|range| !let_be(range)) {
-        if spans.iter().any(|(s, _)| s.start < range.end && range.start < s.end) {
+        let overlaps = |s: &Range<usize>| s.start < range.end && range.start < s.end;
+        if spans.iter().any(|(s, _)| overlaps(s)) || links.iter().any(overlaps) {
             continue;
         }
         note(format!("“{}”", &content[range.clone()]));
@@ -329,6 +340,35 @@ pub fn inspect(rule: &Value, content: &str, mentions: usize) -> Option<Found> {
     }
     spans.sort_by_key(|(range, _)| range.start);
     what.map(|what| Found { what, spans })
+}
+
+/// What a rule's words, filters and patterns find in `content`.
+fn find_text(rule: &Value, content: &str) -> Vec<Range<usize>> {
+    let mut text: Vec<Range<usize>> = find_words(&strings(&rule["words"]), content);
+    if let Some(threshold) = threshold(rule) {
+        text.extend(find_filtered(threshold, content));
+    }
+    for pattern in strings(&rule["patterns"]) {
+        if let Ok(re) = compile(&pattern) {
+            text.extend(re.find_iter(content).filter(|m| !m.is_empty()).map(|m| m.range()));
+        }
+    }
+    text
+}
+
+/// The words in a link's address, one space between each: what is between its
+/// slashes, dashes, dots and the like, leaving out what looks like an id rather
+/// than a word (a digit in it, or capitals in the middle: xT9IgG50Fb7Mi0prBC).
+fn address_words(link: &str) -> String {
+    link.split(|c: char| !c.is_alphabetic() && !c.is_numeric())
+        .filter(|piece| !piece.is_empty())
+        .filter(|piece| !piece.chars().any(char::is_numeric))
+        .filter(|piece| {
+            let rest: Vec<char> = piece.chars().skip(1).collect();
+            rest.iter().all(|c| c.is_lowercase()) || rest.iter().all(|c| c.is_uppercase())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `content` with what was found covered: words as dots (spaces and line breaks
@@ -358,6 +398,39 @@ mod tests {
 
     fn censored(rule: &Value, content: &str) -> String {
         censor(content, &inspect(rule, content, 0).map(|f| f.spans).unwrap_or_default())
+    }
+
+    #[test]
+    fn a_link_is_never_dotted_but_may_be_covered_whole_for_the_words_in_its_address() {
+        let family = json!({ "filters": { "profanity": "mild", "sexual": "mild", "slurs": "mild", "insults": "moderate" }, "words": ["shit"] });
+        // Dots would break it, so a link is left as it is...
+        for link in [
+            "https://media.tenor.com/AbC123/oh-shit-cat.gif",
+            "https://media.tenor.com/Xw9a55QkDicK/cockatoo-dancing.gif",
+            "https://tenor.com/view/scunthorpe-united-hell-yeah-gif-1234",
+            "www.giphy.com/gifs/cat-funny-bitch-please-3o7TKSjRrfIPjeiVyM",
+        ] {
+            assert_eq!(censored(&family, link), link);
+            assert_eq!(censored(&family, &format!("look: {link}, shit")), format!("look: {link}, ••••"));
+        }
+        // ...and the words around it, a caption among them, are still looked at.
+        assert_eq!(censored(&family, "![oh shit cat](https://media.giphy.com/media/xT9IgG50Fb7Mi0prBC/giphy.gif)"), "![oh •••• cat](https://media.giphy.com/media/xT9IgG50Fb7Mi0prBC/giphy.gif)");
+
+        // A rule that would rather may cover the whole link, for a word in its address:
+        let whole = json!({ "filters": { "profanity": "mild", "sexual": "mild" }, "words": ["scam"], "allowed_words": ["hell"], "link_words": true });
+        assert_eq!(censored(&whole, "lol https://media.tenor.com/AbC123/oh-shit-cat.gif!"), "lol <UNSAFE URL BLOCKED>!");
+        assert_eq!(censored(&whole, "https://example.com/free-scam-here"), "<UNSAFE URL BLOCKED>");
+        assert_eq!(inspect(&whole, "https://media.tenor.com/AbC123/oh-shit-cat.gif", 0).unwrap().what, "a link with “shit” in it");
+        // ...but not for the letters of an id, nor for a word it is told to let be.
+        for fine in [
+            "https://media.tenor.com/Xw9a55QkDicK/cockatoo-dancing.gif",
+            "https://media.giphy.com/media/l0HlBO7eyXzSZkJri/giphy.gif",
+            "https://media.giphy.com/media/AsSdIcKfOoBaR/giphy.gif",
+            "https://tenor.com/view/scunthorpe-united-hell-yeah-gif-1234",
+            "https://shipping.example.com/worship",
+        ] {
+            assert!(inspect(&whole, fine, 0).is_none(), "{fine} is let be");
+        }
     }
 
     #[test]

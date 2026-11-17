@@ -902,6 +902,7 @@ impl Community {
         fields.extend([
             json!({ "type": "text-input", "form-id": "blocked_domains", "label": "Links never allowed to (domains, separated by commas)", "value": lines("blocked_domains").join(", ") }),
             json!({ "type": "text-input", "form-id": "allowed_domains", "label": "Links always allowed to (domains, separated by commas)", "value": lines("allowed_domains").join(", ") }),
+            json!({ "type": "check-box", "form-id": "link_words", "label": "Cover a whole link for a word above in its address (part of a link is never dotted: that would break it)", "value": rule["link_words"] == true }),
             json!({ "type": "text-input", "form-id": "max_mentions", "label": "Most mentions in one post (empty: no limit)", "value": rule["max_mentions"].as_u64().map(|n| n.to_string()).unwrap_or_default() }),
             json!({ "type": "title", "text": "What it does" }),
             json!({ "type": "drop-down", "form-id": "action", "label": "With a post it finds something in", "value": crate::automod::action_of(&rule), "options": crate::automod::ACTIONS.iter().map(|(value, label)| json!({ "value": value, "label": label })).collect::<Vec<_>>() }),
@@ -1043,7 +1044,7 @@ impl Community {
                 let rule = json!({
                     "id": id, "name": name, "enabled": ticked(&input["enabled"]),
                     "filters": filters, "words": words("words", &['\n', ',']), "allowed_words": words("allowed_words", &['\n', ',']), "patterns": patterns,
-                    "links": ticked(&input["links"]), "domain_lists": lists,
+                    "links": ticked(&input["links"]), "domain_lists": lists, "link_words": ticked(&input["link_words"]),
                     "allowed_domains": words("allowed_domains", &[',', ' ']), "blocked_domains": words("blocked_domains", &[',', ' ']),
                     "max_mentions": mentions, "block": action == "block", "hold": action == "hold", "censor": action == "censor",
                     "alert_channel": alert, "timeout_seconds": timeout, "exempt_roles": roles, "exempt_channels": channels,
