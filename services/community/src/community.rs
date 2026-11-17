@@ -217,6 +217,8 @@ pub struct Community {
     pub public_url: String,
     /// The DID it speaks as, where that isn't `own` (a did:webvh): never a person's.
     pub speaks_as: Option<String>,
+    /// Held while a Discord template is imported: one import at a time.
+    pub importing: std::sync::Mutex<()>,
 }
 
 /// What handling a message came to.
@@ -438,7 +440,7 @@ impl Community {
             Some(kept) => kept.load()?,
             None => Changed::default(),
         };
-        let community = Self { store, config, changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, expressions: None, live: Default::default(), web_url: None, public_url: String::new(), speaks_as: None };
+        let community = Self { store, config, changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, expressions: None, live: Default::default(), web_url: None, public_url: String::new(), speaks_as: None, importing: Default::default() };
         community.ensure_roles()?;
         Ok(community)
     }

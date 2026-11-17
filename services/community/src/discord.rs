@@ -246,6 +246,9 @@ pub struct Plan {
     pub removed: Vec<(&'static str, String, String)>,
     /// What Wyvrn doesn't have yet, said once each.
     pub missing: Vec<String>,
+    /// Of `removed`, what is left unticked to begin with when making it all match
+    /// (`kind-local`): a role someone holds.
+    pub unticked: HashSet<String>,
 }
 
 /// Field by field: what to take from the template, and what is changed on both
@@ -404,8 +407,10 @@ impl Community {
             let at = if is_everyone {
                 records.iter().position(|r| r.local == EVERYONE_ROLE)
             } else {
-                // (Same name and id first: two roles may have one name.)
-                records.iter().position(|r| r.local != EVERYONE_ROLE && r.source["name"] == role["name"] && r.source_id == source_id && !used.contains(&r.local)).or_else(|| records.iter().position(|r| r.local != EVERYONE_ROLE && r.source["name"] == role["name"] && !used.contains(&r.local))).or_else(|| records.iter().position(|r| r.local != EVERYONE_ROLE && r.source_id == source_id && !used.contains(&r.local)))
+                // (Same name and id first: two roles may have one name. Of two copies
+                // of one, the one still called what the template calls it.)
+                records.iter().position(|r| r.local != EVERYONE_ROLE && r.source_id == source_id && !used.contains(&r.local) && roles_here.iter().any(|here| here.id == r.local && here.name == name))
+                .or_else(|| records.iter().position(|r| r.local != EVERYONE_ROLE && r.source["name"] == role["name"] && r.source_id == source_id && !used.contains(&r.local))).or_else(|| records.iter().position(|r| r.local != EVERYONE_ROLE && r.source["name"] == role["name"] && !used.contains(&r.local))).or_else(|| records.iter().position(|r| r.local != EVERYONE_ROLE && r.source_id == source_id && !used.contains(&r.local)))
             };
             let record = at.map(|at| records.remove(at));
             let local = match &record {
@@ -533,9 +538,12 @@ impl Community {
                     }
                 }
             }
+            // Of two copies of one (#bot-room and #bot-room-2), the one still called
+            // what the template calls it.
             let at = records
                 .iter()
-                .position(|r| r.source["name"] == channel["name"] && kind_of(&r.source).0 == kind && r.source_id == source_id && !used.contains(&r.local))
+                .position(|r| r.source_id == source_id && kind_of(&r.source).0 == kind && !used.contains(&r.local) && channels_here.iter().any(|here| here.id == r.local && here.name == name))
+                .or_else(|| records.iter().position(|r| r.source["name"] == channel["name"] && kind_of(&r.source).0 == kind && r.source_id == source_id && !used.contains(&r.local)))
                 .or_else(|| records.iter().position(|r| r.source["name"] == channel["name"] && kind_of(&r.source).0 == kind && r.source["parent_id"] == channel["parent_id"] && !used.contains(&r.local)))
                 .or_else(|| records.iter().position(|r| r.source["name"] == channel["name"] && kind_of(&r.source).0 == kind && !used.contains(&r.local)))
                 .or_else(|| records.iter().position(|r| r.source_id == source_id && kind_of(&r.source).0 == kind && !used.contains(&r.local)));
@@ -579,6 +587,60 @@ impl Community {
         Ok(plan)
     }
 
+    /// `plan`, made to leave everything here as the template has it: every field
+    /// that differs is the template's, whatever changed where; what was deleted
+    /// here is made again; and everything here that isn't in the template (made
+    /// here, a copy, imported and since dropped from it) is to be removed.
+    pub fn exactly(&self, mut plan: Plan) -> anyhow::Result<Plan> {
+        for item in &mut plan.items {
+            item.conflicts.clear();
+            item.take = match &item.here {
+                Some(here) => item.want.as_object().into_iter().flatten().filter(|(field, wanted)| field.as_str() != "kind" && here[field.as_str()] != **wanted).map(|(field, _)| field.clone()).collect(),
+                None => Vec::new(),
+            };
+        }
+        let kept = |kind: &str| -> HashSet<String> { plan.items.iter().filter(|i| i.kind == kind).filter_map(|i| i.local.clone()).collect() };
+        let listed: HashSet<(String, String)> = plan.removed.iter().map(|(kind, local, _)| (kind.to_string(), local.clone())).collect();
+        let mut extra: Vec<(&'static str, String, String)> = Vec::new();
+        let (channels, categories) = (kept("channel"), kept("category"));
+        for channel in self.store.channels()? {
+            if !channels.contains(&channel.id) && !listed.contains(&("channel".to_string(), channel.id.clone())) {
+                let label = if channel.voice.is_some() { format!("🔊{}", channel.name) } else { format!("#{}", channel.name) };
+                extra.push(("channel", channel.id, if channel.closed { format!("{label} (closed)") } else { label }));
+            }
+        }
+        for category in self.store.categories()? {
+            if !categories.contains(&category.id) && !listed.contains(&("category".to_string(), category.id.clone())) {
+                extra.push(("category", category.id, format!("The category {}", category.name)));
+            }
+        }
+        // Roles only if the template's are here at all: `everyone` always stays.
+        let roles = kept("role");
+        if plan.items.iter().any(|i| i.kind == "role") {
+            for role in self.store.roles()? {
+                if role.id != EVERYONE_ROLE && !roles.contains(&role.id) && !listed.contains(&("role".to_string(), role.id.clone())) {
+                    extra.push(("role", role.id, format!("The role {}", role.name)));
+                }
+            }
+        }
+        plan.removed.extend(extra);
+        // A role someone holds (Admin, say) is asked about, not ticked: taking it
+        // away takes what they may do.
+        let mut holders: HashMap<String, usize> = HashMap::new();
+        for (_, role) in self.store.all_member_roles()? {
+            *holders.entry(role).or_default() += 1;
+        }
+        for (kind, local, label) in &mut plan.removed {
+            if *kind == "role" {
+                if let Some(n) = holders.get(local.as_str()) {
+                    label.push_str(&if *n == 1 { " (1 member has it)".to_string() } else { format!(" ({n} members have it)") });
+                    plan.unticked.insert(format!("role-{local}"));
+                }
+            }
+        }
+        Ok(plan)
+    }
+
     /// The workflow's page for its state now.
     pub fn discord_import_ui(&self, flow: &Flow) -> anyhow::Result<(Value, Vec<&'static str>)> {
         let last = self.store.setting("discord_template")?.and_then(|text| serde_json::from_str::<Value>(&text).ok());
@@ -586,7 +648,12 @@ impl Community {
             "review" => {
                 let template = &flow.data["template"];
                 let plan = self.plan_import(template)?;
-                Ok((self.review_ui(template, &plan), vec!["import", "back"]))
+                Ok((self.review_ui(template, &plan, false), vec!["import", "exact", "back"]))
+            }
+            "exact" => {
+                let template = &flow.data["template"];
+                let plan = self.exactly(self.plan_import(template)?)?;
+                Ok((self.review_ui(template, &plan, true), vec!["import", "back"]))
             }
             "done" => Ok((json!([{ "type": "title", "text": "Imported" }, { "type": "text", "text": flow.data["report"].as_str().unwrap_or("Done.") }]), Vec::new())),
             _ => {
@@ -611,9 +678,12 @@ impl Community {
         }
     }
 
-    fn review_ui(&self, template: &Value, plan: &Plan) -> Value {
+    fn review_ui(&self, template: &Value, plan: &Plan, exact: bool) -> Value {
         let name = template["name"].as_str().unwrap_or("the template");
-        let mut items = vec![json!({ "type": "title", "text": format!("Import “{name}”") })];
+        let mut items = vec![json!({ "type": "title", "text": if exact { format!("Make it match “{name}”") } else { format!("Import “{name}”") } })];
+        if exact {
+            items.push(json!({ "type": "text", "text": "Everything here is made as the template has it, as if imported for the first time: whatever differs is changed to the template's, even what was changed here on purpose; what's missing is made, what was deleted here too; and what isn't in the template is removed, below." }));
+        }
         let count = |kind: &str, new: bool| plan.items.iter().filter(|i| i.kind == kind && i.is_new() == new && !i.deleted_here).count();
         items.push(json!({ "type": "text", "text": format!(
             "To be made: {} roles, {} categories, {} channels. Already here: {} roles, {} categories, {} channels. Channels and roles are put in the template's order.",
@@ -653,14 +723,23 @@ impl Community {
             }
         }
         if !plan.removed.is_empty() {
-            fields.push(json!({ "type": "title", "text": "No longer in the template" }));
-            fields.push(json!({ "type": "text", "text": "Ticked, it is removed (a channel to the trash, where it can be brought back for 30 days). Left, it stays, as something made here." }));
+            if exact {
+                fields.push(json!({ "type": "title", "text": "Not in the template" }));
+                fields.push(json!({ "type": "text", "text": "Made here, copies, or dropped from the template since. Ticked, it is removed: a channel to the trash, where it can be brought back for 30 days; a role or category deleted. Untick what should stay." }));
+            } else {
+                fields.push(json!({ "type": "title", "text": "No longer in the template" }));
+                fields.push(json!({ "type": "text", "text": "Ticked, it is removed (a channel to the trash, where it can be brought back for 30 days). Left, it stays, as something made here." }));
+            }
             for (kind, local, label) in &plan.removed {
-                fields.push(json!({ "type": "check-box", "form-id": format!("remove-{kind}-{local}"), "label": format!("Remove {label}"), "value": false }));
+                fields.push(json!({ "type": "check-box", "form-id": format!("remove-{kind}-{local}"), "label": format!("Remove {label}"), "value": exact && !plan.unticked.contains(&format!("{kind}-{local}")) }));
             }
         }
-        fields.push(json!({ "type": "submit-button", "label": "Import", "event": "import", "input": {} }));
+        fields.push(json!({ "type": "submit-button", "label": if exact { "Make it match" } else { "Import" }, "event": "import", "input": {} }));
         items.push(json!({ "type": "form", "children": fields }));
+        if !exact {
+            items.push(json!({ "type": "text", "text": "Or make everything here exactly as the template has it: change what differs, even what was changed here, and remove what isn't in it (copies included)." }));
+            items.push(json!({ "type": "submit-button", "label": "Make it match exactly...", "event": "exact", "input": {} }));
+        }
         if !plan.missing.is_empty() {
             items.push(json!({ "type": "title", "text": "Not in Wyvrn yet" }));
             items.push(json!({ "type": "text", "text": "Kept with what was imported: once Wyvrn has it, import the template again and it comes over." }));
@@ -715,17 +794,39 @@ impl Community {
                 flow.state = "link".into();
                 Ok(false)
             }
-            ("review", "import") => {
+            ("review", "exact") => {
+                flow.state = "exact".into();
+                Ok(false)
+            }
+            ("exact", "back") => {
+                flow.state = "review".into();
+                Ok(false)
+            }
+            ("review" | "exact", "import") => {
+                // One at a time: a second, planned before the first had made
+                // anything, would make it all again (#general-2).
+                let Ok(_importing) = self.importing.try_lock() else {
+                    return Err(Refusal::new("guard_failed", "The template is being imported already: wait for that to finish, then look again."));
+                };
                 let template = flow.data["template"].clone();
+                let exact = flow.state == "exact";
                 let plan = self.plan_import(&template).map_err(failed)?;
-                // Each thing changed on both sides is chosen for, first.
+                let plan = if exact { self.exactly(plan).map_err(failed)? } else { plan };
                 let mut choice: HashMap<String, bool> = HashMap::new();
-                for item in plan.items.iter().filter(|i| asks(i)) {
-                    match input[format!("choose-{}", item.key())].as_str() {
-                        Some("template") => choice.insert(item.key(), true),
-                        Some("here") => choice.insert(item.key(), false),
-                        _ => return Err(Refusal::new("guard_failed", "Choose, for each thing changed both here and in the template, which stays.")),
-                    };
+                if exact {
+                    // Everything the template's, what was deleted here made again.
+                    for item in plan.items.iter().filter(|i| i.deleted_here) {
+                        choice.insert(item.key(), true);
+                    }
+                } else {
+                    // Each thing changed on both sides is chosen for, first.
+                    for item in plan.items.iter().filter(|i| asks(i)) {
+                        match input[format!("choose-{}", item.key())].as_str() {
+                            Some("template") => choice.insert(item.key(), true),
+                            Some("here") => choice.insert(item.key(), false),
+                            _ => return Err(Refusal::new("guard_failed", "Choose, for each thing changed both here and in the template, which stays.")),
+                        };
+                    }
                 }
                 // Hundreds of writes: committed together, not each by itself.
                 let report = self.store.db.grouped(|| self.import(&flow.owner, &template, &plan, &choice, input, now)).map_err(failed)?;

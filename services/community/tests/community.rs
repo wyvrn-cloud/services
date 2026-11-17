@@ -2474,6 +2474,82 @@ async fn an_import_past_the_channel_limit_says_what_it_left_out_and_brings_it_ne
     assert!(review.contains("has 4, so only 0 of the template's 2 new channels"), "{review}");
 }
 
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // held on purpose: another import going on
+async fn importing_again_exactly_puts_back_what_differs_and_clears_out_copies_and_what_isnt_in_the_template() {
+    let template = Arc::new(std::sync::Mutex::new(discord_template("Say hi", "announcements", false)));
+    let discord = fake_discord(template.clone()).await;
+    let server = start_server(&format!("discord_api = \"{discord}\"\n[voice]\nrelay_url = \"https://voice.example/\"")).await;
+    let owner = Peer::start(&server).await;
+    server.admit(&[&owner]);
+    owner.community("join", json!({})).await;
+    owner.workflow("start", json!({ "template_id": "discord-import", "instance_id": "e1" })).await;
+    advance(&owner, "e1", "read", json!({ "link": "TESTCODE1234" })).await;
+    advance(&owner, "e1", "import", json!({ "choose-community-guild": "template", "choose-role-0": "template" })).await;
+    let store = &server.state.community.store;
+    let shape = || {
+        let mut channels: Vec<(String, Option<String>, String)> = store.channels().unwrap().into_iter().map(|c| (c.name, c.category, c.topic)).collect();
+        channels.sort();
+        (channels, store.categories().unwrap().len(), store.roles().unwrap().len())
+    };
+    let first = shape();
+
+    // A mess, as two imports at once left one: a copy of #announcements, recorded
+    // as imported from the same channel; #general out of its category and its
+    // topic changed here; and a channel, category and role made here.
+    let original = store.imported("channel").unwrap().into_iter().find(|r| r.source["name"] == "announcements").unwrap();
+    let copy = open_channel(&owner, "announcements-2").await;
+    store.set_imported("channel", &copy, &original.source_id, &original.source, &original.applied).unwrap();
+    let general = store.channels().unwrap().into_iter().find(|c| c.name == "general").unwrap();
+    store.set_channel_category(&general.id, None).unwrap();
+    owner.community("update-channel", json!({ "channel": general.id, "topic": "Ours now" })).await;
+    let made_here = open_channel(&owner, "made-here").await;
+    store.save_category(&wyvrn_community::store::Category { id: "mine".into(), name: "Mine".into(), position: 9 }).unwrap();
+    store.save_role(&wyvrn_community::store::RoleDef { id: "ours".into(), name: "Ours".into(), color: None, icon: None, position: 99, permissions: vec![], mentionable: false, hoist: false, self_assignable: false }).unwrap();
+    assert_ne!(shape(), first);
+
+    owner.workflow("start", json!({ "template_id": "discord-import", "instance_id": "e2" })).await;
+    let review = advance(&owner, "e2", "read", json!({ "link": "TESTCODE1234" })).await["body"]["ui"].to_string();
+    assert!(review.contains("Make it match exactly..."), "{review}");
+    let exact = advance(&owner, "e2", "exact", json!({})).await;
+    assert_eq!(exact["body"]["state"], "exact", "{exact}");
+    let page = exact["body"]["ui"].to_string();
+    for said in ["Make it match “Test Fort”", "Remove #announcements-2", "Remove #made-here", "Remove The category Mine", "Remove The role Ours", "topic to “Say hi”"] {
+        assert!(page.contains(said), "{said} in {page}");
+    }
+    // Nothing asked: everything is the template's.
+    assert!(asked_about(&page).is_empty(), "{page}");
+    assert!(!page.contains("Remove #announcements\""), "the one still called so stays: {page}");
+    // Ticked to begin with; the app sends them as they are.
+    let ticks: serde_json::Map<String, Value> = page.split("\"form-id\":\"").skip(1).map(|rest| rest.split('"').next().unwrap().to_string()).filter(|id| id.starts_with("remove-")).map(|id| (id, json!(true))).collect();
+    // Wyvrn's own roles aren't in the template: Moderator, which nobody holds, is
+    // ticked; Admin, which the owner holds, is asked about, unticked.
+    assert!(page.contains("Remove The role Admin (1 member has it)\",\"value\":false"), "{page}");
+    assert!(page.contains("Remove The role Moderator\",\"value\":true"), "{page}");
+    let ticks: serde_json::Map<String, Value> = ticks.into_iter().filter(|(id, _)| id != "remove-role-admin").collect();
+    assert_eq!(ticks.len(), 5, "{ticks:?}");
+    assert!(ticks.contains_key(&format!("remove-channel-{copy}")) && ticks.contains_key(&format!("remove-channel-{made_here}")));
+
+    // While another import is going on, refused.
+    {
+        let _held = server.state.community.importing.lock().unwrap();
+        assert_eq!(advance(&owner, "e2", "import", Value::Object(ticks.clone())).await["body"]["code"], "guard_failed");
+    }
+    let done = advance(&owner, "e2", "import", Value::Object(ticks)).await;
+    assert_eq!(done["body"]["state"], "done", "{done}");
+    assert!(done["body"]["ui"].to_string().contains("5 removed"), "{done}");
+    // As first imported, but for Moderator, removed.
+    let (channels, categories, roles) = first.clone();
+    assert_eq!(shape(), (channels, categories, roles - 1));
+
+    // And again, exactly, with nothing changed: nothing to do.
+    owner.workflow("start", json!({ "template_id": "discord-import", "instance_id": "e3" })).await;
+    advance(&owner, "e3", "read", json!({ "link": "TESTCODE1234" })).await;
+    let page = advance(&owner, "e3", "exact", json!({})).await["body"]["ui"].to_string();
+    assert!(!page.contains("Changed to the template's"), "{page}");
+    assert_eq!(page.matches("Remove ").count(), 1, "only Admin, kept: {page}");
+}
+
 /// The things a review asks which stays of, by form id.
 fn asked_about(text: &str) -> Vec<String> {
     text.split("\"form-id\":\"").skip(1).map(|rest| rest.split('"').next().unwrap().to_string()).filter(|id| id.starts_with("choose-")).collect()
