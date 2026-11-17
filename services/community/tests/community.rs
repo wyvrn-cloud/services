@@ -2804,3 +2804,27 @@ async fn a_webhook_posts_as_discords_do_and_changes_and_takes_back_its_own_posts
     assert_eq!(http.post(&old).json(&json!({ "content": "x" })).send().await.unwrap().status(), 401);
 }
 
+
+#[tokio::test]
+async fn an_admin_chooses_the_rules_channel_and_members_are_told_which_it_is() {
+    let server = start_server("").await;
+    let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member]);
+    let rules = open_channel(&owner, "rules").await;
+    let general = open_channel(&owner, "general").await;
+    member.community("join", json!({})).await;
+    assert!(member.community("join", json!({})).await["body"].get("rules_channel").is_none());
+
+    // Only someone who manages channels chooses it.
+    let refused = member.community("update-channel", json!({ "channel": rules, "rules": true })).await;
+    assert_eq!(refused["body"]["code"], "e.p.trust.not-authorized", "{refused}");
+    owner.community("update-channel", json!({ "channel": rules, "rules": true })).await;
+    assert_eq!(member.community("join", json!({})).await["body"]["rules_channel"], rules.as_str());
+
+    // One at a time: another moves it; taking it off another changes nothing.
+    owner.community("update-channel", json!({ "channel": general, "rules": true })).await;
+    owner.community("update-channel", json!({ "channel": rules, "rules": false })).await;
+    assert_eq!(member.community("join", json!({})).await["body"]["rules_channel"], general.as_str());
+    owner.community("update-channel", json!({ "channel": general, "rules": false })).await;
+    assert!(member.community("join", json!({})).await["body"].get("rules_channel").is_none());
+}

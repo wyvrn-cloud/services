@@ -1660,6 +1660,11 @@ impl Store {
         Ok(())
     }
 
+    pub fn delete_setting(&self, name: &str) -> Result<()> {
+        self.db.lock().execute("DELETE FROM settings WHERE name = ?1", params![name])?;
+        Ok(())
+    }
+
     // --- Roles --------------------------------------------------------------------
 
     /// Every role, highest first, `everyone` last.

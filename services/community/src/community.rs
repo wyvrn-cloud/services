@@ -10,6 +10,8 @@ use crate::config::{CommunityConfig, VoiceConfig};
 use crate::store::{Channel, Invite, Member, Mention, Post, Report, Role, Store, Waiting};
 use wyvrn_service::profile::{Change, Changed, Kept};
 
+/// The setting naming the community's rules channel (`community`'s `rules_channel`).
+pub const RULES_CHANNEL: &str = "rules_channel";
 pub const PIURI: &str = "https://wyvrn.app/community/1.0";
 pub const JOIN: &str = "https://wyvrn.app/community/1.0/join";
 pub const LEAVE: &str = "https://wyvrn.app/community/1.0/leave";
@@ -544,6 +546,11 @@ impl Community {
             }
             if let Some(accepted) = self.store.rules_accepted(&member.did)? {
                 body["rules_accepted"] = json!(accepted);
+            }
+            // The channel an admin made the rules channel, where this member sees it:
+            // shown with a book in place of its #.
+            if let Some(id) = self.store.setting(RULES_CHANNEL)?.filter(|id| seen.contains(id)) {
+                body["rules_channel"] = json!(id);
             }
             if let Some(mut voice) = self.voice_defaults()? {
                 if voice["invites_to"].as_str().is_some_and(|id| !seen.contains(id)) {
@@ -1440,6 +1447,24 @@ impl Community {
                     let since = public.then(|| if given["history"].as_bool() == Some(true) { 0 } else { now });
                     self.store.set_web_channel(&channel.id, since)?;
                     self.audit(now, sender, "channel.web", Some(&channel.id), Some(json!({ "public": public, "history": given["history"].as_bool() == Some(true) })));
+                }
+                if let Some(given) = body.get("rules").filter(|v| !v.is_null()) {
+                    let Some(rules) = given.as_bool() else {
+                        return refuse(message, "e.p.msg.invalid-rules-channel", "rules is true or false.");
+                    };
+                    if channel.voice.is_some() {
+                        return refuse(message, "e.p.msg.invalid-rules-channel", "The rules channel is a text channel.");
+                    }
+                    if !self.powers(sender)?.has("manage_channels") {
+                        return refuse(message, "e.p.trust.not-authorized", "Choosing the rules channel takes Manage channels.");
+                    }
+                    let current = self.store.setting(RULES_CHANNEL)?;
+                    if rules {
+                        self.store.set_setting(RULES_CHANNEL, &channel.id)?;
+                    } else if current.as_deref() == Some(channel.id.as_str()) {
+                        self.store.delete_setting(RULES_CHANNEL)?;
+                    }
+                    self.audit(now, sender, "channel.rules", Some(&channel.id), Some(json!({ "rules": rules })));
                 }
                 if let Some(given) = body.get("slow_mode").filter(|v| !v.is_null()) {
                     if channel.voice.is_some() {
