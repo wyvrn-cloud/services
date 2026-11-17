@@ -2525,3 +2525,46 @@ async fn a_moderator_moves_someone_to_another_voice_channel_full_or_not() {
     rooms.sweep(&server.state.community, wyvrn_service::now() + wyvrn_community::voice::MOVE_GRACE + 5);
     assert_eq!(tell(&admin, "moderate", json!({ "channel": lounge, "participant": id, "mute": true })).await.unwrap()["body"]["code"], "e.p.msg.not-in-room");
 }
+
+#[tokio::test]
+async fn roles_are_dragged_into_order_where_the_app_draws_a_sortable_list() {
+    let server = start_server("").await;
+    let (owner, moderator) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &moderator]);
+    for peer in [&owner, &moderator] {
+        peer.community("join", json!({})).await;
+    }
+    let names = |body: &Value| body["roles"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let id_of = |body: &Value, name: &str| body["roles"].as_array().unwrap().iter().find(|r| r["name"] == name).unwrap()["id"].as_str().unwrap().to_string();
+
+    // An app that says nothing of sortable lists gets the arrows.
+    let plain = owner.workflow("start", json!({ "template_id": "roles", "instance_id": "r0" })).await;
+    assert!(!plain["body"]["ui"].to_string().contains("sortable-list"), "{plain}");
+    assert!(plain["body"]["ui"].to_string().contains("\"↑\""));
+    advance(&owner, "r0", "create", json!({ "name": "Artist" })).await;
+    advance(&owner, "r0", "back", json!({})).await;
+    advance(&owner, "r0", "done", json!({})).await;
+
+    // One that says it can draw them gets one, highest first, and sends the order back.
+    let sorting = owner.workflow("start", json!({ "template_id": "roles", "instance_id": "r1", "capabilities": ["ui:sortable-list"] })).await;
+    let ui = sorting["body"]["ui"].to_string();
+    assert!(ui.contains("\"sortable-list\"") && !ui.contains("\"↑\""), "{ui}");
+    let told = owner.community("join", json!({})).await["body"].clone();
+    assert_eq!(names(&told), ["Admin", "Moderator", "Artist", "everyone"]);
+    let (artist, admin, moderator_role) = (id_of(&told, "Artist"), id_of(&told, "Admin"), id_of(&told, "Moderator"));
+    let saved = advance(&owner, "r1", "reorder", json!({ "order": [artist, admin, moderator_role] })).await;
+    assert!(saved["body"]["ui"].to_string().contains("Saved the order."), "{saved}");
+    assert_eq!(names(&owner.community("join", json!({})).await["body"]), ["Artist", "Admin", "Moderator", "everyone"]);
+    advance(&owner, "r1", "reorder", json!({ "order": [admin, moderator_role, artist] })).await;
+    assert_eq!(names(&owner.community("join", json!({})).await["body"]), ["Admin", "Moderator", "Artist", "everyone"]);
+    assert_eq!(advance(&owner, "r1", "reorder", json!({ "order": [admin, artist] })).await["body"]["code"], "guard_failed");
+
+    // Someone who manages roles moves only those below their own; theirs and above stay.
+    owner.workflow("start", json!({ "template_id": "member-roles", "instance_id": "m1", "context": { "member": moderator.did() } })).await;
+    advance(&owner, "m1", "save", json!({ format!("role-{moderator_role}"): true })).await;
+    advance(&owner, "r1", "edit", json!({ "role": moderator_role })).await;
+    advance(&owner, "r1", "save", json!({ "name": "Moderator", "perm-manage_roles": true, "perm-kick_members": true, "perm-manage_messages": true })).await;
+    let theirs = moderator.workflow("start", json!({ "template_id": "roles", "instance_id": "r2", "capabilities": ["ui:sortable-list"] })).await;
+    assert!(theirs["body"]["ui"].to_string().contains("\"locked\":true"), "{theirs}");
+    assert_eq!(advance(&moderator, "r2", "reorder", json!({ "order": [moderator_role, admin, artist] })).await["body"]["code"], "not_authorized");
+}

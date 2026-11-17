@@ -167,6 +167,16 @@ pub fn is_template(id: &str) -> bool {
     templates().iter().any(|(known, _, _)| *known == id)
 }
 
+/// The capability (workflow/1.0's `status` `capabilities`) an app says it has to
+/// draw a `sortable-list` (Workflow UI's sortable list, wyvrn-protocols'
+/// `workflow-ui-sortable-list/1.0`).
+pub const SORTABLE_LIST: &str = "ui:sortable-list";
+
+/// Whether the app running `flow` said it can draw `capability`.
+fn can_draw(flow: &Flow, capability: &str) -> bool {
+    flow.data["capabilities"].as_array().is_some_and(|all| all.iter().any(|c| c == capability))
+}
+
 fn button(label: &str, event: &str, input: Value) -> Value {
     json!({ "type": "submit-button", "label": label, "event": event, "input": input })
 }
@@ -259,6 +269,25 @@ impl Community {
             items.push(json!({ "type": "pass", "text": note }));
         }
         let lowest_movable = roles.iter().filter(|role| role.id != EVERYONE_ROLE).map(|role| role.position).min().unwrap_or(0);
+        let sortable = can_draw(flow, SORTABLE_LIST);
+        let ranked: Vec<&RoleDef> = roles.iter().filter(|role| role.id != EVERYONE_ROLE).collect();
+        if sortable && ranked.iter().any(|role| powers.above(role.position)) {
+            // Highest first; a role this person doesn't outrank stays where it is.
+            let entries: Vec<Value> = ranked
+                .iter()
+                .map(|role| {
+                    let mut entry = json!({ "value": role.id, "label": role.name });
+                    if !powers.above(role.position) {
+                        entry["locked"] = json!(true);
+                    }
+                    entry
+                })
+                .collect();
+            items.push(json!({ "type": "form", "children": [
+                { "type": "sortable-list", "form-id": "order", "label": "Rank: drag a role higher or lower (everyone is always last)", "items": entries },
+                button("Save the order", "reorder", json!({}))
+            ] }));
+        }
         for role in &roles {
             let count = if role.id == EVERYONE_ROLE { None } else { Some(held.iter().filter(|(_, id)| *id == role.id).count()) };
             let mut text = match (&role.icon, count) {
@@ -272,7 +301,8 @@ impl Community {
             let mut row = vec![json!({ "type": "text", "text": text })];
             if powers.above(role.position) || (role.id == EVERYONE_ROLE && powers.has("manage_roles") && (powers.owner || powers.rank > 0)) {
                 row.push(button("Edit", "edit", json!({ "role": role.id })));
-                if role.id != EVERYONE_ROLE {
+                // (Dragged into order, below, where the app draws a sortable list.)
+                if role.id != EVERYONE_ROLE && !sortable {
                     // Raised only past a role still below them; lowered only above everyone.
                     let above = roles.iter().filter(|other| other.id != EVERYONE_ROLE && other.position > role.position).map(|other| other.position).min();
                     if above.is_some_and(|position| powers.above(position)) {
@@ -290,7 +320,7 @@ impl Community {
             { "type": "text-input", "form-id": "name", "label": "New role", "placeholder": "Artist", "required": true },
             button("Add role", "create", json!({}))
         ] }));
-        let mut events = vec!["edit", "create", "raise", "lower", "done"];
+        let mut events = vec!["edit", "create", "raise", "lower", "reorder", "done"];
         if powers.owner {
             items.push(json!({ "type": "divider" }));
             items.push(json!({ "type": "form", "children": [
@@ -588,7 +618,12 @@ impl Community {
             DISCORD_IMPORT_FLOW => "link",
             _ => "roles",
         };
-        let flow = Flow { id: wanted.into(), owner: member.did.clone(), template: template.into(), context, state: state.into(), data: json!({}), status: "active".into(), updated: now };
+        // What the app says it can draw (workflow/1.0's `capabilities`), kept with the flow.
+        let data = match body.get("capabilities").filter(|c| c.is_array()) {
+            Some(capabilities) => json!({ "capabilities": capabilities }),
+            None => json!({}),
+        };
+        let flow = Flow { id: wanted.into(), owner: member.did.clone(), template: template.into(), context, state: state.into(), data, status: "active".into(), updated: now };
         self.store.save_flow(&flow).map_err(failed)?;
         self.flow_status(&flow).map(|status| (format!("{P}status"), status))
     }
@@ -684,6 +719,29 @@ impl Community {
                 order.swap(at, other);
                 self.store.rank_roles(&order.iter().map(|r| r.id.clone()).collect::<Vec<_>>()).map_err(failed)?;
                 self.audit(now, &flow.owner, "role.rank", Some(&role.id), Some(json!({ "moved": event })));
+                true
+            }
+            (ROLES, "list", "reorder") => {
+                // Highest first, every role but everyone, each once; one this person
+                // doesn't outrank where it was.
+                let held: Vec<RoleDef> = self.store.roles().map_err(failed)?.into_iter().filter(|r| r.id != EVERYONE_ROLE).collect();
+                let given: Vec<String> = input["order"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+                let mut sorted_given = given.clone();
+                sorted_given.sort();
+                let mut sorted_held: Vec<String> = held.iter().map(|r| r.id.clone()).collect();
+                sorted_held.sort();
+                if sorted_given != sorted_held {
+                    return Err(refused("The order names each role once, and no others."));
+                }
+                for (at, role) in held.iter().enumerate() {
+                    if !powers.above(role.position) && given.get(at) != Some(&role.id) {
+                        return Err(not_allowed("You can only rank roles below your own."));
+                    }
+                }
+                let lowest_first: Vec<String> = given.iter().rev().cloned().collect();
+                self.store.rank_roles(&lowest_first).map_err(failed)?;
+                self.audit(now, &flow.owner, "role.rank", None, Some(json!({ "order": given })));
+                flow.data["note"] = json!("Saved the order.");
                 true
             }
             (ROLES, "list", "hand_over") => {

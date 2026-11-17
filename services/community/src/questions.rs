@@ -275,7 +275,17 @@ impl Community {
             },
             _ => None,
         };
-        if let Some(flow) = flow {
+        if let Some(mut flow) = flow {
+            // What the app says it can draw, as it says it again.
+            if let Some(capabilities) = body.get("capabilities").filter(|c| c.is_array()) {
+                if flow.data["capabilities"] != *capabilities {
+                    if !flow.data.is_object() {
+                        flow.data = json!({});
+                    }
+                    flow.data["capabilities"] = capabilities.clone();
+                    let _ = self.store.save_flow(&flow);
+                }
+            }
             let answer = match kind {
                 "status" => self.flow_status_answer(&flow),
                 "cancel" => self.cancel_flow(flow, now),
