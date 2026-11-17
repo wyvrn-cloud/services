@@ -2448,6 +2448,32 @@ async fn an_owner_imports_a_discord_template_and_again_once_it_has_changed() {
     assert_eq!(channel(&member.community("join", json!({})).await["body"], "general")["topic"], "Ours now");
 }
 
+#[tokio::test]
+async fn an_import_past_the_channel_limit_says_what_it_left_out_and_brings_it_next_time() {
+    let template = Arc::new(std::sync::Mutex::new(discord_template("Say hi", "announcements", true)));
+    let discord = fake_discord(template.clone()).await;
+    let server = start_server(&format!("discord_api = \"{discord}\"\nmax_channels = 4")).await;
+    let owner = Peer::start(&server).await;
+    server.admit(&[&owner]);
+    owner.community("join", json!({})).await;
+
+    owner.workflow("start", json!({ "template_id": "discord-import", "instance_id": "l1" })).await;
+    let read = advance(&owner, "l1", "read", json!({ "link": "TESTCODE1234" })).await;
+    let review = read["body"]["ui"].to_string();
+    assert!(review.contains("may have 4 channels and has 0, so only 4 of the template's 6 new channels can be made"), "{review}");
+    let done = advance(&owner, "l1", "import", json!({ "choose-community-guild": "template", "choose-role-0": "template" })).await;
+    assert_eq!(done["body"]["state"], "done", "{done}");
+    let said = done["body"]["ui"].to_string();
+    assert!(said.contains("2 channels weren't made: this community may have only 4 channels"), "{said}");
+    assert_eq!(owner.community("join", json!({})).await["body"]["channels"].as_array().unwrap().len(), 4);
+
+    // Those left out are still to be made, next time.
+    owner.workflow("start", json!({ "template_id": "discord-import", "instance_id": "l2" })).await;
+    let review = advance(&owner, "l2", "read", json!({ "link": "TESTCODE1234" })).await["body"]["ui"].to_string();
+    assert!(review.contains("To be made: 0 roles, 0 categories, 2 channels"), "{review}");
+    assert!(review.contains("has 4, so only 0 of the template's 2 new channels"), "{review}");
+}
+
 /// The things a review asks which stays of, by form id.
 fn asked_about(text: &str) -> Vec<String> {
     text.split("\"form-id\":\"").skip(1).map(|rest| rest.split('"').next().unwrap().to_string()).filter(|id| id.starts_with("choose-")).collect()

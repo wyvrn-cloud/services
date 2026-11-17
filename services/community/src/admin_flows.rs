@@ -26,7 +26,7 @@ pub const ONBOARDING_SETUP_FLOW: &str = "onboarding-setup";
 pub const ONBOARDING_FLOW: &str = "onboarding";
 pub const VERSION: &str = "1.0";
 const P: &str = "https://didcomm.org/workflow/1.0/";
-const MAX_ROLES: usize = 250;
+pub(crate) const MAX_ROLES: usize = 250;
 const MAX_ROLE_NAME: usize = 100;
 
 /// Each template: its id, title, states and the events that move between them.

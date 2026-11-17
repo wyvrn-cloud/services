@@ -619,6 +619,9 @@ impl Community {
             "To be made: {} roles, {} categories, {} channels. Already here: {} roles, {} categories, {} channels. Channels and roles are put in the template's order.",
             count("role", true), count("category", true), count("channel", true), count("role", false), count("category", false), count("channel", false)
         ) }));
+        if let Some(warning) = self.room_warning(plan) {
+            items.push(json!({ "type": "information", "text": warning }));
+        }
         let mut fields: Vec<Value> = Vec::new();
 
         let changing: Vec<&Planned> = plan.items.iter().filter(|i| !i.take.is_empty()).collect();
@@ -667,6 +670,27 @@ impl Community {
         }
         items.push(json!({ "type": "submit-button", "label": "Back", "event": "back", "input": {} }));
         Value::Array(items)
+    }
+
+    /// What of the template there's no room for here, if anything: channels past
+    /// the community's limit (which a hosted community's host sets) and roles past
+    /// 250. Those are left out, and come over on importing again once there's room.
+    fn room_warning(&self, plan: &Plan) -> Option<String> {
+        let new = |kind: &str| plan.items.iter().filter(|i| i.kind == kind && (i.is_new() || i.deleted_here)).count();
+        let open = self.store.channels().ok()?.iter().filter(|c| !c.closed).count();
+        let room = self.config.max_channels.saturating_sub(open);
+        let roles_room = crate::admin_flows::MAX_ROLES.saturating_sub(self.store.roles().ok()?.len());
+        let mut said = Vec::new();
+        if new("channel") > room {
+            said.push(format!(
+                "This community may have {} channels and has {open}, so only {room} of the template's {} new channels can be made: the first ones, in the template's order. Whoever hosts the community can let it have more; then import the template again and the rest come over.",
+                self.config.max_channels, new("channel")
+            ));
+        }
+        if new("role") > roles_room {
+            said.push(format!("A community may have {} roles, so only {roles_room} of the template's {} new roles can be made.", crate::admin_flows::MAX_ROLES, new("role")));
+        }
+        (!said.is_empty()).then(|| said.join(" "))
     }
 
     /// Advances the import: `read` (the template fetched, as the server put it in
@@ -719,6 +743,7 @@ impl Community {
     fn import(&self, owner: &str, template: &Value, plan: &Plan, choice: &HashMap<String, bool>, input: &Value, now: i64) -> anyhow::Result<String> {
         let mut ids: HashMap<String, String> = HashMap::new();
         let (mut made, mut changed, mut removed) = (0, 0, 0);
+        let (mut no_room_channels, mut no_room_roles) = (0, 0);
         let resolve = |value: &Value, ids: &HashMap<String, String>| -> Value {
             match value {
                 Value::String(text) if text.starts_with("new:") => json!(ids.get(text).cloned().unwrap_or_default()),
@@ -795,7 +820,14 @@ impl Community {
                             made += 1;
                             local
                         }
-                        None => continue,
+                        None => {
+                            match item.kind {
+                                "channel" => no_room_channels += 1,
+                                "role" => no_room_roles += 1,
+                                _ => {}
+                            }
+                            continue;
+                        }
                     },
                 };
                 ids.insert(format!("new:{}:{}", item.kind, item.source_id), local.clone());
@@ -809,8 +841,18 @@ impl Community {
         let code = template["code"].as_str().unwrap_or_default();
         let name = template["name"].as_str().unwrap_or_default();
         self.store.set_setting("discord_template", &json!({ "code": code, "name": name, "imported_at": now, "guild": template["serialized_source_guild"].as_object().map(|g| g.iter().filter(|(k, _)| *k != "roles" && *k != "channels").map(|(k, v)| (k.clone(), v.clone())).collect::<Map<_, _>>()) }).to_string())?;
-        self.audit(now, owner, "community.import", None, Some(json!({ "template": code, "name": name, "made": made, "changed": changed, "removed": removed })));
-        Ok(format!("From “{name}”: {made} made, {changed} changed, {removed} removed."))
+        self.audit(now, owner, "community.import", None, Some(json!({ "template": code, "name": name, "made": made, "changed": changed, "removed": removed, "no_room": { "channels": no_room_channels, "roles": no_room_roles } })));
+        let mut report = format!("From “{name}”: {made} made, {changed} changed, {removed} removed.");
+        if no_room_channels > 0 {
+            report.push_str(&format!(
+                " {no_room_channels} channels weren't made: this community may have only {} channels. Once it may have more, import the template again and they come over.",
+                self.config.max_channels
+            ));
+        }
+        if no_room_roles > 0 {
+            report.push_str(&format!(" {no_room_roles} roles weren't made: a community may have only {} roles.", crate::admin_flows::MAX_ROLES));
+        }
+        Ok(report)
     }
 
     /// A channel name not yet taken (`name`, else `name-2`, ...), but by `except`.
@@ -842,7 +884,7 @@ impl Community {
     fn make(&self, kind: &str, want: &Value, owner: &str, now: i64) -> anyhow::Result<Option<String>> {
         match kind {
             "role" => {
-                if self.store.roles()?.len() >= 250 {
+                if self.store.roles()?.len() >= crate::admin_flows::MAX_ROLES {
                     return Ok(None);
                 }
                 let id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
