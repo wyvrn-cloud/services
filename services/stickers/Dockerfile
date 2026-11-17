@@ -11,13 +11,15 @@
 #                   --secret id=ca_bundle,src=/path/to/ca.pem
 # Neither ends up in any image layer.
 # ---------------------------------------------------------------------------
-# The shared base: the same in every service's Dockerfile, word for word, so that
+# The shared build: the same in every service's Dockerfile, word for word, so that
 # Docker builds it once and every other service's build finds it already made
-# (scripts/check-dockerfiles.sh keeps them the same). It compiles what every
-# service has in common -- the dependencies of crates/wyvrn-service, wyvrn-didcomm
-# among them -- as an image layer, which a change to the code leaves alone: it is
-# made again only when a Cargo.toml or Cargo.lock changes. What a service needs
-# beyond that, and its own code, is compiled in its own stage below.
+# (scripts/check-dockerfiles.sh keeps them the same). It compiles every service
+# at once: their dependencies as one image layer, made again only when a
+# Cargo.toml or Cargo.lock changes, and then their code. Each service's image
+# takes its own binary from it. (Built one service at a time, each of the nine
+# compiled the shared crates and most dependencies again.)
+#
+# As many jobs as the builder has cores; --build-arg CARGO_JOBS=2 for a small one.
 # ---------------------------------------------------------------------------
 FROM rust:1-slim-bookworm AS chef
 
@@ -42,7 +44,9 @@ COPY wyvrn-services/crates crates
 COPY wyvrn-services/services services
 RUN cargo chef prepare --recipe-path recipe.json
 
-FROM chef AS base
+# Every service's dependencies.
+FROM chef AS deps
+ARG CARGO_JOBS
 COPY wyvrn-sign-in/Cargo.toml wyvrn-sign-in/Cargo.lock /build/wyvrn-sign-in/
 COPY wyvrn-sign-in/src /build/wyvrn-sign-in/src
 COPY --from=planner /build/wyvrn-services/recipe.json recipe.json
@@ -52,33 +56,22 @@ RUN --mount=type=secret,id=github_token,required=false \
     --mount=type=secret,id=ca_bundle,required=false \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo-secrets cargo chef cook --release --locked -j 2 -p wyvrn-service --recipe-path recipe.json
-# --------------------------- end of the shared base ---------------------------
+    cargo-secrets cargo chef cook --release --locked ${CARGO_JOBS:+-j $CARGO_JOBS} -p wyvrn-announce -p wyvrn-cards -p wyvrn-claude -p wyvrn-community -p wyvrn-community-host -p wyvrn-did-host -p wyvrn-files -p wyvrn-relay -p wyvrn-stickers --recipe-path recipe.json
 
-# This service's own dependencies, beyond the shared base: an image layer of its
-# own, made again only when a manifest or the lock file changes, so that a change
-# to the code compiles the code alone.
-FROM base AS deps
-RUN --mount=type=secret,id=github_token,required=false \
-    --mount=type=secret,id=ca_bundle,required=false \
-    --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    cargo-secrets cargo chef cook --release --locked -j 2 -p wyvrn-stickers --recipe-path recipe.json
-
+# Every service's code, on top of everything it depends on.
 FROM deps AS builder
+ARG CARGO_JOBS
 COPY wyvrn-services/Cargo.toml wyvrn-services/Cargo.lock ./
 COPY wyvrn-services/.cargo .cargo
-# The whole workspace: cargo needs every member's manifest to read the lock file,
-# and this service's own crates are among them.
+# The whole workspace: cargo needs every member's manifest to read the lock file.
 COPY wyvrn-services/crates crates
 COPY wyvrn-services/services services
-# Its code, on top of everything it depends on.
 RUN --mount=type=secret,id=github_token,required=false \
     --mount=type=secret,id=ca_bundle,required=false \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo-secrets cargo build --release --locked -j 2 -p wyvrn-stickers \
-    && cp target/release/wyvrn-stickers /usr/local/bin/wyvrn-stickers
+    cargo-secrets cargo build --release --locked ${CARGO_JOBS:+-j $CARGO_JOBS} -p wyvrn-announce -p wyvrn-cards -p wyvrn-claude -p wyvrn-community -p wyvrn-community-host -p wyvrn-did-host -p wyvrn-files -p wyvrn-relay -p wyvrn-stickers
+# ---------------------------- end of the shared build ----------------------------
 
 FROM debian:bookworm-slim
 # ca-certificates: resolving the DIDs of whoever writes to the service, and answering them.
@@ -86,7 +79,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --home /app stickers
 WORKDIR /app
-COPY --from=builder /usr/local/bin/wyvrn-stickers /usr/local/bin/wyvrn-stickers
+COPY --from=builder /build/wyvrn-services/target/release/wyvrn-stickers /usr/local/bin/wyvrn-stickers
 COPY wyvrn-services/services/stickers/config config
 # The service's own identity, and every pack it hosts.
 RUN mkdir -p data && chown stickers data
