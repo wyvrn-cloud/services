@@ -2482,3 +2482,46 @@ fn what_came_from_a_discord_template_is_kept_in_mysql_too() {
     assert_eq!(store.search(&["plan".into()], None, None, Some(&["c3".to_string()]), None, 10).unwrap().len(), 0);
     assert_eq!(store.search(&["plan".into()], None, None, Some(&["c2".to_string(), "c3".to_string()]), None, 10).unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn a_moderator_moves_someone_to_another_voice_channel_full_or_not() {
+    let server = voice_server().await;
+    let (admin, member, other) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member, &other]);
+    let lounge = voice_channel(&admin, "lounge", json!({})).await;
+    let small = voice_channel(&admin, "small", json!({ "limit": 1 })).await;
+    voice(&other, "join", json!({ "channel": small, "device": "o" })).await;
+    let joined = voice(&member, "join", json!({ "channel": lounge, "device": "m" })).await;
+    let id = joined["body"]["participant"].as_str().unwrap().to_string();
+    let mut live = Live::open(&admin, &server).await;
+    live.send(&admin, "watch-presence", json!({})).await;
+    live.next_of(&admin, "presence").await;
+
+    // Only a moderator moves, and only to another open voice channel.
+    assert_eq!(tell(&member, "moderate", json!({ "channel": lounge, "participant": id, "move_to": small })).await.unwrap()["body"]["code"], "e.p.trust.not-authorized");
+    assert_eq!(tell(&admin, "moderate", json!({ "channel": lounge, "participant": id, "move_to": "nowhere" })).await.unwrap()["body"]["code"], "e.p.msg.unknown-channel");
+    assert!(tell(&admin, "moderate", json!({ "channel": lounge, "participant": id, "move_to": small })).await.is_none());
+    // Everyone watching is told where they are going: their app goes.
+    let told = loop {
+        let presence = live.next_of(&admin, "presence").await;
+        if let Some(entry) = presence["body"]["channels"].as_array().unwrap().iter().find(|c| c["channel"] == lounge.as_str()) {
+            break entry["participants"].clone();
+        }
+    };
+    assert_eq!(told[0]["moving_to"], small.as_str(), "{told}");
+    // Full as it is, they get in, and are out of the lounge.
+    let moved = voice(&member, "join", json!({ "channel": small, "device": "m" })).await;
+    assert_eq!(kind(&moved), "joined", "{moved}");
+    let rooms = &server.state.rooms;
+    // Someone else not moved still finds it full.
+    let third = Peer::start(&server).await;
+    server.admit(&[&admin, &third]);
+    assert_eq!(voice(&third, "join", json!({ "channel": small })).await["body"]["code"], "e.p.req.room-full");
+
+    // Moved, and not gone there in time: taken out where they were.
+    let back = voice(&member, "join", json!({ "channel": lounge, "device": "m" })).await;
+    let id = back["body"]["participant"].as_str().unwrap().to_string();
+    tell(&admin, "moderate", json!({ "channel": lounge, "participant": id, "move_to": small })).await;
+    rooms.sweep(&server.state.community, wyvrn_service::now() + wyvrn_community::voice::MOVE_GRACE + 5);
+    assert_eq!(tell(&admin, "moderate", json!({ "channel": lounge, "participant": id, "mute": true })).await.unwrap()["body"]["code"], "e.p.msg.not-in-room");
+}

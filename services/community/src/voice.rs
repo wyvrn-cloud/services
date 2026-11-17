@@ -35,6 +35,8 @@ pub const SILENT_FOR: i64 = 60;
 /// long each answer lasts if it can't ask.
 pub const REVALIDATE_SECONDS: u64 = 15;
 pub const GRANT_SECONDS: i64 = 60;
+/// How long someone moved to another voice channel has to get there.
+pub const MOVE_GRACE: i64 = 15;
 /// As many as one `invite` asks.
 const MAX_INVITEES: usize = 10;
 /// How long a ring lasts.
@@ -70,6 +72,9 @@ pub struct Participant {
     pub server_muted: bool,
     pub sharing: Sharing,
     pub seen: i64,
+    /// Moved by a moderator: the voice channel their app is to join instead, and
+    /// since when. Taken out of this one if it hasn't within [`MOVE_GRACE`].
+    pub moving_to: Option<(String, i64)>,
 }
 
 #[derive(Debug, Default)]
@@ -269,6 +274,9 @@ impl Rooms {
                 if !p.room_key.is_empty() {
                     entry["room_key"] = json!(p.room_key);
                 }
+                if let Some((to, _)) = &p.moving_to {
+                    entry["moving_to"] = json!(to);
+                }
                 entry
             })
             .collect()
@@ -295,6 +303,10 @@ impl Rooms {
                 // Someone holding a live connection is still there, whatever they last
                 // said: the one they joined over, or any of theirs if they joined otherwise.
                 room.participants.retain(|_, p| {
+                    // Moved, and not gone where they were moved: out.
+                    if p.moving_to.as_ref().is_some_and(|(_, since)| now - since > MOVE_GRACE) {
+                        return false;
+                    }
                     now - p.seen <= SILENT_FOR
                         || match p.live {
                             Some(live) => live_ids.contains(&live),
@@ -401,7 +413,13 @@ impl Rooms {
                 if community.rules_owed_by(sender)? {
                     return refuse(message, "e.p.msg.rules-not-accepted", "Accept this community's rules first.");
                 }
-                if !community.may_in(sender, &channel, "connect")? {
+                // Moved here by a moderator (`moderate`'s `move_to`): let in, as on Discord,
+                // whatever its limit and Connect.
+                let inner_moved_here = {
+                    let device = body["device"].as_str().unwrap_or_default();
+                    self.lock().rooms.values().flat_map(|room| room.participants.values()).any(|p| p.did == sender && p.device == device && p.moving_to.as_ref().is_some_and(|(to, _)| *to == channel.id))
+                };
+                if !inner_moved_here && !community.may_in(sender, &channel, "connect")? {
                     return refuse(message, "e.p.trust.not-authorized", "You can't join this voice channel.");
                 }
                 let transport = settings["transport"].as_str().map(str::to_string).or_else(|| community.voice_defaults().ok().flatten().and_then(|v| v["transport"].as_str().map(str::to_string))).unwrap_or_else(|| "moq".into());
@@ -419,7 +437,9 @@ impl Rooms {
                         room.participants.retain(|_, p| p.did != sender || p.device == device);
                     }
                     let held = room.participants.values().find(|p| p.did == sender && p.device == device).map(|p| p.id.clone());
-                    let full = settings["limit"].as_i64().is_some_and(|limit| held.is_none() && room.participants.len() as i64 >= limit);
+                    // (Someone a moderator moved here comes in whatever the limit, as on Discord.)
+                    let moved_here = inner_moved_here;
+                    let full = !moved_here && settings["limit"].as_i64().is_some_and(|limit| held.is_none() && room.participants.len() as i64 >= limit);
                     if full {
                         drop(inner);
                         return refuse(message, "e.p.req.room-full", "That voice channel is full.");
@@ -448,6 +468,7 @@ impl Rooms {
                                 server_muted: false,
                                 sharing: Sharing::default(),
                                 seen: now,
+                                moving_to: None,
                             };
                             room.participants.insert(p.id.clone(), p.clone());
                             p
@@ -621,18 +642,48 @@ impl Rooms {
                     return refuse(message, "e.p.trust.not-authorized", "Moderating a voice channel takes Mute and remove people in voice channels.");
                 }
                 let target = self.lock().rooms.get(channel).and_then(|room| room.participants.get(participant)).map(|p| p.did.clone());
-                if let Some(target) = target.filter(|target| target != sender) {
+                if let Some(target) = target.clone().filter(|target| target != sender) {
                     if !community.outranks(&community.powers(sender)?, &target)? {
                         return refuse(message, "e.p.trust.not-authorized", "You can only moderate someone ranked below you.");
                     }
                 }
+                // Moved to another voice channel: one the mover moderates too, and the
+                // one moved sees.
+                let move_to = match body["move_to"].as_str() {
+                    None => None,
+                    Some(to) => {
+                        let Some((there, _)) = voice_channel(to)? else {
+                            return refuse(message, "e.p.msg.unknown-channel", "There is no such voice channel to move them to.");
+                        };
+                        if there.closed || there.id == channel {
+                            return refuse(message, "e.p.msg.unknown-channel", "That isn't another open voice channel.");
+                        }
+                        if !community.may_in(sender, &there, "moderate_voice")? {
+                            return refuse(message, "e.p.trust.not-authorized", "Moving someone takes Mute and remove people in voice channels in both channels.");
+                        }
+                        if let Some(target) = &target {
+                            if !community.sees_id(target, &there.id)? {
+                                return refuse(message, "e.p.trust.not-authorized", "They can't see that voice channel.");
+                            }
+                        }
+                        Some(there.id)
+                    }
+                };
                 let found = {
                     let mut inner = self.lock();
                     let Some(room) = inner.rooms.get_mut(channel) else {
                         drop(inner);
                         return refuse(message, "e.p.msg.not-in-room", "Nobody is in that voice channel.");
                     };
-                    if body["remove"] == true {
+                    if let Some(to) = &move_to {
+                        match room.participants.get_mut(participant) {
+                            Some(p) => {
+                                p.moving_to = Some((to.clone(), now));
+                                true
+                            }
+                            None => false,
+                        }
+                    } else if body["remove"] == true {
                         room.participants.remove(participant).is_some()
                     } else if let Some(p) = room.participants.get_mut(participant) {
                         if let Some(mute) = body["mute"].as_bool() {
