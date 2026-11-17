@@ -41,6 +41,7 @@ pub const INVITES_REQUEST: &str = "https://wyvrn.app/community/1.0/invites-reque
 pub const INVITES: &str = "https://wyvrn.app/community/1.0/invites";
 pub const SET_VOICE: &str = "https://wyvrn.app/community/1.0/set-voice";
 pub const SET_WEB: &str = "https://wyvrn.app/community/1.0/set-web";
+pub const SET_WELCOME: &str = "https://wyvrn.app/community/1.0/set-welcome";
 pub const RULES: &str = "https://wyvrn.app/community/1.0/rules";
 pub const ACCEPT_RULES: &str = "https://wyvrn.app/community/1.0/accept-rules";
 pub const SET_RULES: &str = "https://wyvrn.app/community/1.0/set-rules";
@@ -570,6 +571,11 @@ impl Community {
             if let Some(url) = &self.web_url {
                 body["web"] = crate::web::community_body(url, &self.store);
             }
+            // How newcomers are welcomed, to whoever may change it.
+            if powers.has("manage_community") {
+                let set = self.welcome_setting()?;
+                body["welcome"] = json!({ "channel": set["channel"], "lines": set["lines"], "built_in": crate::welcome::BUILT_IN });
+            }
             if let Some(level) = self.store.notify_level(&member.did)? {
                 let following: Vec<String> = self.store.followed_threads(&member.did)?.into_iter().filter(|thread| self.store.post_by_id(thread).ok().flatten().is_some_and(|post| seen.contains(&post.channel))).collect();
                 body["notifications"] = json!({ "level": level, "following": following });
@@ -940,6 +946,8 @@ impl Community {
             self.store.set_joined(sender, true)?;
             let member = self.store.member(sender)?.expect("just let in");
             let mut outcome = Outcome::reply(reply_to(message, COMMUNITY, self.community(&member)?));
+            // Said in the welcome channel, where there is one.
+            outcome.posted = self.welcome(sender, now)?;
             if was_waiting.is_some() {
                 outcome.notices = self.admins_told()?;
             }
@@ -1750,6 +1758,31 @@ impl Community {
 
             INVITES_REQUEST => Ok(Outcome::reply(reply_to(message, INVITES, self.invites_body(&member, now)?))),
 
+            SET_WELCOME => {
+                if !self.powers(sender)?.has("manage_community") {
+                    return refuse(message, "e.p.trust.not-authorized", "Welcome messages take Manage the community.");
+                }
+                let current = self.welcome_setting()?;
+                let channel = match body.get("channel") {
+                    None => current["channel"].as_str().map(str::to_string),
+                    Some(Value::Null) => None,
+                    Some(given) => match given.as_str().map(|id| self.store.channel(id)).transpose()?.flatten() {
+                        Some(channel) if !channel.closed && channel.voice.is_none() => Some(channel.id),
+                        _ => return refuse(message, "e.p.msg.invalid-welcome", "The welcome goes in an open text channel."),
+                    },
+                };
+                let lines = match body.get("lines") {
+                    None => current["lines"].as_array().map(|lines| lines.iter().filter_map(Value::as_str).map(str::to_string).collect()),
+                    Some(given) => match crate::welcome::read_lines(given) {
+                        Ok(lines) => lines,
+                        Err(why) => return refuse(message, "e.p.msg.invalid-welcome", why),
+                    },
+                };
+                self.set_welcome(channel.as_deref(), lines)?;
+                self.audit(now, sender, "community.welcome", None, Some(body.clone()));
+                Ok(Outcome::reply(reply_to(message, COMMUNITY, self.community(&member)?)))
+            }
+
             SET_WEB => {
                 if !self.powers(sender)?.has("manage_community") {
                     return refuse(message, "e.p.trust.not-authorized", "The community on the web takes Manage the community.");
@@ -2065,6 +2098,7 @@ impl Community {
                             }
                             let admitted = self.store.member(did)?.expect("just let in");
                             let mut outcome = Outcome::reply(reply_to(message, MEMBERS, self.members_for(&member)?));
+                            outcome.posted = self.welcome(did, now)?;
                             outcome.notices.push((did.to_string(), json!({ "type": COMMUNITY, "body": self.community(&admitted)? })));
                             outcome.notices.extend(self.admins_told()?);
                             return Ok(outcome);

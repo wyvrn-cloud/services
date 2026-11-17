@@ -2828,3 +2828,39 @@ async fn an_admin_chooses_the_rules_channel_and_members_are_told_which_it_is() {
     owner.community("update-channel", json!({ "channel": general, "rules": false })).await;
     assert!(member.community("join", json!({})).await["body"].get("rules_channel").is_none());
 }
+
+#[tokio::test]
+async fn a_newcomer_is_welcomed_in_the_channel_an_admin_chose_in_lines_of_their_own() {
+    let server = start_server("").await;
+    let (owner, ana, ben) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner]);
+    let lobby = open_channel(&owner, "lobby").await;
+    owner.community("join", json!({})).await;
+
+    // Off to begin with: nothing is said.
+    let made = owner.community("create-invite", json!({ "uses": 5 })).await;
+    let code = made["body"]["created"].as_str().unwrap().to_string();
+    let told = owner.community("join", json!({})).await["body"].clone();
+    assert!(told["welcome"]["channel"].is_null(), "{told}");
+    assert_eq!(told["welcome"]["built_in"].as_array().unwrap().len(), 12);
+    assert_eq!(kind(&ana.community("join", json!({ "invite": code })).await), "community");
+    assert_eq!(owner.community("history-request", json!({ "channel": lobby })).await["body"]["messages"].as_array().unwrap().len(), 0);
+
+    // In #lobby, in a line of the admin's own; a member may not set it, and a line says {name}.
+    assert_eq!(ana.community("set-welcome", json!({ "channel": lobby })).await["body"]["code"], "e.p.trust.not-authorized");
+    assert_eq!(owner.community("set-welcome", json!({ "lines": ["Hi!"] })).await["body"]["code"], "e.p.msg.invalid-welcome");
+    let set = owner.community("set-welcome", json!({ "channel": lobby, "lines": ["Pillows out for {name}!"] })).await;
+    assert_eq!(set["body"]["welcome"]["channel"], lobby.as_str(), "{set}");
+    ben.community("join", json!({ "invite": code })).await;
+    let said = owner.community("history-request", json!({ "channel": lobby })).await["body"]["messages"][0].clone();
+    // (Its name isn't known yet as it comes in: an app shows it by its member id.)
+    assert_eq!(said["content"], "Pillows out for A new member!", "{said}");
+    assert_eq!(said["welcome"]["member"], server.id(&ben).as_str(), "{said}");
+    assert_eq!(said["welcome"]["line"], "Pillows out for {name}!");
+
+    // Back to the built-in lines, then off.
+    owner.community("set-welcome", json!({ "lines": null })).await;
+    assert!(owner.community("join", json!({})).await["body"]["welcome"]["lines"].is_null());
+    owner.community("set-welcome", json!({ "channel": null })).await;
+    assert!(owner.community("join", json!({})).await["body"]["welcome"]["channel"].is_null());
+}

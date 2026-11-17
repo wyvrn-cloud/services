@@ -388,7 +388,6 @@ impl Community {
             ("explicit_content_filter", "Discord's filter of explicit images"),
             ("default_message_notifications", "Default notifications (all posts or mentions only)"),
             ("afk_channel_id", "An AFK voice channel"),
-            ("system_channel_id", "A channel for system messages (who joined)"),
         ] {
             if guild[field].as_i64().is_some_and(|n| n > 0) {
                 miss(says.to_string());
@@ -880,6 +879,14 @@ impl Community {
             // categories by the ids they now have.
             self.import_items(owner, plan, choice, &["role", "category", "channel"], &mut ids, &mut counts, now)?;
             self.order_as_template(plan, &ids)?;
+            // Discord's system messages channel, where it says who joined, is where
+            // newcomers are welcomed, unless this community has a welcome channel.
+            let system = template["serialized_source_guild"]["system_channel_id"].as_i64().and_then(|sid| ids.get(&format!("new:channel:{sid}")).cloned()).filter(|id| !id.is_empty());
+            let welcome = self.welcome_setting()?;
+            if let (Some(channel), true) = (system, welcome["channel"].is_null()) {
+                let lines = welcome["lines"].as_array().map(|lines| lines.iter().filter_map(Value::as_str).map(str::to_string).collect());
+                self.set_welcome(Some(&channel), lines)?;
+            }
             Ok(())
         })?;
         let Counts { made, changed, removed, no_room_channels, no_room_roles } = counts;

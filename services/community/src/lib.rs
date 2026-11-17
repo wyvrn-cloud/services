@@ -33,4 +33,5 @@ pub mod store;
 pub mod structure;
 pub mod voice;
 pub mod webhooks;
+pub mod welcome;
 pub mod web;
