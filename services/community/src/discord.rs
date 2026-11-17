@@ -246,9 +246,6 @@ pub struct Plan {
     pub removed: Vec<(&'static str, String, String)>,
     /// What Wyvrn doesn't have yet, said once each.
     pub missing: Vec<String>,
-    /// Of `removed`, what is left unticked to begin with when making it all match
-    /// (`kind-local`): a role someone holds.
-    pub unticked: HashSet<String>,
 }
 
 /// Field by field: what to take from the template, and what is changed on both
@@ -624,8 +621,9 @@ impl Community {
             }
         }
         plan.removed.extend(extra);
-        // A role someone holds (Admin, say) is asked about, not ticked: taking it
-        // away takes what they may do.
+        // A role someone holds says so: taking it takes what they may do (an
+        // owner keeps everything regardless). Ticked all the same: the template's
+        // roles are what there is to be.
         let mut holders: HashMap<String, usize> = HashMap::new();
         for (_, role) in self.store.all_member_roles()? {
             *holders.entry(role).or_default() += 1;
@@ -634,7 +632,6 @@ impl Community {
             if *kind == "role" {
                 if let Some(n) = holders.get(local.as_str()) {
                     label.push_str(&if *n == 1 { " (1 member has it)".to_string() } else { format!(" ({n} members have it)") });
-                    plan.unticked.insert(format!("role-{local}"));
                 }
             }
         }
@@ -725,13 +722,13 @@ impl Community {
         if !plan.removed.is_empty() {
             if exact {
                 fields.push(json!({ "type": "title", "text": "Not in the template" }));
-                fields.push(json!({ "type": "text", "text": "Made here, copies, or dropped from the template since. Ticked, it is removed: a channel to the trash, where it can be brought back for 30 days; a role or category deleted. Untick what should stay." }));
+                fields.push(json!({ "type": "text", "text": "Made here, copies, or dropped from the template since. Ticked, it is removed: a channel to the trash, where it can be brought back for 30 days; a role or category deleted, and with a role whatever it let its members do (an owner keeps everything). Untick what should stay." }));
             } else {
                 fields.push(json!({ "type": "title", "text": "No longer in the template" }));
                 fields.push(json!({ "type": "text", "text": "Ticked, it is removed (a channel to the trash, where it can be brought back for 30 days). Left, it stays, as something made here." }));
             }
             for (kind, local, label) in &plan.removed {
-                fields.push(json!({ "type": "check-box", "form-id": format!("remove-{kind}-{local}"), "label": format!("Remove {label}"), "value": exact && !plan.unticked.contains(&format!("{kind}-{local}")) }));
+                fields.push(json!({ "type": "check-box", "form-id": format!("remove-{kind}-{local}"), "label": format!("Remove {label}"), "value": exact }));
             }
         }
         fields.push(json!({ "type": "submit-button", "label": if exact { "Make it match" } else { "Import" }, "event": "import", "input": {} }));

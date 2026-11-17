@@ -2522,12 +2522,11 @@ async fn importing_again_exactly_puts_back_what_differs_and_clears_out_copies_an
     assert!(!page.contains("Remove #announcements\""), "the one still called so stays: {page}");
     // Ticked to begin with; the app sends them as they are.
     let ticks: serde_json::Map<String, Value> = page.split("\"form-id\":\"").skip(1).map(|rest| rest.split('"').next().unwrap().to_string()).filter(|id| id.starts_with("remove-")).map(|id| (id, json!(true))).collect();
-    // Wyvrn's own roles aren't in the template: Moderator, which nobody holds, is
-    // ticked; Admin, which the owner holds, is asked about, unticked.
-    assert!(page.contains("Remove The role Admin (1 member has it)\",\"value\":false"), "{page}");
+    // Wyvrn's own roles aren't in the template, so they go too: Admin, which the
+    // owner holds, says so (the owner keeps everything regardless).
+    assert!(page.contains("Remove The role Admin (1 member has it)\",\"value\":true"), "{page}");
     assert!(page.contains("Remove The role Moderator\",\"value\":true"), "{page}");
-    let ticks: serde_json::Map<String, Value> = ticks.into_iter().filter(|(id, _)| id != "remove-role-admin").collect();
-    assert_eq!(ticks.len(), 5, "{ticks:?}");
+    assert_eq!(ticks.len(), 6, "{ticks:?}");
     assert!(ticks.contains_key(&format!("remove-channel-{copy}")) && ticks.contains_key(&format!("remove-channel-{made_here}")));
 
     // While another import is going on, refused.
@@ -2537,17 +2536,19 @@ async fn importing_again_exactly_puts_back_what_differs_and_clears_out_copies_an
     }
     let done = advance(&owner, "e2", "import", Value::Object(ticks)).await;
     assert_eq!(done["body"]["state"], "done", "{done}");
-    assert!(done["body"]["ui"].to_string().contains("5 removed"), "{done}");
-    // As first imported, but for Moderator, removed.
+    assert!(done["body"]["ui"].to_string().contains("6 removed"), "{done}");
+    // As first imported, but for Wyvrn's own two roles, removed; and the owner
+    // may still do everything.
     let (channels, categories, roles) = first.clone();
-    assert_eq!(shape(), (channels, categories, roles - 1));
+    assert_eq!(shape(), (channels, categories, roles - 2));
+    assert!(owner.community("join", json!({})).await["body"]["permissions"].as_array().unwrap().contains(&json!("administrator")));
 
     // And again, exactly, with nothing changed: nothing to do.
     owner.workflow("start", json!({ "template_id": "discord-import", "instance_id": "e3" })).await;
     advance(&owner, "e3", "read", json!({ "link": "TESTCODE1234" })).await;
     let page = advance(&owner, "e3", "exact", json!({})).await["body"]["ui"].to_string();
     assert!(!page.contains("Changed to the template's"), "{page}");
-    assert_eq!(page.matches("Remove ").count(), 1, "only Admin, kept: {page}");
+    assert!(!page.contains("Remove "), "{page}");
 }
 
 /// The things a review asks which stays of, by form id.
@@ -2780,3 +2781,4 @@ async fn a_webhook_posts_as_discords_do_and_changes_and_takes_back_its_own_posts
     tokio::time::sleep(Duration::from_millis(2100)).await;
     assert_eq!(http.post(&old).json(&json!({ "content": "x" })).send().await.unwrap().status(), 401);
 }
+
