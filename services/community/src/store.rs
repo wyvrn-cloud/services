@@ -2693,8 +2693,10 @@ impl Store {
     }
 
     /// `did`'s choice to be seen online, and as what: `(share, status)`.
+    /// Whether `did` shares their presence, and as what. Shared unless they said
+    /// otherwise (asked 2026-11-17: seen online by default, as on Discord).
     pub fn presence(&self, did: &str) -> Result<(bool, String)> {
-        Ok(self.db.lock().query_row("SELECT share, status FROM presence WHERE did = ?1", params![did], |row| Ok((row.get::<bool>(0)?, row.get::<String>(1)?)))?.unwrap_or((false, "online".into())))
+        Ok(self.db.lock().query_row("SELECT share, status FROM presence WHERE did = ?1", params![did], |row| Ok((row.get::<bool>(0)?, row.get::<String>(1)?)))?.unwrap_or((true, "online".into())))
     }
 
     pub fn set_presence(&self, did: &str, share: bool, status: &str) -> Result<()> {
