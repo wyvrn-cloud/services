@@ -81,7 +81,43 @@ impl Community {
                 entry[kind.as_str()] = json!(count);
             }
         }
-        Ok(json!({ "members": self.store.members()?.len(), "days": days.into_values().collect::<Vec<_>>() }))
+        // Voice: minutes and people, by channel and in all (asked 2026-11-17).
+        for entry in days.values_mut() {
+            entry["voice_minutes"] = json!(0);
+            entry["voice_people"] = json!(0);
+            entry["voice_by_channel"] = json!({});
+            entry["reactions"] = json!(0);
+        }
+        for (day, channel, seconds, people) in self.store.voice_by_day(since)? {
+            if let Some(entry) = days.get_mut(&day) {
+                let minutes = (seconds + 30) / 60;
+                entry["voice_minutes"] = json!(entry["voice_minutes"].as_i64().unwrap_or(0) + minutes);
+                entry["voice_by_channel"][channel] = json!({ "minutes": minutes, "people": people });
+            }
+        }
+        for (day, people) in self.store.voice_people_by_day(since)? {
+            if let Some(entry) = days.get_mut(&day) {
+                entry["voice_people"] = json!(people);
+            }
+        }
+        for (day, count) in self.store.reactions_by_day(since)? {
+            if let Some(entry) = days.get_mut(&day) {
+                entry["reactions"] = json!(count);
+            }
+        }
+        let mut hours = [0i64; 24];
+        for (hour, count) in self.store.posts_by_hour(since)? {
+            if let Some(slot) = usize::try_from(hour).ok().and_then(|h| hours.get_mut(h)) {
+                *slot = count;
+            }
+        }
+        let online = self.seen_online()?.len();
+        Ok(json!({
+            "members": self.store.members()?.len(),
+            "online": online,
+            "days": days.into_values().collect::<Vec<_>>(),
+            "hours": hours,
+        }))
     }
 
     /// `insights-request`; `None` for anything else.

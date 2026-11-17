@@ -110,6 +110,8 @@ struct Live {
 struct Inner {
     rooms: HashMap<String, Room>,
     live: HashMap<u64, Live>,
+    /// When time in voice was last counted (insights).
+    counted: i64,
 }
 
 /// Every voice room of the community, and who holds a live connection.
@@ -126,6 +128,14 @@ impl Rooms {
     pub fn occupied(&self) -> bool {
         let inner = self.lock();
         !inner.live.is_empty() || inner.rooms.values().any(|room| !room.participants.is_empty())
+    }
+
+    /// The seconds since time in voice was last counted, at most a minute (a host
+    /// asleep in between doesn't count); none the first time.
+    pub fn uncounted(&self, now: i64) -> i64 {
+        let mut inner = self.lock();
+        let last = std::mem::replace(&mut inner.counted, now);
+        if last == 0 { 0 } else { (now - last).clamp(0, 60) }
     }
 
     /// Who is in each room now: the members' DIDs, each once, by channel.

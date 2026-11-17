@@ -852,9 +852,19 @@ pub async fn run_polls(state: Arc<AppState>) {
 }
 
 /// Takes out of their rooms those who have gone quiet.
+/// Then counts the time those still in them spent there, for insights.
 pub fn sweep_once(state: &Arc<AppState>) {
-    let presence = state.rooms.sweep(&state.community, now());
+    let at = now();
+    let presence = state.rooms.sweep(&state.community, at);
     voice_send(state, &VoiceOutcome { live: presence, ..VoiceOutcome::default() });
+    let seconds = state.rooms.uncounted(at);
+    if seconds > 0 {
+        for (channel, dids) in state.rooms.in_rooms() {
+            if let Err(e) = state.community.store.add_voice_time(&channel, &dids, at, seconds) {
+                tracing::warn!("counting time in voice: {e:#}");
+            }
+        }
+    }
 }
 
 /// The voice rooms swept every 15 seconds.

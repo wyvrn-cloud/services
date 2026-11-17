@@ -1665,6 +1665,20 @@ async fn channels_are_ordered_in_categories_newcomers_are_onboarded_and_insights
     assert_eq!(today["by_channel"][general.as_str()], 2);
     assert_eq!(insights["body"]["members"], 2);
     assert_eq!(member.community("insights-request", json!({})).await["type"], PROBLEM);
+    // By the hour they were posted in, and time in voice (counted as rooms are swept).
+    assert_eq!(insights["body"]["hours"].as_array().unwrap().iter().filter_map(|h| h.as_i64()).sum::<i64>(), 2, "{insights}");
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let store = &server.state.community.store;
+    store.add_voice_time("lounge", &[owner.did(), member.did()], now, 90).unwrap();
+    store.add_voice_time("lounge", &[owner.did()], now, 30).unwrap();
+    store.add_voice_time("hall", &[member.did()], now, 60).unwrap();
+    let insights = owner.community("insights-request", json!({})).await;
+    let today = insights["body"]["days"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(today["voice_by_channel"]["lounge"], json!({ "minutes": 4, "people": 2 }), "{today}");
+    assert_eq!(today["voice_by_channel"]["hall"], json!({ "minutes": 1, "people": 1 }));
+    assert_eq!(today["voice_minutes"], 5);
+    assert_eq!(today["voice_people"], 2);
+    assert_eq!(today["reactions"], 0);
 }
 
 #[tokio::test]

@@ -296,6 +296,9 @@ pub struct Answering {
     pub updated: i64,
 }
 
+/// How long time in voice is kept for insights: 90 days.
+pub const VOICE_TIME_KEPT: i64 = 90 * 86_400;
+
 pub struct Store {
     pub(crate) db: Db,
 }
@@ -817,6 +820,15 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         kind TEXT NOT NULL,
         at INTEGER NOT NULL
     );
+    -- Time spent in voice channels, a day at a time, for insights: sampled as the
+    -- rooms are swept, kept for VOICE_TIME_KEPT.
+    CREATE TABLE IF NOT EXISTS voice_time (
+        day INTEGER NOT NULL,
+        channel TEXT NOT NULL,
+        did TEXT NOT NULL,
+        seconds INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (day, channel, did)
+    );
     -- Answers to the questions on joining, as JSON.
     CREATE TABLE IF NOT EXISTS join_answers (
         did TEXT PRIMARY KEY,
@@ -1225,6 +1237,13 @@ fn schema() -> Schema {
                 id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
                 kind VARCHAR(16) NOT NULL,
                 at BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS voice_time (
+                day BIGINT NOT NULL,
+                channel VARCHAR(255) NOT NULL,
+                did {MYSQL_DID} NOT NULL,
+                seconds BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (day, channel, did(255))
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS join_answers (
                 did {MYSQL_DID} NOT NULL PRIMARY KEY,
@@ -2115,6 +2134,47 @@ impl Store {
     pub fn posters_by_day(&self, since: i64) -> Result<Vec<(i64, i64)>> {
         self.db.lock().query(
             "SELECT posted_at - posted_at % 86400 AS day, COUNT(DISTINCT author_did) FROM posts WHERE posted_at >= ?1 GROUP BY day",
+            params![since],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+    }
+
+    /// `seconds` more in a voice channel for each of `dids`, on the day `at` is in;
+    /// what is older than `VOICE_TIME_KEPT` goes.
+    pub fn add_voice_time(&self, channel: &str, dids: &[String], at: i64, seconds: i64) -> Result<()> {
+        let day = at - at.rem_euclid(86_400);
+        let mut db = self.db.lock();
+        for did in dids {
+            db.execute("INSERT OR IGNORE INTO voice_time (day, channel, did, seconds) VALUES (?1, ?2, ?3, 0)", params![day, channel, did])?;
+            db.execute("UPDATE voice_time SET seconds = seconds + ?4 WHERE day = ?1 AND channel = ?2 AND did = ?3", params![day, channel, did, seconds])?;
+        }
+        db.execute("DELETE FROM voice_time WHERE day < ?1", params![day - VOICE_TIME_KEPT])?;
+        Ok(())
+    }
+
+    /// Time in voice since `since`, a day and a channel at a time: `(day, channel, seconds, people)`.
+    pub fn voice_by_day(&self, since: i64) -> Result<Vec<(i64, String, i64, i64)>> {
+        self.db.lock().query(
+            "SELECT day, channel, CAST(SUM(seconds) AS SIGNED), COUNT(*) FROM voice_time WHERE day >= ?1 GROUP BY day, channel",
+            params![since],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+    }
+
+    /// How many were in voice at all, a day at a time: `(day, people)`.
+    pub fn voice_people_by_day(&self, since: i64) -> Result<Vec<(i64, i64)>> {
+        self.db.lock().query("SELECT day, COUNT(DISTINCT did) FROM voice_time WHERE day >= ?1 GROUP BY day", params![since], |row| Ok((row.get(0)?, row.get(1)?)))
+    }
+
+    /// Reactions given since `since`, a day at a time: `(day, count)`.
+    pub fn reactions_by_day(&self, since: i64) -> Result<Vec<(i64, i64)>> {
+        self.db.lock().query("SELECT at - at % 86400 AS day, COUNT(*) FROM reactions WHERE at >= ?1 GROUP BY day", params![since], |row| Ok((row.get(0)?, row.get(1)?)))
+    }
+
+    /// Posts since `since` by the hour of the day they were posted in (UTC): `(hour, count)`.
+    pub fn posts_by_hour(&self, since: i64) -> Result<Vec<(i64, i64)>> {
+        self.db.lock().query(
+            "SELECT CAST(((posted_at % 86400) - (posted_at % 3600)) / 3600 AS SIGNED) AS hour, COUNT(*) FROM posts WHERE posted_at >= ?1 GROUP BY hour",
             params![since],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
