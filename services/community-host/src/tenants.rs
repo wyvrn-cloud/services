@@ -168,8 +168,10 @@ impl Host {
                 max_roles: limits.roles,
                 max_community_posts_per_minute: limits.posts_per_minute,
                 max_store_bytes: limits.store_bytes,
-                max_packs: limits.packs,
-                max_per_pack: limits.per_pack,
+                max_sticker_packs: limits.sticker_packs,
+                max_stickers_per_pack: limits.stickers_per_pack,
+                max_emoji_packs: limits.emoji_packs,
+                max_emoji_per_pack: limits.emoji_per_pack,
                 ..CommunityConfig::default()
             },
             mediator: None,

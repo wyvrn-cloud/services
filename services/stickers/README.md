@@ -93,8 +93,10 @@ Under `[service]` in the configuration:
 |---|---|---|
 | `max_sticker_px`, `max_sticker_bytes` | 512, 500 KB | A sticker's longest side, and its file. |
 | `max_emoji_px`, `max_emoji_bytes` | 128, 128 KB | The same for a custom emoji. |
-| `max_per_pack` | 120 | Pictures in one pack. |
-| `max_packs_per_maker` | 50 | Packs one maker may have. |
+| `max_per_pack` | 120 | Stickers in one sticker pack. |
+| `max_per_emoji_pack` | 120 | Custom emoji in one emoji pack. |
+| `max_packs_per_maker` | 50 | Sticker packs one maker may have. |
+| `max_emoji_packs_per_maker` | 50 | Emoji packs one maker may have. |
 | `draft_hours` | 24 | How long an unfinished pack is kept. |
 | `reserved_names` | the service's own routes, and names like `official` | Names no pack may take. |
 

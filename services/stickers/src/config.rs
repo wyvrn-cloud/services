@@ -47,9 +47,14 @@ pub struct ServiceConfig {
     pub max_sticker_bytes: usize,
     pub max_emoji_px: u32,
     pub max_emoji_bytes: usize,
+    /// How many stickers a sticker pack holds.
     pub max_per_pack: usize,
-    /// How many packs one maker may have.
+    /// How many custom emoji an emoji pack holds.
+    pub max_per_emoji_pack: usize,
+    /// How many sticker packs one maker may have.
     pub max_packs_per_maker: usize,
+    /// How many emoji packs one maker may have.
+    pub max_emoji_packs_per_maker: usize,
     /// How long a pack that was started and never published is kept.
     pub draft_hours: i64,
     /// Names no pack may take: the service's own routes, and names that would
@@ -66,7 +71,9 @@ impl Default for ServiceConfig {
             max_emoji_px: 128,
             max_emoji_bytes: 128 * 1024,
             max_per_pack: 120,
+            max_per_emoji_pack: 120,
             max_packs_per_maker: 50,
+            max_emoji_packs_per_maker: 50,
             draft_hours: 24,
             reserved_names: ["did", "healthz", "drafts", "api", "admin", "official", "wyvrn", "support", "help", "abuse", "security", "staff", "system"]
                 .map(str::to_string)

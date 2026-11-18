@@ -359,7 +359,7 @@ async fn a_pack_has_a_name_nobody_else_has_and_as_many_stickers_as_allowed() {
     alice.advance("a-2", "add_sticker", json!({ "image": data_url(&png(10, 10, 9)), "emoji": "🐶" })).await;
     alice.advance("a-2", "publish", json!({})).await;
     alice.advance("a-2", "skip_icon", json!({})).await;
-    assert!(refused_with(&alice.advance("a-2", "set_name", json!({ "name": "dogs" })).await, "action_failed").contains("as many as one maker may"));
+    assert!(refused_with(&alice.advance("a-2", "set_name", json!({ "name": "dogs" })).await, "action_failed").contains("There is 1 sticker pack already"));
 }
 
 #[tokio::test]

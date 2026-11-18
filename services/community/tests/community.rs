@@ -1922,7 +1922,7 @@ async fn the_community_has_emoji_packs_of_its_own_made_by_whoever_may_manage_the
 
 #[tokio::test]
 async fn a_community_holds_as_many_packs_and_as_full_as_its_host_allows() {
-    let server = start_server_with("max_packs = 1\nmax_per_pack = 1", true).await;
+    let server = start_server_with("max_emoji_packs = 1\nmax_emoji_per_pack = 1", true).await;
     let owner = Peer::start(&server).await;
     server.admit(&[&owner]);
     owner.workflow("start", json!({ "template_id": "new-emoji-pack", "instance_id": "e1" })).await;
@@ -1943,7 +1943,7 @@ async fn a_community_holds_as_many_packs_and_as_full_as_its_host_allows() {
     advance(&owner, "e2", "publish", json!({})).await;
     advance(&owner, "e2", "skip_icon", json!({})).await;
     let refused = advance(&owner, "e2", "set_name", json!({ "name": "more" })).await;
-    assert!(refused.to_string().contains("which is as many as one maker may"), "{refused}");
+    assert!(refused.to_string().contains("There is 1 emoji pack already"), "{refused}");
 }
 
 #[tokio::test]

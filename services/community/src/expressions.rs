@@ -25,7 +25,8 @@ pub struct Expressions {
 
 impl Expressions {
     /// Packs kept at `location`, served under `public_url`'s `s/`, as many and as
-    /// full as `community` says (its `max_packs`, `max_per_pack`).
+    /// full as `community` says (`max_sticker_packs`, `max_stickers_per_pack`,
+    /// `max_emoji_packs`, `max_emoji_per_pack`).
     pub fn open(location: &wyvrn_service::db::Location, public_url: &str, community: &CommunityConfig) -> anyhow::Result<Self> {
         Ok(Self::with(Store::open(location)?, public_url, community))
     }
@@ -37,7 +38,13 @@ impl Expressions {
     fn with(store: Store, public_url: &str, community: &CommunityConfig) -> Self {
         let base = format!("{}s/", if public_url.ends_with('/') { public_url.to_string() } else { format!("{public_url}/") });
         // Every pack's maker is the community, so "packs a maker" is the community's packs.
-        let limits = ServiceConfig { max_packs_per_maker: community.max_packs, max_per_pack: community.max_per_pack.max(1), ..Default::default() };
+        let limits = ServiceConfig {
+            max_packs_per_maker: community.max_sticker_packs,
+            max_per_pack: community.max_stickers_per_pack.max(1),
+            max_emoji_packs_per_maker: community.max_emoji_packs,
+            max_per_emoji_pack: community.max_emoji_per_pack.max(1),
+            ..Default::default()
+        };
         Self { processor: Processor::new(store, limits, &base) }
     }
 

@@ -101,6 +101,22 @@ impl Processor {
         }
     }
 
+    /// How many a pack of `kind` holds.
+    fn per_pack(&self, kind: Kind) -> usize {
+        match kind {
+            Kind::Sticker => self.config.max_per_pack,
+            Kind::Emoji => self.config.max_per_emoji_pack,
+        }
+    }
+
+    /// How many packs of `kind` one maker may have.
+    fn packs_per_maker(&self, kind: Kind) -> usize {
+        match kind {
+            Kind::Sticker => self.config.max_packs_per_maker,
+            Kind::Emoji => self.config.max_emoji_packs_per_maker,
+        }
+    }
+
     fn limits(&self, kind: Kind) -> (u32, usize) {
         match kind {
             Kind::Sticker => (self.config.max_sticker_px, self.config.max_sticker_bytes),
@@ -143,10 +159,10 @@ impl Processor {
         let kind = Self::kind_of(&instance.template, pack.as_ref());
         let (scope, files) = self.scope(instance)?;
         let stickers = self.store.stickers(&scope)?;
-        let full = stickers.len() >= self.config.max_per_pack;
+        let full = stickers.len() >= self.per_pack(kind);
         let mut artifacts = json!({
             "count": stickers.len(),
-            "limit": self.config.max_per_pack,
+            "limit": self.per_pack(kind),
             "full": full,
             "max_px": self.limits(kind).0,
             "stickers": Self::listed(&stickers, &files),
@@ -433,8 +449,8 @@ impl Processor {
             }
             "add" => {
                 let stickers = self.store.stickers(&scope).map_err(failed)?;
-                if stickers.len() >= self.config.max_per_pack {
-                    return Err(mistake(format!("A pack holds {} at most.", self.config.max_per_pack)));
+                if stickers.len() >= self.per_pack(kind) {
+                    return Err(mistake(format!("A pack holds {} at most.", self.per_pack(kind))));
                 }
                 let (emoji, shortcode) = (text(input, "emoji"), text(input, "shortcode"));
                 let shortcode = match kind {
@@ -511,9 +527,12 @@ impl Processor {
                 if self.reserved_names().contains(&name) {
                     return Err(mistake("That name is set aside. Please choose another."));
                 }
-                let mine = self.store.packs(Some(&instance.owner)).map_err(failed)?.iter().filter(|pack| !pack.removed).count();
-                if mine >= self.config.max_packs_per_maker {
-                    return Err(mistake(format!("You have {mine} packs, which is as many as one maker may. Delete one first.")));
+                // Counted by kind: sticker packs and emoji packs each have their own limit.
+                let mine = self.store.packs(Some(&instance.owner)).map_err(failed)?.iter().filter(|pack| !pack.removed && pack.kind == kind).count();
+                let most = self.packs_per_maker(kind);
+                if mine >= most {
+                    let what = if kind == Kind::Emoji { "emoji" } else { "sticker" };
+                    return Err(mistake(format!("There {} {mine} {what} pack{} already, as many as allowed. Delete one first.", if mine == 1 { "is" } else { "are" }, if mine == 1 { "" } else { "s" })));
                 }
                 let pack = Pack {
                     name: name.clone(),
