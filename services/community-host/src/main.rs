@@ -26,6 +26,10 @@ wyvrn-community-host [--config <path>] import <name> <owner-did> --community <da
                                                                   address and everything it keeps. A
                                                                   database is a mysql:// URL or a SQLite file.
                                                                   Stop its own server first.
+wyvrn-community-host [--config <path>] backup <name>              back one up now (backups.key set)
+wyvrn-community-host [--config <path>] open-backup <file> <out.tar.gz>
+                                                                  open a backup with the backup key: the
+                                                                  .tar.gz is what an export is
 
 The config path is --config, else $COMMUNITY_HOST_CONFIG, else config/default.toml.
 A change made here while the host runs is taken up when the community is next opened.";
@@ -59,6 +63,18 @@ async fn main() -> anyhow::Result<()> {
     };
     match args.as_slice() {
         [] | ["serve"] => serve(config).await,
+        ["open-backup", file, out] => {
+            let key = wyvrn_community_host::backups::key(&config.backups)?.context("no backup key: set backups.key or COMMUNITY_HOST_BACKUP_KEY")?;
+            wyvrn_community_host::backups::open(&key, std::path::Path::new(file), std::path::Path::new(out))?;
+            println!("opened: {out}");
+            Ok(())
+        }
+        ["backup", name] => {
+            let host = Host::new(config.clone(), registry(&config)?);
+            let made = tokio::task::block_in_place(|| host.back_up(name, now()))?;
+            println!("{}", made.display());
+            Ok(())
+        }
         ["list"] => {
             for record in registry(&config)?.all()? {
                 println!("{}\t{}\t{}\t{}\t{}", record.name, record.state.as_str(), record.storage.as_str(), record.owner, record.title);

@@ -73,7 +73,7 @@ impl Pages for AppState {
             id: COMMUNITIES,
             title: "Communities",
             summary: "Every community kept here; make one, set what it may hold, suspend or remove it.",
-            events: &["create", "suspend", "resume", "delete", "restore", "limits", "move", "handed", "creating", "code", "revoke_code"],
+            events: &["create", "suspend", "resume", "delete", "restore", "limits", "move", "handed", "creating", "code", "revoke_code", "backup"],
         }]
     }
 
@@ -123,8 +123,15 @@ impl Pages for AppState {
             if let Some(until) = record.sealed_until {
                 what.push_str(&format!(" · kept {} more days", ((until - now).max(0) + 86_399) / 86_400));
             }
+            if let Some((_, at)) = host.backups(&record.name).first() {
+                let hours = (now - at).max(0) / 3600;
+                what.push_str(&if hours < 1 { " · backed up within the hour".to_string() } else { format!(" · backed up {hours} h ago") });
+            }
             let mut row = vec![json!({ "type": "text", "text": what })];
             let named = json!({ "name": record.name });
+            if record.state.served() && crate::backups::key(&host.config.backups).ok().flatten().is_some() {
+                row.push(button("Back up now", "backup", named.clone()));
+            }
             match record.state {
                 State::Active => {
                     row.push(button("Suspend", "suspend", named.clone()));
@@ -252,6 +259,10 @@ impl Pages for AppState {
                     tracing::error!(community = %name, error = %format!("{error:#}"), "couldn't move a community's storage");
                     format!("It couldn't be moved, and is kept where it was: {error}")
                 })?
+            }
+            "backup" => {
+                let made = tokio::task::block_in_place(|| host.back_up(&name, now)).map_err(|error| format!("It couldn't be backed up: {error}"))?;
+                format!("{name} is backed up: {}", made.display())
             }
             "handed" if record.state == State::Moving => {
                 host.exports.forget(&name);

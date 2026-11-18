@@ -288,3 +288,26 @@ every_seconds = 600    # how long between two from the same person
 ```
 
 The app offers it under "Add a community or channel" when the host (`did:web:communities.wyvrn.app`) lists it.
+
+## 8. Backups of each hosted community (new 2026-11-17, in `wyvrn-community-host`)
+
+Off until a key is set: a backup holds each community's keys. To turn them on, make a key and keep a copy of it somewhere else (without it no backup opens):
+
+```sh
+openssl rand -hex 32 > community-host-backup.key
+chmod 600 community-host-backup.key
+```
+
+and give it to `community-host`, by environment (`COMMUNITY_HOST_BACKUP_KEY=<the 64 hex digits>` in `.env`) or by file, with the rest optional:
+
+```toml
+[backups]
+key = "/community-host/backup.key"   # or COMMUNITY_HOST_BACKUP_KEY
+dir = ""                             # empty: <storage.dir>/.backups (a volume: keep it off the same disk if you can)
+every_hours = 24
+keep = 7
+```
+
+Each community is then backed up once a day, sealed (AES-256-GCM), the last 7 kept; Admin, Communities shows when and has "Back up now". To open one: `docker compose run --rm community-host open-backup <file> /tmp/out.tar.gz`, which is what an export is (it runs as its own `wyvrn-community`, or can be brought back in with `import`).
+
+Also new on that page: a community's roles, posts a minute from everyone, and its store's size, under What it may hold.

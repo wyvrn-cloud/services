@@ -186,38 +186,13 @@ impl Host {
     pub fn export(&self, name: &str, now: i64) -> anyhow::Result<String> {
         let record = self.registry.get(name)?.ok_or_else(|| anyhow::anyhow!("there is no community called {name}"))?;
         anyhow::ensure!(record.state == Standing::Moving, "{name} isn't moving");
-        let from = self.stores(&record, record.storage)?;
         let exports = self.config.storage.dir.join(".exports");
         let token = token();
         let staging = exports.join(&token);
         let data = staging.join("data");
-        std::fs::create_dir_all(data.join("files"))?;
-
-        // Its keys, as the single server keeps them beside a SQLite store.
-        let keys = self.folder(name).join("identity.json");
-        let identity = wyvrn_service::identity::load(&from.community, &keys, "community")?.ok_or_else(|| anyhow::anyhow!("{name} has no keys"))?;
-        identity.save(data.join("identity.json"))?;
-        // Everything it keeps, in the files the single server reads.
-        let community = Location::Sqlite(data.join("community.sqlite"));
-        let store = wyvrn_community::store::Store::open(&community)?;
-        wyvrn_service::profile::Kept::open(&community, "community")?;
-        wyvrn_service::hosted_address::Kept::open(&community, "community")?;
-        copy_store(&from.community, &community, "community", &["wyvrn_identity"])?;
+        self.snapshot(name, &data)?;
         // Not moving any more, where it arrives.
-        store.set_setting(wyvrn_community::community::MOVING_SETTING, "0")?;
-        drop(store);
-        if let Some(stickers) = &from.stickers {
-            let to = Location::Sqlite(data.join("stickers.sqlite"));
-            wyvrn_stickers::store::Store::open(&to)?;
-            copy_store(stickers, &to, "stickers", &[])?;
-        }
-        if let Some(files) = &from.files {
-            // Where the single server looks for its files' records: beside the files.
-            let to = Location::Sqlite(data.join("files").join("files.sqlite"));
-            wyvrn_files::store::Store::open(&to, &data.join("files"))?;
-            copy_store(files, &to, "files", &[])?;
-            copy_dir(&self.folder(name).join("files"), &data.join("files"))?;
-        }
+        wyvrn_community::store::Store::open(&Location::Sqlite(data.join("community.sqlite")))?.set_setting(wyvrn_community::community::MOVING_SETTING, "0")?;
         std::fs::create_dir_all(staging.join("config"))?;
         std::fs::write(staging.join("config").join("default.toml"), self.single_config(&record))?;
         std::fs::write(staging.join("README.txt"), self.export_readme(name)?)?;
@@ -234,6 +209,40 @@ impl Host {
         self.exports.add(token.clone(), Export { community: name.to_string(), file, expires: now + LINK_FOR });
         tracing::info!(community = %name, "made a community's export");
         Ok(token)
+    }
+
+    /// Everything `name` keeps, into `data` as the single `wyvrn-community` keeps
+    /// a community in SQLite: its keys, its store, its packs, its files. What an
+    /// export (here) and a backup (backups.rs) are made of. Blocks.
+    pub fn snapshot(&self, name: &str, data: &Path) -> anyhow::Result<()> {
+        let record = self.registry.get(name)?.ok_or_else(|| anyhow::anyhow!("there is no community called {name}"))?;
+        let from = self.stores(&record, record.storage)?;
+        std::fs::create_dir_all(data.join("files"))?;
+
+        // Its keys, as the single server keeps them beside a SQLite store.
+        let keys = self.folder(name).join("identity.json");
+        let identity = wyvrn_service::identity::load(&from.community, &keys, "community")?.ok_or_else(|| anyhow::anyhow!("{name} has no keys"))?;
+        identity.save(data.join("identity.json"))?;
+        // Everything it keeps, in the files the single server reads.
+        let community = Location::Sqlite(data.join("community.sqlite"));
+        let store = wyvrn_community::store::Store::open(&community)?;
+        wyvrn_service::profile::Kept::open(&community, "community")?;
+        wyvrn_service::hosted_address::Kept::open(&community, "community")?;
+        copy_store(&from.community, &community, "community", &["wyvrn_identity"])?;
+        drop(store);
+        if let Some(stickers) = &from.stickers {
+            let to = Location::Sqlite(data.join("stickers.sqlite"));
+            wyvrn_stickers::store::Store::open(&to)?;
+            copy_store(stickers, &to, "stickers", &[])?;
+        }
+        if let Some(files) = &from.files {
+            // Where the single server looks for its files' records: beside the files.
+            let to = Location::Sqlite(data.join("files").join("files.sqlite"));
+            wyvrn_files::store::Store::open(&to, &data.join("files"))?;
+            copy_store(files, &to, "files", &[])?;
+            copy_dir(&self.folder(name).join("files"), &data.join("files"))?;
+        }
+        Ok(())
     }
 
     /// The single server's configuration for `record`, as it stands here.

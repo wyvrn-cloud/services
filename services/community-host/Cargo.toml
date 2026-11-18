@@ -27,6 +27,8 @@ toml = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 # A community handed over to its owner's own server, as one .tar.gz (export.rs).
 tar = "0.4"
+# Sealing backups (backups.rs): the version the community server uses.
+aes-gcm = "0.10"
 flate2 = "1"
 uuid = { workspace = true }
 tower-http = { workspace = true, features = ["fs"] }

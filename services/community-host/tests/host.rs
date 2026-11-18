@@ -90,11 +90,16 @@ async fn start_host(idle_seconds: i64) -> Running {
 
 /// A host, with `mysql` its MySQL server (no database), or none.
 async fn start_host_with(idle_seconds: i64, mysql: &str) -> Running {
+    start_host_with_extra(idle_seconds, mysql, "").await
+}
+
+/// The same, with more of the host's configuration (`[backups]`, say).
+async fn start_host_with_extra(idle_seconds: i64, mysql: &str, extra: &str) -> Running {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let dir = std::env::temp_dir().join(format!("wyvrn-host-test-{}-{}", std::process::id(), unique()));
     let mut config: Config = toml::from_str(&format!(
-        "[server]\nbind = \"unused\"\npublic_url = \"{url}\"\ndid_method = \"peer\"\n[identity]\npath = \"{dir}/identity.json\"\n[store]\npath = \"unused\"\n[storage]\ndir = \"{dir}/communities\"\nmysql = \"{mysql}\"\nshared_database = \"wyvrn_test_shared_{shared}\"\ndatabase_prefix = \"wyvrn_test_c{shared}_\"\n[loading]\nidle_seconds = {idle_seconds}\n[voice]\nrelay_url = \"https://voice.example/\"\n",
+        "[server]\nbind = \"unused\"\npublic_url = \"{url}\"\ndid_method = \"peer\"\n[identity]\npath = \"{dir}/identity.json\"\n[store]\npath = \"unused\"\n[storage]\ndir = \"{dir}/communities\"\nmysql = \"{mysql}\"\nshared_database = \"wyvrn_test_shared_{shared}\"\ndatabase_prefix = \"wyvrn_test_c{shared}_\"\n[loading]\nidle_seconds = {idle_seconds}\n[voice]\nrelay_url = \"https://voice.example/\"\n{extra}\n",
         dir = dir.display(),
         shared = unique().replace('-', "_"),
     ))
@@ -573,4 +578,40 @@ async fn a_hosted_community_is_held_to_its_posts_a_minute_and_the_room_its_store
     .unwrap();
     let refused = owner.community(&full, "post", json!({ "channel": general, "content": "no room" })).await;
     assert_eq!(refused["body"]["code"], "e.p.msg.quota", "{refused}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_community_is_backed_up_sealed_with_the_hosts_key_and_opens_whole() {
+    let dir = std::env::temp_dir().join(format!("wyvrn-host-backup-test-{}", unique()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = dir.join("backup.key");
+    std::fs::write(&key, "ab".repeat(32)).unwrap();
+    let running = start_host_with_extra(600, "", &format!("[backups]\ndir = \"{}\"\nkeep = 2\nkey = \"{}\"", dir.join("kept").display(), key.display())).await;
+    let owner = Peer::start().await;
+    running.host.registry.create("kept", "Kept", Storage::Sqlite, &owner.did(), "test", 1).unwrap();
+    let kept = running.did_of("kept").await;
+    owner.community(&kept, "join", json!({})).await;
+    let channel = owner.community(&kept, "create-channel", json!({ "name": "general" })).await["body"]["created"].as_str().unwrap().to_string();
+    owner.community(&kept, "post", json!({ "channel": channel, "id": "p1", "content": "keep this safe" })).await;
+
+    // Three backed up, two kept: the newest.
+    for at in [100, 200, 300] {
+        let host = running.host.clone();
+        tokio::task::spawn_blocking(move || host.back_up("kept", at)).await.unwrap().unwrap();
+    }
+    let listed = running.host.backups("kept");
+    assert_eq!(listed.iter().map(|(_, at)| *at).collect::<Vec<_>>(), [300, 200]);
+
+    // Sealed: not an archive as it is; opened with the key, the community whole.
+    let sealed = running.host.backups_of("kept").join(&listed[0].0);
+    assert!(!std::fs::read(&sealed).unwrap().starts_with(&[0x1f, 0x8b]));
+    let opened = dir.join("opened.tar.gz");
+    let key_bytes = [0xab_u8; 32];
+    wyvrn_community_host::backups::open(&key_bytes, &sealed, &opened).unwrap();
+    let out = dir.join("out");
+    tar::Archive::new(flate2::read::GzDecoder::new(std::fs::File::open(&opened).unwrap())).unpack(&out).unwrap();
+    let store = wyvrn_community::store::Store::open(&wyvrn_service::db::Location::Sqlite(out.join("kept/data/community.sqlite"))).unwrap();
+    assert_eq!(store.post_by_id("p1").unwrap().unwrap().content, "keep this safe");
+    assert!(out.join("kept/data/identity.json").exists());
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -42,6 +42,33 @@ pub struct Config {
     /// admin says otherwise on the admin page.
     #[serde(default)]
     pub creating: CreatingConfig,
+    /// Each community backed up on a schedule, sealed with a key (backups.rs).
+    #[serde(default)]
+    pub backups: BackupsConfig,
+}
+
+/// Backups: where (`dir`, empty for `<storage.dir>/.backups`), how often, how many
+/// kept, and the key they are sealed with (`key`, a file of 64 hex digits, or
+/// `COMMUNITY_HOST_BACKUP_KEY`); none, no backups.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BackupsConfig {
+    pub dir: PathBuf,
+    pub every_hours: i64,
+    pub keep: usize,
+    pub key: PathBuf,
+}
+
+impl Default for BackupsConfig {
+    fn default() -> Self {
+        Self { dir: PathBuf::new(), every_hours: 24, keep: 7, key: PathBuf::new() }
+    }
+}
+
+impl BackupsConfig {
+    pub fn dir_or(&self, storage: &Path) -> PathBuf {
+        if self.dir.as_os_str().is_empty() { storage.join(".backups") } else { self.dir.clone() }
+    }
 }
 
 /// Making a community from the app: `closed` (host admins only), `codes` (with a

@@ -324,11 +324,18 @@ impl Host {
     /// measured every five minutes.
     pub async fn run_housekeeping(self: Arc<Self>) {
         let mut measured = 0;
+        let mut backed_up = 0;
         loop {
             if now() - measured >= MEASURE_EVERY {
                 measured = now();
                 let host = self.clone();
                 let _ = tokio::task::spawn_blocking(move || host.measure()).await;
+            }
+            // Backups due, looked for every ten minutes, made one at a time off to the side.
+            if now() - backed_up >= 600 {
+                backed_up = now();
+                let host = self.clone();
+                tokio::task::spawn_blocking(move || host.back_up_due(now()));
             }
             self.housekeeping(now()).await;
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;

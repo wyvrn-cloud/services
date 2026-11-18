@@ -9,6 +9,7 @@
 //!   voice relay's question passed to the community a token is of.
 //! - [`admin`]: the host's admin pages.
 //! - [`creating`]: making a community from the app, as the host's admins allow.
+//! - [`backups`]: each community backed up on a schedule, sealed with a key.
 //! - [`export`]: a community's owner moving it to a server of their own.
 //! - [`import`]: the reverse, a community run on its own brought onto the host.
 //!
@@ -16,6 +17,7 @@
 //! `wyvrn-community`, keeping its keys and public address.
 
 pub mod admin;
+pub mod backups;
 pub mod config;
 pub mod creating;
 pub mod export;
