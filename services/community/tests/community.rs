@@ -2761,6 +2761,47 @@ async fn make_webhook(owner: &Peer, instance: &str, name: &str, channel: &str) -
 }
 
 #[tokio::test]
+async fn a_webhook_calls_on_members_and_roles_as_allowed_mentions_says_and_automod_checks_it() {
+    let server = start_server_with("", true).await;
+    let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member]);
+    let general = open_channel(&owner, "general").await;
+    for peer in [&owner, &member] {
+        peer.community("join", json!({})).await;
+    }
+    member.agent.send(&member.server, &json!({ "type": "https://didcomm.org/user-profile/1.0/profile", "body": { "profile": { "displayName": "Bob" } } })).await.unwrap();
+    let url = make_webhook(&owner, "w1", "Alerts", &general).await;
+    let http = reqwest::Client::new();
+    let bob = server.id(&member);
+
+    // Said as Discord says it, by this community's member ids: shown by name, and calling on him.
+    assert_eq!(http.post(&url).json(&json!({ "content": format!("<@{bob}> the build broke") })).send().await.unwrap().status(), 204);
+    let got = member.next_message().await;
+    assert_eq!(got["content"], "@Bob the build broke", "{got}");
+    assert_eq!(got["mentions"], json!([{ "who": bob, "name": "Bob" }]));
+    // Not let through by allowed_mentions: shown, calling on nobody.
+    let quiet = json!({ "content": format!("<@{bob}> and @everyone, FYI"), "allowed_mentions": { "parse": [] } });
+    assert_eq!(http.post(&url).json(&quiet).send().await.unwrap().status(), 204);
+    let got = member.next_message().await;
+    assert_eq!(got["content"], "@Bob and @everyone, FYI");
+    assert!(got.get("mentions").is_none_or(|m| m.as_array().is_some_and(|m| m.is_empty())), "{got}");
+    // Only whom it names.
+    let named = json!({ "content": format!("<@{bob}> @everyone"), "allowed_mentions": { "parse": [], "users": [bob] } });
+    assert_eq!(http.post(&url).json(&named).send().await.unwrap().status(), 204);
+    assert_eq!(member.next_message().await["mentions"], json!([{ "who": bob, "name": "Bob" }]));
+
+    // AutoMod: a webhook is no owner, and a word it refuses is refused as Discord says.
+    owner.workflow("start", json!({ "template_id": "automod", "instance_id": "a1" })).await;
+    advance(&owner, "a1", "create", json!({ "name": "No scams" })).await;
+    advance(&owner, "a1", "save", json!({ "name": "No scams", "enabled": true, "words": "scam*", "block": true })).await;
+    advance(&owner, "a1", "done", json!({})).await;
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let refused = http.post(&url).json(&json!({ "content": "free scam coins" })).send().await.unwrap();
+    assert_eq!(refused.status(), 400);
+    assert_eq!(refused.json::<Value>().await.unwrap()["code"], 200000);
+}
+
+#[tokio::test]
 async fn a_webhook_posts_as_discords_do_and_changes_and_takes_back_its_own_posts() {
     let server = start_server_with("", true).await;
     let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);

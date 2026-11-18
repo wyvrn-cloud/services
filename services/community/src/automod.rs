@@ -110,6 +110,14 @@ pub struct Censored {
     pub rules: Vec<String>,
 }
 
+/// What AutoMod is checking.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Placing {
+    Post,
+    Edit,
+    Webhook,
+}
+
 /// What AutoMod made of a post.
 pub enum Verdict {
     /// It goes through: as it was, or `censored`. `noted` carries anything AutoMod
@@ -130,20 +138,34 @@ impl Community {
         if powers.all() || self.channel_permissions(&member.did, &powers, channel)?.contains("manage_messages") {
             return Ok(Verdict::Placed { noted: None, censored: None });
         }
+        self.run_rules(member, &powers.roles, channel, message, content, mentions, now, if editing { Placing::Edit } else { Placing::Post })
+    }
+
+    /// AutoMod for what a webhook posts (webhooks.rs): the community's own post, so
+    /// nothing exempts it as the owner's would be, and a rule that would hold it
+    /// refuses it -- a held post is let through as its author's, which a webhook's
+    /// name and embeds are not.
+    pub fn automod_webhook(&self, member: &Member, channel: &Channel, message: &Value, content: &str, mentions: usize, now: i64) -> anyhow::Result<Verdict> {
+        self.run_rules(member, &[], channel, message, content, mentions, now, Placing::Webhook)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_rules(&self, member: &Member, roles: &[String], channel: &Channel, message: &Value, content: &str, mentions: usize, now: i64, placing: Placing) -> anyhow::Result<Verdict> {
+        let editing = placing == Placing::Edit;
         let body = &message["body"];
         let mut outcome = Outcome::default();
         let mut noted = false;
         let mut now_says = content.to_string();
         let mut censored_by: Vec<String> = Vec::new();
         for rule in self.store.automod_rules()?.into_iter().filter(|rule| rule["enabled"] == true) {
-            let exempt = strings(&rule["exempt_roles"]).iter().any(|role| powers.roles.contains(role)) || strings(&rule["exempt_channels"]).contains(&channel.id);
+            let exempt = strings(&rule["exempt_roles"]).iter().any(|role| roles.contains(role)) || strings(&rule["exempt_channels"]).contains(&channel.id);
             if exempt {
                 continue;
             }
             let Some(found) = inspect(&rule, &now_says, mentions) else { continue };
             noted = true;
             let rule_name = rule["name"].as_str().unwrap_or("A rule").to_string();
-            let blocked = rule["block"] == true || (editing && rule["hold"] == true);
+            let blocked = rule["block"] == true || (placing != Placing::Post && rule["hold"] == true);
             let held = !blocked && rule["hold"] == true;
             let censors = !blocked && !held && rule["censor"] == true && !found.spans.is_empty();
             let done = if blocked { "refused" } else if held { "held" } else if censors { "censored" } else { "noticed" };
@@ -159,7 +181,11 @@ impl Community {
             if let Some(alert) = rule["alert_channel"].as_str().and_then(|id| self.store.channel(id).ok().flatten()).filter(|c| !c.closed && c.voice.is_none()) {
                 let name = member.name.clone().unwrap_or_else(|| "someone".into());
                 let quoted: String = content.chars().take(300).collect();
-                let kind = if editing { "an edit" } else { "a post" };
+                let kind = match placing {
+                    Placing::Post => "a post",
+                    Placing::Edit => "an edit",
+                    Placing::Webhook => "a webhook's post",
+                };
                 let text = format!("**{AUTOMOD_NAME}** {done} {kind} by {name} in #{} ({rule_name}: {what}):\n> {}", channel.name, quoted.replace('\n', "\n> "));
                 if self.post_as_server(&alert.id, &text, now)? {
                     outcome.posted = true;

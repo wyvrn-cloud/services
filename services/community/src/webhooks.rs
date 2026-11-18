@@ -32,7 +32,7 @@ use serde_json::{json, Map, Value};
 use crate::community::{line, Community};
 use crate::questions::{failed, Refusal};
 use crate::server::AppState;
-use crate::store::{Channel, Flow, Post, Webhook};
+use crate::store::{Channel, Flow, Mention, Post, Webhook};
 
 pub const WEBHOOKS_FLOW: &str = "webhooks";
 /// How long what a webhook says is, as Discord's limits are.
@@ -330,7 +330,15 @@ pub async fn execute(State(state): State<Arc<AppState>>, Path((id, token)): Path
     if content.is_empty() && embeds.is_empty() && attachments.is_empty() {
         return problem(StatusCode::BAD_REQUEST, 50006, "Cannot send an empty message");
     }
-    let posted = match post(community, &hook, &channel, &content, embeds, attachments, &sent.payload, query.thread_id.as_deref(), now) {
+    let (content, mentions) = mentions_in(community, &content, &sent.payload);
+    let (content, alerted) = match automod(community, &channel, &hook, &content, mentions.len(), now) {
+        Ok(checked) => checked,
+        Err(response) => return response,
+    };
+    if alerted {
+        state.deliver.notify_one();
+    }
+    let posted = match post(community, &hook, &channel, &content, &mentions, embeds, attachments, &sent.payload, query.thread_id.as_deref(), now) {
         Ok(posted) => posted,
         Err(response) => return response,
     };
@@ -344,9 +352,68 @@ pub async fn execute(State(state): State<Arc<AppState>>, Path((id, token)): Path
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// What a webhook's text calls on, as Discord's do: `<@member>` (a member id here,
+/// where Discord has a user id), `<@&role>`, `@everyone` and `@here` (this
+/// community's everyone), as far as `allowed_mentions` lets it -- everything, where
+/// it says nothing, as on Discord. The text says each by name, whether or not it
+/// calls on them: one not let through is shown, and notifies nobody.
+pub fn mentions_in(community: &Community, content: &str, payload: &Value) -> (String, Vec<Mention>) {
+    static TOKEN: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"<@(!|&)?([A-Za-z0-9_-]{1,64})>|@(everyone|here)\b").unwrap());
+    let allowed = &payload["allowed_mentions"];
+    let said = allowed.is_object();
+    let parse: Vec<&str> = allowed["parse"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    let listed = |field: &str, id: &str| allowed[field].as_array().is_some_and(|ids| ids.iter().any(|one| one.as_str() == Some(id)));
+    let may = |kind: &str, field: &str, id: &str| !said || parse.contains(&kind) || listed(field, id);
+    let mut mentions: Vec<Mention> = Vec::new();
+    let text = TOKEN.replace_all(content, |found: &regex::Captures| {
+        let whole = found[0].to_string();
+        if found.get(3).is_some() {
+            if may("everyone", "", "") && !mentions.iter().any(|m| m.who == crate::community::EVERYONE) {
+                mentions.push(Mention { who: crate::community::EVERYONE.into(), name: crate::community::EVERYONE.into() });
+            }
+            return "@everyone".to_string();
+        }
+        let id = &found[2];
+        if found.get(1).map(|m| m.as_str()) == Some("&") {
+            let Some(role) = community.store.role(id).ok().flatten().filter(|role| role.id != crate::roles::EVERYONE_ROLE) else { return whole };
+            let who = format!("role:{}", role.id);
+            if may("roles", "roles", id) && !mentions.iter().any(|m| m.who == who) {
+                mentions.push(Mention { who, name: role.name.clone() });
+            }
+            return format!("@{}", role.name);
+        }
+        let Some(did) = community.store.did_of_member(id).ok().flatten() else { return whole };
+        let Some(member) = community.store.member(&did).ok().flatten() else { return whole };
+        let name = member.name.clone().unwrap_or_else(|| "someone".into());
+        if may("users", "users", id) && !mentions.iter().any(|m| m.who == did) {
+            mentions.push(Mention { who: did, name: name.clone() });
+        }
+        format!("@{name}")
+    });
+    mentions.truncate(crate::community::MAX_MENTIONS);
+    (text.into_owned(), mentions)
+}
+
+/// What AutoMod makes of a webhook's post: what it says now (censored, maybe),
+/// whether anything was posted besides (an alert), or why it is refused.
+fn automod(community: &Community, channel: &Channel, hook: &Webhook, content: &str, mentions: usize, now: i64) -> Result<(String, bool), Response> {
+    fn failed<E>(_: E) -> Response {
+        problem(StatusCode::INTERNAL_SERVER_ERROR, 0, "500: Internal Server Error")
+    }
+    let Some(own) = community.own.clone() else { return Ok((content.to_string(), false)) };
+    let Some(mut author) = community.store.member(&own).map_err(failed)? else { return Ok((content.to_string(), false)) };
+    author.name = Some(hook.name.clone());
+    let message = json!({ "type": "webhook", "id": uuid::Uuid::new_v4().to_string(), "body": { "channel": channel.id, "content": content } });
+    match community.automod_webhook(&author, channel, &message, content, mentions, now).map_err(failed)? {
+        crate::automod::Verdict::Placed { noted, censored } => Ok((censored.map(|c| c.content).unwrap_or_else(|| content.to_string()), noted.is_some_and(|n| n.posted))),
+        // Discord's own word for it.
+        crate::automod::Verdict::Stopped(_) => Err(problem(StatusCode::BAD_REQUEST, 200000, "Message was blocked by automatic moderation")),
+    }
+}
+
 /// Makes the post: it, and the posts whose threads changed with it.
 #[allow(clippy::too_many_arguments)]
-fn post(community: &Community, hook: &Webhook, channel: &Channel, content: &str, embeds: Vec<Value>, attachments: Vec<Value>, payload: &Value, thread_id: Option<&str>, now: i64) -> Result<(Post, Vec<String>), Response> {
+fn post(community: &Community, hook: &Webhook, channel: &Channel, content: &str, mentions: &[Mention], embeds: Vec<Value>, attachments: Vec<Value>, payload: &Value, thread_id: Option<&str>, now: i64) -> Result<(Post, Vec<String>), Response> {
     let failed = |_| problem(StatusCode::INTERNAL_SERVER_ERROR, 0, "500: Internal Server Error");
     let Some(own) = community.own.clone() else { return Err(problem(StatusCode::SERVICE_UNAVAILABLE, 0, "This server posts as nobody.")) };
     community.store.admit(&own, crate::store::Role::Member, now).map_err(failed)?;
@@ -386,7 +453,7 @@ fn post(community: &Community, hook: &Webhook, channel: &Channel, content: &str,
     }
     let id = uuid::Uuid::new_v4().to_string();
     let added = community.store.add_post(&channel.id, &id, content, &author, None, None, now).map_err(failed)?;
-    community.store.set_written_with(&added.id, None, thread.as_deref(), &[]).map_err(failed)?;
+    community.store.set_written_with(&added.id, None, thread.as_deref(), mentions).map_err(failed)?;
     community.store.set_post_extra(&added.id, &extra).map_err(failed)?;
     let mut changed = Vec::new();
     if let Some(title) = &title {
@@ -456,6 +523,22 @@ pub async fn edit_message(State(state): State<Arc<AppState>>, Path((id, token, m
     if content.chars().count() > MAX_CONTENT {
         return problem(StatusCode::BAD_REQUEST, 50035, "Must be 2000 or fewer in length.");
     }
+    // What it calls on, and AutoMod, as for a new post (only when the text changes).
+    let (content, mentions) = if sent.payload.get("content").is_some() { mentions_in(community, &content, &sent.payload) } else { (content, Vec::new()) };
+    let content = if sent.payload.get("content").is_some() {
+        let Some(channel) = community.store.channel(&post.channel).ok().flatten() else { return problem(StatusCode::NOT_FOUND, 10003, "Unknown Channel") };
+        match automod(community, &channel, &hook, &content, mentions.len(), now) {
+            Ok((content, alerted)) => {
+                if alerted {
+                    state.deliver.notify_one();
+                }
+                content
+            }
+            Err(response) => return response,
+        }
+    } else {
+        content
+    };
     let (added, by_name) = match keep_files(community, &hook, &sent, now) {
         Ok(kept) => kept,
         Err(response) => return response,
@@ -488,7 +571,7 @@ pub async fn edit_message(State(state): State<Arc<AppState>>, Path((id, token, m
     if content.is_empty() && extra.get("embeds").is_none() && extra.get("attachments").is_none() {
         return problem(StatusCode::BAD_REQUEST, 50006, "Cannot send an empty message");
     }
-    let saved = community.store.edit_post(&post.id, &content, &[], now).and_then(|_| community.store.set_post_extra(&post.id, &extra));
+    let saved = community.store.edit_post(&post.id, &content, &mentions, now).and_then(|_| community.store.set_post_extra(&post.id, &extra));
     if saved.is_err() {
         return problem(StatusCode::INTERNAL_SERVER_ERROR, 0, "500: Internal Server Error");
     }

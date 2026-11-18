@@ -71,7 +71,7 @@ pub const CHANGES: &str = "https://wyvrn.app/community/1.0/changes";
 /// Who a post calls on when it calls on everyone in the community.
 pub const EVERYONE: &str = "everyone";
 /// As many as one post may call on by name.
-const MAX_MENTIONS: usize = 50;
+pub const MAX_MENTIONS: usize = 50;
 const MAX_MENTION_NAME: usize = 40;
 /// As many different emoji as one post takes, and as one member puts on it.
 const MAX_REACTIONS: usize = 20;
