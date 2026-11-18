@@ -73,6 +73,9 @@ impl Tenant {
     }
 }
 
+/// How often each open community's store is measured, in seconds.
+const MEASURE_EVERY: i64 = 300;
+
 pub struct Host {
     pub config: Config,
     pub registry: Registry,
@@ -162,6 +165,9 @@ impl Host {
                 owners: self.owners_of(record),
                 max_members: limits.members,
                 max_channels: limits.channels,
+                max_roles: limits.roles,
+                max_community_posts_per_minute: limits.posts_per_minute,
+                max_store_bytes: limits.store_bytes,
                 ..CommunityConfig::default()
             },
             mediator: None,
@@ -302,9 +308,28 @@ impl Host {
         }
     }
 
-    /// Housekeeping every 15 seconds, for as long as the host runs.
+    /// What each open community's store takes up, measured for its limit
+    /// (`store_bytes`): every few minutes, and as it opens.
+    pub fn measure(&self) {
+        for tenant in self.open_map().values() {
+            let community = &tenant.state.community;
+            match community.store.bytes_used() {
+                Ok(bytes) => community.used_bytes.store(bytes, Ordering::Relaxed),
+                Err(error) => tracing::warn!(community = %tenant.name, %error, "couldn't measure a community's store"),
+            }
+        }
+    }
+
+    /// Housekeeping every 15 seconds, for as long as the host runs; stores
+    /// measured every five minutes.
     pub async fn run_housekeeping(self: Arc<Self>) {
+        let mut measured = 0;
         loop {
+            if now() - measured >= MEASURE_EVERY {
+                measured = now();
+                let host = self.clone();
+                let _ = tokio::task::spawn_blocking(move || host.measure()).await;
+            }
             self.housekeeping(now()).await;
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
         }

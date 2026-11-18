@@ -132,11 +132,18 @@ pub struct Limits {
     pub files_quota: u64,
     /// The most kept of everyone's.
     pub files_total: u64,
+    /// Roles (at most 250).
+    pub roles: usize,
+    /// Posts a minute, from everyone; 0 for no limit.
+    pub posts_per_minute: usize,
+    /// What its store may hold, in bytes (as measured every few minutes); 0 for no
+    /// limit. Files have limits of their own.
+    pub store_bytes: u64,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { members: 1000, channels: 500, file_bytes: 25 * 1024 * 1024, files_quota: 1024 * 1024 * 1024, files_total: 5 * 1024 * 1024 * 1024 }
+        Self { members: 1000, channels: 500, file_bytes: 25 * 1024 * 1024, files_quota: 1024 * 1024 * 1024, files_total: 5 * 1024 * 1024 * 1024, roles: 250, posts_per_minute: 0, store_bytes: 0 }
     }
 }
 

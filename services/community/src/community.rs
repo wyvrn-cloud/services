@@ -226,6 +226,9 @@ fn new_code() -> String {
 pub struct Community {
     pub store: Store,
     pub config: CommunityConfig,
+    /// What its store holds, in bytes, as its host last measured it (0 unmeasured):
+    /// what `config.max_store_bytes` is held to.
+    pub used_bytes: std::sync::atomic::AtomicU64,
     /// What an admin has changed of its name, description and picture
     /// (`set-profile`), and where that is kept.
     changed: std::sync::RwLock<Changed>,
@@ -472,7 +475,7 @@ impl Community {
             Some(kept) => kept.load()?,
             None => Changed::default(),
         };
-        let community = Self { store, config, changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, expressions: None, live: Default::default(), web_url: None, public_url: String::new(), speaks_as: None, importing: Default::default() };
+        let community = Self { store, config, used_bytes: Default::default(), changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, expressions: None, live: Default::default(), web_url: None, public_url: String::new(), speaks_as: None, importing: Default::default() };
         community.ensure_roles()?;
         Ok(community)
     }

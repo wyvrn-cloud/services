@@ -27,6 +27,14 @@ pub const ONBOARDING_FLOW: &str = "onboarding";
 pub const VERSION: &str = "1.0";
 const P: &str = "https://didcomm.org/workflow/1.0/";
 pub(crate) const MAX_ROLES: usize = 250;
+
+impl Community {
+    /// As many roles as this community may have: [`MAX_ROLES`], or fewer where its
+    /// host says (`max_roles`).
+    pub(crate) fn max_roles(&self) -> usize {
+        self.config.max_roles.clamp(1, MAX_ROLES)
+    }
+}
 const MAX_ROLE_NAME: usize = 100;
 
 /// Each template: its id, title, states and the events that move between them.
@@ -843,7 +851,7 @@ impl Community {
             (ROLES, "list" | "edit", "create") => {
                 let name = line(&input["name"], MAX_ROLE_NAME).ok_or_else(|| refused("A role needs a name."))?;
                 let roles = self.store.roles().map_err(failed)?;
-                if roles.len() >= MAX_ROLES {
+                if roles.len() >= self.max_roles() {
                     return Err(refused("This community has as many roles as it can hold."));
                 }
                 if self.role_name_taken(&name, "").map_err(failed)? {

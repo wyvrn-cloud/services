@@ -56,6 +56,14 @@ fn limits_from(input: &Value, base: Limits) -> Result<Limits, String> {
         file_bytes: size("file_bytes", base.file_bytes)?,
         files_quota: size("files_quota", base.files_quota)?,
         files_total: size("files_total", base.files_total)?,
+        roles: count("roles", base.roles)?.clamp(1, 250),
+        posts_per_minute: count("posts_per_minute", base.posts_per_minute)?,
+        // Left empty, as it was; 0, no limit.
+        store_bytes: match field(input, "store_bytes") {
+            "" => base.store_bytes,
+            "0" => 0,
+            text => parse_bytes(text).ok_or("Its store: a size, as in 2 GB, or 0 for no limit.")?,
+        },
     })
 }
 
@@ -143,6 +151,9 @@ impl Pages for AppState {
                 { "type": "text-input", "form-id": "file_bytes", "label": "Largest file", "value": bytes(limits.file_bytes) },
                 { "type": "text-input", "form-id": "files_quota", "label": "Files, a member", "value": bytes(limits.files_quota) },
                 { "type": "text-input", "form-id": "files_total", "label": "Files, in all", "value": bytes(limits.files_total) },
+                { "type": "text-input", "form-id": "roles", "label": "Roles", "value": limits.roles.to_string() },
+                { "type": "text-input", "form-id": "posts_per_minute", "label": "Posts a minute, from everyone (0: no limit)", "value": limits.posts_per_minute.to_string() },
+                { "type": "text-input", "form-id": "store_bytes", "label": "Its store (0: no limit)", "value": if limits.store_bytes == 0 { "0".to_string() } else { bytes(limits.store_bytes) } },
                 button("Set", "limits", named.clone()),
             ]}));
             if record.state.served() {

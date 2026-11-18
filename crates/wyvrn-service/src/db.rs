@@ -1185,6 +1185,38 @@ impl Session<'_> {
         Ok(listed.into_iter().filter_map(|name| name.strip_prefix(prefix.as_str()).map(str::to_string)).filter(|name| name != "wyvrn_service").collect())
     }
 
+    /// How much the store takes up, in bytes: SQLite's pages; MySQL's tables (those
+    /// of this store alone, where it shares a database), data and indexes, as
+    /// `information_schema` last counted them (an estimate, refreshed as MySQL
+    /// does).
+    pub fn bytes_used(&mut self) -> Result<u64> {
+        let naming = self.naming.cloned();
+        let size: i64 = match (&*self.backend, &naming) {
+            (Backend::Sqlite(_), _) => self.as_written("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()", &[])?.rows.first().map(|row| row.get::<i64>(0)).transpose()?.unwrap_or(0),
+            (_, Some(Naming { database, prefix })) => {
+                let schema = database.clone().map(Value::Text).unwrap_or(Value::Null);
+                let like = Value::Text(format!("{}%", prefix.replace('_', "\\_")));
+                self.as_written(
+                    "SELECT CAST(COALESCE(SUM(data_length + index_length), 0) AS SIGNED) FROM information_schema.tables WHERE table_schema = COALESCE(?1, DATABASE()) AND table_name LIKE ?2",
+                    &[schema, like],
+                )?
+                .rows
+                .first()
+                .map(|row| row.get::<i64>(0))
+                .transpose()?
+                .unwrap_or(0)
+            }
+            _ => self
+                .as_written("SELECT CAST(COALESCE(SUM(data_length + index_length), 0) AS SIGNED) FROM information_schema.tables WHERE table_schema = DATABASE()", &[])?
+                .rows
+                .first()
+                .map(|row| row.get::<i64>(0))
+                .transpose()?
+                .unwrap_or(0),
+        };
+        Ok(size.max(0) as u64)
+    }
+
     /// Every row of `table`, with its columns' names: text as text and bytes as
     /// bytes, as each column holds them.
     pub fn dump(&mut self, table: &str) -> Result<(Vec<String>, Vec<Vec<Value>>)> {

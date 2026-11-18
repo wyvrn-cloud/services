@@ -541,3 +541,36 @@ async fn someone_makes_a_community_from_their_app_as_far_as_the_hosts_admins_all
     assert!(right["body"]["artifacts"]["community"].is_string(), "{right}");
     assert!(running.host.registry.codes().unwrap().is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hosted_community_is_held_to_its_posts_a_minute_and_the_room_its_store_has() {
+    let running = start_host(600).await;
+    let owner = Peer::start().await;
+    running.host.registry.create("busy", "Busy", Storage::Sqlite, &owner.did(), "test", 1).unwrap();
+    let limits = wyvrn_community_host::config::Limits { posts_per_minute: 2, ..Default::default() };
+    running.host.registry.set_limits("busy", Some(&limits)).unwrap();
+    let busy = running.did_of("busy").await;
+    owner.community(&busy, "join", json!({})).await;
+    let channel = owner.community(&busy, "create-channel", json!({ "name": "general" })).await["body"]["created"].as_str().unwrap().to_string();
+    for n in 0..2 {
+        assert_eq!(kind(&owner.community(&busy, "post", json!({ "channel": channel, "content": format!("post {n}") })).await), "posted");
+    }
+    // Two a minute, from everyone: the owner too.
+    let third = owner.community(&busy, "post", json!({ "channel": channel, "content": "one too many" })).await;
+    assert_eq!(third["body"]["code"], "e.p.req.rate-limited", "{third}");
+
+    // Its store, measured, past the room it has: nothing more is posted.
+    running.host.registry.create("full", "Full", Storage::Sqlite, &owner.did(), "test", 1).unwrap();
+    running.host.registry.set_limits("full", Some(&wyvrn_community_host::config::Limits { store_bytes: 1, ..Default::default() })).unwrap();
+    let full = running.did_of("full").await;
+    owner.community(&full, "join", json!({})).await;
+    let general = owner.community(&full, "create-channel", json!({ "name": "general" })).await["body"]["created"].as_str().unwrap().to_string();
+    tokio::task::spawn_blocking({
+        let host = running.host.clone();
+        move || host.measure()
+    })
+    .await
+    .unwrap();
+    let refused = owner.community(&full, "post", json!({ "channel": general, "content": "no room" })).await;
+    assert_eq!(refused["body"]["code"], "e.p.msg.quota", "{refused}");
+}

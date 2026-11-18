@@ -2372,6 +2372,8 @@ fn where_events_go_and_what_waits_to_go_are_kept_in_mysql_too() {
     store.event_done("e2").unwrap();
     store.delete_event_hook("h1").unwrap();
     assert!(store.event_hook("h1").unwrap().is_none());
+    // What it takes up, as a host measures it for its limit.
+    assert!(store.bytes_used().unwrap() > 0);
     assert!(store.due_events(1000, 10).unwrap().is_empty());
 }
 

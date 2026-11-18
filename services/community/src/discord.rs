@@ -799,7 +799,7 @@ impl Community {
         let new = |kind: &str| plan.items.iter().filter(|i| i.kind == kind && (i.is_new() || i.deleted_here)).count();
         let open = self.store.open_channel_count().ok()?;
         let room = self.config.max_channels.saturating_sub(open);
-        let roles_room = crate::admin_flows::MAX_ROLES.saturating_sub(self.store.roles().ok()?.len());
+        let roles_room = self.max_roles().saturating_sub(self.store.roles().ok()?.len());
         let mut said = Vec::new();
         if new("channel") > room {
             said.push(format!(
@@ -808,7 +808,7 @@ impl Community {
             ));
         }
         if new("role") > roles_room {
-            said.push(format!("A community may have {} roles, so only {roles_room} of the template's {} new roles can be made.", crate::admin_flows::MAX_ROLES, new("role")));
+            said.push(format!("A community may have {} roles, so only {roles_room} of the template's {} new roles can be made.", self.max_roles(), new("role")));
         }
         (!said.is_empty()).then(|| said.join(" "))
     }
@@ -937,7 +937,7 @@ impl Community {
             ));
         }
         if no_room_roles > 0 {
-            report.push_str(&format!(" {no_room_roles} roles weren't made: a community may have only {} roles.", crate::admin_flows::MAX_ROLES));
+            report.push_str(&format!(" {no_room_roles} roles weren't made: a community may have only {} roles.", self.max_roles()));
         }
         Ok(report)
     }
@@ -1052,7 +1052,7 @@ impl Community {
     fn make(&self, kind: &str, want: &Value, owner: &str, now: i64) -> anyhow::Result<Option<String>> {
         match kind {
             "role" => {
-                if self.store.roles()?.len() >= crate::admin_flows::MAX_ROLES {
+                if self.store.roles()?.len() >= self.max_roles() {
                     return Ok(None);
                 }
                 let id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();

@@ -170,6 +170,14 @@ pub struct CommunityConfig {
     /// Where Discord's API is, for reading a server template to import
     /// (discord.rs). A test points it elsewhere.
     pub discord_api: String,
+    /// As many roles as there may be (at most [`crate::admin_flows::MAX_ROLES`]).
+    pub max_roles: usize,
+    /// As many posts as the whole community takes in a minute, from everyone; 0
+    /// for no limit (a host's, for each community it keeps).
+    pub max_community_posts_per_minute: usize,
+    /// How much its store may hold, in bytes, as the host measures it
+    /// (`Community::used_bytes`); 0 for no limit. Past it, nothing more is posted.
+    pub max_store_bytes: u64,
     /// Whether events may be sent out (outgoing.rs) to an address on this
     /// server's own network, or over plain http: for a receiver beside it, and
     /// tests. Off, only https out on the internet.
@@ -208,6 +216,9 @@ impl Default for CommunityConfig {
             max_members: 0,
             discord_api: "https://discord.com/api/v10".to_string(),
             outgoing_private: false,
+            max_roles: 250,
+            max_community_posts_per_minute: 0,
+            max_store_bytes: 0,
         }
     }
 }

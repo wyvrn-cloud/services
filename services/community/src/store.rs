@@ -1914,6 +1914,16 @@ impl Store {
     }
 
     /// How many posts `did` has made, anywhere, since `since`.
+    /// How much the store takes up, in bytes (a host's limit, measured now and then).
+    pub fn bytes_used(&self) -> Result<u64> {
+        self.db.lock().bytes_used()
+    }
+
+    /// Every post since `since`, from anyone (a host's limit on the whole community).
+    pub fn all_posts_since(&self, since: i64) -> Result<i64> {
+        self.db.lock().query_value("SELECT COUNT(*) FROM posts WHERE posted_at >= ?1", params![since])
+    }
+
     pub fn posts_since(&self, did: &str, since: i64) -> Result<i64> {
         self.db.lock().query_value("SELECT COUNT(*) FROM posts WHERE author_did = ?1 AND posted_at >= ?2", params![did, since])
     }
