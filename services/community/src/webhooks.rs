@@ -10,6 +10,9 @@
 //! - `GET`, `PATCH` and `DELETE` on `.../messages/{message_id}`: a post the
 //!   webhook made, read, changed or taken back.
 //! - `GET /api/webhooks/{id}/{token}`: the webhook itself.
+//! - `POST .../slack` and `.../github`: Slack's incoming-webhook messages and
+//!   GitHub's webhook events, made into the same post (webhook_formats.rs), as
+//!   Discord's own endpoints of those names do.
 //!
 //! A webhook's post is the community's own (its DID, as AutoMod's alerts are),
 //! named as the webhook or as the post asks, with `webhook` saying which, and
@@ -294,21 +297,88 @@ pub struct ExecuteQuery {
     thread_id: Option<String>,
 }
 
+/// The webhook a request is for, if its token is right and it isn't posting too fast.
+fn hook_now(community: &Community, id: &str, token: &str) -> Result<Webhook, Response> {
+    let hook = hook_for(community, id, token)?;
+    if let Err(wait) = allowed_now(&hook.id, chrono::Utc::now().timestamp_millis()) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, axum::Json(json!({ "message": "You are being rate limited.", "retry_after": wait, "global": false }))).into_response());
+    }
+    Ok(hook)
+}
+
 /// `POST /api/webhooks/{id}/{token}`: a post, from whatever holds the URL.
 pub async fn execute(State(state): State<Arc<AppState>>, Path((id, token)): Path<(String, String)>, Query(query): Query<ExecuteQuery>, request: Request) -> Response {
-    let community = &state.community;
-    let hook = match hook_for(community, &id, &token) {
+    let hook = match hook_now(&state.community, &id, &token) {
         Ok(hook) => hook,
         Err(response) => return response,
     };
-    let now = crate::gates::now();
-    if let Err(wait) = allowed_now(&hook.id, chrono::Utc::now().timestamp_millis()) {
-        return (StatusCode::TOO_MANY_REQUESTS, axum::Json(json!({ "message": "You are being rate limited.", "retry_after": wait, "global": false }))).into_response();
-    }
     let sent = match read_sent(&state, request).await {
         Ok(sent) => sent,
         Err(response) => return response,
     };
+    post_sent(&state, &hook, sent, &query)
+}
+
+/// A body that is JSON, or a form whose `payload` field is (as Slack's and
+/// GitHub's may be sent).
+async fn json_or_payload_form(request: Request) -> Result<Value, Response> {
+    let form = request.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|t| t.starts_with("application/x-www-form-urlencoded"));
+    let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024).await.map_err(|_| problem(StatusCode::PAYLOAD_TOO_LARGE, 40005, "Request entity too large"))?;
+    let text = if form {
+        url::form_urlencoded::parse(&bytes).find(|(name, _)| name == "payload").map(|(_, value)| value.into_owned()).unwrap_or_default().into_bytes()
+    } else {
+        bytes.to_vec()
+    };
+    let body: Value = serde_json::from_slice(&text).map_err(|_| problem(StatusCode::BAD_REQUEST, 50109, "The request body is not JSON."))?;
+    if !body.is_object() {
+        return Err(problem(StatusCode::BAD_REQUEST, 50109, "The request body is not a JSON object."));
+    }
+    Ok(body)
+}
+
+/// `POST /api/webhooks/{id}/{token}/slack`: a Slack incoming-webhook message,
+/// posted as Discord's `/slack` does (webhook_formats.rs). Answers `ok`, as Slack.
+pub async fn execute_slack(State(state): State<Arc<AppState>>, Path((id, token)): Path<(String, String)>, Query(query): Query<ExecuteQuery>, request: Request) -> Response {
+    let hook = match hook_now(&state.community, &id, &token) {
+        Ok(hook) => hook,
+        Err(response) => return response,
+    };
+    let body = match json_or_payload_form(request).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let sent = Sent { payload: crate::webhook_formats::from_slack(&body), files: Vec::new() };
+    let response = post_sent(&state, &hook, sent, &ExecuteQuery { wait: None, thread_id: query.thread_id });
+    if response.status().is_success() {
+        return (StatusCode::OK, "ok").into_response();
+    }
+    response
+}
+
+/// `POST /api/webhooks/{id}/{token}/github`: one of GitHub's webhook events (its
+/// `X-GitHub-Event`), posted as Discord's `/github` does (webhook_formats.rs). An
+/// event nothing is shown for (a `ping`, say) is answered 204 and posts nothing.
+pub async fn execute_github(State(state): State<Arc<AppState>>, Path((id, token)): Path<(String, String)>, Query(query): Query<ExecuteQuery>, request: Request) -> Response {
+    let hook = match hook_now(&state.community, &id, &token) {
+        Ok(hook) => hook,
+        Err(response) => return response,
+    };
+    let event = request.headers().get("x-github-event").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+    let body = match json_or_payload_form(request).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let Some(payload) = crate::webhook_formats::from_github(&event, &body) else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    post_sent(&state, &hook, Sent { payload, files: Vec::new() }, &query)
+}
+
+/// Posts what `hook` was sent: checked, kept and posted as any webhook's post.
+fn post_sent(state: &Arc<AppState>, hook: &Webhook, sent: Sent, query: &ExecuteQuery) -> Response {
+    let community = &state.community;
+    let hook = hook.clone();
+    let now = crate::gates::now();
     let Some(channel) = community.store.channel(&hook.channel).ok().flatten().filter(|c| !c.closed && c.voice.is_none()) else {
         return problem(StatusCode::NOT_FOUND, 10003, "Unknown Channel");
     };
@@ -344,7 +414,7 @@ pub async fn execute(State(state): State<Arc<AppState>>, Path((id, token)): Path
     };
     state.deliver.notify_one();
     for changed in posted.1 {
-        crate::server::send_changed_later(&state, changed);
+        crate::server::send_changed_later(state, changed);
     }
     if query.wait.as_deref() == Some("true") {
         return axum::Json(as_discord(&posted.0, &hook)).into_response();

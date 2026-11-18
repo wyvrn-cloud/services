@@ -2864,6 +2864,49 @@ async fn make_webhook(owner: &Peer, instance: &str, name: &str, channel: &str) -
 }
 
 #[tokio::test]
+async fn a_webhook_takes_slacks_messages_and_githubs_events_as_discords_do() {
+    let server = start_server_with("", true).await;
+    let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member]);
+    let general = open_channel(&owner, "general").await;
+    for peer in [&owner, &member] {
+        peer.community("join", json!({})).await;
+    }
+    let url = make_webhook(&owner, "w1", "Feeds", &general).await;
+    let http = reqwest::Client::new();
+
+    // Slack's JSON: its mrkdwn as Markdown, an attachment as an embed, answered "ok".
+    let slack = json!({ "text": "Deploy <https://ci.example/9|#9> *done*", "username": "Deployer", "attachments": [{ "color": "good", "title": "production", "text": "3 services" }] });
+    let answer = http.post(format!("{url}/slack")).json(&slack).send().await.unwrap();
+    assert_eq!(answer.status(), 200);
+    assert_eq!(answer.text().await.unwrap(), "ok");
+    let got = member.next_message().await;
+    assert_eq!(got["content"], "Deploy [#9](https://ci.example/9) **done**", "{got}");
+    assert_eq!(got["webhook"]["name"], "Deployer", "{got}");
+    assert_eq!(got["embeds"][0]["title"], "production");
+    // And as a form with a `payload`, as older Slack clients send it.
+    let form = http.post(format!("{url}/slack")).form(&[("payload", json!({ "text": "From a form" }).to_string())]).send().await.unwrap();
+    assert_eq!(form.status(), 200);
+    assert_eq!(member.next_message().await["content"], "From a form");
+
+    // GitHub's ping posts nothing; an issue opened is an embed, as from GitHub.
+    let ping = http.post(format!("{url}/github")).header("x-github-event", "ping").json(&json!({ "zen": "Speak like a human." })).send().await.unwrap();
+    assert_eq!(ping.status(), 204);
+    let issue = json!({ "action": "opened", "repository": { "full_name": "wyvrn/chat" }, "sender": { "login": "ada" }, "issue": { "number": 7, "title": "Stages", "body": "Like Discord's.", "html_url": "https://github.com/wyvrn/chat/issues/7" } });
+    let opened = http.post(format!("{url}/github")).header("x-github-event", "issues").json(&issue).send().await.unwrap();
+    assert_eq!(opened.status(), 204);
+    let got = member.next_message().await;
+    assert_eq!(got["webhook"]["name"], "GitHub", "{got}");
+    assert_eq!(got["embeds"][0]["title"], "[wyvrn/chat] Issue opened: #7 Stages");
+    assert_eq!(got["embeds"][0]["url"], "https://github.com/wyvrn/chat/issues/7");
+
+    // A wrong token is refused before anything is read.
+    let wrong = url.rsplit_once('/').unwrap().0.to_string() + "/nottheone";
+    assert_eq!(http.post(format!("{wrong}/slack")).json(&slack).send().await.unwrap().status(), 401);
+    assert_eq!(http.post(format!("{wrong}/github")).header("x-github-event", "issues").json(&issue).send().await.unwrap().status(), 401);
+}
+
+#[tokio::test]
 async fn events_go_out_signed_to_a_receiver_an_admin_names_naming_members_by_member_id() {
     // A receiver beside the server: what it is sent, with the headers that matter.
     let (heard, mut hearing) = tokio::sync::mpsc::unbounded_channel::<(String, String, String)>();

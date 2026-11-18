@@ -1031,6 +1031,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/webhooks/{id}/{token}",
             post(crate::webhooks::execute).get(crate::webhooks::describe).layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
+        // Slack's and GitHub's bodies, as Discord takes them (webhook_formats.rs).
+        .route("/api/webhooks/{id}/{token}/slack", post(crate::webhooks::execute_slack))
+        .route("/api/webhooks/{id}/{token}/github", post(crate::webhooks::execute_github))
         .route(
             "/api/webhooks/{id}/{token}/messages/{message}",
             get(crate::webhooks::read_message)
