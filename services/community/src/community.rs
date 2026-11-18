@@ -115,6 +115,9 @@ const MAX_VOICE_LIMIT: i64 = 500;
 /// A voice channel's settings as an admin gives them (community-voice/1.0, "A voice
 /// channel"), laid over what it had: checked, and with nothing in them the protocol
 /// doesn't name. `Err` says what is wrong.
+/// How long a stage's topic may be, as Discord's.
+const MAX_STAGE_TOPIC: usize = 120;
+
 pub fn clean_voice(given: &Value, held: Option<&Value>) -> Result<Value, &'static str> {
     let mut out = held.and_then(Value::as_object).cloned().unwrap_or_default();
     if !given.is_object() && !given.is_null() {
@@ -133,6 +136,32 @@ pub fn clean_voice(given: &Value, held: Option<&Value>) -> Result<Value, &'stati
                 None => return Err("A voice setting has a value it doesn't take."),
             },
         }
+    }
+    // A stage (community-voice/1.0's "Stages"), and what it is about.
+    match given.get("stage") {
+        None => {}
+        Some(Value::Bool(true)) => {
+            out.insert("stage".into(), json!(true));
+        }
+        Some(Value::Bool(false)) | Some(Value::Null) => {
+            out.remove("stage");
+        }
+        Some(_) => return Err("A stage is true or false."),
+    }
+    match given.get("topic") {
+        None => {}
+        Some(Value::Null) => {
+            out.remove("topic");
+        }
+        Some(Value::String(topic)) => {
+            let topic: String = topic.trim().chars().take(MAX_STAGE_TOPIC).collect();
+            if topic.is_empty() {
+                out.remove("topic");
+            } else {
+                out.insert("topic".into(), json!(topic));
+            }
+        }
+        Some(_) => return Err("A stage's topic is text."),
     }
     match given.get("limit") {
         None => {}

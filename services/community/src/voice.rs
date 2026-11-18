@@ -75,6 +75,27 @@ pub struct Participant {
     /// Moved by a moderator: the voice channel their app is to join instead, and
     /// since when. Taken out of this one if it hasn't within [`MOVE_GRACE`].
     pub moving_to: Option<(String, i64)>,
+    /// On a stage: among those who speak, not the audience (a moderator's say).
+    pub speaker: bool,
+    /// On a stage, in the audience: when they raised their hand to speak.
+    pub hand: Option<i64>,
+}
+
+/// Whether a voice channel is a stage (community-voice/1.0's "Stages"): its
+/// speakers are heard, everyone else listens, and moderators choose who speaks.
+pub fn is_stage(channel: &crate::store::Channel) -> bool {
+    channel.voice.as_ref().is_some_and(|voice| voice["stage"] == true)
+}
+
+/// Whether `p` may be heard in `channel`: as anyone may in a voice channel, and on
+/// a stage, only as a speaker.
+fn heard(community: &Community, p: &Participant, channel: &crate::store::Channel) -> bool {
+    may(community, &p.did, channel, "speak") && !p.server_muted && (!is_stage(channel) || p.speaker)
+}
+
+/// Whether `p` may show `field` (`video`, `screen`): on a stage, only a speaker.
+fn shows(community: &Community, p: &Participant, channel: &crate::store::Channel, field: &str) -> bool {
+    may(community, &p.did, channel, field) && (!is_stage(channel) || p.speaker)
 }
 
 #[derive(Debug, Default)]
@@ -264,6 +285,7 @@ impl Rooms {
     /// Who is in `channel`, as `presence` says them.
     fn participants_body(&self, community: &Community, inner: &Inner, channel: &str) -> Vec<Value> {
         let Some(room) = inner.rooms.get(channel) else { return Vec::new() };
+        let stage = community.store.channel(channel).ok().flatten().is_some_and(|held| is_stage(&held));
         room.participants
             .values()
             .map(|p| {
@@ -286,6 +308,12 @@ impl Rooms {
                 }
                 if let Some((to, _)) = &p.moving_to {
                     entry["moving_to"] = json!(to);
+                }
+                if stage {
+                    entry["speaker"] = json!(p.speaker);
+                    if let Some(at) = p.hand {
+                        entry["hand"] = json!(at);
+                    }
                 }
                 entry
             })
@@ -343,14 +371,14 @@ impl Rooms {
             community.store.member(did).ok().flatten()?;
             let path = room_path(community_did, channel);
             let mut publish = vec![format!("{path}/{}/position", p.id)];
-            if may(community, did, &held, "speak") && !p.server_muted {
+            if heard(community, p, &held) {
                 publish.push(format!("{path}/{}/mic", p.id));
             }
-            if may(community, did, &held, "video") {
+            if shows(community, p, &held, "video") {
                 publish.push(format!("{path}/{}/camera", p.id));
                 publish.push(format!("{path}/{}/avatar", p.id));
             }
-            if may(community, did, &held, "screen") {
+            if shows(community, p, &held, "screen") {
                 publish.push(format!("{path}/{}/screen", p.id));
             }
             // A grant that is revalidated has to say when it runs out (moq-auth):
@@ -479,6 +507,9 @@ impl Rooms {
                                 sharing: Sharing::default(),
                                 seen: now,
                                 moving_to: None,
+                                // On a stage everyone comes in listening.
+                                speaker: false,
+                                hand: None,
                             };
                             room.participants.insert(p.id.clone(), p.clone());
                             p
@@ -508,7 +539,7 @@ impl Rooms {
                     "channel": channel.id,
                     "participant": participant.id,
                     "transport": transport_body,
-                    "may": { "speak": may(community, sender, &channel, "speak") && !participant.server_muted, "video": may(community, sender, &channel, "video"), "screen": may(community, sender, &channel, "screen") },
+                    "may": { "speak": heard(community, &participant, &channel), "video": shows(community, &participant, &channel, "video"), "screen": shows(community, &participant, &channel, "screen") },
                     "participants": participants,
                 });
                 let mut outcome = VoiceOutcome::reply(reply_to(message, JOINED, joined));
@@ -543,21 +574,30 @@ impl Rooms {
                     screen: body["sharing"]["screen"] == true,
                     avatar: body["sharing"]["avatar"] == true,
                 };
-                if ((sharing.camera || sharing.avatar) && !may(community, sender, &held, "video")) || (sharing.screen && !may(community, sender, &held, "screen")) {
-                    return refuse(message, "e.p.trust.not-authorized", "You may not share that here.");
-                }
+                let stage = is_stage(&held);
                 let changed = {
                     let mut inner = self.lock();
                     let Some(p) = inner.rooms.get_mut(channel).and_then(|room| room.of(sender, named).and_then(|id| room.participants.get_mut(&id))) else {
                         drop(inner);
                         return refuse(message, "e.p.msg.not-in-room", "You aren't in that voice channel.");
                     };
+                    if ((sharing.camera || sharing.avatar) && !shows(community, p, &held, "video")) || (sharing.screen && !shows(community, p, &held, "screen")) {
+                        drop(inner);
+                        return refuse(message, "e.p.trust.not-authorized", "You may not share that here.");
+                    }
                     let muted = body["muted"] == true;
                     let deafened = body["deafened"] == true;
-                    let changed = p.muted != muted || p.deafened != deafened || p.sharing != sharing;
+                    // A hand raised to speak, on a stage, by someone listening.
+                    let hand = match body.get("hand").and_then(Value::as_bool) {
+                        Some(true) if stage && !p.speaker => p.hand.or(Some(now)),
+                        Some(_) => None,
+                        None => p.hand,
+                    };
+                    let changed = p.muted != muted || p.deafened != deafened || p.sharing != sharing || p.hand != hand;
                     p.muted = muted;
                     p.deafened = deafened;
                     p.sharing = sharing;
+                    p.hand = hand;
                     changed
                 };
                 let mut outcome = VoiceOutcome::default();
@@ -648,10 +688,15 @@ impl Rooms {
                 let Some((held, _)) = voice_channel(channel)? else {
                     return refuse(message, "e.p.msg.unknown-channel", "There is no such voice channel.");
                 };
-                if !community.may_in(sender, &held, "moderate_voice")? {
+                let target = self.lock().rooms.get(channel).and_then(|room| room.participants.get(participant)).map(|p| p.did.clone());
+                // On a stage, a speaker may go back to the audience by themselves.
+                let stepping_down = body["speak"] == false && target.as_deref() == Some(sender) && body.get("mute").is_none() && body.get("move_to").is_none() && body["remove"] != true;
+                if !stepping_down && !community.may_in(sender, &held, "moderate_voice")? {
                     return refuse(message, "e.p.trust.not-authorized", "Moderating a voice channel takes Mute and remove people in voice channels.");
                 }
-                let target = self.lock().rooms.get(channel).and_then(|room| room.participants.get(participant)).map(|p| p.did.clone());
+                if body.get("speak").is_some() && !is_stage(&held) {
+                    return refuse(message, "e.p.msg.not-a-stage", "Only a stage has speakers.");
+                }
                 if let Some(target) = target.clone().filter(|target| target != sender) {
                     if !community.outranks(&community.powers(sender)?, &target)? {
                         return refuse(message, "e.p.trust.not-authorized", "You can only moderate someone ranked below you.");
@@ -698,6 +743,11 @@ impl Rooms {
                     } else if let Some(p) = room.participants.get_mut(participant) {
                         if let Some(mute) = body["mute"].as_bool() {
                             p.server_muted = mute;
+                        }
+                        // Asked up to speak, or back to the audience: either way the hand is down.
+                        if let Some(speak) = body["speak"].as_bool() {
+                            p.speaker = speak;
+                            p.hand = None;
                         }
                         true
                     } else {

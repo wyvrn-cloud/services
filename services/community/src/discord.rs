@@ -287,6 +287,7 @@ fn field_label(field: &str) -> &str {
         "category" => "category",
         "slow_mode" => "slow mode",
         "limit" => "how many may be in it",
+        "stage" => "whether it is a stage",
         "tags" => "tags",
         "overrides" => "its permissions",
         "permissions" => "permissions",
@@ -356,6 +357,7 @@ impl Community {
         let mut here = json!({ "kind": kind, "name": channel.name, "topic": channel.topic, "category": channel.category, "slow_mode": channel.slow_mode, "overrides": overrides });
         if let Some(voice) = &channel.voice {
             here["limit"] = voice["limit"].clone();
+            here["stage"] = json!(voice["stage"] == true);
         }
         if let Some(tags) = &channel.forum {
             here["tags"] = json!(tags.as_array().into_iter().flatten().map(|t| json!({ "name": t["name"], "emoji": t["emoji"] })).collect::<Vec<_>>());
@@ -526,7 +528,6 @@ impl Community {
             let shown_name = if kind == "voice" { format!("🔊{name}") } else { format!("#{name}") };
             match as_on_discord {
                 Some("announcement") => miss(format!("{shown_name} is an announcement channel on Discord: a text channel here for now")),
-                Some("stage") => miss(format!("{shown_name} is a stage on Discord: a voice channel here for now")),
                 Some("media") => miss(format!("{shown_name} is a media channel on Discord: a forum here for now")),
                 _ => {}
             }
@@ -563,6 +564,8 @@ impl Community {
             if kind == "voice" {
                 let limit = channel["user_limit"].as_i64().filter(|n| *n > 0).map(|n| n.min(500));
                 want["limit"] = json!(limit);
+                // A stage on Discord is one here (community-voice/1.0's "Stages").
+                want["stage"] = json!(as_on_discord == Some("stage"));
                 if channel["bitrate"].as_i64().is_some_and(|b| b != 64_000) {
                     miss("A voice channel's sound quality (bitrate)".into());
                 }
@@ -1084,7 +1087,7 @@ impl Community {
                 let name = self.free_channel_name(want["name"].as_str().unwrap_or("channel"), voice, None)?;
                 self.store.add_channel(&id, &name, want["topic"].as_str().unwrap_or_default(), owner, now)?;
                 if voice {
-                    self.store.set_channel_voice(&id, &crate::community::clean_voice(&json!({ "limit": want["limit"] }), None).unwrap_or_else(|_| json!({})))?;
+                    self.store.set_channel_voice(&id, &crate::community::clean_voice(&json!({ "limit": want["limit"], "stage": want["stage"] == true }), None).unwrap_or_else(|_| json!({})))?;
                 }
                 if want["kind"] == "forum" {
                     self.store.set_forum(&id, &crate::posting::read_tags(&tags_given(&want["tags"], None), None).unwrap_or_else(|_| json!([])))?;
@@ -1164,6 +1167,12 @@ impl Community {
                 }
                 if has("limit") && voice {
                     let settings = crate::community::clean_voice(&json!({ "limit": want["limit"] }), channel.voice.as_ref()).unwrap_or_else(|_| channel.voice.clone().unwrap_or_default());
+                    self.store.set_channel_voice(local, &settings)?;
+                }
+                // Imported before as a voice channel, and a stage on Discord: one now too.
+                if has("stage") && voice {
+                    let held = self.store.channel(local)?.and_then(|c| c.voice);
+                    let settings = crate::community::clean_voice(&json!({ "stage": want["stage"] == true }), held.as_ref()).unwrap_or_else(|_| held.clone().unwrap_or_default());
                     self.store.set_channel_voice(local, &settings)?;
                 }
                 if has("tags") && channel.forum.is_some() {

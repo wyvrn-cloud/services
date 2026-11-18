@@ -1142,6 +1142,66 @@ async fn the_relay_is_told_what_each_token_may_publish_from_who_is_in_the_room_n
 }
 
 #[tokio::test]
+async fn on_a_stage_the_audience_listens_raises_hands_and_moderators_choose_who_speaks() {
+    let server = voice_server().await;
+    let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member]);
+    let made = admin.community("create-channel", json!({ "name": "town-hall", "kind": "voice", "voice": { "stage": true, "topic": "  Q&A with the team  " } })).await;
+    let stage = made["body"]["created"].as_str().unwrap().to_string();
+    let listed = made["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == stage.as_str()).unwrap().clone();
+    assert_eq!((listed["voice"]["stage"].as_bool(), listed["voice"]["topic"].as_str()), (Some(true), Some("Q&A with the team")), "{listed}");
+
+    let ask = |token: String| {
+        let url = format!("{}voice/auth", server.url);
+        async move {
+            let response = reqwest::Client::new()
+                .post(url)
+                .json(&json!({ "id": "s1", "event": "connect", "node": "n", "transport": "quic", "path": "/", "query": format!("jwt={token}") }))
+                .send()
+                .await
+                .unwrap();
+            let grant = response.json::<Value>().await.unwrap_or(Value::Null);
+            grant["publish"].as_array().into_iter().flatten().filter_map(|p| p.as_str()).map(|p| p.rsplit('/').next().unwrap().to_string()).collect::<Vec<_>>()
+        }
+    };
+    // In the audience: heard by nobody, showing nothing.
+    let joined = voice(&member, "join", json!({ "channel": stage })).await;
+    assert_eq!(joined["body"]["may"], json!({ "speak": false, "video": false, "screen": false }));
+    let token = joined["body"]["transport"]["token"].as_str().unwrap().to_string();
+    let id = joined["body"]["participant"].as_str().unwrap().to_string();
+    assert_eq!(ask(token.clone()).await, ["position"]);
+    assert_eq!(tell(&member, "state", json!({ "channel": stage, "sharing": { "camera": true } })).await.unwrap()["body"]["code"], "e.p.trust.not-authorized");
+
+    // A hand raised, seen by whoever watches; only a moderator brings them up to speak.
+    let mut live = Live::open(&admin, &server).await;
+    live.send(&admin, "watch-presence", json!({})).await;
+    live.next_of(&admin, "presence").await;
+    assert!(tell(&member, "state", json!({ "channel": stage, "hand": true })).await.is_none());
+    let raised = live.next_of(&admin, "presence").await;
+    let entry = raised["body"]["channels"][0]["participants"][0].clone();
+    assert_eq!(entry["speaker"], false);
+    assert!(entry["hand"].as_i64().is_some(), "{entry}");
+    assert_eq!(tell(&member, "moderate", json!({ "channel": stage, "participant": id, "speak": true })).await.unwrap()["body"]["code"], "e.p.trust.not-authorized");
+    voice(&admin, "join", json!({ "channel": stage })).await;
+    live.next_of(&admin, "presence").await;
+    assert!(tell(&admin, "moderate", json!({ "channel": stage, "participant": id, "speak": true })).await.is_none());
+    let up = live.next_of(&admin, "presence").await;
+    let entry = up["body"]["channels"][0]["participants"].as_array().unwrap().iter().find(|p| p["participant"] == id.as_str()).unwrap().clone();
+    assert_eq!((entry["speaker"].as_bool(), entry.get("hand").is_none()), (Some(true), true), "{entry}");
+    let mut granted = ask(token.clone()).await;
+    granted.sort();
+    assert_eq!(granted, ["avatar", "camera", "mic", "position", "screen"]);
+
+    // A speaker goes back to the audience by themselves.
+    assert!(tell(&member, "moderate", json!({ "channel": stage, "participant": id, "speak": false })).await.is_none());
+    assert_eq!(ask(token).await, ["position"]);
+    // An ordinary voice channel has no speakers.
+    let lounge = voice_channel(&admin, "lounge", json!({})).await;
+    voice(&member, "join", json!({ "channel": lounge })).await;
+    assert_eq!(tell(&admin, "moderate", json!({ "channel": lounge, "participant": id, "speak": true })).await.unwrap()["body"]["code"], "e.p.msg.not-a-stage");
+}
+
+#[tokio::test]
 async fn keys_are_passed_on_as_they_are_to_those_in_the_room_and_invitations_ring_or_are_posted() {
     let server = voice_server().await;
     let (alice, bob, carol, dave) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
@@ -2488,7 +2548,7 @@ async fn an_owner_imports_a_discord_template_and_again_once_it_has_changed() {
     let read = advance(&owner, "d1", "read", json!({ "link": "https://discord.new/TESTCODE1234" })).await;
     assert_eq!(read["body"]["state"], "review", "{read}");
     let review = read["body"]["ui"].to_string();
-    for said in ["Import “Test Fort”", "To be made: 2 roles, 2 categories, 7 channels", "which stays", "#general", "stage on Discord", "announcement channel on Discord", "age-restricted", "Embed Links", "Verification level"] {
+    for said in ["Import “Test Fort”", "To be made: 2 roles, 2 categories, 7 channels", "which stays", "#general", "announcement channel on Discord", "age-restricted", "Embed Links", "Verification level"] {
         assert!(review.contains(said), "{said} in {review}");
     }
     // Asked, the first time, of what was here already: the community's name, what
@@ -2512,6 +2572,9 @@ async fn an_owner_imports_a_discord_template_and_again_once_it_has_changed() {
     assert_eq!(channel(&told, "general")["slow_mode"], 30);
     assert_eq!(channel(&told, "📜rules")["read_only"], true);
     assert_eq!(channel(&told, "Town Hall")["kind"], "voice");
+    // A stage on Discord is a stage here.
+    assert_eq!(channel(&told, "Town Hall")["voice"]["stage"], true);
+    assert!(!review.contains("stage on Discord"));
     assert_eq!(channel(&told, "help")["tags"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect::<Vec<_>>(), ["Bug", "Idea"]);
     assert_eq!(told["categories"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect::<Vec<_>>(), ["Info"]);
     let roles: Vec<&str> = told["roles"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
