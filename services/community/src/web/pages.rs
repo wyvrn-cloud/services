@@ -409,6 +409,19 @@ fn groups(state: &AppState, viewer: &Viewer, root: &str, current: Option<&str>) 
     Ok(by_category)
 }
 
+/// Who is in each voice channel, as the side of `viewer`'s pages shows it (counts,
+/// names, or nothing, by the community's choice): what a live page watches for a
+/// change in (posting.rs's `live`). Empty where nothing of voice is shown.
+pub fn voice_shown(state: &AppState, viewer: &Viewer) -> String {
+    let Ok(groups) = groups(state, viewer, "", None) else { return String::new() };
+    let shown: Vec<Value> = groups.iter().flat_map(|g| g.voice.iter()).map(|room| json!([room.name, room.count, room.names])).collect();
+    if shown.is_empty() {
+        String::new()
+    } else {
+        Value::Array(shown).to_string()
+    }
+}
+
 fn name_of(state: &AppState, did: &str) -> String {
     state.community.store.member(did).ok().flatten().and_then(|m| m.name).unwrap_or_else(|| "A member".to_string())
 }

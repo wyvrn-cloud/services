@@ -138,8 +138,9 @@ async fn react_form(State(state): State<Arc<AppState>>, Path((id, seq)): Path<(S
 
 /// `GET ch/{id}/live`: server-sent events saying, as it changes, how far the
 /// channel has got (`seq`, its latest post) and when a post in it last changed
-/// (`rev`). The page fetches itself again when either moves. Only for a channel the
-/// viewer may read, signed in or not.
+/// (`rev`), as `channel`; and who is in voice as the side of the page shows it, as
+/// `voice` (a fingerprint, only where the page shows any). The page fetches itself
+/// again when either moves. Only for a channel the viewer may read, signed in or not.
 async fn live(State(state): State<Arc<AppState>>, Path(id): Path<String>, headers: HeaderMap) -> Response {
     if state.web.is_none() {
         return StatusCode::NOT_FOUND.into_response();
@@ -148,14 +149,31 @@ async fn live(State(state): State<Arc<AppState>>, Path(id): Path<String>, header
     if super::pages::visible_channel(&state, &viewer, &id).is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    // Each item waits until the channel has moved on (or is gone), then says so.
-    let stream = futures_util::stream::unfold((state, id, None::<(i64, i64)>), |(state, id, last)| async move {
+    // Each item waits until the channel or its voice has moved on (or the channel
+    // is gone), then says so.
+    struct Seen {
+        channel: Option<(i64, i64)>,
+        voice: Option<String>,
+    }
+    let seen = Seen { channel: None, voice: None };
+    let stream = futures_util::stream::unfold((state, id, viewer, seen), |(state, id, viewer, mut seen)| async move {
         loop {
             let store = &state.community.store;
             let now = store.channel(&id).ok().flatten().filter(|c| !c.closed).map(|c| (c.latest_seq, store.channel_rev(&c.id).unwrap_or(0)))?;
-            if last != Some(now) {
+            if seen.channel != Some(now) {
+                seen.channel = Some(now);
                 let event = Event::default().event("channel").data(json!({ "seq": now.0, "rev": now.1 }).to_string());
-                return Some((Ok::<Event, Infallible>(event), (state, id, Some(now))));
+                return Some((Ok::<Event, Infallible>(event), (state, id, viewer, seen)));
+            }
+            let voice = super::pages::voice_shown(&state, &viewer);
+            if seen.voice.as_deref() != Some(voice.as_str()) {
+                let first = seen.voice.is_none();
+                seen.voice = Some(voice.clone());
+                // Nothing of voice on this page to begin with: nothing to say.
+                if !(first && voice.is_empty()) {
+                    let event = Event::default().event("voice").data(voice);
+                    return Some((Ok::<Event, Infallible>(event), (state, id, viewer, seen)));
+                }
             }
             tokio::time::sleep(LOOK_EVERY).await;
         }

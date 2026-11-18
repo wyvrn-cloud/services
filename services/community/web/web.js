@@ -49,23 +49,39 @@
   // What is being written in the form below is left alone.
   function followLive(url, posts) {
     var heard = null
+    var heardVoice = null
     var source = new EventSource(url)
+    // The page again, from the server (not the browser's cache: a public page
+    // may be kept a while); `then` is given it parsed.
+    function fetchAgain(then) {
+      fetch(location.pathname + location.search, { credentials: 'same-origin', cache: 'no-store' })
+        .then(function (response) { return response.ok ? response.text() : null })
+        .then(function (html) { if (html) then(new DOMParser().parseFromString(html, 'text/html')) })
+        .catch(function () { /* the next change tries again */ })
+    }
     source.addEventListener('channel', function (event) {
       if (heard === null) { heard = event.data; return }
       if (event.data === heard) return
       heard = event.data
       var atBottom = document.documentElement.scrollHeight - window.innerHeight - window.scrollY < 48
-      // (Not from the browser's cache: a public page may be kept a while.)
-      fetch(location.pathname + location.search, { credentials: 'same-origin', cache: 'no-store' })
-        .then(function (response) { return response.ok ? response.text() : null })
-        .then(function (html) {
-          if (!html) return
-          var fresh = new DOMParser().parseFromString(html, 'text/html').querySelector('ol.posts')
-          if (!fresh) return
-          posts.innerHTML = fresh.innerHTML
-          if (atBottom) window.scrollTo(0, document.documentElement.scrollHeight)
-        })
-        .catch(function () { /* the next change tries again */ })
+      fetchAgain(function (fresh) {
+        var list = fresh.querySelector('ol.posts')
+        if (!list) return
+        posts.innerHTML = list.innerHTML
+        if (atBottom) window.scrollTo(0, document.documentElement.scrollHeight)
+      })
+    })
+    // Who is in voice changed: the side's list of channels again.
+    source.addEventListener('voice', function (event) {
+      if (heardVoice === null) { heardVoice = event.data; return }
+      if (event.data === heardVoice) return
+      heardVoice = event.data
+      var side = document.querySelector('nav[aria-label="Channels"]')
+      if (!side) return
+      fetchAgain(function (fresh) {
+        var list = fresh.querySelector('nav[aria-label="Channels"]')
+        if (list) side.innerHTML = list.innerHTML
+      })
     })
   }
 

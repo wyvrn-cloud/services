@@ -106,11 +106,13 @@ struct Options<'a> {
     limit: u32,
     /// Which channels are public (`web.public`): these tests choose, but for one.
     public: &'a str,
+    /// With voice channels (a relay named, never reached).
+    voice: bool,
 }
 
 impl Default for Options<'_> {
     fn default() -> Self {
-        Self { name: "The Workshop", web_url: None, fresh: true, limit: 10_000, public: "chosen" }
+        Self { name: "The Workshop", web_url: None, fresh: true, limit: 10_000, public: "chosen", voice: false }
     }
 }
 
@@ -118,8 +120,9 @@ async fn start(options: Options<'_>) -> Running {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let web_line = options.web_url.map(|u| format!("public_url = \"{u}\"\n")).unwrap_or_default();
+    let voice_lines = if options.voice { "[voice]\nrelay_url = \"https://voice.example/\"\nrelay_fingerprint = \"ab12\"\n" } else { "" };
     let config: wyvrn_community::config::Config = toml::from_str(&format!(
-        "[server]\nbind = \"unused\"\npublic_url = \"{url}\"\n[identity]\npath = \"unused\"\n[store]\npath = \"unused\"\n[community]\nname = {}\nmembers_may_create_channels = true\n[web]\n{web_line}requests_per_minute = {}\n",
+        "[server]\nbind = \"unused\"\npublic_url = \"{url}\"\n[identity]\npath = \"unused\"\n[store]\npath = \"unused\"\n[community]\nname = {}\nmembers_may_create_channels = true\n[web]\n{web_line}requests_per_minute = {}\n{voice_lines}",
         toml::Value::String(options.name.to_string()),
         options.limit
     ))
@@ -138,7 +141,7 @@ async fn start(options: Options<'_>) -> Running {
         assert_eq!(store.setting(web::PUBLIC).unwrap().as_deref(), Some("everyone"));
         store.set_setting(web::PUBLIC, options.public).unwrap();
     }
-    let mut community = Community::new(store, config.community.clone(), Some(wyvrn_service::profile::Kept::scratch().unwrap())).unwrap();
+    let mut community = Community::new(store, config.community.clone(), Some(wyvrn_service::profile::Kept::scratch().unwrap())).unwrap().with_voice(config.voice.clone());
     community.web_url = web.as_ref().map(|w| w.url.to_string());
     let mut state = AppState::new(agent, Default::default(), community, did_document, didcomm_quickstart::default_resolver());
     state.web = web;
@@ -320,6 +323,47 @@ async fn a_member_signed_in_posts_replies_and_reacts_from_the_web_as_from_the_ap
     let first_event = tokio::time::timeout(std::time::Duration::from_secs(5), live.chunk()).await.unwrap().unwrap().unwrap();
     let said = String::from_utf8_lossy(&first_event);
     assert!(said.contains("event: channel") && said.contains("\"seq\":2"), "{said}");
+}
+
+/// The next server-sent event of `kind` on `live`, its data.
+async fn next_event(live: &mut reqwest::Response, kind: &str) -> String {
+    let wanted = format!("event: {kind}\n");
+    loop {
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(10), live.chunk()).await.unwrap_or_else(|_| panic!("a {kind} event within ten seconds")).unwrap().unwrap();
+        let said = String::from_utf8_lossy(&chunk).to_string();
+        for event in said.split("\n\n") {
+            if let Some(rest) = event.trim_start().strip_prefix(&wanted) {
+                return rest.trim_start_matches("data: ").trim().to_string();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_channels_live_page_hears_who_comes_into_voice_and_goes() {
+    let server = start(Options { voice: true, ..Options::default() }).await;
+    let (admin, member) = with_channels(&server).await;
+    member.tell("https://didcomm.org/user-profile/1.0/profile", json!({ "profile": { "displayName": "Bob" } })).await;
+    let general = server.channel_id("general");
+    admin.community("update-channel", json!({ "channel": general, "web": { "public": true } })).await;
+    let made = admin.community("create-channel", json!({ "name": "Lounge", "kind": "voice" })).await;
+    let lounge = made["body"]["created"].as_str().expect("a voice channel").to_string();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    // Counts, to anyone (the default): nobody, then one.
+    let mut live = server.get(&format!("ch/{general}/live")).await;
+    assert_eq!(next_event(&mut live, "voice").await, r#"[["Lounge",0,[]]]"#);
+    let joined = member.ask("https://wyvrn.app/community-voice/1.0/join", json!({ "channel": lounge })).await;
+    assert!(joined["body"]["participant"].is_string(), "{joined}");
+    assert_eq!(next_event(&mut live, "voice").await, r#"[["Lounge",1,[]]]"#);
+
+    // Names, to a member signed in; and gone again.
+    admin.community("set-web", json!({ "voice": "names" })).await;
+    let (cookie, _) = server.session(&admin.did());
+    let mut theirs = server.http.get(format!("{}ch/{general}/live", server.url)).header(header::COOKIE, cookie).send().await.unwrap();
+    assert_eq!(next_event(&mut theirs, "voice").await, r#"[["Lounge",1,["Bob"]]]"#);
+    member.tell("https://wyvrn.app/community-voice/1.0/leave", json!({ "channel": lounge })).await;
+    assert_eq!(next_event(&mut theirs, "voice").await, r#"[["Lounge",0,[]]]"#);
 }
 
 #[tokio::test]
