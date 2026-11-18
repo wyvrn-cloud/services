@@ -5226,6 +5226,7 @@ dependencies = [
 name = "wyvrn-community-host"
 version = "0.0.1"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "axum",
  "didcomm-agent",
