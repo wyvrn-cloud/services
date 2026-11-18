@@ -168,6 +168,8 @@ impl Host {
                 max_roles: limits.roles,
                 max_community_posts_per_minute: limits.posts_per_minute,
                 max_store_bytes: limits.store_bytes,
+                max_packs: limits.packs,
+                max_per_pack: limits.per_pack,
                 ..CommunityConfig::default()
             },
             mediator: None,

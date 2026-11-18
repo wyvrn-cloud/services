@@ -11,10 +11,12 @@ use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
+use wyvrn_stickers::config::ServiceConfig;
 use wyvrn_stickers::processor::Processor;
 use wyvrn_stickers::store::{draft_scope, pack_scope, Store};
 use wyvrn_stickers::templates::{EDIT_PACK, NEW_EMOJI_PACK, NEW_STICKER_PACK};
 
+use crate::config::CommunityConfig;
 use crate::server::AppState;
 
 pub struct Expressions {
@@ -22,18 +24,21 @@ pub struct Expressions {
 }
 
 impl Expressions {
-    /// Packs kept at `location`, served under `public_url`'s `s/`.
-    pub fn open(location: &wyvrn_service::db::Location, public_url: &str) -> anyhow::Result<Self> {
-        Ok(Self::with(Store::open(location)?, public_url))
+    /// Packs kept at `location`, served under `public_url`'s `s/`, as many and as
+    /// full as `community` says (its `max_packs`, `max_per_pack`).
+    pub fn open(location: &wyvrn_service::db::Location, public_url: &str, community: &CommunityConfig) -> anyhow::Result<Self> {
+        Ok(Self::with(Store::open(location)?, public_url, community))
     }
 
-    pub fn scratch(public_url: &str) -> anyhow::Result<Self> {
-        Ok(Self::with(Store::in_memory()?, public_url))
+    pub fn scratch(public_url: &str, community: &CommunityConfig) -> anyhow::Result<Self> {
+        Ok(Self::with(Store::in_memory()?, public_url, community))
     }
 
-    fn with(store: Store, public_url: &str) -> Self {
+    fn with(store: Store, public_url: &str, community: &CommunityConfig) -> Self {
         let base = format!("{}s/", if public_url.ends_with('/') { public_url.to_string() } else { format!("{public_url}/") });
-        Self { processor: Processor::new(store, Default::default(), &base) }
+        // Every pack's maker is the community, so "packs a maker" is the community's packs.
+        let limits = ServiceConfig { max_packs_per_maker: community.max_packs, max_per_pack: community.max_per_pack.max(1), ..Default::default() };
+        Self { processor: Processor::new(store, limits, &base) }
     }
 
     /// Whether a workflow message is about the packs: a start of one of their

@@ -166,11 +166,15 @@ pub struct Limits {
     /// What its store may hold, in bytes (as measured every few minutes); 0 for no
     /// limit. Files have limits of their own.
     pub store_bytes: u64,
+    /// The community's own sticker and emoji packs.
+    pub packs: usize,
+    /// Stickers or emoji in each pack.
+    pub per_pack: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { members: 1000, channels: 500, file_bytes: 25 * 1024 * 1024, files_quota: 1024 * 1024 * 1024, files_total: 5 * 1024 * 1024 * 1024, roles: 250, posts_per_minute: 0, store_bytes: 0 }
+        Self { members: 1000, channels: 500, file_bytes: 25 * 1024 * 1024, files_quota: 1024 * 1024 * 1024, files_total: 5 * 1024 * 1024 * 1024, roles: 250, posts_per_minute: 0, store_bytes: 0, packs: 50, per_pack: 120 }
     }
 }
 

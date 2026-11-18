@@ -97,7 +97,7 @@ pub async fn open(config: &Config, stores: &Stores, opening: Opening) -> anyhow:
     community.public_url = config.server.public_url.clone();
     community.assistant = opening.assistant.as_ref().map(Assistant::listing);
     if let Some(stickers) = &stores.stickers {
-        community.expressions = Some(crate::expressions::Expressions::open(stickers, &config.server.public_url).context("the community's packs")?);
+        community.expressions = Some(crate::expressions::Expressions::open(stickers, &config.server.public_url, &config.community).context("the community's packs")?);
     }
     if let (Some(files), Some(location)) = (&config.files, &stores.files) {
         community.files = Some(crate::files::Files::open(files, location, &config.server.public_url).context("the files members attach")?);

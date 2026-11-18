@@ -310,4 +310,4 @@ keep = 7
 
 Each community is then backed up once a day, sealed (AES-256-GCM), the last 7 kept; Admin, Communities shows when and has "Back up now". To open one: `docker compose run --rm community-host open-backup <file> /tmp/out.tar.gz`, which is what an export is (it runs as its own `wyvrn-community`, or can be brought back in with `import`).
 
-Also new on that page: a community's roles, posts a minute from everyone, and its store's size, under What it may hold.
+Also new on that page: a community's roles, posts a minute from everyone, its store's size, and its own sticker and emoji packs (how many, and how full: 50 and 120 unless set), under What it may hold.

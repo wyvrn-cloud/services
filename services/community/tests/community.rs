@@ -132,7 +132,7 @@ async fn start_server_with(settings: &str, files: bool) -> Running {
     community.assistant = assistant.as_ref().map(wyvrn_community::assistant::Assistant::listing);
     if files {
         community.files = Some(wyvrn_community::files::Files::scratch(&Default::default(), &url).unwrap());
-        community.expressions = Some(wyvrn_community::expressions::Expressions::scratch(&url).unwrap());
+        community.expressions = Some(wyvrn_community::expressions::Expressions::scratch(&url, &config.community).unwrap());
     }
     let state = AppState::new(agent, Default::default(), community, did_document, didcomm_quickstart::default_resolver());
     let state = Arc::new(match assistant {
@@ -1918,6 +1918,32 @@ async fn the_community_has_emoji_packs_of_its_own_made_by_whoever_may_manage_the
     assert!(link.starts_with(&format!("{}s/", server.url)), "{link}");
     let pack: Value = reqwest::get(&link).await.unwrap().json().await.unwrap();
     assert_eq!(pack["title"], "Workshop", "{pack}");
+}
+
+#[tokio::test]
+async fn a_community_holds_as_many_packs_and_as_full_as_its_host_allows() {
+    let server = start_server_with("max_packs = 1\nmax_per_pack = 1", true).await;
+    let owner = Peer::start(&server).await;
+    server.admit(&[&owner]);
+    owner.workflow("start", json!({ "template_id": "new-emoji-pack", "instance_id": "e1" })).await;
+    advance(&owner, "e1", "set_title", json!({ "title": "Workshop" })).await;
+    let added = advance(&owner, "e1", "add_emoji", json!({ "image": png_data_url(64, 1), "shortcode": "hammer_time" })).await;
+    assert_eq!(kind(&added), "status", "{added}");
+    // One in a pack: the second is refused.
+    let second = advance(&owner, "e1", "add_emoji", json!({ "image": png_data_url(64, 2), "shortcode": "saw_time" })).await;
+    assert!(second.to_string().contains("A pack holds 1 at most."), "{second}");
+    advance(&owner, "e1", "publish", json!({})).await;
+    advance(&owner, "e1", "skip_icon", json!({})).await;
+    assert_eq!(kind(&advance(&owner, "e1", "set_name", json!({ "name": "workshop" })).await), "complete");
+
+    // One pack: a second can't be named.
+    owner.workflow("start", json!({ "template_id": "new-emoji-pack", "instance_id": "e2" })).await;
+    advance(&owner, "e2", "set_title", json!({ "title": "More" })).await;
+    advance(&owner, "e2", "add_emoji", json!({ "image": png_data_url(64, 3), "shortcode": "drill" })).await;
+    advance(&owner, "e2", "publish", json!({})).await;
+    advance(&owner, "e2", "skip_icon", json!({})).await;
+    let refused = advance(&owner, "e2", "set_name", json!({ "name": "more" })).await;
+    assert!(refused.to_string().contains("which is as many as one maker may"), "{refused}");
 }
 
 #[tokio::test]

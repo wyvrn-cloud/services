@@ -178,6 +178,11 @@ pub struct CommunityConfig {
     /// How much its store may hold, in bytes, as the host measures it
     /// (`Community::used_bytes`); 0 for no limit. Past it, nothing more is posted.
     pub max_store_bytes: u64,
+    /// As many sticker and emoji packs of its own as it may have (every pack's
+    /// maker is the community: expressions.rs).
+    pub max_packs: usize,
+    /// As many stickers or emoji as each of those packs may hold.
+    pub max_per_pack: usize,
     /// Whether events may be sent out (outgoing.rs) to an address on this
     /// server's own network, or over plain http: for a receiver beside it, and
     /// tests. Off, only https out on the internet.
@@ -219,6 +224,8 @@ impl Default for CommunityConfig {
             max_roles: 250,
             max_community_posts_per_minute: 0,
             max_store_bytes: 0,
+            max_packs: 50,
+            max_per_pack: 120,
         }
     }
 }

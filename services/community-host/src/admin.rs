@@ -64,6 +64,8 @@ fn limits_from(input: &Value, base: Limits) -> Result<Limits, String> {
             "0" => 0,
             text => parse_bytes(text).ok_or("Its store: a size, as in 2 GB, or 0 for no limit.")?,
         },
+        packs: count("packs", base.packs)?,
+        per_pack: count("per_pack", base.per_pack)?.max(1),
     })
 }
 
@@ -161,6 +163,8 @@ impl Pages for AppState {
                 { "type": "text-input", "form-id": "roles", "label": "Roles", "value": limits.roles.to_string() },
                 { "type": "text-input", "form-id": "posts_per_minute", "label": "Posts a minute, from everyone (0: no limit)", "value": limits.posts_per_minute.to_string() },
                 { "type": "text-input", "form-id": "store_bytes", "label": "Its store (0: no limit)", "value": if limits.store_bytes == 0 { "0".to_string() } else { bytes(limits.store_bytes) } },
+                { "type": "text-input", "form-id": "packs", "label": "Sticker and emoji packs", "value": limits.packs.to_string() },
+                { "type": "text-input", "form-id": "per_pack", "label": "Stickers or emoji in a pack", "value": limits.per_pack.to_string() },
                 button("Set", "limits", named.clone()),
             ]}));
             if record.state.served() {
