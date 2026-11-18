@@ -186,8 +186,12 @@ impl Community {
         Ok(Some(self.presence_notice(did, opened.then_some(status))))
     }
 
+    /// `member-presence`, to every live connection: by member id, as everyone in a
+    /// community is named to everyone else (community/1.0, "Who members are to each
+    /// other"). It said the DID, to everyone watching.
     fn presence_notice(&self, did: &str, status: Option<String>) -> Value {
-        let mut body = json!({ "did": did });
+        let member = self.store.member_id(did, crate::gates::now()).unwrap_or_default();
+        let mut body = json!({ "member": member });
         if let Some(status) = status {
             body["presence"] = json!(status);
         }

@@ -1023,6 +1023,35 @@ async fn tell(peer: &Peer, kind: &str, body: Value) -> Option<Value> {
 }
 
 #[tokio::test]
+async fn whoever_keeps_a_live_connection_is_told_who_comes_and_goes_by_member_id_never_by_did() {
+    let server = voice_server().await;
+    let (alice, bob) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&alice, &bob]);
+    let mut watching = Live::open(&alice, &server).await;
+    watching.send(&alice, "watch-presence", json!({})).await;
+    watching.next_of(&alice, "presence").await;
+    // Bob's member id, as the owner is told it beside his DID.
+    let members = alice.community("members-request", json!({})).await;
+    let member = members["body"]["members"].as_array().unwrap().iter().find(|m| m["did"] == bob.did()).map(|m| m["member"].clone()).unwrap_or_else(|| panic!("{members}"));
+    let mut coming = Live::open(&bob, &server).await;
+    coming.send(&bob, "watch-presence", json!({})).await;
+    // (Alice's own coming online may be said first.)
+    let told = loop {
+        let told = watching.next_typed(&alice, "https://wyvrn.app/community/1.0/member-presence").await;
+        assert!(told["body"].get("did").is_none(), "{told}");
+        if told["body"]["member"] == member {
+            break told;
+        }
+    };
+    assert_eq!(told["body"]["presence"], "online", "{told}");
+    // Gone: said again, with no presence.
+    drop(coming);
+    let gone = watching.next_typed(&alice, "https://wyvrn.app/community/1.0/member-presence").await;
+    assert_eq!(gone["body"]["member"], member);
+    assert!(gone["body"].get("presence").is_none(), "{gone}");
+}
+
+#[tokio::test]
 async fn joining_a_voice_channel_gives_a_room_a_token_and_who_else_is_there_and_watchers_are_told() {
     let server = voice_server().await;
     let (alice, bob, carol) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
