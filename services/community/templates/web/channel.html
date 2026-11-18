@@ -13,7 +13,7 @@
     {% else %}<div class="avatar">{% if let Some(picture) = post.picture %}<img src="{{ picture }}" alt="" width="40" height="40" loading="lazy">{% else %}<span aria-hidden="true">{{ post.initial }}</span>{% endif %}</div>{% endif %}
     <article class="body">
       <header{% if post.continued %} class="visually-hidden"{% endif %}>
-        <span class="author">{{ post.author }}</span>
+        <span class="author">{{ post.author }}</span>{% if post.app %} <span class="app-badge" title="Posted by a webhook">APP</span>{% endif %}
         <a class="time" href="{{ post.href }}"><time datetime="{{ post.iso }}">{{ post.when }}</time></a>
         {% if post.edited %}<span class="note">edited</span>{% endif %}
         {% if post.pinned %}<span class="note">pinned</span>{% endif %}
@@ -32,6 +32,17 @@
         {% endfor %}
       </div>
       {% endif %}
+      {% for embed in post.embeds %}
+      <div class="embed"{% if let Some(color) = embed.color %} style="border-left-color: {{ color }}"{% endif %}>
+        {% if let Some(thumbnail) = embed.thumbnail %}<img class="embed-thumbnail" src="{{ thumbnail }}" alt="" loading="lazy">{% endif %}
+        {% if let Some(author) = embed.author %}<div class="embed-author">{{ author }}</div>{% endif %}
+        {% if let Some(title) = embed.title %}{% if let Some(href) = embed.href %}<a class="embed-title" href="{{ href }}" rel="nofollow ugc noopener noreferrer">{{ title }}</a>{% else %}<div class="embed-title">{{ title }}</div>{% endif %}{% endif %}
+        {% if !embed.html.is_empty() %}<div class="embed-description">{{ embed.html|safe }}</div>{% endif %}
+        {% if !embed.fields.is_empty() %}<dl class="embed-fields">{% for field in embed.fields %}<div class="embed-field{% if field.inline %} inline{% endif %}"><dt>{{ field.name }}</dt><dd>{{ field.html|safe }}</dd></div>{% endfor %}</dl>{% endif %}
+        {% if let Some(image) = embed.image %}<img class="embed-image" src="{{ image }}" alt="" loading="lazy">{% endif %}
+        {% if let Some(footer) = embed.footer %}<div class="embed-footer">{{ footer }}</div>{% endif %}
+      </div>
+      {% endfor %}
       {% for card in post.cards %}
       <div class="link-card{% if card.kind == "youtube" %} youtube{% endif %}">
         {% if let Some(site) = card.site %}<div class="link-card-site">{{ site }}</div>{% endif %}

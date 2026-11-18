@@ -164,3 +164,20 @@ a.link-card-channel:hover { text-decoration: underline; }
   .who { display: none; }
 }
 @media (prefers-reduced-motion: no-preference) { .post, .card, .button { transition: background-color .15s, border-color .15s, filter .15s; } }
+
+/* A webhook's post (webhooks.rs): APP beside its name, and its embeds. */
+.app-badge { display: inline-block; padding: 0 .3rem; border-radius: 3px; background: #5865f2; color: #fff; font-size: .65rem; font-weight: 700; vertical-align: middle; letter-spacing: .02em; }
+.embed { position: relative; display: flex; flex-direction: column; gap: .3rem; max-width: 520px; margin-top: .5rem; padding: .6rem .75rem; border-left: 4px solid var(--border); border-radius: calc(var(--radius) / 2); background: var(--surface); }
+.embed-author { font-size: .8rem; font-weight: 600; }
+.embed-title { font-weight: 700; }
+.embed-description p { margin: 0; }
+.embed-fields { display: flex; flex-wrap: wrap; gap: .4rem 1rem; margin: .2rem 0 0; }
+.embed-field { flex: 1 1 100%; }
+.embed-field.inline { flex: 1 1 30%; }
+.embed-field dt { font-size: .8rem; font-weight: 700; }
+.embed-field dd { margin: 0; }
+.embed-field dd p { margin: 0; }
+.embed-image { max-width: 100%; border-radius: 4px; margin-top: .3rem; }
+.embed-thumbnail { position: absolute; top: .6rem; right: .75rem; width: 64px; height: 64px; object-fit: cover; border-radius: 4px; }
+.embed:has(.embed-thumbnail) { padding-right: 5.5rem; }
+.embed-footer { font-size: .75rem; color: var(--muted); }

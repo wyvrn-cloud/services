@@ -164,6 +164,26 @@ pub struct ReactionView {
 }
 
 /// A link's preview under a post: a page's, or a YouTube video's.
+/// A webhook's embed (webhooks.rs), as a card: its colour down the side, its
+/// pictures through this server, as link previews' are.
+pub struct EmbedView {
+    pub color: Option<String>,
+    pub author: Option<String>,
+    pub title: Option<String>,
+    pub href: Option<String>,
+    pub html: String,
+    pub fields: Vec<EmbedField>,
+    pub image: Option<String>,
+    pub thumbnail: Option<String>,
+    pub footer: Option<String>,
+}
+
+pub struct EmbedField {
+    pub name: String,
+    pub html: String,
+    pub inline: bool,
+}
+
 pub struct Card {
     /// `page` or `youtube`.
     pub kind: &'static str,
@@ -192,6 +212,9 @@ pub struct PostView {
     pub reply_author: Option<String>,
     pub reply_snippet: Option<String>,
     pub media: Vec<Media>,
+    /// Posted by a webhook (webhooks.rs): shown as from an app, not a member.
+    pub app: bool,
+    pub embeds: Vec<EmbedView>,
     /// Nothing but emoji: the class that draws it large (larger the fewer), as the
     /// app does; empty otherwise.
     pub giant: &'static str,
@@ -473,6 +496,33 @@ fn post_view(state: &AppState, post: &Post, channel: &Channel, root: &str, focus
         reply_author: post.reply_to.as_ref().and(post.reply_author.as_deref()).map(|did| name_of(state, did)),
         reply_snippet: post.reply_snippet.clone(),
         media,
+        app: extra["webhook"].is_object(),
+        embeds: extra["embeds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(10)
+            .map(|embed| {
+                let text = |value: &Value| value.as_str().map(str::to_string).filter(|t| !t.trim().is_empty());
+                let picture = |value: &Value| value.as_str().and_then(|address| secret.as_deref().and_then(|secret| super::outside::picture_href(secret, root, address)));
+                EmbedView {
+                    color: embed["color"].as_u64().filter(|c| *c <= 0xFF_FF_FF).map(|c| format!("#{c:06x}")),
+                    author: text(&embed["author"]["name"]),
+                    title: text(&embed["title"]),
+                    href: text(&embed["url"]).filter(|u| u.starts_with("https://") || u.starts_with("http://")),
+                    html: text(&embed["description"]).map(|d| render::markdown(&d)).unwrap_or_default(),
+                    fields: embed["fields"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|field| Some(EmbedField { name: text(&field["name"])?, html: render::markdown(field["value"].as_str().unwrap_or_default()), inline: field["inline"] == true }))
+                        .collect(),
+                    image: picture(&embed["image"]["url"]),
+                    thumbnail: picture(&embed["thumbnail"]["url"]),
+                    footer: text(&embed["footer"]["text"]),
+                }
+            })
+            .collect(),
         giant: render::giant_class(render::emoji_only_count(&post.content, &|address| {
             url::Url::parse(address).ok().and_then(|u| u.path_segments()?.next_back().map(str::to_string)).is_some_and(|file| super::outside::pack_file(&file).is_some())
         })),

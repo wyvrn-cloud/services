@@ -270,6 +270,40 @@ async fn only_public_channels_show_and_what_is_said_is_only_ever_text() {
 }
 
 #[tokio::test]
+async fn a_webhooks_post_shows_as_from_an_app_with_its_embeds_its_pictures_through_here() {
+    let server = start(Options::default()).await;
+    let (admin, _member) = with_channels(&server).await;
+    let general = server.channel_id("general");
+    admin.community("update-channel", json!({ "channel": general, "web": { "public": true } })).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let store = &server.state.community.store;
+    let author = store.member(&admin.did()).unwrap().unwrap();
+    let post = store.add_post(&general, "w1", "Build finished", &author, None, None, chrono::Utc::now().timestamp()).unwrap();
+    store
+        .set_post_extra(
+            &post.id,
+            &json!({
+                "webhook": { "id": "h1", "name": "CI" },
+                "embeds": [{ "title": "Build #42", "url": "https://ci.example/42", "description": "All **green**", "color": 3066993,
+                             "fields": [{ "name": "Tests", "value": "1203 passed", "inline": true }],
+                             "image": { "url": "https://ci.example/chart.png" }, "footer": { "text": "main <b>" } }]
+            }),
+        )
+        .unwrap();
+    let (status, html) = server.text(&format!("ch/{general}/general")).await;
+    assert_eq!(status, 200);
+    assert!(html.contains("class=\"app-badge\""), "{html}");
+    assert!(html.contains("Build #42") && html.contains("href=\"https://ci.example/42\""));
+    assert!(html.contains("<strong>green</strong>"));
+    assert!(html.contains("border-left-color: #2ecc71"));
+    assert!(html.contains("<dt>Tests</dt>") && html.contains("1203 passed"));
+    // The footer is text; the picture comes through this server, never straight from elsewhere.
+    assert!(html.contains("main &#60;b&#62;") || html.contains("main &lt;b&gt;"));
+    assert!(!html.contains("src=\"https://ci.example/chart.png\""));
+    assert!(html.contains("class=\"embed-image\" src=\"/i/") || html.contains("class=\"embed-image\" src=\""));
+}
+
+#[tokio::test]
 async fn every_channel_everyone_may_see_is_public_while_they_may() {
     let server = start(Options { public: "everyone", ..Options::default() }).await;
     let (admin, member) = with_channels(&server).await;
