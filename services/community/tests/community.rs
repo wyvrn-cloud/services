@@ -2955,3 +2955,21 @@ async fn an_app_that_draws_a_list_beside_its_editor_is_given_the_roles_so() {
     let reordered = advance(&owner, "l1", "reorder", json!({ "order": ["moderator", "admin", "everyone"] })).await;
     assert!(reordered["body"]["ui"].to_string().contains("Saved the order."), "{reordered}");
 }
+
+#[tokio::test]
+async fn a_post_keeps_when_its_sender_sent_it_beside_its_own_time_and_sends_only_its_own() {
+    let server = start_server("").await;
+    let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member]);
+    let general = open_channel(&owner, "general").await;
+    member.community("join", json!({})).await;
+    // Sent from a device whose clock says 1970.
+    let message = json!({ "type": format!("{C}post"), "body": { "channel": general, "content": "hello" }, "created_time": 1000, "return_route": "all" });
+    let answer = member.agent.send(&server.did, &message).await.expect("sent").expect("an answer").message;
+    let id = answer["body"]["id"].as_str().map(str::to_string).unwrap_or_else(|| panic!("{answer}"));
+    assert_eq!(server.state.community.store.post_sent(&id).unwrap(), Some(1000));
+    let history = owner.community("history-request", json!({ "channel": general })).await;
+    let post = history["body"]["messages"].as_array().unwrap().iter().find(|p| p["id"] == id.as_str()).cloned().unwrap_or_else(|| panic!("{history}"));
+    assert!(post["posted_at"].as_i64().unwrap() > 1_700_000_000, "{post}");
+    assert!(!post.to_string().contains("sent_at") && !post.to_string().contains(":1000"), "{post}");
+}

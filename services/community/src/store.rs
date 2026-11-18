@@ -783,6 +783,13 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         rules TEXT NOT NULL
     );
     -- What a post carries beyond its text, as JSON (media, a poll, a forum title and tags).
+    -- When the sender's own device says it sent a post (its message's
+    -- created_time): kept beside posts.posted_at, the server's own time, which is
+    -- the only one sent to anyone (asked 2026-11-17).
+    CREATE TABLE IF NOT EXISTS post_sent (
+        post TEXT NOT NULL PRIMARY KEY,
+        sent_at INTEGER NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS post_extra (
         post TEXT PRIMARY KEY,
         extra TEXT NOT NULL
@@ -1183,6 +1190,10 @@ fn schema() -> Schema {
                 channel VARCHAR(255) NOT NULL PRIMARY KEY,
                 position BIGINT NOT NULL,
                 category VARCHAR(64)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS post_sent (
+                post VARCHAR(255) NOT NULL PRIMARY KEY,
+                sent_at BIGINT NOT NULL
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS post_extra (
                 post VARCHAR(255) NOT NULL PRIMARY KEY,
@@ -2230,7 +2241,7 @@ impl Store {
         let due: Vec<String> = self.db.lock().query("SELECT channel FROM channel_trash WHERE trashed_at < ?1", params![before], |row| row.get(0))?;
         for id in &due {
             self.db.lock().transaction(|tx| {
-                for table in ["post_state", "reactions", "post_removals", "post_voice_invites", "post_extra", "post_censored", "votes", "polls_ended", "answering"] {
+                for table in ["post_state", "reactions", "post_removals", "post_voice_invites", "post_extra", "post_sent", "post_censored", "votes", "polls_ended", "answering"] {
                     tx.execute(&format!("DELETE FROM {table} WHERE post IN (SELECT id FROM posts WHERE channel = ?1)"), params![id])?;
                 }
                 tx.execute("DELETE FROM thread_follows WHERE thread IN (SELECT id FROM threads WHERE channel = ?1)", params![id])?;
@@ -2695,6 +2706,16 @@ impl Store {
 
     pub fn censored_original(&self, id: &str) -> Result<Option<String>> {
         Ok(self.db.lock().query("SELECT original FROM post_censored WHERE post = ?1", params![id], |row| row.get(0))?.into_iter().next())
+    }
+
+    /// When the sender says they sent `id` (see post_sent).
+    pub fn set_post_sent(&self, id: &str, sent_at: i64) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO post_sent (post, sent_at) VALUES (?1, ?2)", params![id, sent_at])?;
+        Ok(())
+    }
+
+    pub fn post_sent(&self, id: &str) -> Result<Option<i64>> {
+        Ok(self.db.lock().query("SELECT sent_at FROM post_sent WHERE post = ?1", params![id], |row| row.get(0))?.into_iter().next())
     }
 
     pub fn set_post_extra(&self, id: &str, extra: &Value) -> Result<()> {

@@ -1180,6 +1180,11 @@ impl Community {
         let written = content;
         let content = censored.as_ref().map_or(content, |censored| censored.content.as_str());
         let post = self.store.add_post(&channel.id, &id, content, member, question.as_ref(), None, now)?;
+        // The sender's own time kept beside the server's (posted_at), which alone is
+        // sent: a device's clock can be anything.
+        if let Some(sent_at) = message["created_time"].as_i64() {
+            self.store.set_post_sent(&post.id, sent_at)?;
+        }
         if let Some(censored) = &censored {
             self.store.set_censored(&post.id, Some((written, &censored.rules)))?;
         }
