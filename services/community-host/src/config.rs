@@ -38,6 +38,27 @@ pub struct Config {
     /// ```
     #[serde(default)]
     pub owners: std::collections::BTreeMap<String, Vec<String>>,
+    /// Who may make a community here from their app (creating.rs), until a host
+    /// admin says otherwise on the admin page.
+    #[serde(default)]
+    pub creating: CreatingConfig,
+}
+
+/// Making a community from the app: `closed` (host admins only), `codes` (with a
+/// code a host admin hands out) or `anyone`; as many as one person may have made
+/// here, and how long they wait between two.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CreatingConfig {
+    pub mode: String,
+    pub per_owner: i64,
+    pub every_seconds: i64,
+}
+
+impl Default for CreatingConfig {
+    fn default() -> Self {
+        Self { mode: "closed".into(), per_owner: 3, every_seconds: 600 }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

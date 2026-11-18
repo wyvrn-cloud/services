@@ -61,6 +61,9 @@ impl Peer {
 struct Running {
     url: String,
     host: Arc<Host>,
+    /// The host's own DID, and its state.
+    did: String,
+    state: Arc<AppState>,
     _dir: PathBuf,
 }
 
@@ -99,10 +102,11 @@ async fn start_host_with(idle_seconds: i64, mysql: &str) -> Running {
     config.settle();
     let (agent, did_document) = server::build_agent(&config, Identity::generate().unwrap()).unwrap();
     let host = Host::new(config, Registry::scratch().unwrap());
-    let state = Arc::new(AppState { agent, host: host.clone(), did_document, resolver: didcomm_quickstart::default_resolver(), admin: Default::default() });
-    let app = server::router(state);
+    let did = agent.did();
+    let state = Arc::new(AppState { agent, host: host.clone(), did_document, resolver: didcomm_quickstart::default_resolver(), admin: Default::default(), open: wyvrn_community_host::creating::open_pages(), made: Default::default() });
+    let app = server::router(state.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    Running { url, host, _dir: dir }
+    Running { url, host, did, state, _dir: dir }
 }
 
 /// A number no other host in this run has.
@@ -496,4 +500,44 @@ async fn a_community_run_on_its_own_in_mysql_is_brought_into_shared_tables() {
     assert_eq!(tenant.state.agent.identity().to_json().unwrap(), keys.to_json().unwrap());
     assert_eq!(tenant.state.community.store.post_by_id("m1").unwrap().unwrap().content, "from mysql");
     assert!(!host.folder("from-mysql").join("community.sqlite").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn someone_makes_a_community_from_their_app_as_far_as_the_hosts_admins_allow() {
+    use wyvrn_community_host::creating::Mode;
+    let running = start_host(600).await;
+    let (alice, bob) = (Peer::start().await, Peer::start().await);
+    let offered = |answer: &Value| answer["body"]["workflows"].as_array().unwrap().iter().any(|w| w["template_id"] == "community-create");
+
+    // Closed, as a host starts: nothing offered, nothing made.
+    assert!(!offered(&alice.ask(&running.did, &format!("{W}discover"), json!({})).await));
+    let refused = alice.ask(&running.did, &format!("{W}start"), json!({ "template_id": "community-create", "instance_id": "a1" })).await;
+    assert_eq!(kind(&refused), "problem-report", "{refused}");
+
+    // Open to anyone: made, theirs, and its DID handed back to be added.
+    running.state.set_creating_mode(Mode::Anyone).unwrap();
+    assert!(offered(&alice.ask(&running.did, &format!("{W}discover"), json!({})).await));
+    alice.ask(&running.did, &format!("{W}start"), json!({ "template_id": "community-create", "instance_id": "a1" })).await;
+    let bad = alice.ask(&running.did, &format!("{W}advance"), json!({ "instance_id": "a1", "event": "create", "input": { "title": "Bad", "name": "No Spaces" } })).await;
+    assert!(bad["body"]["ui"].to_string().contains("lowercase"), "{bad}");
+    let made = alice.ask(&running.did, &format!("{W}advance"), json!({ "instance_id": "a1", "event": "create", "input": { "title": "The Kiln", "name": "the-kiln" } })).await;
+    let community = made["body"]["artifacts"]["community"].as_str().unwrap_or_else(|| panic!("{made}")).to_string();
+    assert_eq!(made["body"]["artifacts"]["name"], "the-kiln");
+    assert_eq!(running.host.registry.get("the-kiln").unwrap().unwrap().owner, alice.did());
+    assert_eq!(community, running.did_of("the-kiln").await);
+    let joined = alice.community(&community, "join", json!({})).await;
+    assert_eq!(kind(&joined), "community", "{joined}");
+    // And not another straight away.
+    let again = alice.ask(&running.did, &format!("{W}advance"), json!({ "instance_id": "a1", "event": "create", "input": { "title": "More", "name": "more-kilns" } })).await;
+    assert!(again["body"]["ui"].to_string().contains("wait a little"), "{again}");
+
+    // By code: a wrong one refused, a right one used up.
+    running.state.set_creating_mode(Mode::Codes).unwrap();
+    running.host.registry.add_code("KILNCODE01", 1, "for Bob", "did:example:admin", 1).unwrap();
+    bob.ask(&running.did, &format!("{W}start"), json!({ "template_id": "community-create", "instance_id": "b1" })).await;
+    let wrong = bob.ask(&running.did, &format!("{W}advance"), json!({ "instance_id": "b1", "event": "create", "input": { "title": "Bob's", "name": "bobs-place", "code": "NOPE" } })).await;
+    assert!(wrong["body"]["ui"].to_string().contains("isn't one"), "{wrong}");
+    let right = bob.ask(&running.did, &format!("{W}advance"), json!({ "instance_id": "b1", "event": "create", "input": { "title": "Bob's", "name": "bobs-place", "code": "KILNCODE01" } })).await;
+    assert!(right["body"]["artifacts"]["community"].is_string(), "{right}");
+    assert!(running.host.registry.codes().unwrap().is_empty());
 }

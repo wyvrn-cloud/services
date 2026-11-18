@@ -139,6 +139,6 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     tokio::spawn(host.clone().run_housekeeping());
     // Owners' servers taking their communities over (export.rs).
     tokio::spawn(host.clone().watch_hand_overs(Arc::from(didcomm_quickstart::default_resolver())));
-    let state = Arc::new(AppState { agent, host, did_document, resolver: didcomm_quickstart::default_resolver(), admin: Default::default() });
+    let state = Arc::new(AppState { agent, host, did_document, resolver: didcomm_quickstart::default_resolver(), admin: Default::default(), open: wyvrn_community_host::creating::open_pages(), made: Default::default() });
     wyvrn_service::http::serve(&bind, server::router(state)).await
 }

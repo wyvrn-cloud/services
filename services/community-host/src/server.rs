@@ -28,6 +28,9 @@ pub struct AppState {
     pub resolver: Box<dyn didcomm_core::resolver::DIDResolver>,
     /// The admin pages open now (crate::admin).
     pub admin: wyvrn_service::admin::Admin,
+    /// The pages for anyone open now: making a community (crate::creating).
+    pub open: wyvrn_service::admin::Admin,
+    pub made: crate::creating::Made,
 }
 
 /// The agent for `config`: the host's own DID, which its admins write to.
@@ -69,7 +72,16 @@ impl Service for HostService {
             return Ok(None);
         }
         let is_admin = self.0.is_admin(sender, incoming.sender_kid.as_deref()).await;
-        Ok(self.0.admin.handle(self.0.as_ref(), is_admin, sender, &received.message, now()).map(|answer| match answer {
+        let message = &received.message;
+        let open = crate::creating::ForAnyone(self.0.as_ref());
+        // Asked what there is: the admin pages to an admin, and to anyone what anyone may.
+        if message["type"].as_str() == Some(&format!("{}/discover", wyvrn_service::admin::PIURI)) {
+            let mut workflows = self.0.admin.listed(self.0.as_ref(), is_admin, &message["body"]);
+            workflows.extend(self.0.open.listed(&open, true, &message["body"]));
+            return Ok(Some(received.reply(&format!("{}/workflows", wyvrn_service::admin::PIURI), json!({ "paging": { "total": workflows.len(), "next_offset": 0 }, "workflows": workflows }))));
+        }
+        let answer = if self.0.open.concerns(message) { self.0.open.handle(&open, true, sender, message, now()) } else { self.0.admin.handle(self.0.as_ref(), is_admin, sender, message, now()) };
+        Ok(answer.map(|answer| match answer {
             Ok((kind, body)) => received.reply(&kind, body),
             Err(refusal) => received.reply(&format!("{}/problem-report", wyvrn_service::admin::PIURI), refusal.body()),
         }))

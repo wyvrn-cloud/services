@@ -19,6 +19,19 @@ CREATE TABLE IF NOT EXISTS communities (
     limits TEXT,
     wake_at INTEGER,
     sealed_until INTEGER
+);
+-- The host's own settings: who may make a community here (admin.rs).
+CREATE TABLE IF NOT EXISTS host_settings (
+    name TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+-- Codes a host admin hands out, each letting someone make a community.
+CREATE TABLE IF NOT EXISTS create_codes (
+    code TEXT PRIMARY KEY,
+    uses_left INTEGER NOT NULL,
+    note TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    created_by TEXT NOT NULL
 );";
 
 fn schema() -> Schema {
@@ -37,6 +50,17 @@ fn schema() -> Schema {
                 limits TEXT,
                 wake_at BIGINT,
                 sealed_until BIGINT
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS host_settings (
+                name VARCHAR(64) NOT NULL PRIMARY KEY,
+                value TEXT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS create_codes (
+                code VARCHAR(64) NOT NULL PRIMARY KEY,
+                uses_left BIGINT NOT NULL,
+                note TEXT NOT NULL,
+                created_at BIGINT NOT NULL,
+                created_by {MYSQL_DID} NOT NULL
             ) {MYSQL_TABLE}"
         )
     });
@@ -230,6 +254,51 @@ impl Registry {
         Ok(())
     }
 
+    pub fn setting(&self, name: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.db.lock().query_row("SELECT value FROM host_settings WHERE name = ?1", params![name], |row| row.get(0))?)
+    }
+
+    pub fn set_setting(&self, name: &str, value: &str) -> anyhow::Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO host_settings (name, value) VALUES (?1, ?2)", params![name, value])?;
+        Ok(())
+    }
+
+    /// A code that lets someone make a community, good for `uses` of them.
+    pub fn add_code(&self, code: &str, uses: i64, note: &str, by: &str, now: i64) -> anyhow::Result<()> {
+        self.db.lock().execute("INSERT INTO create_codes (code, uses_left, note, created_at, created_by) VALUES (?1, ?2, ?3, ?4, ?5)", params![code, uses, note, now, by])?;
+        Ok(())
+    }
+
+    /// Every code with uses left: `(code, uses_left, note)`.
+    pub fn codes(&self) -> anyhow::Result<Vec<(String, i64, String)>> {
+        Ok(self.db.lock().query("SELECT code, uses_left, note FROM create_codes WHERE uses_left > 0 ORDER BY created_at, code", params![], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?)
+    }
+
+    /// Uses `code` once, if it has a use left.
+    pub fn use_code(&self, code: &str) -> anyhow::Result<bool> {
+        Ok(self.db.lock().execute("UPDATE create_codes SET uses_left = uses_left - 1 WHERE code = ?1 AND uses_left > 0", params![code])? > 0)
+    }
+
+    /// Gives a use back (the community it was to make wasn't made).
+    pub fn unuse_code(&self, code: &str) -> anyhow::Result<()> {
+        self.db.lock().execute("UPDATE create_codes SET uses_left = uses_left + 1 WHERE code = ?1", params![code])?;
+        Ok(())
+    }
+
+    pub fn revoke_code(&self, code: &str) -> anyhow::Result<bool> {
+        Ok(self.db.lock().execute("DELETE FROM create_codes WHERE code = ?1", params![code])? > 0)
+    }
+
+    /// How many communities `owner` made here that are still kept.
+    pub fn made_by(&self, owner: &str) -> anyhow::Result<i64> {
+        Ok(self.db.lock().query_value("SELECT COUNT(*) FROM communities WHERE created_by = ?1 AND state IN ('active', 'suspended', 'moving')", params![owner])?)
+    }
+
+    /// When `owner` last made one here, if they have.
+    pub fn last_made_by(&self, owner: &str) -> anyhow::Result<Option<i64>> {
+        Ok(self.db.lock().query_value("SELECT MAX(created_at) FROM communities WHERE created_by = ?1", params![owner])?)
+    }
+
     /// Forgets a community altogether (its stores are the caller's to remove).
     pub fn forget(&self, name: &str) -> anyhow::Result<bool> {
         Ok(self.db.lock().execute("DELETE FROM communities WHERE name = ?1", params![name])? > 0)
@@ -261,6 +330,28 @@ mod tests {
         assert_eq!(registry.get("makers").unwrap().unwrap().limits, Some(limits));
         assert!(registry.forget("makers").unwrap());
         assert!(registry.get("makers").unwrap().is_none());
+    }
+
+    #[test]
+    fn settings_and_codes_are_kept_in_mysql_too() {
+        let Some(url) = std::env::var("WYVRN_TEST_DATABASE_URL").ok().filter(|url| !url.is_empty()) else { return };
+        let server = url.trim_end_matches('/');
+        let database = format!("wyvrn_test_host_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        {
+            let mut admin = mysql::Conn::new(mysql::Opts::from_url(server).unwrap()).unwrap();
+            mysql::prelude::Queryable::query_drop(&mut admin, format!("CREATE DATABASE {database}")).unwrap();
+        }
+        let registry = Registry::open(&Location::MySql(format!("{server}/{database}"))).unwrap();
+        registry.set_setting("creating.mode", "codes").unwrap();
+        registry.set_setting("creating.mode", "anyone").unwrap();
+        assert_eq!(registry.setting("creating.mode").unwrap().as_deref(), Some("anyone"));
+        registry.add_code("ABC", 1, "note", &format!("did:example:{}", "a".repeat(2000)), 1).unwrap();
+        assert!(registry.use_code("ABC").unwrap());
+        assert!(!registry.use_code("ABC").unwrap());
+        registry.unuse_code("ABC").unwrap();
+        assert_eq!(registry.codes().unwrap().len(), 1);
+        registry.create("makers", "The Makers", Storage::Sqlite, "did:example:o", "did:example:o", 5).unwrap();
+        assert_eq!((registry.made_by("did:example:o").unwrap(), registry.last_made_by("did:example:o").unwrap()), (1, Some(5)));
     }
 
     #[test]

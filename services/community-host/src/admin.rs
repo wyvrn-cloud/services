@@ -65,7 +65,7 @@ impl Pages for AppState {
             id: COMMUNITIES,
             title: "Communities",
             summary: "Every community kept here; make one, set what it may hold, suspend or remove it.",
-            events: &["create", "suspend", "resume", "delete", "restore", "limits", "move", "handed"],
+            events: &["create", "suspend", "resume", "delete", "restore", "limits", "move", "handed", "creating", "code", "revoke_code"],
         }]
     }
 
@@ -80,6 +80,28 @@ impl Pages for AppState {
             { "type": "drop-down", "form-id": "storage", "label": "Kept in", "value": host.config.storage.default, "options": storage_options(!host.config.storage.mysql.is_empty()) },
             button("Make it", "create", json!({})),
         ]})];
+        // Making a community from the app (creating.rs): who may, and the codes.
+        let mode = self.creating_mode();
+        items.push(json!({ "type": "form", "children": [
+            { "type": "text", "text": format!("Who may make a community here from their app, as its owner (each up to {}).", host.config.creating.per_owner) },
+            { "type": "drop-down", "form-id": "mode", "label": "Who may make one", "value": mode.as_str(), "options": [
+                { "value": "closed", "label": "Only you, here" },
+                { "value": "codes", "label": "Whoever has a code you hand out" },
+                { "value": "anyone", "label": "Anyone" }
+            ] },
+            button("Save", "creating", json!({})),
+        ]}));
+        if mode == crate::creating::Mode::Codes {
+            items.push(json!({ "type": "form", "children": [
+                { "type": "text-input", "form-id": "uses", "label": "A new code, good for how many communities", "value": "1" },
+                { "type": "text-input", "form-id": "note", "label": "For whom (only you see this)", "value": "" },
+                button("Make a code", "code", json!({})),
+            ]}));
+            for (code, uses, note) in host.registry.codes()? {
+                let said = if note.is_empty() { format!("{code} · {uses} left") } else { format!("{code} · {uses} left · {note}") };
+                items.push(json!({ "type": "row", "children": [{ "type": "text", "text": said }, button("Revoke", "revoke_code", json!({ "code": code }))] }));
+            }
+        }
         items.push(json!({ "type": "text", "text": format!(
             "Each may hold, unless set for it: {} members, {} channels, files up to {} ({} a member, {} in all). {} open now.",
             defaults.members, defaults.channels, bytes(defaults.file_bytes), bytes(defaults.files_quota), bytes(defaults.files_total), host.loaded_count()
@@ -149,6 +171,30 @@ impl Pages for AppState {
         };
         let host = &self.host;
         let name = field(input, "name").to_lowercase();
+        match event {
+            "creating" => {
+                let mode = crate::creating::Mode::parse(field(input, "mode")).ok_or("Who may make one: choose.")?;
+                self.set_creating_mode(mode).map_err(failed)?;
+                tracing::info!(mode = mode.as_str(), by = %admin, "who may make a community here changed");
+                return Ok(Some(match mode {
+                    crate::creating::Mode::Closed => "Only host admins make communities here now.".to_string(),
+                    crate::creating::Mode::Codes => "Whoever has a code may make a community now. Make codes below.".to_string(),
+                    crate::creating::Mode::Anyone => "Anyone may make a community here now.".to_string(),
+                }));
+            }
+            "code" => {
+                let uses: i64 = field(input, "uses").parse().ok().filter(|n| (1..=1000).contains(n)).ok_or("Good for: a number from 1 to 1000.")?;
+                // Ten letters and digits from a fresh UUID's randomness: easy to read out, hard to guess.
+                let code: String = uuid::Uuid::new_v4().simple().to_string().chars().filter(|c| c.is_ascii_alphanumeric()).take(10).collect::<String>().to_uppercase();
+                host.registry.add_code(&code, uses, field(input, "note"), admin, now).map_err(failed)?;
+                return Ok(Some(format!("A code: {code}. Hand it to whoever is to make a community.")));
+            }
+            "revoke_code" => {
+                host.registry.revoke_code(field(input, "code")).map_err(failed)?;
+                return Ok(Some("That code no longer works.".into()));
+            }
+            _ => {}
+        }
         if event == "create" {
             let owner = field(input, "owner");
             if !owner.starts_with("did:") {

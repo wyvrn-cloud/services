@@ -55,6 +55,12 @@ pub trait Pages: Send + Sync {
     /// Does `event` on `page`, with what the admin's form held. What to say it
     /// did, if anything; or what was wrong, said so it can be put right.
     fn act(&self, page: &str, event: &str, input: &Value, admin: &str, now: i64) -> Result<Option<String>, String>;
+
+    /// What `page` hands back to whoever has it open (workflow/1.0's
+    /// `artifacts`): what it made, for their app to take up. Nothing, unless said.
+    fn artifacts(&self, _page: &str, _owner: &str) -> Value {
+        json!({})
+    }
 }
 
 /// A `problem-report`: one of the workflow protocol's codes.
@@ -92,6 +98,9 @@ struct Instance {
 #[derive(Default)]
 pub struct Admin {
     instances: Mutex<HashMap<String, Instance>>,
+    /// What its pages' template ids start with: [`PREFIX`], unless it is a set of
+    /// pages for anyone ([`Admin::open_to_all`]).
+    prefix: Option<&'static str>,
 }
 
 /// The workflow template for `page`.
@@ -127,6 +136,17 @@ impl Admin {
         Self::default()
     }
 
+    /// The same, for pages whose template ids start with `prefix` (not
+    /// [`PREFIX`]): a service's pages for anyone, such as asking for something,
+    /// handled with `is_admin` true for whoever may (the service's to say).
+    pub fn with_prefix(prefix: &'static str) -> Self {
+        Self { prefix: Some(prefix), ..Self::default() }
+    }
+
+    fn prefix(&self) -> &'static str {
+        self.prefix.unwrap_or(PREFIX)
+    }
+
     /// What `discover` lists of these: every page to an admin, nothing to anyone
     /// else. For a service whose `discover` also lists workflows of its own.
     pub fn listed(&self, pages: &dyn Pages, is_admin: bool, body: &Value) -> Vec<Value> {
@@ -156,7 +176,7 @@ impl Admin {
     /// service's workflows): a template id with [`PREFIX`], or an instance here.
     pub fn concerns(&self, message: &Value) -> bool {
         let body = &message["body"];
-        if body["template_id"].as_str().is_some_and(|id| id.starts_with(PREFIX)) {
+        if body["template_id"].as_str().is_some_and(|id| id.starts_with(self.prefix())) {
             return true;
         }
         body["instance_id"].as_str().is_some_and(|id| self.instances.lock().unwrap_or_else(|p| p.into_inner()).contains_key(id))
@@ -314,7 +334,7 @@ impl Admin {
                 "status": if instance.done { "completed" } else { "active" },
                 "allowed_events": allowed,
                 "action_menu": {},
-                "artifacts": {},
+                "artifacts": pages.artifacts(page.id, &instance.owner),
                 "ui": ui,
                 "ui_profile": "receiver",
             }),
