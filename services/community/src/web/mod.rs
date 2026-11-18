@@ -25,6 +25,7 @@ pub mod flows;
 pub mod oidc;
 pub mod outside;
 pub mod pages;
+pub mod posting;
 pub mod preview;
 pub mod render;
 pub mod sign_in;
@@ -291,7 +292,7 @@ pub fn channel_path(id: &str, name: &str) -> String {
 /// for a proxy that takes the web view's path off, and under that path too, for
 /// one that doesn't.
 pub fn router(state: Arc<AppState>, web: &Web) -> Router {
-    let routes = || pages::routes().merge(sign_in::routes()).merge(oidc::routes());
+    let routes = || pages::routes().merge(posting::routes()).merge(sign_in::routes()).merge(oidc::routes());
     let mut router = routes();
     let prefix = web.path.trim_end_matches('/');
     if !prefix.is_empty() {

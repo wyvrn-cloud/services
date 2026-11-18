@@ -270,6 +270,59 @@ async fn only_public_channels_show_and_what_is_said_is_only_ever_text() {
 }
 
 #[tokio::test]
+async fn a_member_signed_in_posts_replies_and_reacts_from_the_web_as_from_the_app() {
+    let server = start(Options::default()).await;
+    let (admin, member) = with_channels(&server).await;
+    member.tell("https://didcomm.org/user-profile/1.0/profile", json!({ "profile": { "displayName": "Bob" } })).await;
+    let general = server.channel_id("general");
+    admin.community("update-channel", json!({ "channel": general, "web": { "public": true } })).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let page = format!("ch/{general}/general");
+    let (cookie, csrf) = server.session(&member.did());
+    // (A form is sent from the web view's own pages: its origin.)
+    let origin = server.url.trim_end_matches('/').to_string();
+    let as_member = |method: reqwest::Method, path: String| server.http.request(method, format!("{}{path}", server.url)).header("cookie", cookie.clone()).header("origin", origin.clone());
+
+    // Nobody signed in has a form; Bob does.
+    assert!(!server.text(&page).await.1.contains("id=\"compose\""));
+    let html = as_member(reqwest::Method::GET, page.clone()).send().await.unwrap().text().await.unwrap();
+    assert!(html.contains("id=\"compose\"") && html.contains("data-live="), "{html}");
+
+    // A form that isn't from here is refused; his is posted, as his.
+    let forged = as_member(reqwest::Method::POST, format!("ch/{general}/post")).form(&[("csrf", "nope"), ("content", "x")]).send().await.unwrap();
+    assert_eq!(forged.status(), 403);
+    let posted = as_member(reqwest::Method::POST, format!("ch/{general}/post")).form(&[("csrf", csrf.as_str()), ("content", "Hello from the web")]).send().await.unwrap();
+    assert_eq!(posted.status(), 303, "{:?}", posted.text().await);
+    let store = &server.state.community.store;
+    let first = store.post_at(&general, 1).unwrap().unwrap();
+    assert_eq!((first.content.as_str(), first.author_did.as_str()), ("Hello from the web", member.did().as_str()));
+
+    // A reply names what it answers; a reaction goes on and comes off.
+    let reply = as_member(reqwest::Method::POST, format!("ch/{general}/post")).form(&[("csrf", csrf.as_str()), ("content", "And again"), ("reply", "1")]).send().await.unwrap();
+    assert_eq!(reply.status(), 303);
+    assert_eq!(store.post_at(&general, 2).unwrap().unwrap().reply_to.as_deref(), Some(first.id.as_str()));
+    for expected in [1, 0] {
+        let reacted = as_member(reqwest::Method::POST, format!("ch/{general}/m/1/react")).form(&[("csrf", csrf.as_str()), ("emoji", "👍")]).send().await.unwrap();
+        assert_eq!(reacted.status(), 303);
+        let on = store.post_at(&general, 1).unwrap().unwrap().reactions.iter().find(|(e, _)| e == "👍").map_or(0, |(_, by)| by.len());
+        assert_eq!(on, expected);
+    }
+
+    // Refused as the app would be: timed out, it says so.
+    store.set_timeout(&member.did(), Some(wyvrn_service::now() + 600), None).unwrap();
+    let refused = as_member(reqwest::Method::POST, format!("ch/{general}/post")).form(&[("csrf", csrf.as_str()), ("content", "Let me in")]).send().await.unwrap();
+    assert_eq!(refused.status(), 400);
+    assert!(refused.text().await.unwrap().contains("timed out"));
+
+    // The page hears the channel move on.
+    let mut live = server.get(&format!("ch/{general}/live")).await;
+    assert_eq!(live.headers()["content-type"], "text/event-stream");
+    let first_event = tokio::time::timeout(std::time::Duration::from_secs(5), live.chunk()).await.unwrap().unwrap().unwrap();
+    let said = String::from_utf8_lossy(&first_event);
+    assert!(said.contains("event: channel") && said.contains("\"seq\":2"), "{said}");
+}
+
+#[tokio::test]
 async fn a_webhooks_post_shows_as_from_an_app_with_its_embeds_its_pictures_through_here() {
     let server = start(Options::default()).await;
     let (admin, _member) = with_channels(&server).await;

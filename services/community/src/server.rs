@@ -524,40 +524,48 @@ impl CommunityService {
         if message["type"] != community::PROFILE {
             ask_for_profile(state, &sender);
         }
-        for (did, notice) in outcome.notices {
-            send_later(state, did, notice);
-        }
-        for message in &outcome.live {
-            state.to_every_live(message);
-        }
-        // Who it says it is to someone looking its DID up changes with it.
-        if outcome.profile_changed {
-            if let Some(document) = &state.did_document {
-                document.changed(&state.community.changed());
-            }
-        }
-        if outcome.channels_changed {
-            // Everyone else who has joined: whoever asked has it as their answer.
-            tell_everyone_later(state, Some(sender.clone()));
-        }
-        // A post that changed is sent, as it now stands, to everyone who has joined:
-        // whoever asked included, for their other devices. Not kept for anyone who
-        // can't be reached now: they ask for what changed when they are back.
-        for id in &outcome.changed {
-            send_changed_later(state, id.clone());
-        }
-        if outcome.posted {
-            if outcome.posted_id.is_some() {
-                state.deliver_first.lock().expect("deliver_first lock").push(sender.clone());
-            }
-            state.deliver.notify_one();
-        }
-        // A post in a room: the assistant answers it, in its own time.
-        if let (Some(_), Some(id)) = (&state.assistant, outcome.posted_id.clone()) {
-            tokio::spawn(answer(state.clone(), id));
-        }
-        Ok(outcome.reply)
+        Ok(carry_out(state, &sender, outcome))
     }
+}
+
+/// Does what handling a member's message came to (`Community::handle`), however
+/// it came: over DIDComm, or from the web view (web/pages.rs's posting). Gives
+/// back the answer, if there is one.
+pub(crate) fn carry_out(state: &Arc<AppState>, sender: &str, outcome: community::Outcome) -> Option<Value> {
+    let sender = sender.to_string();
+    for (did, notice) in outcome.notices {
+        send_later(state, did, notice);
+    }
+    for message in &outcome.live {
+        state.to_every_live(message);
+    }
+    // Who it says it is to someone looking its DID up changes with it.
+    if outcome.profile_changed {
+        if let Some(document) = &state.did_document {
+            document.changed(&state.community.changed());
+        }
+    }
+    if outcome.channels_changed {
+        // Everyone else who has joined: whoever asked has it as their answer.
+        tell_everyone_later(state, Some(sender.clone()));
+    }
+    // A post that changed is sent, as it now stands, to everyone who has joined:
+    // whoever asked included, for their other devices. Not kept for anyone who
+    // can't be reached now: they ask for what changed when they are back.
+    for id in &outcome.changed {
+        send_changed_later(state, id.clone());
+    }
+    if outcome.posted {
+        if outcome.posted_id.is_some() {
+            state.deliver_first.lock().expect("deliver_first lock").push(sender.clone());
+        }
+        state.deliver.notify_one();
+    }
+    // A post in a room: the assistant answers it, in its own time.
+    if let (Some(_), Some(id)) = (&state.assistant, outcome.posted_id.clone()) {
+        tokio::spawn(answer(state.clone(), id));
+    }
+    outcome.reply
 }
 
 /// The assistant's answer to post `id` (assistant.rs): from the room's (or the

@@ -158,6 +158,8 @@ pub struct Media {
 /// One reaction to a post: the emoji (a custom emoji's picture, through this
 /// server, where it is one) and how many chose it.
 pub struct ReactionView {
+    /// The reaction as kept: what toggling it from the web sends.
+    pub raw: String,
     pub text: String,
     pub picture: Option<String>,
     pub count: usize,
@@ -199,6 +201,8 @@ pub struct Card {
 
 pub struct PostView {
     pub id: String,
+    /// Its place in its channel: what replying and reacting from the web name.
+    pub seq: i64,
     pub anchor: String,
     pub href: String,
     pub author: String,
@@ -287,6 +291,22 @@ struct ChannelPage {
     heading: String,
     back: Option<String>,
     noindex: bool,
+    /// For a member signed in who may post here: the form, and what it answers.
+    compose: Option<Compose>,
+    /// Where a post's reactions are changed, for a member signed in (`<this><seq>/react`).
+    react_base: Option<String>,
+    /// The emoji a post can be given in one tap (posting.rs).
+    quick: &'static [&'static str],
+    /// Where the page hears that the channel moved on (posting.rs's `live`).
+    live: Option<String>,
+}
+
+/// The form a member signed in posts with.
+pub struct Compose {
+    pub action: String,
+    /// The post it answers, by its place: who wrote it, and what it said.
+    pub reply: Option<(i64, String, String)>,
+    pub placeholder: String,
 }
 
 #[derive(Template)]
@@ -475,6 +495,7 @@ fn post_view(state: &AppState, post: &Post, channel: &Channel, root: &str, focus
     let thread = post.grew.as_ref();
     PostView {
         id: post.id.clone(),
+        seq: post.seq,
         anchor: format!("m{}", post.seq),
         href: format!("{ch}/m/{}", post.seq),
         initial: author.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_else(|| "?".into()),
@@ -530,8 +551,8 @@ fn post_view(state: &AppState, post: &Post, channel: &Channel, root: &str, focus
             .reactions
             .iter()
             .map(|(emoji, who)| match custom_emoji(emoji) {
-                Some((name, address)) => ReactionView { text: format!(":{name}:"), picture: through_here(&address), count: who.len() },
-                None => ReactionView { text: emoji.clone(), picture: None, count: who.len() },
+                Some((name, address)) => ReactionView { raw: emoji.clone(), text: format!(":{name}:"), picture: through_here(&address), count: who.len() },
+                None => ReactionView { raw: emoji.clone(), text: emoji.clone(), picture: None, count: who.len() },
             })
             .collect(),
         cards: super::preview::links_in(&post.content)
@@ -712,10 +733,13 @@ async fn channel_bare(State(state): State<Arc<AppState>>, headers: HeaderMap, Pa
 #[derive(Deserialize)]
 struct Before {
     before: Option<i64>,
+    /// The post a member signed in is answering (`?reply=<seq>`).
+    reply: Option<i64>,
 }
 
 /// A channel's posts, newest last, a page at a time.
 async fn channel(State(state): State<Arc<AppState>>, Path((id, name)): Path<(String, String)>, Query(paging): Query<Before>, headers: HeaderMap) -> Response {
+    let reply = paging.reply;
     let Some(web) = web_of(&state) else { return nothing() };
     if !page_on(&state.community.store) {
         return nothing();
@@ -762,9 +786,45 @@ async fn channel(State(state): State<Arc<AppState>>, Path((id, name)): Path<(Str
     let private = since.is_none() && !is_public(&state, &channel.id);
     let title = format!("#{} · {}", channel.name, site.name);
     page(
-        ChannelPage { heading: format!("#{}", channel.name), channel_name: channel.name.clone(), topic: channel.topic.clone(), posts: views, older, newer, title, description, json_ld, site, groups, back: None, noindex: private }.render(),
+        ChannelPage {
+            heading: format!("#{}", channel.name),
+            channel_name: channel.name.clone(),
+            topic: channel.topic.clone(),
+            posts: views,
+            older,
+            newer,
+            title,
+            description,
+            json_ld,
+            site,
+            groups,
+            back: None,
+            noindex: private,
+            compose: compose_for(&state, &viewer, &channel, root, reply),
+            react_base: react_base(&viewer, &channel, root),
+            quick: super::posting::QUICK_REACTIONS,
+            // The newest page only: an older one doesn't change at its foot.
+            live: before.is_none().then(|| format!("{root}ch/{}/live", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>())),
+        }
+        .render(),
         private || viewer.signed_in(),
     )
+}
+
+/// The form to post with, for a member signed in who may post in `channel`.
+fn compose_for(state: &AppState, viewer: &Viewer, channel: &Channel, root: &str, reply: Option<i64>) -> Option<Compose> {
+    let member = viewer.member.as_ref()?;
+    if channel.forum.is_some() || !state.community.may_in(&member.did, channel, "post").unwrap_or(false) {
+        return None;
+    }
+    let answering = reply.and_then(|seq| state.community.store.post_at(&channel.id, seq).ok().flatten()).filter(|p| !p.deleted).map(|p| (p.seq, p.author_name.clone().unwrap_or_else(|| "A member".into()), render::excerpt(&p.content, 100)));
+    Some(Compose { action: format!("{root}ch/{}/post", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>()), reply: answering, placeholder: format!("Post in #{}", channel.name) })
+}
+
+/// Where reactions go, for a member signed in.
+fn react_base(viewer: &Viewer, channel: &Channel, root: &str) -> Option<String> {
+    viewer.member.as_ref()?;
+    Some(format!("{root}ch/{}/m/", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>()))
 }
 
 fn is_public(state: &AppState, channel: &str) -> bool {
@@ -776,7 +836,7 @@ fn shows_any_before(state: &AppState, channel: &Channel, seq: i64, since: Option
 }
 
 /// The channel, if the viewer may read it, and from when.
-fn visible_channel(state: &AppState, viewer: &Viewer, id: &str) -> Option<(Channel, Option<i64>)> {
+pub(super) fn visible_channel(state: &AppState, viewer: &Viewer, id: &str) -> Option<(Channel, Option<i64>)> {
     let since = *readable(state, viewer).ok()?.get(id)?;
     Some((state.community.store.channel(id).ok()??, since))
 }
@@ -836,6 +896,10 @@ async fn post_page(State(state): State<Arc<AppState>>, Path((id, seq)): Path<(St
             site,
             groups,
             noindex: private,
+            compose: None,
+            react_base: react_base(&viewer, &channel, root),
+            quick: super::posting::QUICK_REACTIONS,
+            live: None,
         }
         .render(),
         private || viewer.signed_in(),
@@ -889,6 +953,10 @@ async fn thread_page(State(state): State<Arc<AppState>>, Path((id, thread)): Pat
             site,
             groups,
             noindex: private,
+            compose: None,
+            react_base: react_base(&viewer, &channel, root),
+            quick: super::posting::QUICK_REACTIONS,
+            live: None,
         }
         .render(),
         private || viewer.signed_in(),

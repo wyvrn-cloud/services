@@ -181,3 +181,15 @@ a.link-card-channel:hover { text-decoration: underline; }
 .embed-thumbnail { position: absolute; top: .6rem; right: .75rem; width: 64px; height: 64px; object-fit: cover; border-radius: 4px; }
 .embed:has(.embed-thumbnail) { padding-right: 5.5rem; }
 .embed-footer { font-size: .75rem; color: var(--muted); }
+
+/* Posting from the web (posting.rs): the form at the foot, reactions as buttons. */
+.compose { position: sticky; bottom: 0; display: flex; flex-wrap: wrap; gap: .5rem; align-items: flex-end; margin-top: 1rem; padding: .75rem 0; background: var(--bg); border-top: 1px solid var(--border); }
+.compose textarea { flex: 1 1 18rem; min-height: 2.6rem; resize: vertical; padding: .55rem .7rem; border: 1px solid var(--border); border-radius: calc(var(--radius) / 2); background: var(--surface); color: inherit; font: inherit; }
+.compose-reply { flex: 1 1 100%; margin: 0; font-size: .85rem; color: var(--muted); }
+form.reactions { display: flex; flex-wrap: wrap; gap: .3rem; margin-top: .4rem; align-items: center; }
+form.reactions button { display: inline-flex; gap: .25rem; align-items: center; padding: .1rem .45rem; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: inherit; font: inherit; cursor: pointer; }
+.react-add { display: inline-block; }
+.react-add summary { list-style: none; cursor: pointer; padding: .1rem .45rem; border: 1px dashed var(--border); border-radius: 999px; color: var(--muted); }
+.react-add summary::-webkit-details-marker { display: none; }
+.react-add[open] { display: inline-flex; gap: .25rem; }
+.reply-link { font-size: .8rem; color: var(--muted); }

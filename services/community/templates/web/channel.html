@@ -52,7 +52,16 @@
         {% if !card.pictures.is_empty() %}<a class="link-card-pictures{% if card.pictures.len() > 1 %} several{% endif %}" href="{{ card.href }}" rel="nofollow ugc noopener noreferrer"{% if card.kind == "youtube" %} aria-label="Watch on YouTube"{% endif %}>{% for picture in card.pictures %}<img src="{{ picture }}" alt="" loading="lazy">{% endfor %}{% if card.kind == "youtube" %}<span class="link-card-play" aria-hidden="true">▶</span>{% endif %}</a>{% endif %}
       </div>
       {% endfor %}
+      {% if let Some(react) = react_base %}
+      <form class="reactions" method="post" action="{{ react }}{{ post.seq }}/react" aria-label="Reactions">
+        <input type="hidden" name="csrf" value="{{ site.csrf }}">
+        {% for reaction in post.reactions %}<button type="submit" name="emoji" value="{{ reaction.raw }}" title="React {{ reaction.text }} (again to take it back)">{% if let Some(picture) = reaction.picture %}<img class="emoji" src="{{ picture }}" alt="{{ reaction.text }}" loading="lazy">{% else %}{{ reaction.text }}{% endif %} <span>{{ reaction.count }}</span></button>{% endfor %}
+        <details class="react-add"><summary aria-label="Add a reaction" title="Add a reaction">☺+</summary>{% for emoji in quick %}<button type="submit" name="emoji" value="{{ emoji }}">{{ emoji }}</button>{% endfor %}</details>
+      </form>
+      {% else %}
       {% if !post.reactions.is_empty() %}<ul class="reactions" aria-label="Reactions">{% for reaction in post.reactions %}<li>{% if let Some(picture) = reaction.picture %}<img class="emoji" src="{{ picture }}" alt="{{ reaction.text }}" title="{{ reaction.text }}" loading="lazy">{% else %}{{ reaction.text }}{% endif %} <span>{{ reaction.count }}</span></li>{% endfor %}</ul>{% endif %}
+      {% endif %}
+      {% if compose.is_some() %}<a class="reply-link" href="?reply={{ post.seq }}#compose">Reply</a>{% endif %}
       {% if let Some(thread) = post.thread_href %}<a class="thread" href="{{ thread }}">{% if let Some(name) = post.thread_name %}{{ name }} · {% endif %}{{ post.thread_count }} {% if post.thread_count == 1 %}reply{% else %}replies{% endif %} →</a>{% endif %}
     </article>
   </li>
@@ -61,4 +70,17 @@
 {% endfor %}
 </ol>
 {% if let Some(newer) = newer %}<p class="paging"><a class="button quiet" href="{{ newer }}" rel="next">Newer posts</a></p>{% endif %}
+{% if let Some(compose) = compose %}
+<form class="compose" id="compose" method="post" action="{{ compose.action }}">
+  <input type="hidden" name="csrf" value="{{ site.csrf }}">
+  {% if let Some((seq, who, snippet)) = compose.reply %}
+  <input type="hidden" name="reply" value="{{ seq }}">
+  <p class="compose-reply">Replying to <span class="author">{{ who }}</span>: {{ snippet }} <a href="?#compose">Cancel</a></p>
+  {% endif %}
+  <label class="visually-hidden" for="compose-text">Your post</label>
+  <textarea id="compose-text" name="content" rows="2" maxlength="16000" placeholder="{{ compose.placeholder }}" required></textarea>
+  <button class="button" type="submit">Post</button>
+</form>
+{% endif %}
+{% if let Some(live) = live %}<div hidden data-live="{{ live }}"></div>{% endif %}
 {% endblock %}

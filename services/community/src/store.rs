@@ -2438,6 +2438,12 @@ impl Store {
         self.db.lock().query_value("SELECT COALESCE(MAX(rev), 0) FROM post_state", params![])
     }
 
+    /// The latest change to any post of `channel` (its `rev`): what the web view's
+    /// live page watches.
+    pub fn channel_rev(&self, channel: &str) -> Result<i64> {
+        self.db.lock().query_value("SELECT COALESCE(MAX(state.rev), 0) FROM post_state state JOIN posts ON posts.id = state.post WHERE posts.channel = ?1", params![channel])
+    }
+
     /// Every post written or changed after `rev`, in the order that happened.
     pub fn posts_changed_after(&self, rev: i64, limit: usize) -> Result<Vec<Post>> {
         let posts = self.db.lock().query(

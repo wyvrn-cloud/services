@@ -39,7 +39,34 @@
 
     var posts = document.querySelector('ol.posts')
     if (posts) keepPlace(posts)
+    var live = document.querySelector('[data-live]')
+    if (posts && live && window.EventSource) followLive(live.getAttribute('data-live'), posts)
   })
+
+  // A channel's newest page, kept up to date as it is read: told when the channel
+  // moves on (posting.rs's server-sent events), the page is fetched again and its
+  // posts put in place of these, the reader kept at the bottom if they were there.
+  // What is being written in the form below is left alone.
+  function followLive(url, posts) {
+    var heard = null
+    var source = new EventSource(url)
+    source.addEventListener('channel', function (event) {
+      if (heard === null) { heard = event.data; return }
+      if (event.data === heard) return
+      heard = event.data
+      var atBottom = document.documentElement.scrollHeight - window.innerHeight - window.scrollY < 48
+      fetch(location.pathname + location.search, { credentials: 'same-origin' })
+        .then(function (response) { return response.ok ? response.text() : null })
+        .then(function (html) {
+          if (!html) return
+          var fresh = new DOMParser().parseFromString(html, 'text/html').querySelector('ol.posts')
+          if (!fresh) return
+          posts.innerHTML = fresh.innerHTML
+          if (atBottom) window.scrollTo(0, document.documentElement.scrollHeight)
+        })
+        .catch(function () { /* the next change tries again */ })
+    })
+  }
 
   // Where a list of posts was left, for this visit (sessionStorage), by page: the
   // post at the top of the screen and how far into it, or "at the bottom". Kept by

@@ -1,0 +1,164 @@
+//! Posting, replying and reacting from the web view, for a member signed in to it
+//! (community/1.0's "The web view"; asked 2026-11-17), and a channel's page told
+//! when there is something new (server-sent events).
+//!
+//! What a form says is made into the community/1.0 message the app would send,
+//! and handled as one: the same permissions, slow mode, timeouts, AutoMod and
+//! rate of posting, refused with the same words. Every form carries the session's
+//! form token (`csrf`), checked before anything else, and the page answers with
+//! the channel again (at the post) or with why it wasn't taken.
+
+use std::convert::Infallible;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Redirect, Response};
+use axum::routing::{get, post};
+use axum::{Form, Router};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use super::pages::Viewer;
+use super::sign_in::form_ok;
+use super::{as_page, channel_path, page_error};
+use crate::server::AppState;
+use crate::store::Channel;
+
+/// The emoji a post can be given from the web view in one tap, besides those it has.
+pub const QUICK_REACTIONS: &[&str] = &["👍", "❤️", "😂", "🎉", "😮", "😢"];
+/// How often a channel's live page is looked at for what is new.
+const LOOK_EVERY: Duration = Duration::from_secs(2);
+
+pub fn routes() -> Router<Arc<AppState>> {
+    Router::new().route("/ch/{id}/post", post(post_form)).route("/ch/{id}/m/{seq}/react", post(react_form)).route("/ch/{id}/live", get(live))
+}
+
+#[derive(Deserialize)]
+pub struct PostForm {
+    csrf: String,
+    content: String,
+    /// The post (by its place in the channel) this answers.
+    #[serde(default)]
+    reply: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct ReactForm {
+    csrf: String,
+    emoji: String,
+}
+
+/// The channel `id`, for a member who may read it from the web, and the page it is at.
+fn readable(state: &AppState, member: &crate::store::Member, id: &str) -> Option<(Channel, String)> {
+    let viewer = Viewer { member: Some(member.clone()), csrf: None };
+    let (channel, _) = super::pages::visible_channel(state, &viewer, id)?;
+    let at = channel_path(&channel.id, &channel.name);
+    Some((channel, at))
+}
+
+/// What handling `message` came to: back to the channel, at `anchor`, or why not.
+fn answered(state: &Arc<AppState>, sender: &str, message: &Value, back: &str) -> Response {
+    let outcome = match state.community.handle(sender, message, crate::gates::now()) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tracing::warn!(%error, "a post from the web failed");
+            return page_error(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong", "That didn't go through. Try again.");
+        }
+    };
+    let reply = crate::server::carry_out(state, sender, outcome);
+    match reply {
+        // Refused: as the app would be told.
+        Some(reply) if reply["type"].as_str().is_some_and(|t| t.ends_with("/problem-report")) => {
+            let said = reply["body"]["comment"].as_str().unwrap_or("That wasn't taken.");
+            page_error(StatusCode::BAD_REQUEST, "Not posted", said)
+        }
+        Some(reply) => {
+            let anchor = reply["body"]["seq"].as_i64().map(|seq| format!("#m{seq}")).unwrap_or_default();
+            as_page(Redirect::to(&format!("{back}{anchor}")).into_response())
+        }
+        None => as_page(Redirect::to(back).into_response()),
+    }
+}
+
+/// `POST ch/{id}/post`: a post, or a reply to one.
+async fn post_form(State(state): State<Arc<AppState>>, Path(id): Path<String>, headers: HeaderMap, Form(form): Form<PostForm>) -> Response {
+    if state.web.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(member) = form_ok(&state, &headers, &form.csrf) else {
+        return page_error(StatusCode::FORBIDDEN, "Sign in again", "Your session ended, or that form wasn't from here.");
+    };
+    let Some((channel, at)) = readable(&state, &member, &id) else { return page_error(StatusCode::NOT_FOUND, "No such channel", "There's no such channel for you here.") };
+    let content = form.content.trim();
+    if content.is_empty() {
+        return as_page(Redirect::to(&format!("../../{at}")).into_response());
+    }
+    let mut body = json!({ "channel": channel.id, "id": uuid::Uuid::new_v4().to_string(), "content": content });
+    if let Some(answered) = form.reply.and_then(|seq| state.community.store.post_at(&channel.id, seq).ok().flatten()).filter(|p| !p.deleted) {
+        body["reply_to"] = json!({ "id": answered.id, "author": answered.author_did, "snippet": super::render::excerpt(&answered.content, 100) });
+        // An answer in a thread is in that thread.
+        if let Some(thread) = &answered.thread {
+            body["thread"] = json!(thread);
+        }
+    }
+    let message = json!({ "type": crate::community::POST, "id": uuid::Uuid::new_v4().to_string(), "body": body });
+    answered(&state, &member.did, &message, &format!("../../{at}"))
+}
+
+/// `POST ch/{id}/m/{seq}/react`: an emoji put on the post, or taken off if it was
+/// this member's already.
+async fn react_form(State(state): State<Arc<AppState>>, Path((id, seq)): Path<(String, i64)>, headers: HeaderMap, Form(form): Form<ReactForm>) -> Response {
+    if state.web.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(member) = form_ok(&state, &headers, &form.csrf) else {
+        return page_error(StatusCode::FORBIDDEN, "Sign in again", "Your session ended, or that form wasn't from here.");
+    };
+    let Some((channel, at)) = readable(&state, &member, &id) else { return page_error(StatusCode::NOT_FOUND, "No such channel", "There's no such channel for you here.") };
+    let Some(post) = state.community.store.post_at(&channel.id, seq).ok().flatten() else { return page_error(StatusCode::NOT_FOUND, "No such post", "That post isn't here.") };
+    // Their whole set on it, as message-reactions/1.0 says it: this one in or out.
+    let mut theirs: Vec<String> = post.reactions.iter().filter(|(_, by)| by.contains(&member.did)).map(|(emoji, _)| emoji.clone()).collect();
+    match theirs.iter().position(|emoji| *emoji == form.emoji) {
+        Some(at) => {
+            theirs.remove(at);
+        }
+        None => theirs.push(form.emoji.clone()),
+    }
+    let message = json!({ "type": crate::community::REACT, "id": uuid::Uuid::new_v4().to_string(), "body": { "to": { "id": post.id, "author": post.author_did }, "emoji": theirs } });
+    let back = format!("../../../../{at}");
+    match answered(&state, &member.did, &message, &back) {
+        // (Back at the post, not the foot of the channel.)
+        response if response.status().is_redirection() => as_page(Redirect::to(&format!("{back}#m{seq}")).into_response()),
+        response => response,
+    }
+}
+
+/// `GET ch/{id}/live`: server-sent events saying, as it changes, how far the
+/// channel has got (`seq`, its latest post) and when a post in it last changed
+/// (`rev`). The page fetches itself again when either moves. Only for a channel the
+/// viewer may read, signed in or not.
+async fn live(State(state): State<Arc<AppState>>, Path(id): Path<String>, headers: HeaderMap) -> Response {
+    if state.web.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let viewer = Viewer::of(&state, &headers);
+    if super::pages::visible_channel(&state, &viewer, &id).is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    // Each item waits until the channel has moved on (or is gone), then says so.
+    let stream = futures_util::stream::unfold((state, id, None::<(i64, i64)>), |(state, id, last)| async move {
+        loop {
+            let store = &state.community.store;
+            let now = store.channel(&id).ok().flatten().filter(|c| !c.closed).map(|c| (c.latest_seq, store.channel_rev(&c.id).unwrap_or(0)))?;
+            if last != Some(now) {
+                let event = Event::default().event("channel").data(json!({ "seq": now.0, "rev": now.1 }).to_string());
+                return Some((Ok::<Event, Infallible>(event), (state, id, Some(now))));
+            }
+            tokio::time::sleep(LOOK_EVERY).await;
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+}
