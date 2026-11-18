@@ -24,6 +24,7 @@ pub mod files;
 pub mod gates;
 pub mod member_ids;
 pub mod moderation;
+pub mod outgoing;
 pub mod posting;
 pub mod questions;
 pub mod roles;

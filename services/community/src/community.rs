@@ -1330,6 +1330,9 @@ impl Community {
                     self.store.note_left(sender, now)?;
                 }
                 self.store.set_joined(sender, message_type == JOIN)?;
+                if member.joined != (message_type == JOIN) {
+                    self.member_event(sender, message_type == JOIN, now);
+                }
                 let member = Member { joined: message_type == JOIN, ..member };
                 Ok(Outcome::reply(reply_to(message, COMMUNITY, self.community(&member)?)))
             }

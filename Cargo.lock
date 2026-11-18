@@ -5199,6 +5199,7 @@ dependencies = [
  "didcomm-crypto-askar",
  "didcomm-quickstart",
  "futures-util",
+ "hmac 0.12.1",
  "mysql",
  "pulldown-cmark",
  "regex",

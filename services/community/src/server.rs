@@ -275,7 +275,11 @@ pub(crate) fn send_changed_later(state: &Arc<AppState>, id: String) {
     let state = state.clone();
     tokio::spawn(async move {
         let sent = state.community.store.post_by_id(&id).map_err(anyhow::Error::from).and_then(|post| match post {
-            Some(post) => send_changed(&state, &state.community.changed_notice(&post)),
+            Some(post) => {
+                // And to whatever takes events (outgoing.rs).
+                state.community.post_changed_event(&post, now());
+                send_changed(&state, &state.community.changed_notice(&post))
+            }
             None => Ok(()),
         });
         if let Err(error) = sent {

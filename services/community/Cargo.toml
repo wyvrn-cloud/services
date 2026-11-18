@@ -42,6 +42,8 @@ base64 = { workspace = true }
 askama = "0.14"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 url = "2"
+# Signing the events sent out (outgoing.rs): the version the lock file has.
+hmac = "0.12"
 # Signing in to the web view (website-sign-in/1.0), and the identity provider's
 # ES256 id tokens (community-sign-in/1.0).
 wyvrn-sign-in = { path = "../../../wyvrn-sign-in" }

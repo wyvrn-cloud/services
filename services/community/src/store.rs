@@ -77,6 +77,23 @@ pub struct Webhook {
     pub created_at: i64,
 }
 
+/// Where events are sent out to (outgoing.rs): a receiver's URL, the secret each
+/// event is signed with, the events it takes (`post.created`, ...), only those
+/// of `channel` where one is named, from whoever made it.
+#[derive(Debug, Clone)]
+pub struct EventHook {
+    pub id: String,
+    pub url: String,
+    pub secret: String,
+    pub events: Vec<String>,
+    pub channel: Option<String>,
+    pub created_by: String,
+    pub created_at: i64,
+    /// Events in a row it didn't take; past enough, it is turned off (`off_at`).
+    pub failures: i64,
+    pub off_at: Option<i64>,
+}
+
 /// Something made or taken over from a Discord template (`imported`).
 #[derive(Debug, Clone)]
 pub struct Imported {
@@ -763,6 +780,27 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         created_by TEXT NOT NULL,
         created_at INTEGER NOT NULL
     );
+    -- Events sent out (outgoing.rs): where each receiver is, the secret its
+    -- events are signed with, which it takes, and whether it is still sent to.
+    CREATE TABLE IF NOT EXISTS event_hooks (
+        id TEXT PRIMARY KEY,
+        url TEXT NOT NULL,
+        secret TEXT NOT NULL,
+        events TEXT NOT NULL,
+        channel TEXT,
+        created_by TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        failures INTEGER NOT NULL DEFAULT 0,
+        off_at INTEGER
+    );
+    -- And each event waiting to go, tried again later when its receiver failed.
+    CREATE TABLE IF NOT EXISTS event_queue (
+        id TEXT PRIMARY KEY,
+        hook TEXT NOT NULL,
+        body TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_at INTEGER NOT NULL
+    );
     -- What came from a Discord server template (discord.rs): each role, category
     -- and channel made or taken over from one, what the template said of it (its
     -- JSON) and what was set here from that (JSON), to tell on importing again
@@ -1207,6 +1245,24 @@ fn schema() -> Schema {
                 token VARCHAR(128) NOT NULL,
                 created_by VARCHAR(3000) NOT NULL,
                 created_at BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS event_hooks (
+                id VARCHAR(64) NOT NULL PRIMARY KEY,
+                url TEXT NOT NULL,
+                secret VARCHAR(128) NOT NULL,
+                events TEXT NOT NULL,
+                channel VARCHAR(255),
+                created_by VARCHAR(3000) NOT NULL,
+                created_at BIGINT NOT NULL,
+                failures BIGINT NOT NULL DEFAULT 0,
+                off_at BIGINT
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS event_queue (
+                id VARCHAR(64) NOT NULL PRIMARY KEY,
+                hook VARCHAR(64) NOT NULL,
+                body MEDIUMTEXT NOT NULL,
+                attempts BIGINT NOT NULL DEFAULT 0,
+                next_at BIGINT NOT NULL
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS imported (
                 kind VARCHAR(32) NOT NULL,
@@ -2682,6 +2738,51 @@ impl Store {
         Ok(())
     }
 
+    pub fn event_hooks(&self) -> Result<Vec<EventHook>> {
+        self.db.lock().query(&format!("SELECT {EVENT_HOOK_COLUMNS} FROM event_hooks ORDER BY created_at, id"), params![], event_hook_from)
+    }
+
+    pub fn event_hook(&self, id: &str) -> Result<Option<EventHook>> {
+        self.db.lock().query_row(&format!("SELECT {EVENT_HOOK_COLUMNS} FROM event_hooks WHERE id = ?1"), params![id], event_hook_from)
+    }
+
+    pub fn save_event_hook(&self, hook: &EventHook) -> Result<()> {
+        self.db.lock().execute(
+            "INSERT OR REPLACE INTO event_hooks (id, url, secret, events, channel, created_by, created_at, failures, off_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![hook.id, hook.url, hook.secret, serde_json::to_string(&hook.events).unwrap_or_default(), hook.channel, hook.created_by, hook.created_at, hook.failures, hook.off_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_event_hook(&self, id: &str) -> Result<()> {
+        let mut db = self.db.lock();
+        db.execute("DELETE FROM event_queue WHERE hook = ?1", params![id])?;
+        db.execute("DELETE FROM event_hooks WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn queue_event(&self, id: &str, hook: &str, body: &str, now: i64) -> Result<()> {
+        self.db.lock().execute("INSERT INTO event_queue (id, hook, body, attempts, next_at) VALUES (?1, ?2, ?3, 0, ?4)", params![id, hook, body, now])?;
+        Ok(())
+    }
+
+    /// Events due to go now, oldest first: `(id, hook, body, attempts)`.
+    pub fn due_events(&self, now: i64, limit: i64) -> Result<Vec<(String, String, String, i64)>> {
+        self.db.lock().query("SELECT id, hook, body, attempts FROM event_queue WHERE next_at <= ?1 ORDER BY next_at, id LIMIT ?2", params![now, limit], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+    }
+
+    pub fn event_done(&self, id: &str) -> Result<()> {
+        self.db.lock().execute("DELETE FROM event_queue WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn event_later(&self, id: &str, attempts: i64, next_at: i64) -> Result<()> {
+        self.db.lock().execute("UPDATE event_queue SET attempts = ?2, next_at = ?3 WHERE id = ?1", params![id, attempts, next_at])?;
+        Ok(())
+    }
+
     /// What came from a Discord template, of `kind` (`role`, `category`,
     /// `channel`, `community`).
     pub fn imported(&self, kind: &str) -> Result<Vec<Imported>> {
@@ -2820,6 +2921,23 @@ impl Store {
     pub fn prune_answering(&self, before: i64) -> Result<usize> {
         self.db.lock().execute("DELETE FROM answering WHERE updated < ?1 AND status != 'completed'", params![before])
     }
+}
+
+const EVENT_HOOK_COLUMNS: &str = "id, url, secret, events, channel, created_by, created_at, failures, off_at";
+
+fn event_hook_from(row: &Row) -> Result<EventHook> {
+    let events: String = row.get(3)?;
+    Ok(EventHook {
+        id: row.get(0)?,
+        url: row.get(1)?,
+        secret: row.get(2)?,
+        events: serde_json::from_str(&events).unwrap_or_default(),
+        channel: row.get(4)?,
+        created_by: row.get(5)?,
+        created_at: row.get(6)?,
+        failures: row.get(7)?,
+        off_at: row.get(8)?,
+    })
 }
 
 fn webhook_from(row: &Row) -> Result<Webhook> {

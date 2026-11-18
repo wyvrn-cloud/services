@@ -231,6 +231,7 @@ impl Host {
             tokio::spawn(server::run_pruning(state.clone())),
             tokio::spawn(server::run_voice_sweep(state.clone())),
             tokio::spawn(server::run_polls(state.clone())),
+            tokio::spawn(wyvrn_community::outgoing::run_outgoing(state.clone())),
         ];
         // Moving out, the address is the owner's server's to write next.
         if let Some(holding) = holding {

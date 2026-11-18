@@ -167,6 +167,7 @@ pub async fn serve(config: Config, assistant: Option<Assistant>) -> anyhow::Resu
         tokio::spawn(holding.run());
     }
     tokio::spawn(server::run_deliveries(state.clone()));
+    tokio::spawn(crate::outgoing::run_outgoing(state.clone()));
     tokio::spawn(server::run_pruning(state.clone()));
     tokio::spawn(server::run_voice_sweep(state.clone()));
     tokio::spawn(server::run_polls(state.clone()));

@@ -601,6 +601,31 @@ pub async fn delete_message(State(state): State<Arc<AppState>>, Path((id, token,
 }
 
 impl Community {
+    /// What a receiver's form says: where, which events, of which channel (none:
+    /// every one, for whoever manages webhooks everywhere).
+    fn read_receiver(&self, flow: &Flow, input: &Value, channels: &[Channel]) -> Result<(String, Vec<String>, Option<String>), Refusal> {
+        let url = crate::outgoing::check_url(input["url"].as_str().unwrap_or_default(), self.config.outgoing_private).map_err(|why| Refusal::new("guard_failed", &why))?.to_string();
+        let events: Vec<String> = crate::outgoing::EVENTS.iter().filter(|(event, _)| input[format!("event-{event}")] == true).map(|(event, _)| event.to_string()).collect();
+        if events.is_empty() {
+            return Err(Refusal::new("guard_failed", "Choose at least one event."));
+        }
+        let channel = match input["channel"].as_str().filter(|c| !c.is_empty()) {
+            Some(id) if channels.iter().any(|c| c.id == id) => Some(id.to_string()),
+            Some(_) => return Err(Refusal::new("guard_failed", "Choose a channel you manage webhooks in.")),
+            None if self.powers(&flow.owner).map_err(failed)?.has("manage_webhooks") => None,
+            None => return Err(Refusal::new("guard_failed", "Events of every channel take Manage webhooks everywhere; choose a channel.")),
+        };
+        Ok((url, events, channel))
+    }
+
+    fn editable_receiver(&self, id: &str, channels: &[Channel]) -> Result<crate::store::EventHook, Refusal> {
+        self.store
+            .event_hook(id)
+            .map_err(failed)?
+            .filter(|h| h.channel.as_deref().is_none_or(|c| channels.iter().any(|ch| ch.id == c)))
+            .ok_or_else(|| Refusal::new("instance_not_found", "That receiver is gone."))
+    }
+
     /// The channels `did` manages webhooks in: text channels and forums they see.
     fn webhook_channels(&self, did: &str) -> anyhow::Result<Vec<Channel>> {
         let powers = self.powers(did)?;
@@ -622,9 +647,39 @@ impl Community {
         let channels = self.webhook_channels(&flow.owner)?;
         let named = |id: &str| channels.iter().find(|c| c.id == id).map(|c| format!("#{}", c.name));
         let options: Vec<Value> = channels.iter().map(|c| json!({ "value": c.id, "label": format!("#{}", c.name) })).collect();
+        // Events of every channel only for whoever manages webhooks everywhere.
+        let everywhere = self.powers(&flow.owner)?.has("manage_webhooks");
+        let mut out_options: Vec<Value> = if everywhere { vec![json!({ "value": "", "label": "Every channel" })] } else { Vec::new() };
+        out_options.extend(options.iter().cloned());
         let mut items = vec![json!({ "type": "title", "text": "Webhooks" })];
         if let Some(note) = flow.data["note"].as_str() {
             items.push(json!({ "type": "pass", "text": note }));
+        }
+        if flow.state == "edit_out" {
+            let id = flow.data["event_hook"].as_str().unwrap_or_default();
+            let Some(hook) = self.store.event_hook(id)?.filter(|h| h.channel.as_deref().is_none_or(|c| named(c).is_some())) else {
+                return Ok((json!([{ "type": "text", "text": "That receiver is gone." }, { "type": "submit-button", "label": "Back", "event": "back", "input": {} }]), vec!["back"]));
+            };
+            if hook.off_at.is_some() {
+                items.push(json!({ "type": "fail", "text": "Turned off: it stopped taking events. Turn it back on once it takes them again." }));
+            }
+            items.push(json!({ "type": "text", "text": "Each event is a POST of JSON, signed with this receiver's secret (the Wyvrn-Signature header). The secret is shown once, when it is made." }));
+            let mut fields = vec![json!({ "type": "text-input", "form-id": "url", "label": "Where they go (https://)", "value": hook.url, "required": true })];
+            for (event, label) in crate::outgoing::EVENTS {
+                fields.push(json!({ "type": "check-box", "form-id": format!("event-{event}"), "label": label, "value": hook.events.iter().any(|e| e == event) }));
+            }
+            fields.push(json!({ "type": "drop-down", "form-id": "channel", "label": "Of", "value": hook.channel.clone().unwrap_or_default(), "options": out_options.clone() }));
+            fields.push(json!({ "type": "submit-button", "label": "Save", "event": "save_out", "input": {} }));
+            items.push(json!({ "type": "form", "children": fields }));
+            let mut row = vec![json!({ "type": "submit-button", "label": "Send a test event", "event": "ping_out", "input": {} })];
+            if hook.off_at.is_some() {
+                row.push(json!({ "type": "submit-button", "label": "Turn back on", "event": "on_out", "input": {} }));
+            }
+            row.push(json!({ "type": "submit-button", "label": "New secret", "event": "secret_out", "input": {} }));
+            row.push(json!({ "type": "submit-button", "label": "Delete", "event": "delete_out", "input": {} }));
+            row.push(json!({ "type": "submit-button", "label": "Back", "event": "back", "input": {} }));
+            items.push(json!({ "type": "row", "children": row }));
+            return Ok((Value::Array(items), vec!["save_out", "ping_out", "on_out", "secret_out", "delete_out", "back"]));
         }
         if flow.state == "edit" {
             let id = flow.data["webhook"].as_str().unwrap_or_default();
@@ -663,8 +718,28 @@ impl Community {
             { "type": "drop-down", "form-id": "channel", "label": "Posts in", "value": channels.first().map(|c| c.id.clone()).unwrap_or_default(), "options": options },
             { "type": "submit-button", "label": "Make it", "event": "create", "input": {} }
         ] }));
+        // Out: events sent, as they happen, to another service (outgoing.rs).
+        items.push(json!({ "type": "divider" }));
+        items.push(json!({ "type": "title", "text": "Sending events out" }));
+        items.push(json!({ "type": "text", "text": "Tell another service what happens here as it happens: new posts, posts changed, members coming and going, sent to its https:// address as signed JSON." }));
+        let receivers: Vec<_> = self.store.event_hooks()?.into_iter().filter(|h| h.channel.as_deref().is_none_or(|c| named(c).is_some())).collect();
+        for hook in &receivers {
+            let of = hook.channel.as_deref().and_then(named).unwrap_or_else(|| "every channel".into());
+            let off = if hook.off_at.is_some() { " (turned off)" } else { "" };
+            items.push(json!({ "type": "row", "children": [
+                { "type": "text", "text": format!("{} · {} · {}{off}", hook.url, of, hook.events.join(", ")) },
+                { "type": "submit-button", "label": "Edit", "event": "edit_out", "input": { "event_hook": hook.id } }
+            ] }));
+        }
+        let mut fields = vec![json!({ "type": "text-input", "form-id": "url", "label": "Where they go", "placeholder": "https://example.com/wyvrn-events", "required": true })];
+        for (event, label) in crate::outgoing::EVENTS {
+            fields.push(json!({ "type": "check-box", "form-id": format!("event-{event}"), "label": label, "value": *event == "post.created" }));
+        }
+        fields.push(json!({ "type": "drop-down", "form-id": "channel", "label": "Of", "value": out_options.first().map(|o| o["value"].clone()).unwrap_or_default(), "options": out_options }));
+        fields.push(json!({ "type": "submit-button", "label": "Send events there", "event": "create_out", "input": {} }));
+        items.push(json!({ "type": "form", "children": fields }));
         items.push(json!({ "type": "submit-button", "label": "Done", "event": "done", "input": {} }));
-        Ok((Value::Array(items), vec!["edit", "create", "done"]))
+        Ok((Value::Array(items), vec!["edit", "create", "edit_out", "create_out", "done"]))
     }
 
     pub fn advance_webhooks(&self, flow: &mut Flow, event: &str, input: &Value, now: i64) -> Result<bool, Refusal> {
@@ -726,7 +801,63 @@ impl Community {
                 flow.state = "list".into();
                 Ok(false)
             }
-            ("edit", "back") => {
+            ("edit", "back") | ("edit_out", "back") => {
+                flow.state = "list".into();
+                Ok(false)
+            }
+            ("list", "create_out") => {
+                let (url, events, channel) = self.read_receiver(flow, input, &channels)?;
+                let secret = format!("whsec_{}", new_token());
+                let hook = crate::store::EventHook { id: uuid::Uuid::new_v4().simple().to_string()[..16].to_string(), url: url.clone(), secret: secret.clone(), events, channel, created_by: flow.owner.clone(), created_at: now, failures: 0, off_at: None };
+                self.store.save_event_hook(&hook).map_err(failed)?;
+                self.audit(now, &flow.owner, "event_hook.create", hook.channel.as_deref(), Some(json!({ "url": url })));
+                flow.data["event_hook"] = json!(hook.id);
+                flow.data["note"] = json!(format!("Events go to {url}. Its signing secret, shown this once: {secret}"));
+                flow.state = "edit_out".into();
+                Ok(false)
+            }
+            ("list", "edit_out") => {
+                let hook = self.editable_receiver(input["event_hook"].as_str().unwrap_or_default(), &channels)?;
+                flow.data["event_hook"] = json!(hook.id);
+                flow.data.as_object_mut().map(|d| d.remove("note"));
+                flow.state = "edit_out".into();
+                Ok(false)
+            }
+            ("edit_out", "save_out") => {
+                let mut hook = self.editable_receiver(flow.data["event_hook"].as_str().unwrap_or_default(), &channels)?;
+                let (url, events, channel) = self.read_receiver(flow, input, &channels)?;
+                (hook.url, hook.events, hook.channel) = (url, events, channel);
+                self.store.save_event_hook(&hook).map_err(failed)?;
+                self.audit(now, &flow.owner, "event_hook.update", hook.channel.as_deref(), Some(json!({ "url": hook.url })));
+                flow.data["note"] = json!("Saved.");
+                Ok(false)
+            }
+            ("edit_out", "ping_out") => {
+                let hook = self.editable_receiver(flow.data["event_hook"].as_str().unwrap_or_default(), &channels)?;
+                self.queue_for(&hook, "ping", json!({ "by": self.store.member_id(&flow.owner, now).unwrap_or_default() }), now);
+                flow.data["note"] = json!("A test event is on its way.");
+                Ok(false)
+            }
+            ("edit_out", "on_out") => {
+                let mut hook = self.editable_receiver(flow.data["event_hook"].as_str().unwrap_or_default(), &channels)?;
+                (hook.off_at, hook.failures) = (None, 0);
+                self.store.save_event_hook(&hook).map_err(failed)?;
+                flow.data["note"] = json!("Turned back on.");
+                Ok(false)
+            }
+            ("edit_out", "secret_out") => {
+                let mut hook = self.editable_receiver(flow.data["event_hook"].as_str().unwrap_or_default(), &channels)?;
+                hook.secret = format!("whsec_{}", new_token());
+                self.store.save_event_hook(&hook).map_err(failed)?;
+                self.audit(now, &flow.owner, "event_hook.update", hook.channel.as_deref(), Some(json!({ "url": hook.url, "new_secret": true })));
+                flow.data["note"] = json!(format!("A new signing secret, shown this once: {}", hook.secret));
+                Ok(false)
+            }
+            ("edit_out", "delete_out") => {
+                let hook = self.editable_receiver(flow.data["event_hook"].as_str().unwrap_or_default(), &channels)?;
+                self.store.delete_event_hook(&hook.id).map_err(failed)?;
+                self.audit(now, &flow.owner, "event_hook.delete", hook.channel.as_deref(), Some(json!({ "url": hook.url })));
+                flow.data["note"] = json!("Events no longer go there.");
                 flow.state = "list".into();
                 Ok(false)
             }

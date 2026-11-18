@@ -2278,6 +2278,44 @@ fn the_trash_is_kept_and_emptied_in_mysql_too() {
 }
 
 #[test]
+fn where_events_go_and_what_waits_to_go_are_kept_in_mysql_too() {
+    let Some(url) = std::env::var("WYVRN_TEST_DATABASE_URL").ok().filter(|url| !url.is_empty()) else { return };
+    let server = url.trim_end_matches('/');
+    let database = format!("wyvrn_test_events_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    {
+        let mut admin = mysql::Conn::new(mysql::Opts::from_url(server).unwrap()).unwrap();
+        mysql::prelude::Queryable::query_drop(&mut admin, format!("CREATE DATABASE {database}")).unwrap();
+    }
+    let store = Store::open(&wyvrn_service::db::Location::MySql(format!("{server}/{database}"))).unwrap();
+    let mut hook = wyvrn_community::store::EventHook {
+        id: "h1".into(),
+        url: "https://example.com/events".into(),
+        secret: "whsec_x".into(),
+        events: vec!["post.created".into(), "member.joined".into()],
+        channel: None,
+        created_by: format!("did:example:{}", "a".repeat(2000)),
+        created_at: 1,
+        failures: 0,
+        off_at: None,
+    };
+    store.save_event_hook(&hook).unwrap();
+    hook.failures = 3;
+    hook.off_at = Some(9);
+    store.save_event_hook(&hook).unwrap();
+    let kept = store.event_hook("h1").unwrap().unwrap();
+    assert_eq!((kept.events.len(), kept.failures, kept.off_at), (2, 3, Some(9)));
+    store.queue_event("e1", "h1", &"x".repeat(100_000), 5).unwrap();
+    store.queue_event("e2", "h1", "{}", 7).unwrap();
+    assert_eq!(store.due_events(6, 10).unwrap().len(), 1);
+    store.event_later("e1", 1, 100).unwrap();
+    assert_eq!(store.due_events(8, 10).unwrap().iter().map(|e| e.0.clone()).collect::<Vec<_>>(), ["e2"]);
+    store.event_done("e2").unwrap();
+    store.delete_event_hook("h1").unwrap();
+    assert!(store.event_hook("h1").unwrap().is_none());
+    assert!(store.due_events(1000, 10).unwrap().is_empty());
+}
+
+#[test]
 fn what_automod_censored_is_kept_in_mysql_too() {
     let Some(url) = std::env::var("WYVRN_TEST_DATABASE_URL").ok().filter(|url| !url.is_empty()) else { return };
     let server = url.trim_end_matches('/');
@@ -2758,6 +2796,67 @@ async fn make_webhook(owner: &Peer, instance: &str, name: &str, channel: &str) -
     let before = &ui[..start];
     let from = before.rfind("http").unwrap();
     format!("{}{}", &ui[from..start], &tail[..url_end])
+}
+
+#[tokio::test]
+async fn events_go_out_signed_to_a_receiver_an_admin_names_naming_members_by_member_id() {
+    // A receiver beside the server: what it is sent, with the headers that matter.
+    let (heard, mut hearing) = tokio::sync::mpsc::unbounded_channel::<(String, String, String)>();
+    let receiver = axum::Router::new().route(
+        "/events",
+        axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+            let heard = heard.clone();
+            async move {
+                let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+                let _ = heard.send((header("wyvrn-event"), header("wyvrn-signature"), body));
+                axum::http::StatusCode::NO_CONTENT
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let at = format!("http://{}/events", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, receiver).await.unwrap() });
+    let mut next = async move || tokio::time::timeout(Duration::from_secs(10), hearing.recv()).await.expect("an event within ten seconds").unwrap();
+
+    let server = start_server_with("outgoing_private = true", false).await;
+    tokio::spawn(wyvrn_community::outgoing::run_outgoing(server.state.clone()));
+    let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member]);
+    let general = open_channel(&owner, "general").await;
+    owner.community("join", json!({})).await;
+
+    owner.workflow("start", json!({ "template_id": "webhooks", "instance_id": "w1" })).await;
+    let refused = advance(&owner, "w1", "create_out", json!({ "url": "ftp://x", "event-post.created": true, "channel": "" })).await;
+    assert_eq!(refused["body"]["code"], "guard_failed", "{refused}");
+    let made = advance(&owner, "w1", "create_out", json!({ "url": at, "event-post.created": true, "event-member.joined": true, "channel": "" })).await;
+    let ui = made["body"]["ui"].to_string();
+    let secret = ui.split("shown this once: ").nth(1).and_then(|rest| rest.split('"').next()).expect("the secret, shown once").to_string();
+
+    // Someone joins: by member id, never their DID.
+    member.community("join", json!({})).await;
+    let (event, signature, body) = next().await;
+    assert_eq!(event, "member.joined");
+    assert!(!body.contains(&member.did()), "{body}");
+    let said: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(said["type"], "member.joined");
+    assert_eq!(said["data"]["member"]["member"], server.id(&member));
+    assert_eq!(said["community"], server.did);
+    // Signed: HMAC-SHA256 of "<t>.<body>" with the secret.
+    let t: i64 = signature.split(',').next().unwrap().trim_start_matches("t=").parse().unwrap();
+    assert_eq!(signature, wyvrn_community::outgoing::signature(&secret, t, &body));
+
+    // A post, as it is made.
+    owner.community("post", json!({ "channel": general, "content": "Release tonight" })).await;
+    let (event, _, body) = next().await;
+    assert_eq!(event, "post.created");
+    let said: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(said["data"]["post"]["content"], "Release tonight");
+    assert_eq!(said["data"]["channel"]["name"], "general");
+    assert_eq!(said["data"]["post"]["author"]["member"], server.id(&owner));
+
+    // A test event, when asked for.
+    advance(&owner, "w1", "ping_out", json!({})).await;
+    assert_eq!(next().await.0, "ping");
 }
 
 #[tokio::test]

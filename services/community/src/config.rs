@@ -170,6 +170,10 @@ pub struct CommunityConfig {
     /// Where Discord's API is, for reading a server template to import
     /// (discord.rs). A test points it elsewhere.
     pub discord_api: String,
+    /// Whether events may be sent out (outgoing.rs) to an address on this
+    /// server's own network, or over plain http: for a receiver beside it, and
+    /// tests. Off, only https out on the internet.
+    pub outgoing_private: bool,
 }
 
 impl CommunityConfig {
@@ -203,6 +207,7 @@ impl Default for CommunityConfig {
             max_posts_per_minute: 30,
             max_members: 0,
             discord_api: "https://discord.com/api/v10".to_string(),
+            outgoing_private: false,
         }
     }
 }
