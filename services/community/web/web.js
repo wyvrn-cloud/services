@@ -55,7 +55,8 @@
       if (event.data === heard) return
       heard = event.data
       var atBottom = document.documentElement.scrollHeight - window.innerHeight - window.scrollY < 48
-      fetch(location.pathname + location.search, { credentials: 'same-origin' })
+      // (Not from the browser's cache: a public page may be kept a while.)
+      fetch(location.pathname + location.search, { credentials: 'same-origin', cache: 'no-store' })
         .then(function (response) { return response.ok ? response.text() : null })
         .then(function (html) {
           if (!html) return
