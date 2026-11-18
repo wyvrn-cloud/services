@@ -264,3 +264,14 @@ For the Niko community (`community-niko`, address `community:saikous`, kept in t
 6. Once it works, remove the `community-niko` service from the compose file, and Caddy's `saikous.community` route.
 
 Before step 2, check in the app which DID the community is held by (its profile, or Settings, Developer): the address (`did:web:id.wyvrn.app:community:saikous`) moves with it; its own `did:web` doesn't, and every member holding that one adds it again by the address afterwards.
+
+## 6. Events sent out from a community (new 2026-11-17, no new image)
+
+A community's admin can now name a receiver in Admin, Channels, Webhooks, "Sending events out": the community server then POSTs new posts, changed posts and members coming and going to it, signed. Nothing to add on the server: the two tables (`event_hooks`, `event_queue`) make themselves.
+
+The server sends only to `https://` addresses out on the internet, so a receiver must be reachable from the container over the internet. A receiver on the server's own network (another container) is refused unless the community's config allows it, which is for testing only:
+
+```toml
+[community]
+outgoing_private = true
+```
