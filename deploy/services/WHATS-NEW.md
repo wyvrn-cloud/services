@@ -275,3 +275,16 @@ The server sends only to `https://` addresses out on the internet, so a receiver
 [community]
 outgoing_private = true
 ```
+
+## 7. Making a community from the app (new 2026-11-17, in `wyvrn-community-host`, no new image)
+
+Nothing to add: it starts closed. To open it, a host admin chooses on the host's admin page (Communities) who may make one: whoever has a code made there, or anyone. Its other settings, in the host's config if wanted:
+
+```toml
+[creating]
+mode = "closed"        # the default until the admin page says otherwise: closed, codes or anyone
+per_owner = 3          # communities one person may have made here
+every_seconds = 600    # how long between two from the same person
+```
+
+The app offers it under "Add a community or channel" when the host (`did:web:communities.wyvrn.app`) lists it.
