@@ -93,6 +93,16 @@ fn heard(community: &Community, p: &Participant, channel: &crate::store::Channel
     may(community, &p.did, channel, "speak") && !p.server_muted && (!is_stage(channel) || p.speaker)
 }
 
+/// Whether the forwarding service lets `p` send a voice at all. On a stage that
+/// is the audience too, so that one asked up to speak is heard at once: the relay
+/// holds what it was told for up to `REVALIDATE_SECONDS`, and a session of its own
+/// for the new speaker took joining again. Who is *heard* there is the listeners'
+/// to decide, from who the server says speaks (community-voice/1.0, "Stages"):
+/// they take no voice from the audience.
+fn may_send_voice(community: &Community, p: &Participant, channel: &crate::store::Channel) -> bool {
+    may(community, &p.did, channel, "speak") && !p.server_muted
+}
+
 /// Whether `p` may show `field` (`video`, `screen`): on a stage, only a speaker.
 fn shows(community: &Community, p: &Participant, channel: &crate::store::Channel, field: &str) -> bool {
     may(community, &p.did, channel, field) && (!is_stage(channel) || p.speaker)
@@ -371,7 +381,7 @@ impl Rooms {
             community.store.member(did).ok().flatten()?;
             let path = room_path(community_did, channel);
             let mut publish = vec![format!("{path}/{}/position", p.id)];
-            if heard(community, p, &held) {
+            if may_send_voice(community, p, &held) {
                 publish.push(format!("{path}/{}/mic", p.id));
             }
             if shows(community, p, &held, "video") {
@@ -535,13 +545,18 @@ impl Rooms {
                 if let Some(fingerprint) = &voice.relay_fingerprint {
                     transport_body["fingerprint"] = json!(fingerprint);
                 }
-                let joined = json!({
+                let mut joined = json!({
                     "channel": channel.id,
                     "participant": participant.id,
                     "transport": transport_body,
                     "may": { "speak": heard(community, &participant, &channel), "video": shows(community, &participant, &channel, "video"), "screen": shows(community, &participant, &channel, "screen") },
                     "participants": participants,
                 });
+                // On a stage: the voice is the relay's to forward from the start, so
+                // one asked up to speak turns their microphone on where they are.
+                if is_stage(&channel) {
+                    joined["stage_mic"] = json!("held");
+                }
                 let mut outcome = VoiceOutcome::reply(reply_to(message, JOINED, joined));
                 outcome.live.extend(self.presence_for_watchers(community, &channel.id));
                 for channel in left {

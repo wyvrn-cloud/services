@@ -1164,12 +1164,17 @@ async fn on_a_stage_the_audience_listens_raises_hands_and_moderators_choose_who_
             grant["publish"].as_array().into_iter().flatten().filter_map(|p| p.as_str()).map(|p| p.rsplit('/').next().unwrap().to_string()).collect::<Vec<_>>()
         }
     };
-    // In the audience: heard by nobody, showing nothing.
+    // In the audience: heard by nobody, showing nothing. Its voice may go through the
+    // relay all the same (`stage_mic`), so that asked up to speak it is heard at once:
+    // listeners take no voice from the audience.
     let joined = voice(&member, "join", json!({ "channel": stage })).await;
     assert_eq!(joined["body"]["may"], json!({ "speak": false, "video": false, "screen": false }));
+    assert_eq!(joined["body"]["stage_mic"], "held");
     let token = joined["body"]["transport"]["token"].as_str().unwrap().to_string();
     let id = joined["body"]["participant"].as_str().unwrap().to_string();
-    assert_eq!(ask(token.clone()).await, ["position"]);
+    let mut audience = ask(token.clone()).await;
+    audience.sort();
+    assert_eq!(audience, ["mic", "position"]);
     assert_eq!(tell(&member, "state", json!({ "channel": stage, "sharing": { "camera": true } })).await.unwrap()["body"]["code"], "e.p.trust.not-authorized");
 
     // A hand raised, seen by whoever watches; only a moderator brings them up to speak.
@@ -1194,10 +1199,13 @@ async fn on_a_stage_the_audience_listens_raises_hands_and_moderators_choose_who_
 
     // A speaker goes back to the audience by themselves.
     assert!(tell(&member, "moderate", json!({ "channel": stage, "participant": id, "speak": false })).await.is_none());
-    assert_eq!(ask(token).await, ["position"]);
-    // An ordinary voice channel has no speakers.
+    let mut back = ask(token).await;
+    back.sort();
+    assert_eq!(back, ["mic", "position"]);
+    // An ordinary voice channel has no speakers, and says nothing of a stage's voice.
     let lounge = voice_channel(&admin, "lounge", json!({})).await;
-    voice(&member, "join", json!({ "channel": lounge })).await;
+    let joined = voice(&member, "join", json!({ "channel": lounge })).await;
+    assert!(joined["body"].get("stage_mic").is_none());
     assert_eq!(tell(&admin, "moderate", json!({ "channel": lounge, "participant": id, "speak": true })).await.unwrap()["body"]["code"], "e.p.msg.not-a-stage");
 }
 
