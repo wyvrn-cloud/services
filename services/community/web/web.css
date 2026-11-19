@@ -24,6 +24,8 @@ a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 img, video { max-width: 100%; height: auto; }
 code, pre { font-family: var(--mono); font-size: .9em; }
+/* A time in a post (`<t:…>`), shown in the reader's zone by web.js. */
+time.timestamp { padding: 0 3px; border-radius: 4px; background: var(--surface); cursor: help; }
 pre { background: var(--surface); border: 1px solid var(--border); border-radius: calc(var(--radius) / 1.5); padding: .75rem 1rem; overflow-x: auto; }
 :not(pre) > code { background: var(--surface); border-radius: 6px; padding: .1em .35em; }
 blockquote { margin: .5rem 0; padding: .1rem .9rem; border-left: 3px solid var(--border); color: var(--muted); }

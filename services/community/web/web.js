@@ -1,7 +1,8 @@
 // The web view's one script. Every page works without it; it adds the switch
 // between light and dark (remembered in this browser), folds the channel list
 // away on a narrow screen, keeps each channel's place for the visit (starting
-// at its newest posts), and runs signing in with the Digital Credentials API.
+// at its newest posts), runs signing in with the Digital Credentials API, and
+// shows each time in a post in the reader's own zone and way of writing dates.
 (function () {
   'use strict'
   var KEY = 'wyvrn-web-theme'
@@ -37,11 +38,55 @@
     var signIn = document.getElementById('signin')
     if (signIn) setUpSignIn(signIn)
 
+    showTimes(document)
+    // Posts put in later (newer, older, a live change) have theirs shown too, and
+    // "in 2 hours" stays true.
+    if (window.MutationObserver) {
+      new MutationObserver(function (changes) {
+        changes.forEach(function (change) {
+          Array.prototype.forEach.call(change.addedNodes, function (node) { if (node.querySelectorAll) showTimes(node) })
+        })
+      }).observe(document.body, { childList: true, subtree: true })
+    }
+    setInterval(function () { showTimes(document, true) }, 30000)
+
     var posts = document.querySelector('ol.posts')
     if (posts) keepPlace(posts)
     var live = document.querySelector('[data-live]')
     if (posts && live && window.EventSource) followLive(live.getAttribute('data-live'), posts)
   })
+
+  // A time in a post (render.rs's `<time class="timestamp">`, from `<t:…>`), as
+  // the app shows one: in this browser's zone and language, `R` relative, the
+  // whole of it on hover. `onlyRelative`: just those, which change as time passes.
+  function showTimes(scope, onlyRelative) {
+    var selector = onlyRelative ? 'time.timestamp[data-style="R"]' : 'time.timestamp'
+    Array.prototype.forEach.call(scope.querySelectorAll(selector), function (time) {
+      var when = new Date(time.getAttribute('datetime'))
+      if (isNaN(when.getTime())) return
+      var as = function (options) { return new Intl.DateTimeFormat(undefined, options).format(when) }
+      var style = time.getAttribute('data-style')
+      var shown
+      if (style === 't') shown = as({ hour: 'numeric', minute: '2-digit' })
+      else if (style === 'T') shown = as({ hour: 'numeric', minute: '2-digit', second: '2-digit' })
+      else if (style === 'd') shown = as({ dateStyle: 'short' })
+      else if (style === 'D') shown = as({ dateStyle: 'long' })
+      else if (style === 'F') shown = as({ dateStyle: 'full', timeStyle: 'short' })
+      else if (style === 'R') shown = relative(when)
+      else shown = as({ dateStyle: 'long', timeStyle: 'short' })
+      time.textContent = shown
+      time.title = as({ dateStyle: 'full', timeStyle: 'short' })
+    })
+  }
+
+  function relative(when) {
+    var diff = Math.round((when.getTime() - Date.now()) / 1000)
+    var units = [['year', 31536000], ['month', 2592000], ['week', 604800], ['day', 86400], ['hour', 3600], ['minute', 60], ['second', 1]]
+    var format = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' })
+    for (var i = 0; i < units.length; i++) {
+      if (Math.abs(diff) >= units[i][1] || units[i][0] === 'second') return format.format(Math.round(diff / units[i][1]), units[i][0])
+    }
+  }
 
   // A channel's newest page, kept up to date as it is read: told when the channel
   // moves on (posting.rs's server-sent events), the page is fetched again and its
