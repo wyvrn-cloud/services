@@ -1371,7 +1371,28 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         to_did TEXT NOT NULL,
         at INTEGER NOT NULL,
         PRIMARY KEY (from_did, to_did)
-    );";
+    );
+    -- What rows are found by, beyond each table's key: kept small on a community
+    -- of a few dozen, and what keeps a big one from reading a whole table to
+    -- answer (a thread's posts, what changed since, a member's posts, …). Made
+    -- on a store from before them when it is next opened.
+    CREATE INDEX IF NOT EXISTS post_state_by_thread ON post_state (thread);
+    CREATE INDEX IF NOT EXISTS post_state_by_rev ON post_state (rev);
+    CREATE INDEX IF NOT EXISTS post_state_by_reply ON post_state (reply_to);
+    CREATE INDEX IF NOT EXISTS posts_by_author ON posts (author_did, posted_at);
+    CREATE INDEX IF NOT EXISTS posts_by_answerer ON posts (answered_by);
+    CREATE INDEX IF NOT EXISTS posts_by_time ON posts (posted_at);
+    CREATE INDEX IF NOT EXISTS reactions_by_time ON reactions (at);
+    CREATE INDEX IF NOT EXISTS threads_by_channel ON threads (channel);
+    CREATE INDEX IF NOT EXISTS answering_by_owner ON answering (owner, post);
+    CREATE INDEX IF NOT EXISTS flows_by_owner ON flows (owner);
+    CREATE INDEX IF NOT EXISTS message_requests_by_to ON message_requests (to_did);
+    CREATE INDEX IF NOT EXISTS form_answers_by_channel ON form_answers (channel, at);
+    CREATE INDEX IF NOT EXISTS wiki_pages_by_channel ON wiki_pages (channel);
+    CREATE INDEX IF NOT EXISTS wiki_comments_by_page ON wiki_comments (page, at);
+    CREATE INDEX IF NOT EXISTS announce_followers_by_channel ON announce_followers (channel);
+    CREATE INDEX IF NOT EXISTS announce_queue_by_due ON announce_queue (next_at);
+    CREATE INDEX IF NOT EXISTS event_queue_by_due ON event_queue (next_at)";
 
 fn schema() -> Schema {
     static MYSQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -1958,7 +1979,24 @@ fn schema() -> Schema {
                 to_did {MYSQL_DID} NOT NULL,
                 at BIGINT NOT NULL,
                 PRIMARY KEY (from_did(255), to_did(255))
-            ) {MYSQL_TABLE}"
+            ) {MYSQL_TABLE};
+            CREATE INDEX IF NOT EXISTS post_state_by_thread ON post_state (thread);
+            CREATE INDEX IF NOT EXISTS post_state_by_rev ON post_state (rev);
+            CREATE INDEX IF NOT EXISTS post_state_by_reply ON post_state (reply_to);
+            CREATE INDEX IF NOT EXISTS posts_by_author ON posts (author_did(255), posted_at);
+            CREATE INDEX IF NOT EXISTS posts_by_answerer ON posts (answered_by(255));
+            CREATE INDEX IF NOT EXISTS posts_by_time ON posts (posted_at);
+            CREATE INDEX IF NOT EXISTS reactions_by_time ON reactions (at);
+            CREATE INDEX IF NOT EXISTS threads_by_channel ON threads (channel);
+            CREATE INDEX IF NOT EXISTS answering_by_owner ON answering (owner(255), post);
+            CREATE INDEX IF NOT EXISTS flows_by_owner ON flows (owner(255));
+            CREATE INDEX IF NOT EXISTS message_requests_by_to ON message_requests (to_did(255));
+            CREATE INDEX IF NOT EXISTS form_answers_by_channel ON form_answers (channel, at);
+            CREATE INDEX IF NOT EXISTS wiki_pages_by_channel ON wiki_pages (channel);
+            CREATE INDEX IF NOT EXISTS wiki_comments_by_page ON wiki_comments (page, at);
+            CREATE INDEX IF NOT EXISTS announce_followers_by_channel ON announce_followers (channel);
+            CREATE INDEX IF NOT EXISTS announce_queue_by_due ON announce_queue (next_at);
+            CREATE INDEX IF NOT EXISTS event_queue_by_due ON event_queue (next_at)"
         )
     });
     Schema { sqlite: SQLITE, mysql }
@@ -4217,5 +4255,38 @@ mod kept_counts {
         // A gallery's posts aren't forum posts.
         store.set_gallery("board", true).unwrap();
         assert_eq!(store.forum_post_counts("board").unwrap(), vec![(bea.did.clone(), 0)]);
+    }
+}
+
+#[cfg(test)]
+mod indexes {
+    use super::*;
+
+    /// How SQLite would answer `sql`: what each step reads.
+    fn plan(store: &Store, sql: &str) -> String {
+        store.db.lock().query(&format!("EXPLAIN QUERY PLAN {sql}"), params![], |row| row.get::<String>(3)).unwrap().join("; ")
+    }
+
+    #[test]
+    fn what_a_big_community_is_asked_most_is_found_without_reading_a_whole_table() {
+        // (The plan asked for is SQLite's; MySQL's is told otherwise.)
+        if std::env::var("WYVRN_TEST_DATABASE_URL").is_ok_and(|url| !url.is_empty()) {
+            return;
+        }
+        let store = Store::in_memory().unwrap();
+        for (sql, index) in [
+            ("SELECT COUNT(*) FROM post_state WHERE thread = 't1'", "post_state_by_thread"),
+            ("SELECT post FROM post_state WHERE rev > 10 ORDER BY rev LIMIT 100", "post_state_by_rev"),
+            ("SELECT post FROM post_state WHERE reply_to = 'p1'", "post_state_by_reply"),
+            ("SELECT COUNT(*) FROM posts WHERE author_did = 'did:example:bea' AND posted_at >= 10", "posts_by_author"),
+            ("SELECT COUNT(*) FROM posts WHERE posted_at >= 10", "posts_by_time"),
+            ("SELECT id FROM threads WHERE channel = 'board'", "threads_by_channel"),
+            ("SELECT id FROM form_answers WHERE channel = 'form' ORDER BY at, id", "form_answers_by_channel"),
+            ("SELECT follower, post FROM announce_queue WHERE next_at <= 10 ORDER BY next_at, post LIMIT 10", "announce_queue_by_due"),
+            ("SELECT id FROM event_queue WHERE next_at <= 10 ORDER BY next_at, id LIMIT 10", "event_queue_by_due"),
+        ] {
+            let plan = plan(&store, sql);
+            assert!(plan.contains(index), "{sql}: {plan}");
+        }
     }
 }

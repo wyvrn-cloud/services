@@ -591,10 +591,24 @@ impl Db {
     /// Makes a MySQL store's tables, and marks it as `service`'s: two services'
     /// tables share names, and not columns, so one started on another's would fail
     /// at its first question.
+    ///
+    /// MySQL has no `CREATE INDEX IF NOT EXISTS`: a schema may say it all the same,
+    /// as SQLite does, and here it is made only if the table hasn't one by that name
+    /// already. So an index added to a schema is made on the tables a server already
+    /// has, the next time it starts.
     fn made(&self, schema: &Schema, service: &str) -> Result<()> {
+        /// MySQL's "Duplicate key name": the index is there already.
+        const INDEX_THERE: u16 = 1061;
         let mut session = self.lock();
         for statement in schema.mysql.split(';').map(str::trim).filter(|statement| !statement.is_empty()) {
-            session.plainly(statement)?;
+            let code = statement.lines().map(str::trim).skip_while(|line| line.is_empty() || line.starts_with("--")).collect::<Vec<_>>().join("\n");
+            match code.strip_prefix("CREATE INDEX IF NOT EXISTS ") {
+                Some(index) => match session.plainly(&format!("CREATE INDEX {index}")) {
+                    Err(Error::MySql(mysql::Error::MySqlError(err))) if err.code == INDEX_THERE => {}
+                    said => said?,
+                },
+                None => session.plainly(statement)?,
+            }
         }
         session.plainly(&format!("CREATE TABLE IF NOT EXISTS wyvrn_service (service VARCHAR(64) NOT NULL PRIMARY KEY) {MYSQL_TABLE}"))?;
         let owner: Option<String> = session.query_row("SELECT service FROM wyvrn_service LIMIT 1", &[], |row| row.get(0))?;
@@ -1609,6 +1623,34 @@ mod tests {
         root.query_drop(format!("KILL {connection}")).unwrap();
         assert_eq!(session.query_value::<i64>("SELECT size FROM things WHERE name = ?1", params!["kept"]).unwrap(), 1);
         assert_ne!(session.query_value::<i64>("SELECT CONNECTION_ID()", params![]).unwrap(), connection);
+    }
+
+    #[test]
+    fn an_index_added_to_a_schema_is_made_on_a_mysql_store_from_before_it_once() {
+        let Some(url) = server() else { return };
+        let Location::MySql(url) = Location::parse(&url).unwrap() else { panic!("WYVRN_TEST_DATABASE_URL is for a MySQL server") };
+        let name = format!("wyvrn_test_{}", scratch_name());
+        let mut root = mysql::Conn::new(mysql_options(&url).unwrap()).unwrap();
+        root.query_drop(format!("CREATE DATABASE {name}")).unwrap();
+        let options: mysql::Opts = mysql::OptsBuilder::from_opts(mysql_options(&url).unwrap()).db_name(Some(name.clone())).into();
+        const INDEXED: Schema = Schema {
+            sqlite: "",
+            mysql: "CREATE TABLE IF NOT EXISTS things (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL UNIQUE, size BIGINT NOT NULL, bytes LONGBLOB, note TEXT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+                -- Found by size.
+                CREATE INDEX IF NOT EXISTS things_by_size ON things (size)",
+        };
+        drop(Db::mysql(options.clone(), &SCHEMA, "community").unwrap());
+        // Opened with the index: made. Opened again: there already, and not an error.
+        drop(Db::mysql(options.clone(), &INDEXED, "community").unwrap());
+        drop(Db::mysql(options, &INDEXED, "community").unwrap());
+        let indexes: Vec<String> = root
+            .exec(
+                "SELECT DISTINCT index_name FROM information_schema.statistics WHERE table_schema = ? AND table_name = 'things' AND index_name = 'things_by_size'",
+                (name.clone(),),
+            )
+            .unwrap();
+        assert_eq!(indexes, ["things_by_size"]);
+        root.query_drop(format!("DROP DATABASE {name}")).unwrap();
     }
 
     /// What `grouped` holds to, on `db`; `apart`, if given, is the same tables
