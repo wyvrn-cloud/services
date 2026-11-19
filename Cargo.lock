@@ -5198,6 +5198,7 @@ dependencies = [
  "didcomm-core",
  "didcomm-crypto-askar",
  "didcomm-quickstart",
+ "ed25519-dalek 2.2.0",
  "futures-util",
  "hmac 0.12.1",
  "mysql",

@@ -14,6 +14,7 @@ use crate::roles::{Powers, CHANNEL_PERMISSIONS, COMMUNITY_PERMISSIONS, EVERYONE_
 use crate::store::{Channel, Flow, Member, RoleDef};
 use crate::discord::DISCORD_IMPORT_FLOW;
 use crate::webhooks::WEBHOOKS_FLOW;
+use crate::announcements::ANNOUNCEMENTS_FLOW;
 use crate::web::flows::{SITES_FLOW, WEB_FLOW};
 
 pub const ROLES: &str = "roles";
@@ -38,7 +39,7 @@ impl Community {
 const MAX_ROLE_NAME: usize = 100;
 
 /// Each template: its id, title, states and the events that move between them.
-fn templates() -> [(&'static str, &'static str, Value); 12] {
+fn templates() -> [(&'static str, &'static str, Value); 13] {
     [
         (
             ROLES,
@@ -165,6 +166,17 @@ fn templates() -> [(&'static str, &'static str, Value); 12] {
                 }
             }),
         ),
+        (
+            ANNOUNCEMENTS_FLOW,
+            "Announcement channels",
+            json!({
+                "states": [{ "name": "list", "type": "start" }, { "name": "done", "type": "final" }],
+                "transitions": {
+                    "add": { "from": "list", "to": "list" }, "remove": { "from": "list", "to": "list" }, "on": { "from": "list", "to": "list" },
+                    "unfollow": { "from": "list", "to": "list" }, "done": { "from": "list", "to": "done" }
+                }
+            }),
+        ),
     ]
 }
 
@@ -259,6 +271,7 @@ impl Community {
                 SITES_FLOW => self.web_url.is_some(),
                 DISCORD_IMPORT_FLOW => self.may_import(did).unwrap_or(false),
                 WEBHOOKS_FLOW => self.may_manage_webhooks(did).unwrap_or(false),
+                ANNOUNCEMENTS_FLOW => self.may_manage_announcements(did).unwrap_or(false),
                 _ => powers.has("manage_channels") || opened_one,
             })
             .map(|(id, title, _)| (id, title))
@@ -638,6 +651,7 @@ impl Community {
                 (SITES_FLOW, _) => self.sites_flow_ui(flow).map_err(failed)?,
                 (DISCORD_IMPORT_FLOW, _) => self.discord_import_ui(flow).map_err(failed)?,
                 (WEBHOOKS_FLOW, _) => self.webhooks_ui(flow).map_err(failed)?,
+                (ANNOUNCEMENTS_FLOW, _) => self.announcements_ui(flow).map_err(failed)?,
                 (CHANNEL_PERMISSIONS_FLOW, "role") => {
                     let target = self.flow_target(flow)?;
                     let held = self.target_held(&flow.owner, &powers, &target)?;
@@ -756,6 +770,12 @@ impl Community {
                 }
                 json!({})
             }
+            ANNOUNCEMENTS_FLOW => {
+                if !self.may_manage_announcements(&member.did).map_err(failed)? {
+                    return Err(not_allowed("That takes Manage webhooks in an announcement channel, or managing a channel that follows one."));
+                }
+                json!({})
+            }
             DISCORD_IMPORT_FLOW => {
                 if !self.may_import(&member.did).map_err(failed)? {
                     return Err(not_allowed("Only an owner imports a Discord template."));
@@ -777,7 +797,7 @@ impl Community {
             return Err(Refusal::new("multiplicity_violation", "That instance id has been used."));
         }
         let state = match template {
-            ROLES | AUTOMOD_FLOW | CHANNELS_FLOW | SITES_FLOW | WEBHOOKS_FLOW => "list",
+            ROLES | AUTOMOD_FLOW | CHANNELS_FLOW | SITES_FLOW | WEBHOOKS_FLOW | ANNOUNCEMENTS_FLOW => "list",
             MEMBER_ROLES => "pick",
             JOIN_GATES_FLOW | ONBOARDING_SETUP_FLOW | WEB_FLOW => "form",
             ONBOARDING_FLOW => "welcome",
@@ -832,6 +852,7 @@ impl Community {
             WEB_FLOW => powers.has("manage_community"),
             DISCORD_IMPORT_FLOW => self.may_import(&flow.owner).map_err(failed)?,
             WEBHOOKS_FLOW => self.may_manage_webhooks(&flow.owner).map_err(failed)?,
+            ANNOUNCEMENTS_FLOW => self.may_manage_announcements(&flow.owner).map_err(failed)?,
             _ => powers.has("manage_roles"),
         };
         if !still {
@@ -942,6 +963,7 @@ impl Community {
             (SITES_FLOW, _, _) => self.advance_sites_flow(&mut flow, event, input)?,
             (DISCORD_IMPORT_FLOW, _, _) => self.advance_discord_import(&mut flow, event, input, now)?,
             (WEBHOOKS_FLOW, _, _) => self.advance_webhooks(&mut flow, event, input, now)?,
+            (ANNOUNCEMENTS_FLOW, _, _) => self.advance_announcements(&mut flow, event, input, now)?,
             (ROLES, "list" | "edit", "done") | (CHANNEL_PERMISSIONS_FLOW, "roles", "done") => {
                 flow.status = "completed".into();
                 false

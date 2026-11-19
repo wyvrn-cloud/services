@@ -40,9 +40,9 @@ pub const EVENTS: &[(&str, &str)] = &[
 ];
 /// When an event its receiver didn't take is tried again, in seconds after each
 /// try; past the last, it is dropped.
-const AGAIN_AFTER: &[i64] = &[60, 300, 1800, 7200, 21600];
+pub(crate) const AGAIN_AFTER: &[i64] = &[60, 300, 1800, 7200, 21600];
 /// Tries in a row a receiver may fail before it is turned off.
-const OFF_AFTER: i64 = 20;
+pub(crate) const OFF_AFTER: i64 = 20;
 /// How long a receiver has to answer.
 const ANSWER_WITHIN: Duration = Duration::from_secs(10);
 /// The setting that says how far new posts have been made events of.
@@ -193,9 +193,10 @@ pub fn check_url(url: &str, private: bool) -> Result<url::Url, String> {
     Ok(parsed)
 }
 
-/// Sends one event. `Ok` when the receiver took it.
-async fn send(hook: &EventHook, body: &str, kind: &str, id: &str, private: bool) -> Result<(), String> {
-    let url = check_url(&hook.url, private)?;
+/// A client that reaches `url` and nowhere else: looked up once, out on the
+/// internet (unless `private`), following no redirect. With the URL, checked.
+pub(crate) async fn client_for(url: &str, private: bool, user_agent: &str) -> Result<(reqwest::Client, url::Url), String> {
+    let url = check_url(url, private)?;
     let host = url.host_str().unwrap_or_default().to_string();
     let port = url.port_or_known_default().unwrap_or(443);
     let addresses: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port)).await.map_err(|e| e.to_string())?.collect();
@@ -209,9 +210,15 @@ async fn send(hook: &EventHook, body: &str, kind: &str, id: &str, private: bool)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(ANSWER_WITHIN)
         .resolve(&host, address)
-        .user_agent("wyvrn-community (events)")
+        .user_agent(user_agent)
         .build()
         .map_err(|e| e.to_string())?;
+    Ok((client, url))
+}
+
+/// Sends one event. `Ok` when the receiver took it.
+async fn send(hook: &EventHook, body: &str, kind: &str, id: &str, private: bool) -> Result<(), String> {
+    let (client, url) = client_for(&hook.url, private, "wyvrn-community (events)").await?;
     let at = chrono::Utc::now().timestamp();
     let answer = client
         .post(url)
@@ -236,6 +243,11 @@ pub async fn run_outgoing(state: Arc<AppState>) {
         }
         if let Err(error) = send_due(&state, now).await {
             tracing::warn!(%error, "couldn't send events");
+        }
+        // Announcement channels' posts to their followers, and what else waits
+        // to go to another server (announcements.rs).
+        if let Err(error) = crate::announcements::send_due(&state, now).await {
+            tracing::warn!(%error, "couldn't send announcements");
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }

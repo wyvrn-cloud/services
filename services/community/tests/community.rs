@@ -128,6 +128,7 @@ async fn start_server_with(settings: &str, files: bool) -> Running {
     let did = agent.did();
     let mut community = Community::new(Store::in_memory().unwrap(), config.community.clone(), Some(wyvrn_service::profile::Kept::scratch().unwrap())).unwrap().with_voice(config.voice.clone());
     community.public_url = url.clone();
+    community.signing_seed = Some([9u8; 32]);
     let assistant = config.assistant.clone().map(wyvrn_community::assistant::Assistant::new);
     community.assistant = assistant.as_ref().map(wyvrn_community::assistant::Assistant::listing);
     if files {
@@ -2584,7 +2585,7 @@ async fn an_owner_imports_a_discord_template_and_again_once_it_has_changed() {
     let read = advance(&owner, "d1", "read", json!({ "link": "https://discord.new/TESTCODE1234" })).await;
     assert_eq!(read["body"]["state"], "review", "{read}");
     let review = read["body"]["ui"].to_string();
-    for said in ["Import “Test Fort”", "To be made: 2 roles, 2 categories, 7 channels", "which stays", "#general", "announcement channel on Discord", "age-restricted", "Embed Links", "Verification level"] {
+    for said in ["Import “Test Fort”", "To be made: 2 roles, 2 categories, 7 channels", "which stays", "#general", "age-restricted", "Embed Links", "Verification level"] {
         assert!(review.contains(said), "{said} in {review}");
     }
     // Asked, the first time, of what was here already: the community's name, what
@@ -2595,6 +2596,8 @@ async fn an_owner_imports_a_discord_template_and_again_once_it_has_changed() {
     let done = advance(&owner, "d1", "import", json!({ "choose-community-guild": "template", "choose-role-0": "template", "choose-channel-4": "template" })).await;
     assert_eq!(done["body"]["state"], "done", "{done}");
     assert!(done["body"]["ui"].to_string().contains("11 made, 3 changed"), "{done}");
+    // Its announcement channel is one here.
+    assert_eq!(server.state.community.store.channels().unwrap().iter().filter(|c| c.announcement).count(), 1);
 
     // As the template has it: the member sees what everyone may, and not the Hideout's.
     let told = member.community("join", json!({})).await["body"].clone();
@@ -3283,4 +3286,217 @@ async fn a_post_keeps_when_its_sender_sent_it_beside_its_own_time_and_sends_only
     let post = history["body"]["messages"].as_array().unwrap().iter().find(|p| p["id"] == id.as_str()).cloned().unwrap_or_else(|| panic!("{history}"));
     assert!(post["posted_at"].as_i64().unwrap() > 1_700_000_000, "{post}");
     assert!(!post.to_string().contains("sent_at") && !post.to_string().contains(":1000"), "{post}");
+}
+
+/// What `peer` is sent next, of `message_type`, in the thread of `thid`.
+async fn next_in(peer: &Peer, message_type: &str, thid: &str) -> Value {
+    loop {
+        let message = peer.next_of(message_type).await;
+        if message["thid"] == thid || message["pthid"] == thid {
+            return message;
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_announcement_channel_is_followed_by_another_community_and_a_service_and_its_posts_go_to_both_as_published_edited_and_taken_back() {
+    use base64::Engine;
+    // A service beside the servers: the Standard Webhooks events it is sent.
+    let (heard, mut hearing) = tokio::sync::mpsc::unbounded_channel::<(String, String, String, String)>();
+    let receiver = axum::Router::new().route(
+        "/hook",
+        axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+            let heard = heard.clone();
+            async move {
+                let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+                let _ = heard.send((header("webhook-id"), header("webhook-timestamp"), header("webhook-signature"), body));
+                axum::http::StatusCode::NO_CONTENT
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hook = format!("http://{}/hook", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, receiver).await.unwrap() });
+    let mut next_event = async move || tokio::time::timeout(Duration::from_secs(15), hearing.recv()).await.expect("an event within fifteen seconds").unwrap();
+
+    // The Workshop posts announcements; the Annex follows them.
+    let source = start_server("outgoing_private = true").await;
+    let annex = start_server("outgoing_private = true").await;
+    tokio::spawn(wyvrn_community::outgoing::run_outgoing(source.state.clone()));
+    tokio::spawn(wyvrn_community::outgoing::run_outgoing(annex.state.clone()));
+    let (owner, fan_there) = (Peer::start(&source).await, Peer::start(&source).await);
+    source.admit(&[&owner, &fan_there]);
+    let (fan, reader) = (Peer::start(&annex).await, Peer::start(&annex).await);
+    annex.admit(&[&fan, &reader]);
+
+    let news = open_channel(&owner, "news").await;
+    let chat = open_channel(&owner, "chat").await;
+    // Only someone who manages channels makes one an announcement channel.
+    assert_eq!(fan_there.community("update-channel", json!({ "channel": news, "announcement": true })).await["body"]["code"], "e.p.trust.not-authorized");
+    let made = owner.community("update-channel", json!({ "channel": news, "announcement": true })).await;
+    let listed = made["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == news).unwrap().clone();
+    assert_eq!(listed["announcement"], true, "{made}");
+    owner.community("join", json!({})).await;
+    let lobby = open_channel(&fan, "lobby").await;
+    reader.community("join", json!({})).await;
+
+    // A code to follow it with, from a member of the Workshop; none for an ordinary channel.
+    assert_eq!(fan_there.community("follow-code-request", json!({ "channel": chat })).await["body"]["code"], "e.p.msg.not-announcement");
+    let code = fan_there.community("follow-code-request", json!({ "channel": news })).await["body"]["code"].as_str().unwrap().to_string();
+    // Given to the Annex by someone who manages a channel there; a member who doesn't may not.
+    assert_eq!(reader.community("follow", json!({ "channel": lobby, "source": { "community": source.did, "code": code } })).await["body"]["code"], "e.p.trust.not-authorized");
+    let follow = json!({ "type": format!("{C}follow"), "id": "follow-1", "body": { "channel": lobby, "source": { "community": source.did, "code": code } } });
+    fan.agent.send(&annex.did, &follow).await.expect("sent");
+    let answered = next_in(&fan, &format!("{C}community"), "follow-1").await;
+    let lobby_now = answered["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == lobby).unwrap().clone();
+    assert_eq!(lobby_now["follows"][0]["name"], "The Workshop", "{answered}");
+    assert_eq!(lobby_now["follows"][0]["channel_name"], "news");
+    // A code is good once.
+    let again = json!({ "type": format!("{C}follow"), "id": "follow-2", "body": { "channel": lobby, "source": { "community": source.did, "code": code } } });
+    fan.agent.send(&annex.did, &again).await.expect("sent");
+    assert_eq!(next_in(&fan, PROBLEM, "follow-2").await["body"]["code"], "e.p.msg.invalid-code");
+
+    // And a service, through the workflow; Discord takes only Discord's webhook URLs.
+    owner.workflow("start", json!({ "template_id": "announcements", "instance_id": "a1" })).await;
+    let refused = advance(&owner, "a1", "add", json!({ "channel": news, "kind": "discord", "url": "https://example.com/hooks/1" })).await;
+    assert_eq!(refused["body"]["code"], "guard_failed", "{refused}");
+    let added = advance(&owner, "a1", "add", json!({ "channel": news, "kind": "webhook", "url": hook })).await;
+    let ui = added["body"]["ui"].to_string();
+    let secret = ui.split("shown this once: ").nth(1).and_then(|rest| rest.split('"').next()).expect("the secret, shown once").to_string();
+    let key = wyvrn_community::announcements::public_key(&[9u8; 32]);
+    assert!(ui.contains(&key), "{ui}");
+
+    // A post stays put until it is published, by its author or a moderator.
+    let posted = owner.community("post", json!({ "channel": news, "id": "n1", "content": "Meetup at 11:30 @everyone", "mentions": [{ "who": "everyone", "name": "everyone" }] })).await;
+    assert_eq!(kind(&posted), "posted", "{posted}");
+    assert_eq!(fan_there.community("publish", json!({ "channel": news, "post": "n1" })).await["body"]["code"], "e.p.trust.not-authorized");
+    let published = owner.community("publish", json!({ "channel": news, "post": "n1" })).await;
+    assert!(published["body"]["published_at"].is_i64(), "{published}");
+    assert_eq!(owner.community("publish", json!({ "channel": news, "post": "n1" })).await["body"]["code"], "e.p.msg.published");
+
+    // The Annex's channel has it, as from the Workshop, calling on nobody.
+    let copied = reader.next_message().await;
+    assert_eq!((copied["channel"].as_str(), copied["content"].as_str()), (Some(lobby.as_str()), Some("Meetup at 11:30 @everyone")), "{copied}");
+    assert_eq!(copied["author"]["name"], "The Workshop #news");
+    assert_eq!(copied["followed"]["name"], "The Workshop");
+    assert_eq!(copied["followed"]["post"], "n1");
+    assert_eq!(copied.get("mentions"), None);
+    // The service has it, signed both ways.
+    let (id, timestamp, signature, body) = next_event().await;
+    let said: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(said["type"], "announcement.published", "{body}");
+    assert_eq!(said["data"]["post"]["content"], "Meetup at 11:30 @everyone");
+    assert_eq!(said["data"]["channel"]["name"], "news");
+    let timestamp: i64 = timestamp.parse().unwrap();
+    assert_eq!(signature, wyvrn_community::announcements::standard_signatures(Some(&secret), Some(&[9u8; 32]), &id, timestamp, &body));
+    let v1a = signature.split(' ').find_map(|s| s.strip_prefix("v1a,")).unwrap();
+    let raw: [u8; 64] = base64::engine::general_purpose::STANDARD.decode(v1a).unwrap().try_into().unwrap();
+    let public: [u8; 32] = base64::engine::general_purpose::STANDARD.decode(key.trim_start_matches("whpk_")).unwrap().try_into().unwrap();
+    use ed25519_dalek::Verifier;
+    assert!(ed25519_dalek::VerifyingKey::from_bytes(&public).unwrap().verify(format!("{id}.{timestamp}.{body}").as_bytes(), &ed25519_dalek::Signature::from_bytes(&raw)).is_ok());
+
+    // Edited: changed everywhere. A reaction changes nothing a follower sees.
+    owner.ask("https://wyvrn.app/message-reactions/1.0/reactions", json!({ "to": { "id": "n1" }, "emoji": ["🎉"] })).await;
+    owner.ask("https://wyvrn.app/message-edits/1.0/edit", json!({ "to": { "id": "n1" }, "content": "Meetup at 11:45" })).await;
+    let changed = reader.next_of(&format!("{C}changed")).await;
+    assert_eq!(changed["body"]["content"], "Meetup at 11:45", "{changed}");
+    assert_eq!(changed["body"]["id"], copied["id"]);
+    let (_, _, _, body) = next_event().await;
+    let said: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!((said["type"].as_str(), said["data"]["post"]["content"].as_str()), (Some("announcement.changed"), Some("Meetup at 11:45")), "{body}");
+    // Taken back: taken back everywhere.
+    owner.ask("https://wyvrn.app/message-edits/1.0/delete", json!({ "to": { "id": "n1" } })).await;
+    let gone = reader.next_of(&format!("{C}changed")).await;
+    assert_eq!(gone["body"]["deleted"], true, "{gone}");
+    let (_, _, _, body) = next_event().await;
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["type"], "announcement.deleted");
+
+    // A post never published goes nowhere.
+    owner.community("post", json!({ "channel": news, "id": "n2", "content": "Just chatting" })).await;
+
+    // The Annex stops following: the Workshop is told, and lets it go.
+    let follow_id = lobby_now["follows"][0]["id"].clone();
+    let stopped = fan.community("unfollow", json!({ "channel": lobby, "follow": follow_id })).await;
+    let lobby_after = stopped["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == lobby).unwrap().clone();
+    assert_eq!(lobby_after.get("follows"), None, "{stopped}");
+    for _ in 0..50 {
+        if source.state.community.store.followers().unwrap().iter().all(|f| f.kind != "community") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(source.state.community.store.followers().unwrap().iter().all(|f| f.kind != "community"));
+    // Made an ordinary channel again, the service is let go too.
+    owner.community("update-channel", json!({ "channel": news, "announcement": false })).await;
+    assert!(source.state.community.store.followers().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_announcement_channels_posts_go_to_a_discord_webhook_as_discord_takes_them_calling_on_nobody() {
+    // A stand-in for Discord: what each request was, and the message id it gives.
+    let (heard, mut hearing) = tokio::sync::mpsc::unbounded_channel::<(String, String, Value)>();
+    let discord = axum::Router::new()
+        .route(
+            "/api/webhooks/{id}/{token}",
+            axum::routing::post({
+                let heard = heard.clone();
+                move |query: axum::extract::RawQuery, body: String| {
+                    let heard = heard.clone();
+                    async move {
+                        let _ = heard.send(("POST".into(), query.0.unwrap_or_default(), serde_json::from_str(&body).unwrap()));
+                        axum::Json(json!({ "id": "9001", "content": "" }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/webhooks/{id}/{token}/messages/{message}",
+            axum::routing::patch({
+                let heard = heard.clone();
+                move |axum::extract::Path((_, _, message)): axum::extract::Path<(String, String, String)>, body: String| {
+                    let heard = heard.clone();
+                    async move {
+                        let _ = heard.send(("PATCH".into(), message, serde_json::from_str(&body).unwrap()));
+                        axum::Json(json!({ "id": "9001" }))
+                    }
+                }
+            })
+            .delete({
+                let heard = heard.clone();
+                move |axum::extract::Path((_, _, message)): axum::extract::Path<(String, String, String)>| {
+                    let heard = heard.clone();
+                    async move {
+                        let _ = heard.send(("DELETE".into(), message, Value::Null));
+                        axum::http::StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let webhook = format!("http://{}/api/webhooks/123/secret-token", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, discord).await.unwrap() });
+    let mut next = async move || tokio::time::timeout(Duration::from_secs(15), hearing.recv()).await.expect("Discord asked within fifteen seconds").unwrap();
+
+    let server = start_server("outgoing_private = true").await;
+    tokio::spawn(wyvrn_community::outgoing::run_outgoing(server.state.clone()));
+    let owner = Peer::start(&server).await;
+    server.admit(&[&owner]);
+    let news = owner.community("create-channel", json!({ "name": "news", "announcement": true })).await["body"]["created"].as_str().unwrap().to_string();
+    owner.workflow("start", json!({ "template_id": "announcements", "instance_id": "d1" })).await;
+    let added = advance(&owner, "d1", "add", json!({ "channel": news, "kind": "discord", "url": webhook })).await;
+    assert!(added["body"]["ui"].to_string().contains("A Discord webhook"), "{added}");
+
+    owner.community("post", json!({ "channel": news, "id": "n1", "content": "We're live @everyone" })).await;
+    owner.community("publish", json!({ "channel": news, "post": "n1" })).await;
+    let (method, query, body) = next().await;
+    assert_eq!((method.as_str(), query.as_str()), ("POST", "wait=true"));
+    assert_eq!(body["content"], "We're live @everyone");
+    assert_eq!(body["username"], "The Workshop #news");
+    assert_eq!(body["allowed_mentions"], json!({ "parse": [] }));
+    owner.ask("https://wyvrn.app/message-edits/1.0/edit", json!({ "to": { "id": "n1" }, "content": "We're live now" })).await;
+    let (method, message, body) = next().await;
+    assert_eq!((method.as_str(), message.as_str(), body["content"].as_str()), ("PATCH", "9001", Some("We're live now")));
+    owner.ask("https://wyvrn.app/message-edits/1.0/delete", json!({ "to": { "id": "n1" } })).await;
+    let (method, message, _) = next().await;
+    assert_eq!((method.as_str(), message.as_str()), ("DELETE", "9001"));
 }

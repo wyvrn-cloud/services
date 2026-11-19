@@ -81,6 +81,9 @@ pub async fn open(config: &Config, stores: &Stores, opening: Opening) -> anyhow:
     let location = &stores.community;
     // Kept with the store: in the database, for a service that has one.
     let identity = wyvrn_service::identity::load_or_generate(location, &config.identity.path, "community")?;
+    // Its DID's Ed25519 key, which also signs what announcement channels send
+    // other services (announcements.rs).
+    let signing_seed = signing_seed(&identity);
     let (agent, did_document) = server::build_agent_for(config, identity, opening.profile_env)?;
     // What an admin has changed of its name, description and picture is kept with
     // the rest, and laid over the settings.
@@ -95,6 +98,7 @@ pub async fn open(config: &Config, stores: &Stores, opening: Opening) -> anyhow:
     let mut community = Community::new(store, config.community.clone(), Some(kept))?.with_voice(config.voice.clone());
     community.web_url = web.as_ref().map(|web| web.url.to_string());
     community.public_url = config.server.public_url.clone();
+    community.signing_seed = signing_seed;
     community.assistant = opening.assistant.as_ref().map(Assistant::listing);
     if let Some(stickers) = &stores.stickers {
         community.expressions = Some(crate::expressions::Expressions::open(stickers, &config.server.public_url, &config.community).context("the community's packs")?);
@@ -176,4 +180,12 @@ pub async fn serve(config: Config, assistant: Option<Assistant>) -> anyhow::Resu
         tokio::spawn(wyvrn_service::mediator::run_pickups(service, mediator.poll_every()));
     }
     wyvrn_service::http::serve(&config.server.bind, server::router(state)).await
+}
+
+/// The seed of `identity`'s Ed25519 key, from its saved form.
+fn signing_seed(identity: &didcomm_agent::Identity) -> Option<[u8; 32]> {
+    use base64::Engine;
+    let saved: serde_json::Value = serde_json::from_str(&identity.to_json().ok()?).ok()?;
+    let d = saved["verification_key"]["d"].as_str()?;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(d).ok()?.try_into().ok()
 }

@@ -13,6 +13,7 @@
 //! posts on a program's behalf (a bot) is a member like any other.
 
 pub mod admin_flows;
+pub mod announcements;
 pub mod assistant;
 pub mod automod;
 pub mod discord;

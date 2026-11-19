@@ -44,6 +44,8 @@ pulldown-cmark = { version = "0.13", default-features = false, features = ["html
 url = "2"
 # Signing the events sent out (outgoing.rs): the version the lock file has.
 hmac = "0.12"
+# And what announcement channels send other services, with the community's own key.
+ed25519-dalek = { workspace = true }
 # Signing in to the web view (website-sign-in/1.0), and the identity provider's
 # ES256 id tokens (community-sign-in/1.0).
 wyvrn-sign-in = { path = "../../../wyvrn-sign-in" }

@@ -288,6 +288,7 @@ fn field_label(field: &str) -> &str {
         "slow_mode" => "slow mode",
         "limit" => "how many may be in it",
         "stage" => "whether it is a stage",
+        "announcement" => "whether it is an announcement channel",
         "tags" => "tags",
         "overrides" => "its permissions",
         "permissions" => "permissions",
@@ -361,6 +362,9 @@ impl Community {
         }
         if let Some(tags) = &channel.forum {
             here["tags"] = json!(tags.as_array().into_iter().flatten().map(|t| json!({ "name": t["name"], "emoji": t["emoji"] })).collect::<Vec<_>>());
+        }
+        if kind == "text" {
+            here["announcement"] = json!(channel.announcement);
         }
         Ok(here)
     }
@@ -526,10 +530,8 @@ impl Community {
             let raw_name = channel["name"].as_str().unwrap_or("channel");
             let name = if kind == "voice" { line(&channel["name"], crate::community::MAX_CHANNEL_NAME).unwrap_or_else(|| "Voice".into()) } else { text_name(raw_name) };
             let shown_name = if kind == "voice" { format!("🔊{name}") } else { format!("#{name}") };
-            match as_on_discord {
-                Some("announcement") => miss(format!("{shown_name} is an announcement channel on Discord: a text channel here for now")),
-                Some("media") => miss(format!("{shown_name} is a media channel on Discord: a forum here for now")),
-                _ => {}
+            if as_on_discord == Some("media") {
+                miss(format!("{shown_name} is a media channel on Discord: a forum here for now"));
             }
             if kind == "voice" && self.voice.is_none() {
                 miss(format!("{shown_name}: this server has no voice channels"));
@@ -569,6 +571,10 @@ impl Community {
                 if channel["bitrate"].as_i64().is_some_and(|b| b != 64_000) {
                     miss("A voice channel's sound quality (bitrate)".into());
                 }
+            }
+            // An announcement channel on Discord is one here.
+            if kind == "text" {
+                want["announcement"] = json!(as_on_discord == Some("announcement"));
             }
             if kind == "forum" {
                 let tags: Vec<Value> = channel["available_tags"].as_array().into_iter().flatten().take(20).map(|t| json!({ "name": line(&t["name"], 20), "emoji": t["emoji_name"].as_str().filter(|e| crate::community::is_emoji(e)) })).collect();
@@ -1092,6 +1098,9 @@ impl Community {
                 if want["kind"] == "forum" {
                     self.store.set_forum(&id, &crate::posting::read_tags(&tags_given(&want["tags"], None), None).unwrap_or_else(|_| json!([])))?;
                 }
+                if want["announcement"] == true {
+                    self.store.set_announcement(&id, true)?;
+                }
                 let fields: Vec<String> = ["slow_mode", "overrides", "category"].iter().map(|f| f.to_string()).collect();
                 self.apply_fields("channel", &id, want, &fields, owner, now)?;
                 self.audit(now, owner, "channel.create", Some(&id), Some(json!({ "name": name, "kind": want["kind"], "imported": true })));
@@ -1174,6 +1183,15 @@ impl Community {
                     let held = self.store.channel(local)?.and_then(|c| c.voice);
                     let settings = crate::community::clean_voice(&json!({ "stage": want["stage"] == true }), held.as_ref()).unwrap_or_else(|_| held.clone().unwrap_or_default());
                     self.store.set_channel_voice(local, &settings)?;
+                }
+                // Imported before as a text channel, and an announcement channel on
+                // Discord: one now too (and no longer one, followers let go).
+                if has("announcement") && !voice && channel.forum.is_none() && channel.announcement != (want["announcement"] == true) {
+                    if want["announcement"] != true {
+                        let notices = self.drop_followers(local)?;
+                        self.outbox.lock().unwrap_or_else(|p| p.into_inner()).extend(notices);
+                    }
+                    self.store.set_announcement(local, want["announcement"] == true)?;
                 }
                 if has("tags") && channel.forum.is_some() {
                     let tags = crate::posting::read_tags(&tags_given(&want["tags"], channel.forum.as_ref()), channel.forum.as_ref()).unwrap_or_else(|_| json!([]));

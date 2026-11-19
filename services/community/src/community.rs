@@ -254,6 +254,12 @@ pub struct Community {
     pub speaks_as: Option<String>,
     /// Held while a Discord template is imported: one import at a time.
     pub importing: std::sync::Mutex<()>,
+    /// The seed of its DID's Ed25519 key, which signs what announcement channels
+    /// send out to other services (announcements.rs).
+    pub signing_seed: Option<[u8; 32]>,
+    /// Messages to send to other DIDs from where no answer goes out (a workflow's
+    /// step): sent by the background loop (outgoing.rs).
+    pub outbox: std::sync::Mutex<Vec<(String, Value)>>,
 }
 
 /// What handling a message came to.
@@ -441,6 +447,9 @@ impl Community {
             body["kind"] = json!("forum");
             body["tags"] = tags.clone();
         }
+        if channel.announcement {
+            body["announcement"] = json!(true);
+        }
         body
     }
 
@@ -475,7 +484,7 @@ impl Community {
             Some(kept) => kept.load()?,
             None => Changed::default(),
         };
-        let community = Self { store, config, used_bytes: Default::default(), changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, expressions: None, live: Default::default(), web_url: None, public_url: String::new(), speaks_as: None, importing: Default::default() };
+        let community = Self { store, config, used_bytes: Default::default(), changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, expressions: None, live: Default::default(), web_url: None, public_url: String::new(), speaks_as: None, importing: Default::default(), signing_seed: None, outbox: Default::default() };
         community.ensure_roles()?;
         Ok(community)
     }
@@ -530,6 +539,7 @@ impl Community {
             None => Default::default(),
         };
         let mut seen = std::collections::HashSet::new();
+        let follows = self.store.follows()?;
         for channel in self.store.channels()? {
             // A channel they may not see isn't there for them.
             if !self.sees(&member.did, &powers, &channel)? {
@@ -547,6 +557,13 @@ impl Community {
             }
             if self.read_only(&channel.id)? {
                 body["read_only"] = json!(true);
+            }
+            // What it follows, for whoever may manage it.
+            if powers.has("manage_channels") || channel.created_by == member.did {
+                let held = Self::follows_body(&follows, &channel.id);
+                if !held.is_empty() {
+                    body["follows"] = json!(held);
+                }
             }
             channels.push(body);
         }
@@ -787,6 +804,9 @@ impl Community {
         }
         if post.deleted {
             body["deleted"] = json!(true);
+        }
+        if let Some(at) = post.published_at {
+            body["published_at"] = json!(at);
         }
         if let Some(removed_by) = &post.removed_by {
             body["removed_by"] = json!(removed_by);
@@ -1088,7 +1108,7 @@ impl Community {
 
     /// The answer to a message that changed the post `id`: the post as it now
     /// stands, which everyone else who has joined is sent too.
-    fn changed_answer(&self, message: &Value, id: &str) -> anyhow::Result<Outcome> {
+    pub(crate) fn changed_answer(&self, message: &Value, id: &str) -> anyhow::Result<Outcome> {
         let Some(post) = self.store.post_by_id(id)? else {
             return refuse(message, "e.p.msg.unknown-post", "There is no such post.");
         };
@@ -1300,6 +1320,12 @@ impl Community {
         if self.store.is_superseded(sender)? {
             return refuse(message, "e.p.trust.superseded", "This DID has been replaced by another.");
         }
+        // Another community's server: following, and what announcement channels send.
+        if crate::announcements::between_servers(message_type) || message_type == PROBLEM_REPORT {
+            if let Some(outcome) = self.from_server(sender, message, now)? {
+                return Ok(outcome);
+            }
+        }
         // Moving: read, and leave, and nothing else.
         if !reads_only(message_type) && self.moving()? {
             if message_type == PROFILE {
@@ -1396,6 +1422,14 @@ impl Community {
                     Some(_) => return refuse(message, "e.p.msg.invalid-kind", "A channel is a text channel, a forum or a voice channel."),
                 };
                 let forum = body["kind"].as_str() == Some("forum");
+                // An announcement channel is a text channel others follow.
+                let announcement = body["announcement"] == true;
+                if announcement && (voice.is_some() || forum) {
+                    return refuse(message, "e.p.msg.invalid-announcement", "An announcement channel is a text channel.");
+                }
+                if announcement && !self.powers(sender)?.has("manage_channels") {
+                    return refuse(message, "e.p.trust.not-authorized", "Opening an announcement channel takes Manage channels.");
+                }
                 let Some(name) = line(&body["name"], MAX_CHANNEL_NAME) else {
                     return refuse(message, "e.p.msg.empty", "A channel needs a name.");
                 };
@@ -1423,6 +1457,9 @@ impl Community {
                         None => json!([]),
                     };
                     self.store.set_forum(&id, &tags)?;
+                }
+                if announcement {
+                    self.store.set_announcement(&id, true)?;
                 }
                 let mut community = self.community(&member)?;
                 community["created"] = json!(id);
@@ -1514,6 +1551,25 @@ impl Community {
                     }
                     self.audit(now, sender, "channel.rules", Some(&channel.id), Some(json!({ "rules": rules })));
                 }
+                let mut notices = Vec::new();
+                if let Some(given) = body.get("announcement").filter(|v| !v.is_null()) {
+                    let Some(announcement) = given.as_bool() else {
+                        return refuse(message, "e.p.msg.invalid-announcement", "announcement is true or false.");
+                    };
+                    if channel.voice.is_some() || channel.forum.is_some() {
+                        return refuse(message, "e.p.msg.invalid-announcement", "An announcement channel is a text channel.");
+                    }
+                    if !self.powers(sender)?.has("manage_channels") {
+                        return refuse(message, "e.p.trust.not-authorized", "Making an announcement channel takes Manage channels.");
+                    }
+                    if announcement != channel.announcement {
+                        if !announcement {
+                            notices = self.drop_followers(&channel.id)?;
+                        }
+                        self.store.set_announcement(&channel.id, announcement)?;
+                        self.audit(now, sender, "channel.announcement", Some(&channel.id), Some(json!({ "announcement": announcement })));
+                    }
+                }
                 if let Some(given) = body.get("slow_mode").filter(|v| !v.is_null()) {
                     if channel.voice.is_some() {
                         return refuse(message, "e.p.msg.invalid-slow-mode", "A voice channel takes no posts, nor slow mode.");
@@ -1534,7 +1590,7 @@ impl Community {
                     }
                 }
                 self.audit(now, sender, "channel.update", Some(&channel.id), Some(Value::Object(details)));
-                Ok(Outcome { reply: Some(reply_to(message, COMMUNITY, self.community(&member)?)), channels_changed: true, ..Outcome::default() })
+                Ok(Outcome { reply: Some(reply_to(message, COMMUNITY, self.community(&member)?)), notices, channels_changed: true, ..Outcome::default() })
             }
 
             POST | CREATE_THREAD if self.rules_owed(sender)?.is_some() => {
@@ -1542,6 +1598,10 @@ impl Community {
             }
 
             POST => self.post(&member, message, now, true),
+            crate::announcements::PUBLISH => self.publish(&member, message, now),
+            crate::announcements::FOLLOW_CODE_REQUEST => self.follow_code(&member, message, now),
+            crate::announcements::FOLLOW => self.follow(&member, message, now),
+            crate::announcements::UNFOLLOW => self.unfollow(&member, message, now),
 
             EDIT | DELETE => {
                 let Some(post) = self.named_post(body, sender)? else {

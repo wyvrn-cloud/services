@@ -204,6 +204,7 @@ mod tests {
             grew: None,
             voice_invite: None,
             censored: None,
+            published_at: None,
             extra: None,
             votes: Vec::new(),
         }

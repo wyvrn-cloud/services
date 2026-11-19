@@ -59,9 +59,45 @@ pub struct Channel {
     pub slow_mode: i64,
     /// A forum's tags, as JSON (`[{ id, name, emoji? }]`); `None` for a channel that isn't one.
     pub forum: Option<Value>,
+    /// Whether it is an announcement channel (announcements.rs).
+    pub announcement: bool,
     /// Its place in the order an admin set, if one did, and its category.
     pub position: Option<i64>,
     pub category: Option<String>,
+}
+
+/// What follows an announcement channel (announcements.rs): another community
+/// (`kind` `community`, `target` its DID, `name` its name and channel's), a
+/// Discord webhook (`discord`, its URL) or another service (`webhook`, its URL,
+/// signed with `secret`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Follower {
+    pub id: String,
+    pub channel: String,
+    pub kind: String,
+    pub target: String,
+    pub name: String,
+    pub secret: Option<String>,
+    pub created_by: String,
+    pub created_at: i64,
+    pub failures: i64,
+    pub off_at: Option<i64>,
+}
+
+/// What a channel here follows: an announcement channel of `source`, the
+/// follow's id there (`remote`) once the source has answered.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Follow {
+    pub id: String,
+    pub channel: String,
+    pub source: String,
+    pub name: String,
+    pub channel_name: String,
+    pub remote: Option<String>,
+    pub asked_by: String,
+    pub asked_thid: Option<String>,
+    pub pending: bool,
+    pub created_at: i64,
 }
 
 /// A webhook (`webhooks`): what posts into `channel` as `name`, from whoever
@@ -158,6 +194,8 @@ pub struct Post {
     /// The AutoMod rules that censored it, where any did (its original is kept
     /// apart, for moderators: `Store::censored_original`).
     pub censored: Option<Vec<String>>,
+    /// In an announcement channel: when it was published, if it was.
+    pub published_at: Option<i64>,
     /// Each member's vote, where it is a poll: `(did, answer ids)`.
     pub votes: Vec<(String, Vec<String>)>,
 }
@@ -337,7 +375,8 @@ const POST_COLUMNS: &str = "serial, channel, seq, id, content, posted_at, author
     (SELECT removed_by FROM post_removals WHERE post_removals.post = posts.id), \
     (SELECT channel FROM post_voice_invites WHERE post_voice_invites.post = posts.id), \
     (SELECT extra FROM post_extra WHERE post_extra.post = posts.id), \
-    (SELECT rules FROM post_censored WHERE post_censored.post = posts.id)";
+    (SELECT rules FROM post_censored WHERE post_censored.post = posts.id), \
+    (SELECT at FROM announce_published WHERE announce_published.post = posts.id)";
 /// A channel not in the trash (`channel_trash`), said of `channels`.
 const NOT_TRASHED: &str = "NOT EXISTS (SELECT 1 FROM channel_trash WHERE channel_trash.channel = channels.id)";
 const CHANNEL_COLUMNS: &str = "id, name, topic, closed, created_at, created_by, (SELECT COALESCE(MAX(seq), 0) FROM posts WHERE posts.channel = channels.id), \
@@ -345,7 +384,8 @@ const CHANNEL_COLUMNS: &str = "id, name, topic, closed, created_at, created_by, 
     (SELECT seconds FROM channel_slow WHERE channel_slow.channel = channels.id), \
     (SELECT position FROM channel_order WHERE channel_order.channel = channels.id), \
     (SELECT category FROM channel_order WHERE channel_order.channel = channels.id), \
-    (SELECT tags FROM channel_forum WHERE channel_forum.channel = channels.id)";
+    (SELECT tags FROM channel_forum WHERE channel_forum.channel = channels.id), \
+    (SELECT COUNT(*) FROM announce_channels WHERE announce_channels.channel = channels.id)";
 
 fn member_from(row: &Row) -> Result<Member> {
     let role: String = row.get(1)?;
@@ -390,6 +430,7 @@ fn post_from(row: &Row) -> Result<Post> {
         voice_invite: row.get(21)?,
         extra: json_from(row.get(22)?),
         censored: json_from(row.get(23)?).and_then(|rules| serde_json::from_value(rules).ok()),
+        published_at: row.get(24)?,
         votes: Vec::new(),
         // Read after, each by a query of its own (`Store::filled`).
         reactions: Vec::new(),
@@ -411,6 +452,7 @@ fn channel_from(row: &Row) -> Result<Channel> {
         position: row.get(9)?,
         category: row.get(10)?,
         forum: json_from(row.get(11)?),
+        announcement: row.get::<Option<i64>>(12)?.unwrap_or(0) > 0,
     })
 }
 
@@ -828,6 +870,70 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         post TEXT NOT NULL PRIMARY KEY,
         sent_at INTEGER NOT NULL
     );
+    -- Announcement channels (announcements.rs): which channels are, the posts
+    -- published in them, codes given to follow one, what follows each (another
+    -- community, a Discord webhook, another service), what was last sent each of
+    -- a post and as what it is known there, and what is waiting to be sent.
+    CREATE TABLE IF NOT EXISTS announce_channels (
+        channel TEXT PRIMARY KEY
+    );
+    CREATE TABLE IF NOT EXISTS announce_published (
+        post TEXT PRIMARY KEY,
+        channel TEXT NOT NULL,
+        at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS follow_codes (
+        code TEXT PRIMARY KEY,
+        channel TEXT NOT NULL,
+        did TEXT NOT NULL,
+        expires INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS announce_followers (
+        id TEXT PRIMARY KEY,
+        channel TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        target TEXT NOT NULL,
+        name TEXT NOT NULL,
+        secret TEXT,
+        created_by TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        failures INTEGER NOT NULL DEFAULT 0,
+        off_at INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS announce_copies (
+        follower TEXT NOT NULL,
+        post TEXT NOT NULL,
+        remote TEXT,
+        sent TEXT NOT NULL,
+        PRIMARY KEY (follower, post)
+    );
+    CREATE TABLE IF NOT EXISTS announce_queue (
+        follower TEXT NOT NULL,
+        post TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_at INTEGER NOT NULL,
+        PRIMARY KEY (follower, post)
+    );
+    -- And the other side: what this community's channels follow, asked for
+    -- (`pending`, until the source answers) or held, and the posts copied in.
+    CREATE TABLE IF NOT EXISTS follows (
+        id TEXT PRIMARY KEY,
+        channel TEXT NOT NULL,
+        source TEXT NOT NULL,
+        name TEXT NOT NULL,
+        channel_name TEXT NOT NULL,
+        remote TEXT,
+        asked_by TEXT NOT NULL,
+        asked_thid TEXT,
+        pending INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS followed_posts (
+        follow TEXT NOT NULL,
+        source_post TEXT NOT NULL,
+        post TEXT NOT NULL,
+        PRIMARY KEY (follow, source_post)
+    );
     CREATE TABLE IF NOT EXISTS post_extra (
         post TEXT PRIMARY KEY,
         extra TEXT NOT NULL
@@ -1232,6 +1338,64 @@ fn schema() -> Schema {
             CREATE TABLE IF NOT EXISTS post_sent (
                 post VARCHAR(255) NOT NULL PRIMARY KEY,
                 sent_at BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS announce_channels (
+                channel VARCHAR(255) NOT NULL PRIMARY KEY
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS announce_published (
+                post VARCHAR(255) NOT NULL PRIMARY KEY,
+                channel VARCHAR(255) NOT NULL,
+                at BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS follow_codes (
+                code VARCHAR(64) NOT NULL PRIMARY KEY,
+                channel VARCHAR(255) NOT NULL,
+                did {MYSQL_DID} NOT NULL,
+                expires BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS announce_followers (
+                id VARCHAR(64) NOT NULL PRIMARY KEY,
+                channel VARCHAR(255) NOT NULL,
+                kind VARCHAR(16) NOT NULL,
+                target TEXT NOT NULL,
+                name VARCHAR(255) NOT NULL,
+                secret VARCHAR(128),
+                created_by VARCHAR(3000) NOT NULL,
+                created_at BIGINT NOT NULL,
+                failures BIGINT NOT NULL DEFAULT 0,
+                off_at BIGINT
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS announce_copies (
+                follower VARCHAR(64) NOT NULL,
+                post VARCHAR(255) NOT NULL,
+                remote VARCHAR(255),
+                sent VARCHAR(64) NOT NULL,
+                PRIMARY KEY (follower, post)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS announce_queue (
+                follower VARCHAR(64) NOT NULL,
+                post VARCHAR(255) NOT NULL,
+                attempts BIGINT NOT NULL DEFAULT 0,
+                next_at BIGINT NOT NULL,
+                PRIMARY KEY (follower, post)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS follows (
+                id VARCHAR(64) NOT NULL PRIMARY KEY,
+                channel VARCHAR(255) NOT NULL,
+                source {MYSQL_DID} NOT NULL,
+                name VARCHAR(255) NOT NULL,
+                channel_name VARCHAR(255) NOT NULL,
+                remote VARCHAR(64),
+                asked_by VARCHAR(3000) NOT NULL,
+                asked_thid VARCHAR(255),
+                pending BIGINT NOT NULL,
+                created_at BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS followed_posts (
+                follow VARCHAR(64) NOT NULL,
+                source_post VARCHAR(255) NOT NULL,
+                post VARCHAR(255) NOT NULL,
+                PRIMARY KEY (follow, source_post)
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS post_extra (
                 post VARCHAR(255) NOT NULL PRIMARY KEY,
@@ -2507,6 +2671,14 @@ impl Store {
         Ok(())
     }
 
+    /// Marks a post changed (its `rev`), for what changed of it beside its own
+    /// fields (published).
+    pub fn touch_post(&self, id: &str) -> Result<()> {
+        let mut db = self.db.lock();
+        Self::touch(&mut db, id)?;
+        Ok(())
+    }
+
     pub fn set_pinned(&self, id: &str, pinned: bool) -> Result<()> {
         let mut db = self.db.lock();
         Self::touch(&mut db, id)?;
@@ -2799,6 +2971,145 @@ impl Store {
         Ok(())
     }
 
+    // --- Announcement channels (announcements.rs) --------------------------------
+
+    pub fn announcement_channels(&self) -> Result<std::collections::HashSet<String>> {
+        Ok(self.db.lock().query("SELECT channel FROM announce_channels", params![], |row| row.get(0))?.into_iter().collect())
+    }
+
+    pub fn is_announcement(&self, channel: &str) -> Result<bool> {
+        Ok(self.db.lock().query_row("SELECT channel FROM announce_channels WHERE channel = ?1", params![channel], |row| row.get::<String>(0))?.is_some())
+    }
+
+    pub fn set_announcement(&self, channel: &str, on: bool) -> Result<()> {
+        let mut db = self.db.lock();
+        db.execute("DELETE FROM announce_channels WHERE channel = ?1", params![channel])?;
+        if on {
+            db.execute("INSERT INTO announce_channels (channel) VALUES (?1)", params![channel])?;
+        }
+        Ok(())
+    }
+
+    /// When `post` was published, if it was.
+    pub fn published_at(&self, post: &str) -> Result<Option<i64>> {
+        self.db.lock().query_row("SELECT at FROM announce_published WHERE post = ?1", params![post], |row| row.get(0))
+    }
+
+    pub fn set_published(&self, post: &str, channel: &str, at: i64) -> Result<()> {
+        self.db.lock().execute("INSERT INTO announce_published (post, channel, at) VALUES (?1, ?2, ?3)", params![post, channel, at])?;
+        Ok(())
+    }
+
+    pub fn add_follow_code(&self, code: &str, channel: &str, did: &str, expires: i64) -> Result<()> {
+        let mut db = self.db.lock();
+        db.execute("DELETE FROM follow_codes WHERE expires < ?1", params![expires - 1200])?;
+        db.execute("INSERT INTO follow_codes (code, channel, did, expires) VALUES (?1, ?2, ?3, ?4)", params![code, channel, did, expires])?;
+        Ok(())
+    }
+
+    /// Uses up a follow code: its channel and who asked for it, if it is good now.
+    pub fn take_follow_code(&self, code: &str, now: i64) -> Result<Option<(String, String)>> {
+        let mut db = self.db.lock();
+        let found: Option<(String, String, i64)> = db.query_row("SELECT channel, did, expires FROM follow_codes WHERE code = ?1", params![code], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        db.execute("DELETE FROM follow_codes WHERE code = ?1", params![code])?;
+        Ok(found.filter(|(_, _, expires)| *expires >= now).map(|(channel, did, _)| (channel, did)))
+    }
+
+    pub fn followers(&self) -> Result<Vec<Follower>> {
+        self.db.lock().query(&format!("SELECT {FOLLOWER_COLUMNS} FROM announce_followers ORDER BY created_at, id"), params![], follower_from)
+    }
+
+    pub fn followers_of(&self, channel: &str) -> Result<Vec<Follower>> {
+        self.db.lock().query(&format!("SELECT {FOLLOWER_COLUMNS} FROM announce_followers WHERE channel = ?1 ORDER BY created_at, id"), params![channel], follower_from)
+    }
+
+    pub fn follower(&self, id: &str) -> Result<Option<Follower>> {
+        self.db.lock().query_row(&format!("SELECT {FOLLOWER_COLUMNS} FROM announce_followers WHERE id = ?1"), params![id], follower_from)
+    }
+
+    pub fn save_follower(&self, f: &Follower) -> Result<()> {
+        self.db.lock().execute(
+            "INSERT OR REPLACE INTO announce_followers (id, channel, kind, target, name, secret, created_by, created_at, failures, off_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![f.id, f.channel, f.kind, f.target, f.name, f.secret, f.created_by, f.created_at, f.failures, f.off_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_follower(&self, id: &str) -> Result<()> {
+        let mut db = self.db.lock();
+        db.execute("DELETE FROM announce_queue WHERE follower = ?1", params![id])?;
+        db.execute("DELETE FROM announce_copies WHERE follower = ?1", params![id])?;
+        db.execute("DELETE FROM announce_followers WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// What was last sent `follower` of `post` (a digest), and what it is known as there.
+    pub fn announce_copy(&self, follower: &str, post: &str) -> Result<Option<(Option<String>, String)>> {
+        self.db.lock().query_row("SELECT remote, sent FROM announce_copies WHERE follower = ?1 AND post = ?2", params![follower, post], |row| Ok((row.get(0)?, row.get(1)?)))
+    }
+
+    pub fn set_announce_copy(&self, follower: &str, post: &str, remote: Option<&str>, sent: &str) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO announce_copies (follower, post, remote, sent) VALUES (?1, ?2, ?3, ?4)", params![follower, post, remote, sent])?;
+        Ok(())
+    }
+
+    /// Queues `post` to be sent to `follower` as it then stands (once, however
+    /// often it is queued before it goes).
+    pub fn queue_announcement(&self, follower: &str, post: &str, now: i64) -> Result<()> {
+        let mut db = self.db.lock();
+        db.execute("DELETE FROM announce_queue WHERE follower = ?1 AND post = ?2", params![follower, post])?;
+        db.execute("INSERT INTO announce_queue (follower, post, attempts, next_at) VALUES (?1, ?2, 0, ?3)", params![follower, post, now])?;
+        Ok(())
+    }
+
+    /// What is due to be sent now: `(follower, post, attempts)`.
+    pub fn due_announcements(&self, now: i64, limit: i64) -> Result<Vec<(String, String, i64)>> {
+        self.db.lock().query("SELECT follower, post, attempts FROM announce_queue WHERE next_at <= ?1 ORDER BY next_at, post LIMIT ?2", params![now, limit], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+    }
+
+    pub fn announcement_done(&self, follower: &str, post: &str) -> Result<()> {
+        self.db.lock().execute("DELETE FROM announce_queue WHERE follower = ?1 AND post = ?2", params![follower, post])?;
+        Ok(())
+    }
+
+    pub fn announcement_later(&self, follower: &str, post: &str, attempts: i64, next_at: i64) -> Result<()> {
+        self.db.lock().execute("UPDATE announce_queue SET attempts = ?3, next_at = ?4 WHERE follower = ?1 AND post = ?2", params![follower, post, attempts, next_at])?;
+        Ok(())
+    }
+
+    pub fn follows(&self) -> Result<Vec<Follow>> {
+        self.db.lock().query(&format!("SELECT {FOLLOW_COLUMNS} FROM follows ORDER BY created_at, id"), params![], follow_from)
+    }
+
+    pub fn follow(&self, id: &str) -> Result<Option<Follow>> {
+        self.db.lock().query_row(&format!("SELECT {FOLLOW_COLUMNS} FROM follows WHERE id = ?1"), params![id], follow_from)
+    }
+
+    pub fn save_follow(&self, f: &Follow) -> Result<()> {
+        self.db.lock().execute(
+            "INSERT OR REPLACE INTO follows (id, channel, source, name, channel_name, remote, asked_by, asked_thid, pending, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![f.id, f.channel, f.source, f.name, f.channel_name, f.remote, f.asked_by, f.asked_thid, f.pending as i64, f.created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_follow(&self, id: &str) -> Result<()> {
+        let mut db = self.db.lock();
+        db.execute("DELETE FROM followed_posts WHERE follow = ?1", params![id])?;
+        db.execute("DELETE FROM follows WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// The post here copied from `source_post` through `follow`, if there is one.
+    pub fn followed_post(&self, follow: &str, source_post: &str) -> Result<Option<String>> {
+        self.db.lock().query_row("SELECT post FROM followed_posts WHERE follow = ?1 AND source_post = ?2", params![follow, source_post], |row| row.get(0))
+    }
+
+    pub fn set_followed_post(&self, follow: &str, source_post: &str, post: &str) -> Result<()> {
+        self.db.lock().execute("INSERT INTO followed_posts (follow, source_post, post) VALUES (?1, ?2, ?3)", params![follow, source_post, post])?;
+        Ok(())
+    }
+
     /// What came from a Discord template, of `kind` (`role`, `category`,
     /// `channel`, `community`).
     pub fn imported(&self, kind: &str) -> Result<Vec<Imported>> {
@@ -2937,6 +3248,41 @@ impl Store {
     pub fn prune_answering(&self, before: i64) -> Result<usize> {
         self.db.lock().execute("DELETE FROM answering WHERE updated < ?1 AND status != 'completed'", params![before])
     }
+}
+
+const FOLLOWER_COLUMNS: &str = "id, channel, kind, target, name, secret, created_by, created_at, failures, off_at";
+
+fn follower_from(row: &Row) -> Result<Follower> {
+    Ok(Follower {
+        id: row.get(0)?,
+        channel: row.get(1)?,
+        kind: row.get(2)?,
+        target: row.get(3)?,
+        name: row.get(4)?,
+        secret: row.get(5)?,
+        created_by: row.get(6)?,
+        created_at: row.get(7)?,
+        failures: row.get(8)?,
+        off_at: row.get(9)?,
+    })
+}
+
+const FOLLOW_COLUMNS: &str = "id, channel, source, name, channel_name, remote, asked_by, asked_thid, pending, created_at";
+
+fn follow_from(row: &Row) -> Result<Follow> {
+    let pending: i64 = row.get(8)?;
+    Ok(Follow {
+        id: row.get(0)?,
+        channel: row.get(1)?,
+        source: row.get(2)?,
+        name: row.get(3)?,
+        channel_name: row.get(4)?,
+        remote: row.get(5)?,
+        asked_by: row.get(6)?,
+        asked_thid: row.get(7)?,
+        pending: pending != 0,
+        created_at: row.get(9)?,
+    })
 }
 
 const EVENT_HOOK_COLUMNS: &str = "id, url, secret, events, channel, created_by, created_at, failures, off_at";
