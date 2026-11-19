@@ -1,0 +1,23 @@
+{% extends "web/base.html" %}
+{% block content %}
+<header class="channel-head">
+  <h1>{{ heading }}</h1>
+  {% if !topic.is_empty() %}<p class="topic">{{ topic }}</p>{% endif %}
+</header>
+<div class="wiki">
+  <nav class="wiki-pages" aria-label="Pages">
+    {% if pages.is_empty() %}<p class="note">No pages yet.</p>{% endif %}
+    <ul>
+    {% for entry in pages %}
+      <li style="padding-inline-start: {{ entry.depth }}em"><a href="{{ entry.href }}"{% if entry.current %} aria-current="page"{% endif %}>{{ entry.title }}</a></li>
+    {% endfor %}
+    </ul>
+  </nav>
+  {% if let Some(page_title) = page_title %}
+  <article class="wiki-page">
+    <h2>{{ page_title }}</h2>
+    <div class="body">{{ html|safe }}</div>
+  </article>
+  {% endif %}
+</div>
+{% endblock %}

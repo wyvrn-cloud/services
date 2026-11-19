@@ -67,6 +67,8 @@ pub struct Channel {
     pub calendar: bool,
     /// A form channel's form (forms.rs); `None` for any other.
     pub form: Option<Value>,
+    /// Whether it is a wiki (wiki.rs).
+    pub wiki: bool,
     /// Its place in the order an admin set, if one did, and its category.
     pub position: Option<i64>,
     pub category: Option<String>,
@@ -104,6 +106,36 @@ pub struct Follow {
     pub asked_thid: Option<String>,
     pub pending: bool,
     pub created_at: i64,
+}
+
+/// A page of a wiki channel (wiki.rs).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WikiPage {
+    pub id: String,
+    pub channel: String,
+    pub parent: Option<String>,
+    pub title: String,
+    pub position: i64,
+    pub created_by: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub deleted: bool,
+}
+
+/// A comment on a wiki page's text: its anchors (Yjs relative positions, base64),
+/// or the comment it answers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WikiComment {
+    pub id: String,
+    pub page: String,
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub quote: Option<String>,
+    pub text: String,
+    pub did: String,
+    pub at: i64,
+    pub reply_to: Option<String>,
+    pub resolved: bool,
 }
 
 /// An answer to a form channel's form (forms.rs): whose, what, how it stands, and
@@ -419,7 +451,8 @@ const CHANNEL_COLUMNS: &str = "id, name, topic, closed, created_at, created_by, 
     (SELECT COUNT(*) FROM announce_channels WHERE announce_channels.channel = channels.id), \
     (SELECT COUNT(*) FROM gallery_channels WHERE gallery_channels.channel = channels.id), \
     (SELECT COUNT(*) FROM calendar_channels WHERE calendar_channels.channel = channels.id), \
-    (SELECT form FROM form_channels WHERE form_channels.channel = channels.id)";
+    (SELECT form FROM form_channels WHERE form_channels.channel = channels.id), \
+    (SELECT COUNT(*) FROM wiki_channels WHERE wiki_channels.channel = channels.id)";
 
 fn member_from(row: &Row) -> Result<Member> {
     let role: String = row.get(1)?;
@@ -490,6 +523,7 @@ fn channel_from(row: &Row) -> Result<Channel> {
         gallery: row.get::<Option<i64>>(13)?.unwrap_or(0) > 0,
         calendar: row.get::<Option<i64>>(14)?.unwrap_or(0) > 0,
         form: json_from(row.get(15)?),
+        wiki: row.get::<Option<i64>>(16)?.unwrap_or(0) > 0,
     })
 }
 
@@ -953,6 +987,54 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
     CREATE TABLE IF NOT EXISTS form_channels (
         channel TEXT PRIMARY KEY,
         form TEXT NOT NULL
+    );
+    -- Wiki channels (wiki.rs): their pages; each change to a page (a Yjs update,
+    -- base64) with who sent it; the document they make now; which Yjs client id
+    -- is whose on a page; and the comments on its text.
+    CREATE TABLE IF NOT EXISTS wiki_channels (
+        channel TEXT PRIMARY KEY
+    );
+    CREATE TABLE IF NOT EXISTS wiki_pages (
+        id TEXT PRIMARY KEY,
+        channel TEXT NOT NULL,
+        parent TEXT,
+        title TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        created_by TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        deleted INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS wiki_updates (
+        page TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        data TEXT NOT NULL,
+        did TEXT NOT NULL,
+        at INTEGER NOT NULL,
+        PRIMARY KEY (page, seq)
+    );
+    CREATE TABLE IF NOT EXISTS wiki_state (
+        page TEXT PRIMARY KEY,
+        state TEXT NOT NULL,
+        seq INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS wiki_clients (
+        page TEXT NOT NULL,
+        client INTEGER NOT NULL,
+        did TEXT NOT NULL,
+        PRIMARY KEY (page, client)
+    );
+    CREATE TABLE IF NOT EXISTS wiki_comments (
+        id TEXT PRIMARY KEY,
+        page TEXT NOT NULL,
+        start_at TEXT,
+        end_at TEXT,
+        quote TEXT,
+        text TEXT NOT NULL,
+        did TEXT NOT NULL,
+        at INTEGER NOT NULL,
+        reply_to TEXT,
+        resolved INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS form_answers (
         id TEXT PRIMARY KEY,
@@ -1461,6 +1543,51 @@ fn schema() -> Schema {
             CREATE TABLE IF NOT EXISTS form_channels (
                 channel VARCHAR(255) NOT NULL PRIMARY KEY,
                 form MEDIUMTEXT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS wiki_channels (
+                channel VARCHAR(255) NOT NULL PRIMARY KEY
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS wiki_pages (
+                id VARCHAR(64) NOT NULL PRIMARY KEY,
+                channel VARCHAR(255) NOT NULL,
+                parent VARCHAR(64),
+                title VARCHAR(255) NOT NULL,
+                position BIGINT NOT NULL,
+                created_by VARCHAR(3000) NOT NULL,
+                created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL,
+                deleted BIGINT NOT NULL DEFAULT 0
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS wiki_updates (
+                page VARCHAR(64) NOT NULL,
+                seq BIGINT NOT NULL,
+                data MEDIUMTEXT NOT NULL,
+                did VARCHAR(3000) NOT NULL,
+                at BIGINT NOT NULL,
+                PRIMARY KEY (page, seq)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS wiki_state (
+                page VARCHAR(64) NOT NULL PRIMARY KEY,
+                state LONGTEXT NOT NULL,
+                seq BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS wiki_clients (
+                page VARCHAR(64) NOT NULL,
+                client BIGINT NOT NULL,
+                did VARCHAR(3000) NOT NULL,
+                PRIMARY KEY (page, client)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS wiki_comments (
+                id VARCHAR(64) NOT NULL PRIMARY KEY,
+                page VARCHAR(64) NOT NULL,
+                start_at VARCHAR(600),
+                end_at VARCHAR(600),
+                quote VARCHAR(1000),
+                text TEXT NOT NULL,
+                did VARCHAR(3000) NOT NULL,
+                at BIGINT NOT NULL,
+                reply_to VARCHAR(64),
+                resolved BIGINT NOT NULL DEFAULT 0
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS form_answers (
                 id VARCHAR(64) NOT NULL PRIMARY KEY,
@@ -3166,6 +3293,102 @@ impl Store {
         Ok(())
     }
 
+    // --- Wiki channels (wiki.rs) --------------------------------------------------
+
+    pub fn set_wiki_channel(&self, channel: &str) -> Result<()> {
+        self.db.lock().execute("INSERT INTO wiki_channels (channel) VALUES (?1)", params![channel])?;
+        Ok(())
+    }
+
+    pub fn wiki_pages(&self, channel: &str) -> Result<Vec<WikiPage>> {
+        self.db.lock().query(&format!("SELECT {WIKI_PAGE_COLUMNS} FROM wiki_pages WHERE channel = ?1 ORDER BY position, created_at, id"), params![channel], wiki_page_from)
+    }
+
+    pub fn wiki_page(&self, id: &str) -> Result<Option<WikiPage>> {
+        self.db.lock().query_row(&format!("SELECT {WIKI_PAGE_COLUMNS} FROM wiki_pages WHERE id = ?1"), params![id], wiki_page_from)
+    }
+
+    pub fn save_wiki_page(&self, p: &WikiPage) -> Result<()> {
+        self.db.lock().execute(
+            "INSERT OR REPLACE INTO wiki_pages (id, channel, parent, title, position, created_by, created_at, updated_at, deleted) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![p.id, p.channel, p.parent, p.title, p.position, p.created_by, p.created_at, p.updated_at, p.deleted as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The document a page's changes make now, and how many there are.
+    pub fn wiki_state(&self, page: &str) -> Result<Option<(Vec<u8>, i64)>> {
+        use base64::Engine;
+        self.db.lock().query_row("SELECT state, seq FROM wiki_state WHERE page = ?1", params![page], |row| {
+            let state: String = row.get(0)?;
+            Ok((base64::engine::general_purpose::STANDARD.decode(state).unwrap_or_default(), row.get(1)?))
+        })
+    }
+
+    pub fn set_wiki_state(&self, page: &str, state: &[u8], seq: i64) -> Result<()> {
+        use base64::Engine;
+        self.db.lock().execute("INSERT OR REPLACE INTO wiki_state (page, state, seq) VALUES (?1, ?2, ?3)", params![page, base64::engine::general_purpose::STANDARD.encode(state), seq])?;
+        Ok(())
+    }
+
+    pub fn add_wiki_update(&self, page: &str, seq: i64, update: &[u8], did: &str, at: i64) -> Result<()> {
+        use base64::Engine;
+        self.db.lock().execute("INSERT INTO wiki_updates (page, seq, data, did, at) VALUES (?1, ?2, ?3, ?4, ?5)", params![page, seq, base64::engine::general_purpose::STANDARD.encode(update), did, at])?;
+        Ok(())
+    }
+
+    /// Each change to a page: its number, who sent it, and when, in order.
+    pub fn wiki_update_heads(&self, page: &str) -> Result<Vec<(i64, String, i64)>> {
+        self.db.lock().query("SELECT seq, did, at FROM wiki_updates WHERE page = ?1 ORDER BY seq", params![page], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+    }
+
+    /// A page's changes up to and with `seq`, in order.
+    pub fn wiki_updates_to(&self, page: &str, seq: i64) -> Result<Vec<Vec<u8>>> {
+        use base64::Engine;
+        self.db.lock().query("SELECT data FROM wiki_updates WHERE page = ?1 AND seq <= ?2 ORDER BY seq", params![page, seq], |row| {
+            let data: String = row.get(0)?;
+            Ok(base64::engine::general_purpose::STANDARD.decode(data).unwrap_or_default())
+        })
+    }
+
+    /// Whose Yjs client id `client` is on `page`.
+    pub fn wiki_client(&self, page: &str, client: u64) -> Result<Option<String>> {
+        self.db.lock().query_row("SELECT did FROM wiki_clients WHERE page = ?1 AND client = ?2", params![page, client as i64], |row| row.get(0))
+    }
+
+    pub fn add_wiki_client(&self, page: &str, client: u64, did: &str) -> Result<()> {
+        self.db.lock().execute("INSERT INTO wiki_clients (page, client, did) VALUES (?1, ?2, ?3)", params![page, client as i64, did])?;
+        Ok(())
+    }
+
+    pub fn wiki_clients(&self, page: &str) -> Result<Vec<(u64, String)>> {
+        self.db.lock().query("SELECT client, did FROM wiki_clients WHERE page = ?1", params![page], |row| Ok((row.get::<i64>(0)? as u64, row.get(1)?)))
+    }
+
+    pub fn wiki_comments(&self, page: &str) -> Result<Vec<WikiComment>> {
+        self.db.lock().query(&format!("SELECT {WIKI_COMMENT_COLUMNS} FROM wiki_comments WHERE page = ?1 ORDER BY at, id"), params![page], wiki_comment_from)
+    }
+
+    pub fn wiki_comment(&self, id: &str) -> Result<Option<WikiComment>> {
+        self.db.lock().query_row(&format!("SELECT {WIKI_COMMENT_COLUMNS} FROM wiki_comments WHERE id = ?1"), params![id], wiki_comment_from)
+    }
+
+    pub fn save_wiki_comment(&self, c: &WikiComment) -> Result<()> {
+        self.db.lock().execute(
+            "INSERT OR REPLACE INTO wiki_comments (id, page, start_at, end_at, quote, text, did, at, reply_to, resolved) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![c.id, c.page, c.start, c.end, c.quote, c.text, c.did, c.at, c.reply_to, c.resolved as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes a comment and its answers.
+    pub fn delete_wiki_comment(&self, id: &str) -> Result<()> {
+        let mut db = self.db.lock();
+        db.execute("DELETE FROM wiki_comments WHERE reply_to = ?1", params![id])?;
+        db.execute("DELETE FROM wiki_comments WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     pub fn set_form(&self, channel: &str, form: &Value) -> Result<()> {
         let mut db = self.db.lock();
         db.execute("DELETE FROM form_channels WHERE channel = ?1", params![channel])?;
@@ -3471,6 +3694,20 @@ impl Store {
     pub fn prune_answering(&self, before: i64) -> Result<usize> {
         self.db.lock().execute("DELETE FROM answering WHERE updated < ?1 AND status != 'completed'", params![before])
     }
+}
+
+const WIKI_PAGE_COLUMNS: &str = "id, channel, parent, title, position, created_by, created_at, updated_at, deleted";
+
+fn wiki_page_from(row: &Row) -> Result<WikiPage> {
+    let deleted: i64 = row.get(8)?;
+    Ok(WikiPage { id: row.get(0)?, channel: row.get(1)?, parent: row.get(2)?, title: row.get(3)?, position: row.get(4)?, created_by: row.get(5)?, created_at: row.get(6)?, updated_at: row.get(7)?, deleted: deleted != 0 })
+}
+
+const WIKI_COMMENT_COLUMNS: &str = "id, page, start_at, end_at, quote, text, did, at, reply_to, resolved";
+
+fn wiki_comment_from(row: &Row) -> Result<WikiComment> {
+    let resolved: i64 = row.get(9)?;
+    Ok(WikiComment { id: row.get(0)?, page: row.get(1)?, start: row.get(2)?, end: row.get(3)?, quote: row.get(4)?, text: row.get(5)?, did: row.get(6)?, at: row.get(7)?, reply_to: row.get(8)?, resolved: resolved != 0 })
 }
 
 fn form_answer_from(row: &Row) -> Result<FormAnswer> {

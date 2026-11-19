@@ -539,6 +539,9 @@ pub(crate) fn carry_out(state: &Arc<AppState>, sender: &str, outcome: community:
     for message in &outcome.live {
         state.to_every_live(message);
     }
+    for (did, message) in &outcome.live_to {
+        state.to_watching(did, message);
+    }
     // Who it says it is to someone looking its DID up changes with it.
     if outcome.profile_changed {
         if let Some(document) = &state.did_document {

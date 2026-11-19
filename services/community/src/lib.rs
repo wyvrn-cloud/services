@@ -39,4 +39,5 @@ pub mod voice;
 pub mod webhook_formats;
 pub mod webhooks;
 pub mod welcome;
+pub mod wiki;
 pub mod web;

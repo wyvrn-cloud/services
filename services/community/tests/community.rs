@@ -3706,3 +3706,93 @@ async fn fill(peer: &Peer, channel: &str, data: Value) -> Value {
     let response = json!({ "type": "https://didcomm.org/survey/1.0/response", "thid": request["id"], "return_route": "all", "body": { "response": { "response_type": "data", "data": data } } });
     peer.agent.send(&peer.server, &response).await.unwrap().unwrap().message
 }
+
+#[tokio::test]
+async fn a_wiki_page_is_edited_together_each_change_kept_with_who_made_it_restored_and_commented_on() {
+    use base64::Engine;
+    use yrs::updates::decoder::Decode;
+    use yrs::{Doc, ReadTxn, StateVector, Text, Transact, Update, Xml, XmlTextPrelim};
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let server = start_server("").await;
+    let (owner, writer, reader) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &writer, &reader]);
+    for peer in [&owner, &writer, &reader] {
+        peer.community("join", json!({})).await;
+    }
+    let wiki = owner.community("create-channel", json!({ "name": "handbook", "kind": "wiki" })).await["body"]["created"].as_str().unwrap().to_string();
+    assert_eq!(writer.community("post", json!({ "channel": wiki, "content": "hi" })).await["body"]["code"], "e.p.msg.wiki-channel");
+    let made = writer.community("wiki-create-page", json!({ "channel": wiki, "title": "Rules" })).await;
+    let page = made["body"]["created"].as_str().unwrap().to_string();
+    assert_eq!(made["body"]["pages"][0]["title"], "Rules", "{made}");
+    // Everyone who sees it is told of the new page.
+    assert_eq!(reader.next_of(&format!("{C}wiki-pages")).await["body"]["pages"][0]["id"], page.as_str());
+
+    // The reader has the page open, on a live connection.
+    let mut live = Live::open(&reader, &server).await;
+    live.send_as(&reader, &format!("{C}watch"), json!({})).await;
+    live.send_as(&reader, &format!("{C}wiki-awareness"), json!({ "page": page, "state": "AA==" })).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The writer types, as slate-yjs does: a paragraph embedded in `content`.
+    let doc = Doc::with_client_id(1111);
+    let root = doc.get_or_insert_text("content");
+    let first = {
+        let mut txn = doc.transact_mut();
+        let p = root.insert_embed(&mut txn, 0, XmlTextPrelim::new("Be kind"));
+        p.insert_attribute(&mut txn, "type", "paragraph");
+        drop(txn);
+        doc.transact().encode_state_as_update_v1(&StateVector::default())
+    };
+    let sent = writer.community("wiki-update", json!({ "page": page, "update": b64.encode(&first), "client": 1111 })).await;
+    assert_eq!(sent["body"]["seq"], 1, "{sent}");
+    let arrived = live.next_typed(&reader, &format!("{C}wiki-update")).await;
+    assert_eq!((arrived["body"]["by"].as_str(), arrived["body"]["seq"].as_i64()), (Some(server.id(&writer).as_str()), Some(1)));
+    assert_eq!(server.state.community.wiki_text(&page).unwrap(), "Be kind");
+    // Another can't write as that client: who wrote what stays true.
+    assert_eq!(reader.community("wiki-update", json!({ "page": page, "update": b64.encode(&first), "client": 1111 })).await["body"]["code"], "e.p.msg.not-your-client");
+    assert_eq!(writer.community("wiki-update", json!({ "page": page, "update": "not yjs", "client": 1 })).await["body"]["code"], "e.p.msg.invalid-update");
+
+    // A second change, then the page as it reads, with its clients.
+    let before = doc.transact().state_vector();
+    {
+        let mut txn = doc.transact_mut();
+        let p = root.insert_embed(&mut txn, 1, XmlTextPrelim::new("No spam"));
+        p.insert_attribute(&mut txn, "type", "paragraph");
+    }
+    let second = doc.transact().encode_state_as_update_v1(&before);
+    writer.community("wiki-update", json!({ "page": page, "update": b64.encode(&second), "client": 1111 })).await;
+    let read = reader.community("wiki-page-request", json!({ "page": page })).await;
+    assert_eq!(read["body"]["seq"], 2);
+    assert_eq!(read["body"]["clients"], json!([{ "client": 1111, "member": server.id(&writer) }]));
+    let copy = Doc::new();
+    copy.transact_mut().apply_update(Update::decode_v1(&b64.decode(read["body"]["state"].as_str().unwrap()).unwrap()).unwrap()).unwrap();
+    assert_eq!(wyvrn_community::wiki::text_of(&copy), "Be kind\nNo spam");
+
+    // History, an old version, and restoring it (a moderator's to do).
+    let history = reader.community("wiki-history-request", json!({ "page": page })).await;
+    assert_eq!(history["body"]["versions"].as_array().unwrap().len(), 1, "{history}");
+    assert_eq!(reader.community("wiki-version-request", json!({ "page": page, "seq": 1 })).await["body"]["text"], "Be kind");
+    assert_eq!(reader.community("wiki-restore", json!({ "page": page, "seq": 1 })).await["body"]["code"], "e.p.trust.not-authorized");
+    let restored = owner.community("wiki-restore", json!({ "page": page, "seq": 1 })).await;
+    assert_eq!(restored["body"]["seq"], 3, "{restored}");
+    assert_eq!(server.state.community.wiki_text(&page).unwrap(), "Be kind");
+    live.next_typed(&reader, &format!("{C}wiki-update")).await;
+
+    // Comments on a stretch of text, answered and resolved.
+    let commented = reader.community("wiki-comment", json!({ "page": page, "start": "AQID", "end": "BAUG", "quote": "kind", "text": "Kinder?" })).await;
+    let comment = commented["body"]["comments"][0]["id"].as_str().unwrap().to_string();
+    let answered = writer.community("wiki-comment", json!({ "page": page, "reply_to": comment, "text": "Fine as it is" })).await;
+    assert_eq!(answered["body"]["comments"].as_array().unwrap().len(), 2);
+    assert_eq!(writer.community("wiki-comment", json!({ "page": page, "text": "Where?" })).await["body"]["code"], "e.p.msg.unknown-comment");
+    let resolved = writer.community("wiki-resolve", json!({ "comment": comment, "resolved": true })).await;
+    assert_eq!(resolved["body"]["comments"].as_array().unwrap().iter().find(|c| c["id"] == comment.as_str()).unwrap()["resolved"], true);
+    assert_eq!(writer.community("wiki-delete-comment", json!({ "comment": comment })).await["body"]["code"], "e.p.trust.not-authorized");
+    assert_eq!(reader.community("wiki-delete-comment", json!({ "comment": comment })).await["body"]["comments"], json!([]));
+
+    // Pages nest, but never under themselves; deleted, they are gone.
+    let child = owner.community("wiki-create-page", json!({ "channel": wiki, "title": "Moderation", "parent": page })).await["body"]["created"].as_str().unwrap().to_string();
+    owner.community("wiki-update-page", json!({ "page": child, "parent": page })).await;
+    assert_eq!(owner.community("wiki-update-page", json!({ "page": page, "parent": child })).await["body"]["code"], "e.p.msg.unknown-page");
+    let left = owner.community("wiki-delete-page", json!({ "page": child })).await;
+    assert_eq!(left["body"]["pages"].as_array().unwrap().len(), 1);
+}

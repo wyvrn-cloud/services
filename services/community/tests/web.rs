@@ -890,3 +890,30 @@ async fn the_stylesheet_and_script_are_named_by_version_and_kept_for_good() {
     // Asked for without it (a page from before the update), for an hour only.
     assert_eq!(server.get("assets/web.css").await.headers()[header::CACHE_CONTROL], "public, max-age=3600");
 }
+
+#[tokio::test]
+async fn a_public_wiki_shows_its_pages_as_they_now_read() {
+    use base64::Engine;
+    use yrs::{Doc, ReadTxn, StateVector, Text, Transact, Xml, XmlTextPrelim};
+    let server = start(Options::default()).await;
+    let (admin, _) = with_channels(&server).await;
+    let wiki = admin.community("create-channel", json!({ "name": "handbook", "kind": "wiki" })).await["body"]["created"].as_str().unwrap().to_string();
+    let page = admin.community("wiki-create-page", json!({ "channel": wiki, "title": "Rules" })).await["body"]["created"].as_str().unwrap().to_string();
+    let doc = Doc::with_client_id(77);
+    let root = doc.get_or_insert_text("content");
+    {
+        let mut txn = doc.transact_mut();
+        for (n, line) in ["# Be kind", "<script>alert(1)</script>"].iter().enumerate() {
+            let p = root.insert_embed(&mut txn, n as u32, XmlTextPrelim::new(*line));
+            p.insert_attribute(&mut txn, "type", "paragraph");
+        }
+    }
+    let update = base64::engine::general_purpose::STANDARD.encode(doc.transact().encode_state_as_update_v1(&StateVector::default()));
+    admin.community("wiki-update", json!({ "page": page, "update": update, "client": 77 })).await;
+    assert_eq!(server.text(&format!("ch/{wiki}/handbook")).await.0, 404);
+    admin.community("update-channel", json!({ "channel": wiki, "web": { "public": true, "history": true } })).await;
+    let (status, html) = server.text(&format!("ch/{wiki}/handbook")).await;
+    assert_eq!(status, 200, "{html}");
+    assert!(html.contains(">Rules</a>") && html.contains("<h1>Be kind</h1>"), "{html}");
+    assert!(!html.contains("<script>alert"), "{html}");
+}

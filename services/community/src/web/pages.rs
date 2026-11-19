@@ -748,6 +748,91 @@ struct Before {
     before: Option<i64>,
     /// The post a member signed in is answering (`?reply=<seq>`).
     reply: Option<i64>,
+    /// In a wiki: the page shown (`?page=<id>`).
+    page: Option<String>,
+}
+
+/// A page of a wiki, in the list of its pages.
+struct WikiEntry {
+    title: String,
+    href: String,
+    depth: usize,
+    current: bool,
+}
+
+#[derive(Template)]
+#[template(path = "web/wiki.html")]
+struct WikiView {
+    site: Site,
+    groups: Vec<Group>,
+    title: String,
+    description: String,
+    json_ld: String,
+    noindex: bool,
+    heading: String,
+    topic: String,
+    pages: Vec<WikiEntry>,
+    page_title: Option<String>,
+    html: String,
+}
+
+/// A wiki on the web: its pages as a tree, and the one chosen as it now reads.
+fn wiki_page(state: &AppState, viewer: &Viewer, channel: &Channel, chosen: Option<&str>, private: bool) -> Response {
+    let Some(web) = web_of(state) else { return nothing() };
+    let root = "../../";
+    let pages: Vec<crate::store::WikiPage> = match state.community.store.wiki_pages(&channel.id) {
+        Ok(pages) => pages.into_iter().filter(|p| !p.deleted).collect(),
+        Err(error) => return internal(error.into()),
+    };
+    // Depth first, each under its parent, in their order.
+    fn walk(pages: &[crate::store::WikiPage], parent: Option<&str>, depth: usize, out: &mut Vec<(usize, usize)>) {
+        for (n, page) in pages.iter().enumerate().filter(|(_, p)| p.parent.as_deref() == parent) {
+            out.push((n, depth));
+            if depth < 8 {
+                walk(pages, Some(&page.id), depth + 1, out);
+            }
+        }
+    }
+    let mut order = Vec::new();
+    walk(&pages, None, 0, &mut order);
+    let shown = chosen.and_then(|id| pages.iter().find(|p| p.id == id)).or_else(|| order.first().map(|(n, _)| &pages[*n]));
+    let path = channel_path(&channel.id, &channel.name);
+    let entries = order
+        .iter()
+        .map(|(n, depth)| WikiEntry { title: pages[*n].title.clone(), href: format!("?page={}", url::form_urlencoded::byte_serialize(pages[*n].id.as_bytes()).collect::<String>()), depth: *depth, current: shown.is_some_and(|s| s.id == pages[*n].id) })
+        .collect();
+    let html = shown.map(|p| render::markdown(&state.community.wiki_text(&p.id).unwrap_or_default())).unwrap_or_default();
+    let canonical = web.absolute(&match shown {
+        Some(p) => format!("{path}?page={}", p.id),
+        None => path.clone(),
+    });
+    let site = site(state, viewer, root, canonical);
+    let groups = match groups(state, viewer, root, Some(&channel.id)) {
+        Ok(groups) => groups,
+        Err(error) => return internal(error),
+    };
+    let title = match shown {
+        Some(p) => format!("{} · #{} · {}", p.title, channel.name, site.name),
+        None => format!("#{} · {}", channel.name, site.name),
+    };
+    let description = shown.map(|p| render::excerpt(&state.community.wiki_text(&p.id).unwrap_or_default(), 200)).unwrap_or_else(|| format!("#{} in {}", channel.name, site.name));
+    page(
+        WikiView {
+            json_ld: render::json_ld(&json!({ "@context": "https://schema.org", "@type": "WebPage", "name": title })),
+            site,
+            groups,
+            title,
+            description,
+            noindex: private,
+            heading: format!("📚 {}", channel.name),
+            topic: channel.topic.clone(),
+            pages: entries,
+            page_title: shown.map(|p| p.title.clone()),
+            html,
+        }
+        .render(),
+        private || viewer.signed_in(),
+    )
 }
 
 /// A channel's posts, newest last, a page at a time.
@@ -763,6 +848,11 @@ async fn channel(State(state): State<Arc<AppState>>, Path((id, name)): Path<(Str
     let wanted = super::slug(&channel.name);
     if name != wanted && url::form_urlencoded::byte_serialize(name.as_bytes()).collect::<String>() != wanted {
         return as_page(Redirect::permanent(&format!("../../{}", channel_path(&channel.id, &channel.name))).into_response());
+    }
+    // A wiki: its pages, not posts.
+    if channel.wiki {
+        let private = since.is_none() && !is_public(&state, &channel.id);
+        return wiki_page(&state, &viewer, &channel, paging.page.as_deref(), private);
     }
     let root = "../../";
     let store = &state.community.store;

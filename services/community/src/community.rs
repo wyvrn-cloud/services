@@ -260,6 +260,8 @@ pub struct Community {
     /// Messages to send to other DIDs from where no answer goes out (a workflow's
     /// step): sent by the background loop (outgoing.rs).
     pub outbox: std::sync::Mutex<Vec<(String, Value)>>,
+    /// Wiki pages open now, and who has each open (wiki.rs).
+    pub wiki_open: crate::wiki::OpenPages,
 }
 
 /// What handling a message came to.
@@ -282,6 +284,9 @@ pub struct Outcome {
     pub posted_id: Option<String>,
     /// For every live connection open now (someone seen online, or not).
     pub live: Vec<Value>,
+    /// For the live connections of one member each, and only those: dropped
+    /// where they have none (a wiki's changes and cursors).
+    pub live_to: Vec<(String, Value)>,
 }
 
 impl Outcome {
@@ -456,6 +461,9 @@ impl Community {
         if channel.form.is_some() {
             body["kind"] = json!("form");
         }
+        if channel.wiki {
+            body["kind"] = json!("wiki");
+        }
         body
     }
 
@@ -490,7 +498,7 @@ impl Community {
             Some(kept) => kept.load()?,
             None => Changed::default(),
         };
-        let community = Self { store, config, used_bytes: Default::default(), changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, expressions: None, live: Default::default(), web_url: None, public_url: String::new(), speaks_as: None, importing: Default::default(), signing_seed: None, outbox: Default::default() };
+        let community = Self { store, config, used_bytes: Default::default(), changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, expressions: None, live: Default::default(), web_url: None, public_url: String::new(), speaks_as: None, importing: Default::default(), signing_seed: None, outbox: Default::default(), wiki_open: Default::default() };
         community.ensure_roles()?;
         Ok(community)
     }
@@ -1177,6 +1185,9 @@ impl Community {
         if channel.form.is_some() {
             return refuse(message, "e.p.msg.form-channel", "A form channel takes no posts: it is filled in.");
         }
+        if channel.wiki {
+            return refuse(message, "e.p.msg.wiki-channel", "A wiki takes no posts: its pages are edited.");
+        }
         if !self.may_in(sender, &channel, "post")? {
             return refuse(message, "e.p.trust.not-authorized", "You can't post in this channel.");
         }
@@ -1398,6 +1409,9 @@ impl Community {
         if let Some(outcome) = self.handle_form_message(&member, message, now)? {
             return Ok(outcome);
         }
+        if let Some(outcome) = self.handle_wiki_message(&member, message, now)? {
+            return Ok(outcome);
+        }
 
         match message_type {
             JOIN | LEAVE => {
@@ -1436,7 +1450,7 @@ impl Community {
                             Err(why) => return refuse(message, "e.p.msg.invalid-voice", why),
                         }
                     }
-                    Some("forum") | Some("gallery") | Some("calendar") | Some("form") => {
+                    Some("forum") | Some("gallery") | Some("calendar") | Some("form") | Some("wiki") => {
                         if !self.powers(sender)?.has("manage_channels") {
                             return refuse(message, "e.p.trust.not-authorized", "Opening a forum, a gallery or a calendar channel takes Manage channels.");
                         }
@@ -1501,6 +1515,9 @@ impl Community {
                 }
                 if let Some(form) = form {
                     self.store.set_form(&id, &form)?;
+                }
+                if body["kind"].as_str() == Some("wiki") {
+                    self.store.set_wiki_channel(&id)?;
                 }
                 let mut community = self.community(&member)?;
                 community["created"] = json!(id);
