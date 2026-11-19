@@ -453,6 +453,9 @@ impl Community {
         if channel.calendar {
             body["kind"] = json!("calendar");
         }
+        if channel.form.is_some() {
+            body["kind"] = json!("form");
+        }
         body
     }
 
@@ -560,6 +563,11 @@ impl Community {
             }
             if self.read_only(&channel.id)? {
                 body["read_only"] = json!(true);
+            }
+            if let Some(entry) = self.form_entry(&channel, &member.did)? {
+                for (key, value) in entry.as_object().into_iter().flatten() {
+                    body[key] = value.clone();
+                }
             }
             // What it follows, for whoever may manage it.
             if powers.has("manage_channels") || channel.created_by == member.did {
@@ -1166,6 +1174,9 @@ impl Community {
         if channel.calendar {
             return refuse(message, "e.p.msg.calendar-channel", "A calendar channel takes no posts: it shows the community's events.");
         }
+        if channel.form.is_some() {
+            return refuse(message, "e.p.msg.form-channel", "A form channel takes no posts: it is filled in.");
+        }
         if !self.may_in(sender, &channel, "post")? {
             return refuse(message, "e.p.trust.not-authorized", "You can't post in this channel.");
         }
@@ -1384,6 +1395,9 @@ impl Community {
         if let Some(outcome) = self.handle_event_message(&member, message, now)? {
             return Ok(outcome);
         }
+        if let Some(outcome) = self.handle_form_message(&member, message, now)? {
+            return Ok(outcome);
+        }
 
         match message_type {
             JOIN | LEAVE => {
@@ -1422,7 +1436,7 @@ impl Community {
                             Err(why) => return refuse(message, "e.p.msg.invalid-voice", why),
                         }
                     }
-                    Some("forum") | Some("gallery") | Some("calendar") => {
+                    Some("forum") | Some("gallery") | Some("calendar") | Some("form") => {
                         if !self.powers(sender)?.has("manage_channels") {
                             return refuse(message, "e.p.trust.not-authorized", "Opening a forum, a gallery or a calendar channel takes Manage channels.");
                         }
@@ -1440,6 +1454,14 @@ impl Community {
                 if announcement && !self.powers(sender)?.has("manage_channels") {
                     return refuse(message, "e.p.trust.not-authorized", "Opening an announcement channel takes Manage channels.");
                 }
+                // A form channel's form, checked before anything is made.
+                let form = match body["kind"].as_str() {
+                    Some("form") => match self.checked_form(&body["form"]) {
+                        Ok(form) => Some(form),
+                        Err(why) => return refuse(message, "e.p.msg.invalid-form", &why),
+                    },
+                    _ => None,
+                };
                 let Some(name) = line(&body["name"], MAX_CHANNEL_NAME) else {
                     return refuse(message, "e.p.msg.empty", "A channel needs a name.");
                 };
@@ -1476,6 +1498,9 @@ impl Community {
                 }
                 if body["kind"].as_str() == Some("calendar") {
                     self.store.set_calendar_channel(&id)?;
+                }
+                if let Some(form) = form {
+                    self.store.set_form(&id, &form)?;
                 }
                 let mut community = self.community(&member)?;
                 community["created"] = json!(id);
@@ -1566,6 +1591,18 @@ impl Community {
                         self.store.delete_setting(RULES_CHANNEL)?;
                     }
                     self.audit(now, sender, "channel.rules", Some(&channel.id), Some(json!({ "rules": rules })));
+                }
+                if let Some(given) = body.get("form").filter(|v| !v.is_null()) {
+                    if channel.form.is_none() {
+                        return refuse(message, "e.p.msg.invalid-form", "Only a form channel has a form.");
+                    }
+                    if !self.powers(sender)?.has("manage_channels") {
+                        return refuse(message, "e.p.trust.not-authorized", "Changing a form takes Manage channels.");
+                    }
+                    match self.checked_form(given) {
+                        Ok(form) => self.store.set_form(&channel.id, &form)?,
+                        Err(why) => return refuse(message, "e.p.msg.invalid-form", &why),
+                    }
                 }
                 let mut notices = Vec::new();
                 if let Some(given) = body.get("announcement").filter(|v| !v.is_null()) {

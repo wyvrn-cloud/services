@@ -3621,3 +3621,88 @@ async fn events_are_made_answered_reminded_changed_cancelled_and_fed_to_other_ca
     assert_eq!(calendar["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == calendar_id.as_str()).unwrap()["kind"], "calendar");
     assert_eq!(owner.community("post", json!({ "channel": calendar_id, "content": "hi" })).await["body"]["code"], "e.p.msg.calendar-channel");
 }
+
+#[tokio::test]
+async fn a_form_channel_is_filled_in_with_survey_1_0_reviewed_and_an_accepted_application_gives_its_role() {
+    const SURVEY: &str = "https://didcomm.org/survey/1.0/";
+    let server = start_server("").await;
+    let (owner, member, other) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member, &other]);
+    for peer in [&owner, &member] {
+        peer.community("join", json!({})).await;
+    }
+    let staff = open_channel(&owner, "staff").await;
+    let form = json!({ "type": "application", "title": "Join the mods", "role": "moderator", "post_to": staff, "fields": [
+        { "label": "Why?", "kind": "paragraph", "required": true },
+        { "label": "Time zone", "kind": "choice", "options": ["Americas", "Europe", "Asia"] }
+    ] });
+    assert_eq!(owner.community("create-channel", json!({ "name": "apply", "kind": "form", "form": { "type": "poll" } })).await["body"]["code"], "e.p.msg.invalid-form");
+    let made = owner.community("create-channel", json!({ "name": "apply", "kind": "form", "form": form })).await;
+    let apply = made["body"]["created"].as_str().unwrap().to_string();
+    let listed = made["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == apply.as_str()).unwrap().clone();
+    assert_eq!((listed["kind"].as_str(), listed["form"]["title"].as_str(), listed["answered"].as_i64()), (Some("form"), Some("Join the mods"), Some(0)), "{listed}");
+    assert_eq!(member.community("post", json!({ "channel": apply, "content": "hi" })).await["body"]["code"], "e.p.msg.form-channel");
+
+    // Asked for, the form comes as survey/1.0's request.
+    let request = member.community("form-request", json!({ "channel": apply })).await;
+    assert_eq!(request["type"], format!("{SURVEY}request"), "{request}");
+    assert_eq!(request["body"]["request"]["survey_schema"]["properties"]["q2"]["enum"], json!(["Americas", "Europe", "Asia"]));
+    let thid = request["id"].as_str().unwrap().to_string();
+    let answer = |data: Value| json!({ "type": format!("{SURVEY}response"), "thid": thid, "return_route": "all", "body": { "response": { "response_type": "data", "data": data } } });
+    let wrong = member.agent.send(&server.did, &answer(json!({ "q2": "Mars" }))).await.unwrap().unwrap().message;
+    assert_eq!(wrong["body"]["code"], "e.p.msg.invalid-answer", "{wrong}");
+    let done = member.agent.send(&server.did, &answer(json!({ "q1": "I like helping", "q2": "Europe" }))).await.unwrap().unwrap().message;
+    assert_eq!((done["type"].as_str(), done["body"]["answer"]["status"].as_str()), (Some(format!("{C}form-answered").as_str()), Some("open")), "{done}");
+    let id = done["body"]["answer"]["id"].as_str().unwrap().to_string();
+    // One each.
+    let again = member.agent.send(&server.did, &answer(json!({ "q1": "Again" }))).await.unwrap().unwrap().message;
+    assert_eq!(again["body"]["code"], "e.p.msg.already-answered");
+    // Posted where it said, and the reviewers told.
+    assert_eq!(owner.next_of(&format!("{C}form-answered")).await["body"]["answer"]["id"], id.as_str());
+    let posted = owner.next_message().await;
+    assert!(posted["content"].as_str().unwrap().contains("I like helping"), "{posted}");
+
+    // Only reviewers read the answers; a member reads their own.
+    assert_eq!(other.community("form-answers-request", json!({ "channel": apply })).await["body"]["code"], "e.p.trust.not-authorized");
+    let answers = owner.community("form-answers-request", json!({ "channel": apply })).await;
+    assert_eq!(answers["body"]["answers"][0]["data"], json!({ "q1": "I like helping", "q2": "Europe" }));
+    assert_eq!(answers["body"]["answers"][0]["member"], server.id(&member));
+    // Accepted, with a note: the member is told, and holds the role.
+    let reviewed = owner.community("review-answer", json!({ "answer": id, "status": "accepted", "note": "Welcome aboard" })).await;
+    assert_eq!(reviewed["body"]["answer"]["status"], "accepted", "{reviewed}");
+    let told = member.next_of(&format!("{C}form-answered")).await;
+    assert_eq!((told["body"]["answer"]["status"].as_str(), told["body"]["answer"]["notes"][0]["text"].as_str()), (Some("accepted"), Some("Welcome aboard")));
+    assert!(server.state.community.store.member_roles(&member.did()).unwrap().contains(&"moderator".to_string()));
+    let mine = member.community("my-answers-request", json!({ "channel": apply })).await;
+    assert_eq!(mine["body"]["answers"].as_array().unwrap().len(), 1);
+    // Nobody else reviews (the member, a moderator now, may).
+    assert_eq!(other.community("review-answer", json!({ "answer": id, "status": "rejected" })).await["body"]["code"], "e.p.trust.not-authorized");
+
+    // A sign-up fills up; a survey is summed up, anonymously.
+    let signup = owner.community("create-channel", json!({ "name": "raid", "kind": "form", "form": { "type": "signup", "title": "Raid night", "places": 1, "fields": [{ "label": "Class", "kind": "text" }] } })).await["body"]["created"].as_str().unwrap().to_string();
+    assert_eq!(fill(&member, &signup, json!({ "q1": "Healer" })).await["body"]["answer"]["status"], "open");
+    assert_eq!(fill(&other, &signup, json!({ "q1": "Tank" })).await["body"]["code"], "e.p.msg.form-full");
+    let survey = owner.community("create-channel", json!({ "name": "feedback", "kind": "form", "form": { "type": "survey", "title": "How are we doing?", "anonymous": true, "fields": [{ "label": "Score", "kind": "number" }, { "label": "Again?", "kind": "yes_no" }] } })).await["body"]["created"].as_str().unwrap().to_string();
+    fill(&member, &survey, json!({ "q1": 4, "q2": true })).await;
+    fill(&other, &survey, json!({ "q1": 8, "q2": false })).await;
+    let read = owner.community("form-answers-request", json!({ "channel": survey })).await;
+    assert_eq!(read["body"]["summary"]["q1"]["mean"], 6.0, "{read}");
+    assert!(read["body"]["answers"][0].get("member").is_none());
+
+    // A ticket: as many as a member likes, each a conversation with its reviewers.
+    let tickets = owner.community("create-channel", json!({ "name": "support", "kind": "form", "form": { "type": "ticket", "title": "Get help", "fields": [{ "label": "What's wrong?", "kind": "paragraph", "required": true }] } })).await["body"]["created"].as_str().unwrap().to_string();
+    let first = fill(&other, &tickets, json!({ "q1": "I can't hear anyone" })).await;
+    assert_eq!(fill(&other, &tickets, json!({ "q1": "And my mic" })).await["body"]["answer"]["status"], "open");
+    let ticket = first["body"]["answer"]["id"].as_str().unwrap().to_string();
+    let noted = other.community("review-answer", json!({ "answer": ticket, "note": "It's on Windows" })).await;
+    assert_eq!(noted["body"]["answer"]["notes"][0]["text"], "It's on Windows", "{noted}");
+    // ...but its member doesn't close it.
+    assert_eq!(other.community("review-answer", json!({ "answer": ticket, "status": "accepted" })).await["body"]["code"], "e.p.trust.not-authorized");
+}
+
+/// Fills in the form of `channel` as `peer`, with survey/1.0: what the server answers.
+async fn fill(peer: &Peer, channel: &str, data: Value) -> Value {
+    let request = peer.community("form-request", json!({ "channel": channel })).await;
+    let response = json!({ "type": "https://didcomm.org/survey/1.0/response", "thid": request["id"], "return_route": "all", "body": { "response": { "response_type": "data", "data": data } } });
+    peer.agent.send(&peer.server, &response).await.unwrap().unwrap().message
+}

@@ -65,6 +65,8 @@ pub struct Channel {
     pub gallery: bool,
     /// Whether it is a calendar channel: no posts, the community's events.
     pub calendar: bool,
+    /// A form channel's form (forms.rs); `None` for any other.
+    pub form: Option<Value>,
     /// Its place in the order an admin set, if one did, and its category.
     pub position: Option<i64>,
     pub category: Option<String>,
@@ -102,6 +104,19 @@ pub struct Follow {
     pub asked_thid: Option<String>,
     pub pending: bool,
     pub created_at: i64,
+}
+
+/// An answer to a form channel's form (forms.rs): whose, what, how it stands, and
+/// the notes about it (`[{ by, text, at }]`, `by` a DID).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FormAnswer {
+    pub id: String,
+    pub channel: String,
+    pub did: String,
+    pub data: Value,
+    pub status: String,
+    pub notes: Vec<Value>,
+    pub at: i64,
 }
 
 /// A community event (events.rs): its fields as JSON, who made it (a DID).
@@ -403,7 +418,8 @@ const CHANNEL_COLUMNS: &str = "id, name, topic, closed, created_at, created_by, 
     (SELECT tags FROM channel_forum WHERE channel_forum.channel = channels.id), \
     (SELECT COUNT(*) FROM announce_channels WHERE announce_channels.channel = channels.id), \
     (SELECT COUNT(*) FROM gallery_channels WHERE gallery_channels.channel = channels.id), \
-    (SELECT COUNT(*) FROM calendar_channels WHERE calendar_channels.channel = channels.id)";
+    (SELECT COUNT(*) FROM calendar_channels WHERE calendar_channels.channel = channels.id), \
+    (SELECT form FROM form_channels WHERE form_channels.channel = channels.id)";
 
 fn member_from(row: &Row) -> Result<Member> {
     let role: String = row.get(1)?;
@@ -473,6 +489,7 @@ fn channel_from(row: &Row) -> Result<Channel> {
         announcement: row.get::<Option<i64>>(12)?.unwrap_or(0) > 0,
         gallery: row.get::<Option<i64>>(13)?.unwrap_or(0) > 0,
         calendar: row.get::<Option<i64>>(14)?.unwrap_or(0) > 0,
+        form: json_from(row.get(15)?),
     })
 }
 
@@ -931,6 +948,20 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
     );
     CREATE TABLE IF NOT EXISTS calendar_channels (
         channel TEXT PRIMARY KEY
+    );
+    -- Form channels (forms.rs): each one's form, and the answers to it.
+    CREATE TABLE IF NOT EXISTS form_channels (
+        channel TEXT PRIMARY KEY,
+        form TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS form_answers (
+        id TEXT PRIMARY KEY,
+        channel TEXT NOT NULL,
+        did TEXT NOT NULL,
+        data TEXT NOT NULL,
+        status TEXT NOT NULL,
+        notes TEXT NOT NULL,
+        at INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS announce_published (
         post TEXT PRIMARY KEY,
@@ -1426,6 +1457,19 @@ fn schema() -> Schema {
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS calendar_channels (
                 channel VARCHAR(255) NOT NULL PRIMARY KEY
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS form_channels (
+                channel VARCHAR(255) NOT NULL PRIMARY KEY,
+                form MEDIUMTEXT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS form_answers (
+                id VARCHAR(64) NOT NULL PRIMARY KEY,
+                channel VARCHAR(255) NOT NULL,
+                did {MYSQL_DID} NOT NULL,
+                data MEDIUMTEXT NOT NULL,
+                status VARCHAR(16) NOT NULL,
+                notes MEDIUMTEXT NOT NULL,
+                at BIGINT NOT NULL
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS announce_published (
                 post VARCHAR(255) NOT NULL PRIMARY KEY,
@@ -3122,6 +3166,29 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_form(&self, channel: &str, form: &Value) -> Result<()> {
+        let mut db = self.db.lock();
+        db.execute("DELETE FROM form_channels WHERE channel = ?1", params![channel])?;
+        db.execute("INSERT INTO form_channels (channel, form) VALUES (?1, ?2)", params![channel, form.to_string()])?;
+        Ok(())
+    }
+
+    pub fn form_answers(&self, channel: &str) -> Result<Vec<FormAnswer>> {
+        self.db.lock().query("SELECT id, channel, did, data, status, notes, at FROM form_answers WHERE channel = ?1 ORDER BY at, id", params![channel], form_answer_from)
+    }
+
+    pub fn form_answer(&self, id: &str) -> Result<Option<FormAnswer>> {
+        self.db.lock().query_row("SELECT id, channel, did, data, status, notes, at FROM form_answers WHERE id = ?1", params![id], form_answer_from)
+    }
+
+    pub fn save_form_answer(&self, a: &FormAnswer) -> Result<()> {
+        self.db.lock().execute(
+            "INSERT OR REPLACE INTO form_answers (id, channel, did, data, status, notes, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![a.id, a.channel, a.did, a.data.to_string(), a.status, Value::Array(a.notes.clone()).to_string(), a.at],
+        )?;
+        Ok(())
+    }
+
     pub fn set_calendar_channel(&self, channel: &str) -> Result<()> {
         self.db.lock().execute("INSERT INTO calendar_channels (channel) VALUES (?1)", params![channel])?;
         Ok(())
@@ -3404,6 +3471,19 @@ impl Store {
     pub fn prune_answering(&self, before: i64) -> Result<usize> {
         self.db.lock().execute("DELETE FROM answering WHERE updated < ?1 AND status != 'completed'", params![before])
     }
+}
+
+fn form_answer_from(row: &Row) -> Result<FormAnswer> {
+    let (data, notes): (String, String) = (row.get(3)?, row.get(5)?);
+    Ok(FormAnswer {
+        id: row.get(0)?,
+        channel: row.get(1)?,
+        did: row.get(2)?,
+        data: serde_json::from_str(&data).unwrap_or(Value::Null),
+        status: row.get(4)?,
+        notes: serde_json::from_str(&notes).unwrap_or_default(),
+        at: row.get(6)?,
+    })
 }
 
 fn event_from(row: &Row) -> Result<StoredEvent> {
