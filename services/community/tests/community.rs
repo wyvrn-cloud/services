@@ -3893,6 +3893,52 @@ async fn a_long_thread_is_read_a_page_at_a_time_and_counts_are_kept_and_rebuilt(
 }
 
 #[tokio::test]
+async fn a_forum_section_sits_inside_another_and_its_counts_include_those_inside_it() {
+    let server = start_server("").await;
+    let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member]);
+    for peer in [&owner, &member] {
+        peer.community("join", json!({})).await;
+    }
+    let forum = owner.community("create-channel", json!({ "name": "board", "kind": "forum" })).await["body"]["created"].as_str().unwrap().to_string();
+    let sections = json!([{ "id": "help", "name": "Help" }, { "id": "android", "name": "Android", "parent": "help" }, { "id": "pixel", "name": "Pixel", "parent": "android" }, { "id": "news", "name": "News" }]);
+    let set = owner.community("update-channel", json!({ "channel": forum, "sections": sections })).await;
+    let listed = set["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == forum.as_str()).unwrap().clone();
+    assert_eq!(listed["sections"][2], json!({ "id": "pixel", "name": "Pixel", "parent": "android" }), "{listed}");
+    // A fourth level, a loop, or a parent that isn't there: refused, and nothing changed.
+    for bad in [
+        json!([{ "id": "a", "name": "A" }, { "id": "b", "name": "B", "parent": "a" }, { "id": "c", "name": "C", "parent": "b" }, { "id": "d", "name": "D", "parent": "c" }]),
+        json!([{ "id": "a", "name": "A", "parent": "b" }, { "id": "b", "name": "B", "parent": "a" }]),
+        json!([{ "id": "a", "name": "A", "parent": "gone" }]),
+    ] {
+        assert_eq!(owner.community("update-channel", json!({ "channel": forum, "sections": bad })).await["body"]["code"], "e.p.msg.invalid-sections");
+    }
+
+    // Threads at each level; Help's counts are its own and those inside it.
+    member.community("post", json!({ "channel": forum, "id": "t1", "title": "General", "content": "Hi", "section": "help" })).await;
+    member.community("post", json!({ "channel": forum, "id": "t2", "title": "Android", "content": "Hi", "section": "android" })).await;
+    member.community("post", json!({ "channel": forum, "id": "t3", "title": "Pixel", "content": "Hi", "section": "pixel" })).await;
+    owner.community("post", json!({ "channel": forum, "content": "Answer", "thread": "t3" })).await;
+    let stats = member.community("forum-stats-request", json!({ "channel": forum })).await;
+    let of = |id: &str| {
+        let s = stats["body"]["sections"].as_array().unwrap().iter().find(|s| s["section"] == id).unwrap().clone();
+        (s["threads"].as_i64().unwrap(), s["posts"].as_i64().unwrap(), s["last_thread"].as_str().map(str::to_string))
+    };
+    assert_eq!(of("help"), (3, 4, Some("t3".into())), "{stats}");
+    assert_eq!(of("android"), (2, 3, Some("t3".into())));
+    assert_eq!(of("pixel"), (1, 2, Some("t3".into())));
+    assert_eq!(of("news"), (0, 0, None));
+
+    // Moved up a level, a thread counts in the section it is now in.
+    owner.community("set-thread", json!({ "thread": "t3", "section": "help" })).await;
+    let moved = member.community("forum-stats-request", json!({ "channel": forum })).await;
+    let pixel = moved["body"]["sections"].as_array().unwrap().iter().find(|s| s["section"] == "pixel").unwrap().clone();
+    assert_eq!(pixel["threads"].as_i64(), Some(0), "{moved}");
+    let help = moved["body"]["sections"].as_array().unwrap().iter().find(|s| s["section"] == "help").unwrap().clone();
+    assert_eq!(help["threads"].as_i64(), Some(3));
+}
+
+#[tokio::test]
 async fn a_discord_follower_is_sent_the_files_kept_here_opened_is_renamed_and_an_unanswered_follow_is_given_up() {
     use aes_gcm::aead::{Aead, KeyInit};
     // A stand-in for Discord that takes a message with files.

@@ -228,6 +228,8 @@ pub struct PostView {
     pub thread_href: Option<String>,
     pub thread_count: i64,
     pub thread_name: Option<String>,
+    /// The forum section its thread is in, with those that section is inside ("Help › Android").
+    pub section: Option<String>,
     pub pinned: bool,
     pub focus: bool,
     /// Carries on the run of posts above it (as the app's cozy layout has it): drawn
@@ -589,6 +591,7 @@ fn post_view(state: &AppState, post: &Post, channel: &Channel, root: &str, focus
         thread_href: thread.map(|t| format!("{ch}/t/{}", url::form_urlencoded::byte_serialize(t.id.as_bytes()).collect::<String>())),
         thread_count: thread.map_or(0, |t| t.count),
         thread_name: thread.and_then(|t| t.name.clone()),
+        section: thread.and_then(|t| t.section.as_deref()).and_then(|id| crate::board::section_path(channel.sections.as_ref(), id)),
         pinned: post.pinned,
         focus: focus == Some(post.seq),
         continued: false,
@@ -1155,7 +1158,8 @@ async fn thread_page(State(state): State<Arc<AppState>>, Path((id, thread)): Pat
         ChannelPage {
             heading: name.clone(),
             channel_name: channel.name.clone(),
-            topic: String::new(),
+            // In a forum, the section it is in: where it sits on the board.
+            topic: root_post.grew.as_ref().and_then(|t| t.section.as_deref()).and_then(|id| crate::board::section_path(channel.sections.as_ref(), id)).unwrap_or_default(),
             posts: views,
             older: None,
             newer: None,

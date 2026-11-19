@@ -76,7 +76,7 @@
       {% if !post.reactions.is_empty() %}<ul class="reactions" aria-label="Reactions">{% for reaction in post.reactions %}<li>{% if let Some(picture) = reaction.picture %}<img class="emoji" src="{{ picture }}" alt="{{ reaction.text }}" title="{{ reaction.text }}" loading="lazy">{% else %}{{ reaction.text }}{% endif %} <span>{{ reaction.count }}</span></li>{% endfor %}</ul>{% endif %}
       {% endif %}
       {% if compose.is_some() %}<a class="reply-link" href="?reply={{ post.seq }}#compose">Reply</a>{% endif %}
-      {% if let Some(thread) = post.thread_href %}<a class="thread" href="{{ thread }}">{% if let Some(name) = post.thread_name %}{{ name }} · {% endif %}{{ post.thread_count }} {% if post.thread_count == 1 %}reply{% else %}replies{% endif %} →</a>{% endif %}
+      {% if let Some(thread) = post.thread_href %}<a class="thread" href="{{ thread }}">{% if let Some(section) = post.section %}<span class="quiet">{{ section }} ·</span> {% endif %}{% if let Some(name) = post.thread_name %}{{ name }} · {% endif %}{{ post.thread_count }} {% if post.thread_count == 1 %}reply{% else %}replies{% endif %} →</a>{% endif %}
     </article>
   </li>
 {% else %}

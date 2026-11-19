@@ -947,3 +947,19 @@ async fn a_public_calendar_lists_the_events_and_a_gallery_is_a_grid() {
     assert_eq!(status, 200, "{html}");
     assert!(html.contains("class=\"gallery\"") && html.contains("<strong>Sunset</strong>") && html.contains("<img src="), "{html}");
 }
+
+#[tokio::test]
+async fn a_public_forum_says_which_section_each_thread_is_in_and_the_sections_it_is_inside() {
+    let server = start(Options::default()).await;
+    let (admin, _) = with_channels(&server).await;
+    let forum = admin.community("create-channel", json!({ "name": "board", "kind": "forum" })).await["body"]["created"].as_str().unwrap().to_string();
+    admin.community("update-channel", json!({ "channel": forum, "sections": [{ "id": "help", "name": "Help" }, { "id": "android", "name": "Android", "parent": "help" }], "web": { "public": true, "history": true } })).await;
+    admin.community("post", json!({ "channel": forum, "id": "t1", "title": "Mic too quiet", "content": "Help!", "section": "android" })).await;
+    admin.community("post", json!({ "channel": forum, "content": "Turn it up", "thread": "t1" })).await;
+    let (status, html) = server.text(&format!("ch/{forum}/board")).await;
+    assert_eq!(status, 200, "{html}");
+    assert!(html.contains("Help › Android ·"), "{html}");
+    let (status, html) = server.text(&format!("ch/{forum}/t/t1")).await;
+    assert_eq!(status, 200, "{html}");
+    assert!(html.contains("<p class=\"topic\">Help › Android</p>"), "{html}");
+}
