@@ -26,7 +26,7 @@ pub const MODERATING: &[&str] = &["administrator", "kick_members", "ban_members"
 
 /// Keys whose value, a string or an array of strings, names a person where it is a DID.
 const PERSON_KEYS: &[&str] = &[
-    "did", "by", "author", "answered_by", "removed_by", "created_by", "resolved_by", "who", "voters", "owner", "owners", "you", "actor", "target", "member", "participants", "speakers", "to",
+    "did", "by", "author", "answered_by", "removed_by", "created_by", "last_by", "resolved_by", "who", "voters", "owner", "owners", "you", "actor", "target", "member", "participants", "speakers", "to",
     "invited_by", "holder", "from",
 ];
 
@@ -502,6 +502,16 @@ impl Community {
                 Ok(wyvrn_service::profile::Field::Removed) => here.picture = None,
                 Ok(wyvrn_service::profile::Field::Unchanged) => {}
                 Err(refused) => return refuse(message, refused.code, &refused.comment),
+            }
+        }
+        if let Some(signature) = body.get("signature") {
+            said = true;
+            match signature {
+                Value::Null => self.store.set_signature(sender, None)?,
+                Value::String(text) if text.trim().is_empty() => self.store.set_signature(sender, None)?,
+                Value::String(text) if text.trim().chars().count() > 300 => return refuse(message, "e.p.msg.too-long", "A signature is at most 300 characters."),
+                Value::String(text) => self.store.set_signature(sender, Some(text.trim()))?,
+                _ => return refuse(message, "e.p.msg.invalid-profile", "A signature is text."),
             }
         }
         if let Some(requests) = body.get("requests") {

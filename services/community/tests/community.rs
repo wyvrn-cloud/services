@@ -3796,3 +3796,43 @@ async fn a_wiki_page_is_edited_together_each_change_kept_with_who_made_it_restor
     let left = owner.community("wiki-delete-page", json!({ "page": child })).await;
     assert_eq!(left["body"]["pages"].as_array().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn a_forum_is_a_board_with_sections_sticky_and_locked_threads_signatures_and_post_counts() {
+    let server = start_server("").await;
+    let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member]);
+    for peer in [&owner, &member] {
+        peer.community("join", json!({})).await;
+    }
+    let forum = owner.community("create-channel", json!({ "name": "board", "kind": "forum" })).await["body"]["created"].as_str().unwrap().to_string();
+    let set = owner.community("update-channel", json!({ "channel": forum, "sections": [{ "name": "Help", "description": "Ask here" }, { "id": "news", "name": "News" }] })).await;
+    let listed = set["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == forum.as_str()).unwrap().clone();
+    let help = listed["sections"][0]["id"].as_str().unwrap().to_string();
+    assert_eq!(listed["sections"][1], json!({ "id": "news", "name": "News" }), "{listed}");
+    assert_eq!(member.community("update-channel", json!({ "channel": forum, "sections": [] })).await["body"]["code"], "e.p.trust.not-authorized");
+
+    // A thread begun in a section; another section that isn't there, refused.
+    assert_eq!(member.community("post", json!({ "channel": forum, "title": "x", "content": "x", "section": "nope" })).await["body"]["code"], "e.p.msg.unknown-section");
+    member.community("post", json!({ "channel": forum, "id": "t1", "title": "My mic is quiet", "content": "Help!", "section": help })).await;
+    owner.community("post", json!({ "channel": forum, "content": "Turn it up", "thread": "t1" })).await;
+    let read = member.community("history-request", json!({ "channel": forum })).await;
+    let root = read["body"]["messages"].as_array().unwrap().iter().find(|p| p["id"] == "t1").unwrap().clone();
+    assert_eq!((root["grew"]["section"].as_str(), root["grew"]["last_by"].as_str()), (Some(help.as_str()), Some(server.id(&owner).as_str())), "{root}");
+
+    // Made sticky, locked and moved, by a moderator: then only they post in it.
+    assert_eq!(member.community("set-thread", json!({ "thread": "t1", "locked": true })).await["body"]["code"], "e.p.trust.not-authorized");
+    let changed = owner.community("set-thread", json!({ "thread": "t1", "sticky": true, "locked": true, "section": "news" })).await;
+    assert_eq!((changed["body"]["grew"]["sticky"].as_bool(), changed["body"]["grew"]["locked"].as_bool(), changed["body"]["grew"]["section"].as_str()), (Some(true), Some(true), Some("news")), "{changed}");
+    assert_eq!(member.community("post", json!({ "channel": forum, "content": "Still quiet", "thread": "t1" })).await["body"]["code"], "e.p.msg.locked");
+    assert_eq!(kind(&owner.community("post", json!({ "channel": forum, "content": "Locked now", "thread": "t1" })).await), "posted");
+
+    // A signature, in the member list; and how much each has posted.
+    member.community("set-member-profile", json!({ "signature": "— Bea, *mic enjoyer*" })).await;
+    let members = owner.community("members-request", json!({})).await;
+    let entry = members["body"]["members"].as_array().unwrap().iter().find(|m| m["signature"].is_string()).unwrap().clone();
+    assert_eq!(entry["signature"], "— Bea, *mic enjoyer*");
+    let stats = member.community("forum-stats-request", json!({ "channel": forum })).await;
+    let of = |peer: &Peer| stats["body"]["stats"].as_array().unwrap().iter().find(|s| s["member"] == server.id(peer).as_str()).unwrap()["posts"].as_i64().unwrap();
+    assert_eq!((of(&member), of(&owner)), (1, 2), "{stats}");
+}

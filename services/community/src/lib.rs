@@ -16,6 +16,7 @@ pub mod admin_flows;
 pub mod announcements;
 pub mod assistant;
 pub mod automod;
+pub mod board;
 pub mod discord;
 pub mod events;
 pub mod filters;

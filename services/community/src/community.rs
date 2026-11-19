@@ -451,6 +451,9 @@ impl Community {
         if let Some(tags) = &channel.forum {
             body["kind"] = json!(if channel.gallery { "gallery" } else { "forum" });
             body["tags"] = tags.clone();
+            if let Some(sections) = channel.sections.as_ref().filter(|s| s.as_array().is_some_and(|a| !a.is_empty())) {
+                body["sections"] = sections.clone();
+            }
         }
         if channel.announcement {
             body["announcement"] = json!(true);
@@ -852,6 +855,18 @@ impl Community {
             if let Some(name) = &thread.name {
                 grew["name"] = json!(name);
             }
+            if let Some(last_by) = &thread.last_by {
+                grew["last_by"] = json!(last_by);
+            }
+            if thread.sticky {
+                grew["sticky"] = json!(true);
+            }
+            if thread.locked {
+                grew["locked"] = json!(true);
+            }
+            if let Some(section) = &thread.section {
+                grew["section"] = json!(section);
+            }
             body["grew"] = grew;
         }
         body
@@ -1122,6 +1137,9 @@ impl Community {
         if let Some(left_at) = member.left_at.filter(|_| !member.joined) {
             listed["left_at"] = json!(left_at);
         }
+        if let Some(signature) = self.store.signature(&member.did)? {
+            listed["signature"] = json!(signature);
+        }
         Ok(listed)
     }
 
@@ -1241,6 +1259,19 @@ impl Community {
             // answer to a thread's first post is in its thread too.
             None => answered.as_ref().and_then(|post| post.thread.clone().or_else(|| (channel.forum.is_some() && post.grew.is_some()).then(|| post.id.clone()))),
         };
+        // A locked thread takes posts only from whoever manages them.
+        let locked = thread.as_deref().map(|id| self.store.thread(id)).transpose()?.flatten().is_some_and(|t| t.locked);
+        if locked && !self.may_in(sender, &channel, "manage_messages")? {
+            return refuse(message, "e.p.msg.locked", "This thread is locked.");
+        }
+        // A forum thread begun in one of its sections.
+        let section = match body["section"].as_str() {
+            Some(id) if thread.is_none() && channel.forum.is_some() => match channel.sections.as_ref().and_then(|s| s.as_array()).is_some_and(|s| s.iter().any(|x| x["id"] == id)) {
+                true => Some(id.to_string()),
+                false => return refuse(message, "e.p.msg.unknown-section", "There is no such section in this forum."),
+            },
+            _ => None,
+        };
         let extra = match crate::posting::read_extra(body, &channel, thread.is_some(), now) {
             Ok(extra) => extra,
             Err((code, why)) => return refuse(message, code, &why),
@@ -1278,6 +1309,9 @@ impl Community {
         if begins_thread {
             let title = extra.as_ref().and_then(|extra| extra["title"].as_str()).map(str::to_string);
             self.store.add_thread(&post.id, &channel.id, title.as_deref(), sender, now)?;
+            if section.is_some() {
+                self.store.set_thread_flags(&post.id, false, false, section.as_deref())?;
+            }
         }
         // Whoever posts in a thread, or begins one, follows it.
         if let Some(followed) = thread.as_deref().or(begins_thread.then_some(post.id.as_str())) {
@@ -1410,6 +1444,9 @@ impl Community {
             return Ok(outcome);
         }
         if let Some(outcome) = self.handle_wiki_message(&member, message, now)? {
+            return Ok(outcome);
+        }
+        if let Some(outcome) = self.handle_board_message(&member, message, now)? {
             return Ok(outcome);
         }
 
@@ -1560,6 +1597,18 @@ impl Community {
                     match clean_voice(given, Some(held)) {
                         Ok(voice) => self.store.set_channel_voice(&channel.id, &voice)?,
                         Err(why) => return refuse(message, "e.p.msg.invalid-voice", why),
+                    }
+                }
+                if let Some(given) = body.get("sections").filter(|v| !v.is_null()) {
+                    if channel.forum.is_none() {
+                        return refuse(message, "e.p.msg.invalid-sections", "Only a forum has sections.");
+                    }
+                    if !self.powers(sender)?.has("manage_channels") {
+                        return refuse(message, "e.p.trust.not-authorized", "A forum's sections take Manage channels.");
+                    }
+                    match crate::board::read_sections(given) {
+                        Ok(sections) => self.store.set_forum_sections(&channel.id, &sections)?,
+                        Err(why) => return refuse(message, "e.p.msg.invalid-sections", why),
                     }
                 }
                 if let Some(given) = body.get("tags").filter(|v| !v.is_null()) {

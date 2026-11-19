@@ -69,6 +69,8 @@ pub struct Channel {
     pub form: Option<Value>,
     /// Whether it is a wiki (wiki.rs).
     pub wiki: bool,
+    /// A forum's sections, its sub-forums (`[{ id, name, description? }]`).
+    pub sections: Option<Value>,
     /// Its place in the order an admin set, if one did, and its category.
     pub position: Option<i64>,
     pub category: Option<String>,
@@ -284,6 +286,14 @@ pub struct Thread {
     pub count: i64,
     /// When its last post was posted.
     pub last_at: Option<i64>,
+    /// Who posted last (a DID).
+    pub last_by: Option<String>,
+    /// Listed first, in a forum.
+    pub sticky: bool,
+    /// Only those who manage posts post in it.
+    pub locked: bool,
+    /// The forum section it is in.
+    pub section: Option<String>,
 }
 
 /// A role (community/1.0's roles): a name, permissions and a rank, `position`,
@@ -452,7 +462,8 @@ const CHANNEL_COLUMNS: &str = "id, name, topic, closed, created_at, created_by, 
     (SELECT COUNT(*) FROM gallery_channels WHERE gallery_channels.channel = channels.id), \
     (SELECT COUNT(*) FROM calendar_channels WHERE calendar_channels.channel = channels.id), \
     (SELECT form FROM form_channels WHERE form_channels.channel = channels.id), \
-    (SELECT COUNT(*) FROM wiki_channels WHERE wiki_channels.channel = channels.id)";
+    (SELECT COUNT(*) FROM wiki_channels WHERE wiki_channels.channel = channels.id), \
+    (SELECT sections FROM forum_sections WHERE forum_sections.channel = channels.id)";
 
 fn member_from(row: &Row) -> Result<Member> {
     let role: String = row.get(1)?;
@@ -524,6 +535,7 @@ fn channel_from(row: &Row) -> Result<Channel> {
         calendar: row.get::<Option<i64>>(14)?.unwrap_or(0) > 0,
         form: json_from(row.get(15)?),
         wiki: row.get::<Option<i64>>(16)?.unwrap_or(0) > 0,
+        sections: json_from(row.get(17)?),
     })
 }
 
@@ -993,6 +1005,22 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
     -- is whose on a page; and the comments on its text.
     CREATE TABLE IF NOT EXISTS wiki_channels (
         channel TEXT PRIMARY KEY
+    );
+    -- Forums as message boards (forums_board.rs): a forum's sections, a thread's
+    -- standing, and each member's signature.
+    CREATE TABLE IF NOT EXISTS forum_sections (
+        channel TEXT PRIMARY KEY,
+        sections TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS thread_flags (
+        thread TEXT PRIMARY KEY,
+        sticky INTEGER NOT NULL DEFAULT 0,
+        locked INTEGER NOT NULL DEFAULT 0,
+        section TEXT
+    );
+    CREATE TABLE IF NOT EXISTS member_signatures (
+        did TEXT PRIMARY KEY,
+        signature TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS wiki_pages (
         id TEXT PRIMARY KEY,
@@ -1546,6 +1574,20 @@ fn schema() -> Schema {
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS wiki_channels (
                 channel VARCHAR(255) NOT NULL PRIMARY KEY
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS forum_sections (
+                channel VARCHAR(255) NOT NULL PRIMARY KEY,
+                sections MEDIUMTEXT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS thread_flags (
+                thread VARCHAR(255) NOT NULL PRIMARY KEY,
+                sticky BIGINT NOT NULL DEFAULT 0,
+                locked BIGINT NOT NULL DEFAULT 0,
+                section VARCHAR(64)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS member_signatures (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                signature TEXT NOT NULL
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS wiki_pages (
                 id VARCHAR(64) NOT NULL PRIMARY KEY,
@@ -2839,11 +2881,28 @@ impl Store {
         let threads = db.query(
             &format!(
                 "SELECT id, channel, name, created_by, created_at, (SELECT COUNT(*) FROM post_state WHERE post_state.thread = threads.id), \
-                 (SELECT MAX(posted_at) FROM posts WHERE posts.id IN (SELECT post FROM post_state WHERE post_state.thread = threads.id)) FROM threads WHERE id IN ({})",
+                 (SELECT MAX(posted_at) FROM posts WHERE posts.id IN (SELECT post FROM post_state WHERE post_state.thread = threads.id)), \
+                 (SELECT author_did FROM posts WHERE posts.id IN (SELECT post FROM post_state WHERE post_state.thread = threads.id) ORDER BY serial DESC LIMIT 1), \
+                 (SELECT sticky FROM thread_flags WHERE thread_flags.thread = threads.id), (SELECT locked FROM thread_flags WHERE thread_flags.thread = threads.id), \
+                 (SELECT section FROM thread_flags WHERE thread_flags.thread = threads.id) FROM threads WHERE id IN ({})",
                 marks(ids.len())
             ),
             &ids,
-            |row| Ok(Thread { id: row.get(0)?, channel: row.get(1)?, name: row.get(2)?, created_by: row.get(3)?, created_at: row.get(4)?, count: row.get(5)?, last_at: row.get(6)? }),
+            |row| {
+                Ok(Thread {
+                    id: row.get(0)?,
+                    channel: row.get(1)?,
+                    name: row.get(2)?,
+                    created_by: row.get(3)?,
+                    created_at: row.get(4)?,
+                    count: row.get(5)?,
+                    last_at: row.get(6)?,
+                    last_by: row.get(7)?,
+                    sticky: row.get::<Option<i64>>(8)?.unwrap_or(0) != 0,
+                    locked: row.get::<Option<i64>>(9)?.unwrap_or(0) != 0,
+                    section: row.get(10)?,
+                })
+            },
         )?;
         for thread in threads {
             if let Some(n) = at(&thread.id) {
@@ -2973,10 +3032,66 @@ impl Store {
     pub fn thread(&self, id: &str) -> Result<Option<Thread>> {
         self.db.lock().query_row(
             "SELECT id, channel, name, created_by, created_at, (SELECT COUNT(*) FROM post_state WHERE post_state.thread = threads.id), \
-             (SELECT MAX(posted_at) FROM posts WHERE posts.id IN (SELECT post FROM post_state WHERE post_state.thread = threads.id)) FROM threads WHERE id = ?1",
+             (SELECT MAX(posted_at) FROM posts WHERE posts.id IN (SELECT post FROM post_state WHERE post_state.thread = threads.id)), \
+             (SELECT author_did FROM posts WHERE posts.id IN (SELECT post FROM post_state WHERE post_state.thread = threads.id) ORDER BY serial DESC LIMIT 1), \
+             (SELECT sticky FROM thread_flags WHERE thread_flags.thread = threads.id), (SELECT locked FROM thread_flags WHERE thread_flags.thread = threads.id), \
+             (SELECT section FROM thread_flags WHERE thread_flags.thread = threads.id) FROM threads WHERE id = ?1",
             params![id],
-            |row| Ok(Thread { id: row.get(0)?, channel: row.get(1)?, name: row.get(2)?, created_by: row.get(3)?, created_at: row.get(4)?, count: row.get(5)?, last_at: row.get(6)? }),
+            |row| {
+                Ok(Thread {
+                    id: row.get(0)?,
+                    channel: row.get(1)?,
+                    name: row.get(2)?,
+                    created_by: row.get(3)?,
+                    created_at: row.get(4)?,
+                    count: row.get(5)?,
+                    last_at: row.get(6)?,
+                    last_by: row.get(7)?,
+                    sticky: row.get::<Option<i64>>(8)?.unwrap_or(0) != 0,
+                    locked: row.get::<Option<i64>>(9)?.unwrap_or(0) != 0,
+                    section: row.get(10)?,
+                })
+            },
         )
+    }
+
+    /// A thread's standing in a forum: sticky, locked, its section.
+    pub fn set_thread_flags(&self, thread: &str, sticky: bool, locked: bool, section: Option<&str>) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO thread_flags (thread, sticky, locked, section) VALUES (?1, ?2, ?3, ?4)", params![thread, sticky as i64, locked as i64, section])?;
+        Ok(())
+    }
+
+    pub fn set_forum_sections(&self, channel: &str, sections: &Value) -> Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO forum_sections (channel, sections) VALUES (?1, ?2)", params![channel, sections.to_string()])?;
+        Ok(())
+    }
+
+    pub fn signature(&self, did: &str) -> Result<Option<String>> {
+        self.db.lock().query_row("SELECT signature FROM member_signatures WHERE did = ?1", params![did], |row| row.get(0))
+    }
+
+    pub fn set_signature(&self, did: &str, signature: Option<&str>) -> Result<()> {
+        let mut db = self.db.lock();
+        db.execute("DELETE FROM member_signatures WHERE did = ?1", params![did])?;
+        if let Some(signature) = signature {
+            db.execute("INSERT INTO member_signatures (did, signature) VALUES (?1, ?2)", params![did, signature])?;
+        }
+        Ok(())
+    }
+
+    /// How many posts each member made in `channels` (the community's forums), of
+    /// those who posted in `in_channel`.
+    pub fn forum_post_counts(&self, channels: &[String], in_channel: &str) -> Result<Vec<(String, i64)>> {
+        let mut out = Vec::new();
+        let authors: Vec<String> = self.db.lock().query("SELECT DISTINCT author_did FROM posts WHERE channel = ?1 LIMIT 500", params![in_channel], |row| row.get(0))?;
+        for author in authors {
+            let mut count = 0i64;
+            for channel in channels {
+                count += self.db.lock().query_value::<i64>("SELECT COUNT(*) FROM posts WHERE channel = ?1 AND author_did = ?2", params![channel, author])?;
+            }
+            out.push((author, count));
+        }
+        Ok(out)
     }
 
     /// Grows a thread from the post `id`. `false` if one had grown from it already.
