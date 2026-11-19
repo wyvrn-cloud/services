@@ -61,6 +61,8 @@ pub struct Channel {
     pub forum: Option<Value>,
     /// Whether it is an announcement channel (announcements.rs).
     pub announcement: bool,
+    /// Whether it is a gallery: a forum each of whose posts is a picture or video.
+    pub gallery: bool,
     /// Its place in the order an admin set, if one did, and its category.
     pub position: Option<i64>,
     pub category: Option<String>,
@@ -385,7 +387,8 @@ const CHANNEL_COLUMNS: &str = "id, name, topic, closed, created_at, created_by, 
     (SELECT position FROM channel_order WHERE channel_order.channel = channels.id), \
     (SELECT category FROM channel_order WHERE channel_order.channel = channels.id), \
     (SELECT tags FROM channel_forum WHERE channel_forum.channel = channels.id), \
-    (SELECT COUNT(*) FROM announce_channels WHERE announce_channels.channel = channels.id)";
+    (SELECT COUNT(*) FROM announce_channels WHERE announce_channels.channel = channels.id), \
+    (SELECT COUNT(*) FROM gallery_channels WHERE gallery_channels.channel = channels.id)";
 
 fn member_from(row: &Row) -> Result<Member> {
     let role: String = row.get(1)?;
@@ -453,6 +456,7 @@ fn channel_from(row: &Row) -> Result<Channel> {
         category: row.get(10)?,
         forum: json_from(row.get(11)?),
         announcement: row.get::<Option<i64>>(12)?.unwrap_or(0) > 0,
+        gallery: row.get::<Option<i64>>(13)?.unwrap_or(0) > 0,
     })
 }
 
@@ -875,6 +879,11 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
     -- community, a Discord webhook, another service), what was last sent each of
     -- a post and as what it is known there, and what is waiting to be sent.
     CREATE TABLE IF NOT EXISTS announce_channels (
+        channel TEXT PRIMARY KEY
+    );
+    -- Forums that are galleries: each post a picture or video (community/1.0's
+    -- Gallery channels).
+    CREATE TABLE IF NOT EXISTS gallery_channels (
         channel TEXT PRIMARY KEY
     );
     CREATE TABLE IF NOT EXISTS announce_published (
@@ -1340,6 +1349,9 @@ fn schema() -> Schema {
                 sent_at BIGINT NOT NULL
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS announce_channels (
+                channel VARCHAR(255) NOT NULL PRIMARY KEY
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS gallery_channels (
                 channel VARCHAR(255) NOT NULL PRIMARY KEY
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS announce_published (
@@ -2979,6 +2991,16 @@ impl Store {
 
     pub fn is_announcement(&self, channel: &str) -> Result<bool> {
         Ok(self.db.lock().query_row("SELECT channel FROM announce_channels WHERE channel = ?1", params![channel], |row| row.get::<String>(0))?.is_some())
+    }
+
+    /// Makes a forum a gallery, or an ordinary forum again.
+    pub fn set_gallery(&self, channel: &str, on: bool) -> Result<()> {
+        let mut db = self.db.lock();
+        db.execute("DELETE FROM gallery_channels WHERE channel = ?1", params![channel])?;
+        if on {
+            db.execute("INSERT INTO gallery_channels (channel) VALUES (?1)", params![channel])?;
+        }
+        Ok(())
     }
 
     pub fn set_announcement(&self, channel: &str, on: bool) -> Result<()> {

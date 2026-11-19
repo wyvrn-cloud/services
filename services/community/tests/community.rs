@@ -2523,6 +2523,7 @@ fn discord_template(general_topic: &str, announcements: &str, with_old: bool) ->
         json!({ "id": 8, "type": 13, "name": "Town Hall", "position": 1, "parent_id": null, "user_limit": 0, "bitrate": 64000, "nsfw": false, "rate_limit_per_user": 0, "permission_overwrites": [] }),
         json!({ "id": 9, "type": 15, "name": "help", "position": 4, "parent_id": null, "topic": "", "nsfw": false, "rate_limit_per_user": 0, "permission_overwrites": [],
                 "available_tags": [{ "id": 1, "name": "Bug", "moderated": false, "emoji_id": null, "emoji_name": "🐛" }, { "id": 2, "name": "Idea", "moderated": false, "emoji_id": null, "emoji_name": null }] }),
+        json!({ "id": 12, "type": 16, "name": "art", "position": 6, "parent_id": null, "topic": "", "nsfw": false, "rate_limit_per_user": 0, "permission_overwrites": [], "available_tags": [] }),
     ];
     if with_old {
         channels.push(json!({ "id": 10, "type": 0, "name": "old-stuff", "position": 5, "parent_id": null, "topic": "", "nsfw": false, "rate_limit_per_user": 0, "permission_overwrites": [] }));
@@ -2585,7 +2586,7 @@ async fn an_owner_imports_a_discord_template_and_again_once_it_has_changed() {
     let read = advance(&owner, "d1", "read", json!({ "link": "https://discord.new/TESTCODE1234" })).await;
     assert_eq!(read["body"]["state"], "review", "{read}");
     let review = read["body"]["ui"].to_string();
-    for said in ["Import “Test Fort”", "To be made: 2 roles, 2 categories, 7 channels", "which stays", "#general", "age-restricted", "Embed Links", "Verification level"] {
+    for said in ["Import “Test Fort”", "To be made: 2 roles, 2 categories, 8 channels", "which stays", "#general", "age-restricted", "Embed Links", "Verification level"] {
         assert!(review.contains(said), "{said} in {review}");
     }
     // Asked, the first time, of what was here already: the community's name, what
@@ -2595,7 +2596,9 @@ async fn an_owner_imports_a_discord_template_and_again_once_it_has_changed() {
     assert_eq!(advance(&owner, "d1", "import", json!({})).await["body"]["code"], "guard_failed");
     let done = advance(&owner, "d1", "import", json!({ "choose-community-guild": "template", "choose-role-0": "template", "choose-channel-4": "template" })).await;
     assert_eq!(done["body"]["state"], "done", "{done}");
-    assert!(done["body"]["ui"].to_string().contains("11 made, 3 changed"), "{done}");
+    assert!(done["body"]["ui"].to_string().contains("12 made, 3 changed"), "{done}");
+    // Its media channel is a gallery here.
+    assert!(server.state.community.store.channels().unwrap().iter().any(|c| c.name == "art" && c.gallery));
     // Its announcement channel is one here.
     assert_eq!(server.state.community.store.channels().unwrap().iter().filter(|c| c.announcement).count(), 1);
 
@@ -2604,7 +2607,7 @@ async fn an_owner_imports_a_discord_template_and_again_once_it_has_changed() {
     assert_eq!(told["name"], "Test Fort");
     let names: Vec<&str> = told["channels"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
     // In Discord's order: those in no category first, text before voice; then by category.
-    assert_eq!(names, ["help", "old-stuff", "Town Hall", "📜rules", "announcements", "general"], "{told}");
+    assert_eq!(names, ["help", "old-stuff", "art", "Town Hall", "📜rules", "announcements", "general"], "{told}");
     let channel = |body: &Value, name: &str| body["channels"].as_array().unwrap().iter().find(|c| c["name"] == name).unwrap().clone();
     assert_eq!(channel(&told, "general")["id"], general.as_str());
     assert_eq!(channel(&told, "general")["topic"], "Say hi");
@@ -3514,4 +3517,30 @@ async fn an_announcement_channels_posts_go_to_a_discord_webhook_as_discord_takes
     owner.ask("https://wyvrn.app/message-edits/1.0/delete", json!({ "to": { "id": "n1" } })).await;
     let (method, message, _) = next().await;
     assert_eq!((method.as_str(), message.as_str()), ("DELETE", "9001"));
+}
+
+#[tokio::test]
+async fn a_gallery_is_a_forum_of_pictures_each_post_with_one_and_its_title_optional() {
+    let server = start_server("").await;
+    let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member]);
+    assert_eq!(member.community("create-channel", json!({ "name": "art", "kind": "gallery" })).await["body"]["code"], "e.p.trust.not-authorized");
+    let made = owner.community("create-channel", json!({ "name": "art", "kind": "gallery", "tags": [{ "name": "Fan art" }] })).await;
+    let gallery = made["body"]["created"].as_str().unwrap().to_string();
+    let listed = made["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == gallery.as_str()).unwrap().clone();
+    assert_eq!((listed["kind"].as_str(), listed["tags"][0]["name"].as_str()), (Some("gallery"), Some("Fan art")), "{listed}");
+    // Words alone aren't a gallery post; a picture is, with or without a title.
+    assert_eq!(member.community("post", json!({ "channel": gallery, "content": "Look!" })).await["body"]["code"], "e.p.msg.media-needed");
+    let picture = |id: &str| json!({ "channel": gallery, "id": id, "content": "My drawing", "media": [{ "attachment": "f1" }], "attachments": [{ "id": "f1", "media_type": "image/png", "data": { "links": ["https://files.example/f/x"], "hash": "Qm1" } }] });
+    assert_eq!(kind(&member.community("post", picture("g1")).await), "posted");
+    let mut titled = picture("g2");
+    titled["title"] = json!("Sunset");
+    assert_eq!(kind(&member.community("post", titled).await), "posted");
+    // Each begins a thread, which is answered in words.
+    member.community("post", json!({ "channel": gallery, "content": "Lovely", "thread": "g1" })).await;
+    let history = member.community("history-request", json!({ "channel": gallery })).await;
+    let posts = history["body"]["messages"].as_array().unwrap();
+    let first = posts.iter().find(|p| p["id"] == "g1").unwrap();
+    assert!(first.get("title").is_none() && first["grew"]["count"] == 1, "{first}");
+    assert_eq!(posts.iter().find(|p| p["id"] == "g2").unwrap()["title"], "Sunset");
 }

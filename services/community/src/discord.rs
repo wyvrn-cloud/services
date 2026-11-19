@@ -289,6 +289,7 @@ fn field_label(field: &str) -> &str {
         "limit" => "how many may be in it",
         "stage" => "whether it is a stage",
         "announcement" => "whether it is an announcement channel",
+        "gallery" => "whether it is a gallery",
         "tags" => "tags",
         "overrides" => "its permissions",
         "permissions" => "permissions",
@@ -362,6 +363,7 @@ impl Community {
         }
         if let Some(tags) = &channel.forum {
             here["tags"] = json!(tags.as_array().into_iter().flatten().map(|t| json!({ "name": t["name"], "emoji": t["emoji"] })).collect::<Vec<_>>());
+            here["gallery"] = json!(channel.gallery);
         }
         if kind == "text" {
             here["announcement"] = json!(channel.announcement);
@@ -530,9 +532,6 @@ impl Community {
             let raw_name = channel["name"].as_str().unwrap_or("channel");
             let name = if kind == "voice" { line(&channel["name"], crate::community::MAX_CHANNEL_NAME).unwrap_or_else(|| "Voice".into()) } else { text_name(raw_name) };
             let shown_name = if kind == "voice" { format!("🔊{name}") } else { format!("#{name}") };
-            if as_on_discord == Some("media") {
-                miss(format!("{shown_name} is a media channel on Discord: a forum here for now"));
-            }
             if kind == "voice" && self.voice.is_none() {
                 miss(format!("{shown_name}: this server has no voice channels"));
                 continue;
@@ -577,6 +576,8 @@ impl Community {
                 want["announcement"] = json!(as_on_discord == Some("announcement"));
             }
             if kind == "forum" {
+                // A media channel on Discord is a gallery here.
+                want["gallery"] = json!(as_on_discord == Some("media"));
                 let tags: Vec<Value> = channel["available_tags"].as_array().into_iter().flatten().take(20).map(|t| json!({ "name": line(&t["name"], 20), "emoji": t["emoji_name"].as_str().filter(|e| crate::community::is_emoji(e)) })).collect();
                 want["tags"] = json!(tags);
                 for (field, says) in [("default_reaction_emoji", "A forum's default reaction"), ("default_sort_order", "A forum's order"), ("default_forum_layout", "A forum's layout"), ("default_thread_rate_limit_per_user", "A forum's slow mode for posts in it")] {
@@ -1097,6 +1098,9 @@ impl Community {
                 }
                 if want["kind"] == "forum" {
                     self.store.set_forum(&id, &crate::posting::read_tags(&tags_given(&want["tags"], None), None).unwrap_or_else(|_| json!([])))?;
+                    if want["gallery"] == true {
+                        self.store.set_gallery(&id, true)?;
+                    }
                 }
                 if want["announcement"] == true {
                     self.store.set_announcement(&id, true)?;
@@ -1192,6 +1196,10 @@ impl Community {
                         self.outbox.lock().unwrap_or_else(|p| p.into_inner()).extend(notices);
                     }
                     self.store.set_announcement(local, want["announcement"] == true)?;
+                }
+                // Imported before as a forum, and a media channel on Discord: a gallery now.
+                if has("gallery") && channel.forum.is_some() {
+                    self.store.set_gallery(local, want["gallery"] == true)?;
                 }
                 if has("tags") && channel.forum.is_some() {
                     let tags = crate::posting::read_tags(&tags_given(&want["tags"], channel.forum.as_ref()), channel.forum.as_ref()).unwrap_or_else(|_| json!([]));

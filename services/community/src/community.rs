@@ -444,7 +444,7 @@ impl Community {
             body["category"] = json!(category);
         }
         if let Some(tags) = &channel.forum {
-            body["kind"] = json!("forum");
+            body["kind"] = json!(if channel.gallery { "gallery" } else { "forum" });
             body["tags"] = tags.clone();
         }
         if channel.announcement {
@@ -1413,15 +1413,16 @@ impl Community {
                             Err(why) => return refuse(message, "e.p.msg.invalid-voice", why),
                         }
                     }
-                    Some("forum") => {
+                    Some("forum") | Some("gallery") => {
                         if !self.powers(sender)?.has("manage_channels") {
-                            return refuse(message, "e.p.trust.not-authorized", "Opening a forum takes Manage channels.");
+                            return refuse(message, "e.p.trust.not-authorized", "Opening a forum or a gallery takes Manage channels.");
                         }
                         None
                     }
-                    Some(_) => return refuse(message, "e.p.msg.invalid-kind", "A channel is a text channel, a forum or a voice channel."),
+                    Some(_) => return refuse(message, "e.p.msg.invalid-kind", "A channel is a text channel, a forum, a gallery or a voice channel."),
                 };
-                let forum = body["kind"].as_str() == Some("forum");
+                let gallery = body["kind"].as_str() == Some("gallery");
+                let forum = gallery || body["kind"].as_str() == Some("forum");
                 // An announcement channel is a text channel others follow.
                 let announcement = body["announcement"] == true;
                 if announcement && (voice.is_some() || forum) {
@@ -1457,6 +1458,9 @@ impl Community {
                         None => json!([]),
                     };
                     self.store.set_forum(&id, &tags)?;
+                    if gallery {
+                        self.store.set_gallery(&id, true)?;
+                    }
                 }
                 if announcement {
                     self.store.set_announcement(&id, true)?;

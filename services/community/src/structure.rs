@@ -184,7 +184,7 @@ impl Community {
             .trashed_channels()?
             .into_iter()
             .map(|(channel, at, by)| {
-                let kind = if channel.voice.is_some() { "voice" } else if channel.forum.is_some() { "forum" } else { "text" };
+                let kind = if channel.voice.is_some() { "voice" } else if channel.gallery { "gallery" } else if channel.forum.is_some() { "forum" } else { "text" };
                 json!({ "id": channel.id, "name": channel.name, "kind": kind, "deleted_at": at, "by": by, "purge_at": at + TRASH_KEPT_FOR })
             })
             .collect();

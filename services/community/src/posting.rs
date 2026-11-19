@@ -68,10 +68,20 @@ pub fn read_extra(body: &Value, channel: &Channel, in_thread: bool, now: i64) ->
     }
     if let Some(tags) = &channel.forum {
         if !in_thread {
-            let title = line(&body["title"], MAX_TITLE).ok_or(("e.p.msg.title-needed", "A post in a forum begins a thread, and needs a title.".to_string()))?;
+            // A gallery's post is a picture or video, its title optional.
+            if channel.gallery && !extra.contains_key("media") {
+                return Err(("e.p.msg.media-needed", "A post in a gallery has a picture or a video.".to_string()));
+            }
+            let title = match line(&body["title"], MAX_TITLE) {
+                Some(title) => Some(title),
+                None if channel.gallery => None,
+                None => return Err(("e.p.msg.title-needed", "A post in a forum begins a thread, and needs a title.".to_string())),
+            };
             let offered: Vec<&str> = tags.as_array().into_iter().flatten().filter_map(|t| t["id"].as_str()).collect();
             let chosen: Vec<String> = body["tags"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|t| offered.contains(t)).take(MAX_POST_TAGS).map(str::to_string).collect();
-            extra.insert("title".into(), json!(title));
+            if let Some(title) = title {
+                extra.insert("title".into(), json!(title));
+            }
             if !chosen.is_empty() {
                 extra.insert("tags".into(), json!(chosen));
             }
