@@ -162,6 +162,44 @@ fn unmapped(bits: u64) -> Vec<&'static str> {
     PERMISSIONS.iter().filter(|(bit, _, ours)| bits >> bit & 1 == 1 && ours.is_empty()).map(|(_, name, _)| *name).collect()
 }
 
+/// What Discord left out of the template, said for the owner: a template numbers
+/// the server's channels 1, 2, 3, ... and skips those it leaves out (a community
+/// server's announcement channels, at least), saying nothing else of them. So
+/// the skipped numbers are how many, and the channels around each where.
+fn left_out(template: &Value) -> Option<String> {
+    let channels = template["serialized_source_guild"]["channels"].as_array()?;
+    let by_id: HashMap<i64, &Value> = channels.iter().filter_map(|c| Some((c["id"].as_i64()?, c))).collect();
+    let last = *by_id.keys().max()?;
+    let mut places: Vec<(String, usize)> = Vec::new();
+    let mut skipped = 0;
+    for id in 1..last {
+        if by_id.contains_key(&id) {
+            continue;
+        }
+        skipped += 1;
+        // Where: after the channel numbered before it, or at the top of its category.
+        let before = (1..id).rev().find_map(|i| by_id.get(&i));
+        let place = match before {
+            Some(c) if kind_of(c).0 == "category" => format!("at the top of {}", c["name"].as_str().unwrap_or("a category")),
+            Some(c) => format!("after #{}", c["name"].as_str().unwrap_or("?")),
+            None => "at the top".to_string(),
+        };
+        match places.last_mut() {
+            Some((at, n)) if *at == place => *n += 1,
+            _ => places.push((place, 1)),
+        }
+    }
+    if skipped == 0 {
+        return None;
+    }
+    let places: Vec<String> = places.into_iter().map(|(at, n)| if n == 1 { at } else { format!("{n} {at}") }).collect();
+    let them = if skipped == 1 { "1 channel".to_string() } else { format!("{skipped} channels") };
+    Some(format!(
+        "Discord left {them} out of this template ({}), and says nothing of what they were: it leaves out a community server's announcement channels. Make them here by hand (New channel, Announcements).",
+        places.join("; ")
+    ))
+}
+
 /// A Discord channel's kind: `text`, `voice`, `forum` or `category`, and what it
 /// is on Discord where that isn't the same (`announcement`, `stage`, `media`).
 fn kind_of(channel: &Value) -> (&'static str, Option<&'static str>) {
@@ -739,6 +777,9 @@ impl Community {
         ) }));
         if let Some(warning) = self.room_warning(plan) {
             items.push(json!({ "type": "information", "text": warning }));
+        }
+        if let Some(note) = left_out(template) {
+            items.push(json!({ "type": "information", "text": note }));
         }
         let mut fields: Vec<Value> = Vec::new();
 
@@ -1331,6 +1372,29 @@ fn strings(value: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn says_where_discord_left_channels_out_of_a_template() {
+        let channel = |id: i64, kind: i64, name: &str| json!({ "id": id, "type": kind, "name": name });
+        let template = |channels: Vec<Value>| json!({ "serialized_source_guild": { "channels": channels } });
+        // As the Frosty Pillow Fort's: 2, 4, 5 and 9, 10 skipped.
+        let fort = template(vec![
+            channel(1, 0, "newcomers"),
+            channel(3, 0, "unlock-all-channels"),
+            channel(6, 0, "📜rules"),
+            channel(7, 4, "Special VCs"),
+            channel(8, 0, "nyaflix"),
+            channel(11, 2, "Nyaflix"),
+        ]);
+        // (8 is after the category; 9 and 10 follow #nyaflix.)
+        assert_eq!(
+            left_out(&fort).unwrap(),
+            "Discord left 5 channels out of this template (after #newcomers; 2 after #unlock-all-channels; 2 after #nyaflix), and says nothing of what they were: it leaves out a community server's announcement channels. Make them here by hand (New channel, Announcements)."
+        );
+        let top = template(vec![channel(2, 4, "Info"), channel(4, 0, "general")]);
+        assert_eq!(left_out(&top).unwrap().split(" (").nth(1).unwrap().split(')').next().unwrap(), "at the top; at the top of Info");
+        assert_eq!(left_out(&template(vec![channel(1, 0, "general"), channel(2, 2, "Lounge")])), None);
+    }
 
     #[test]
     fn a_templates_code_is_read_from_its_link() {
