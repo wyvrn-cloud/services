@@ -1341,28 +1341,14 @@ async fn media(State(state): State<Arc<AppState>>, Path((post_id, n)): Path<(Str
         return nothing();
     }
     let extra = post.extra.unwrap_or(Value::Null);
-    let Some(item) = extra["media"].as_array().and_then(|m| m.get(n)) else { return nothing() };
-    let Some(attachment) = extra["attachments"].as_array().into_iter().flatten().find(|a| a["id"] == item["attachment"]) else { return nothing() };
-    let (Some(files), Some(link)) = (&state.community.files, attachment["data"]["links"].as_array().and_then(|l| l.first()).and_then(Value::as_str)) else { return nothing() };
-    // Only what is kept here: a link elsewhere is never fetched.
-    let Some(web) = web_of(&state) else { return nothing() };
-    let own = format!("{}f/", web.server_url);
-    let Some(file_id) = link.strip_prefix(&own).filter(|id| !id.is_empty() && !id.contains('/')) else { return nothing() };
-    let Ok(stored) = files.host.stored(file_id, wyvrn_service::now()) else { return nothing() };
-    if stored.byte_count > MAX_MEDIA_BYTES {
-        return nothing();
-    }
-    let Ok(bytes) = tokio::fs::read(files.host.store.path(file_id)).await else { return nothing() };
-    let bytes = match item.get("ciphering").filter(|c| !c.is_null()) {
-        Some(ciphering) => match open(&bytes, ciphering) {
-            Some(plain) => plain,
-            None => return page_error(StatusCode::UNPROCESSABLE_ENTITY, "Can't be opened", "This file isn't what the post says it is."),
-        },
-        None => bytes,
+    let Some(files) = &state.community.files else { return nothing() };
+    let (bytes, media_type, name) = match files.carried(&extra, n, MAX_MEDIA_BYTES).await {
+        crate::files::Carried::Opened { bytes, media_type, name } => (bytes, media_type, name),
+        crate::files::Carried::NotHere => return nothing(),
+        crate::files::Carried::Unreadable => return page_error(StatusCode::UNPROCESSABLE_ENTITY, "Can't be opened", "This file isn't what the post says it is."),
     };
-    let media_type = attachment["media_type"].as_str().unwrap_or("application/octet-stream");
+    let media_type = media_type.as_str();
     let shown = inline_type(media_type);
-    let name: String = attachment["filename"].as_str().unwrap_or("file").chars().filter(|c| !c.is_control() && *c != '"' && *c != '\\').take(120).collect();
     let mut response = bytes.into_response();
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(if shown { media_type } else { "application/octet-stream" }).unwrap_or(HeaderValue::from_static("application/octet-stream")));
@@ -1373,27 +1359,6 @@ async fn media(State(state): State<Arc<AppState>>, Path((post_id, n)): Path<(Str
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(if since.is_some() { "public, max-age=3600" } else { "private, max-age=3600" }));
     headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; sandbox"));
     as_page(response)
-}
-
-/// A file encrypted as wyvrn-chat encrypts what it puts at a host: AES-256-GCM,
-/// the tag apart from the ciphertext (chat-message/1.0's `ciphering`).
-fn open(ciphertext: &[u8], ciphering: &Value) -> Option<Vec<u8>> {
-    use aes_gcm::aead::{Aead, KeyInit};
-    if ciphering["algorithm"] != "aes-256-gcm" {
-        return None;
-    }
-    let hex = |name: &str| -> Option<Vec<u8>> {
-        let text = ciphering["parameters"][name].as_str()?;
-        (0..text.len()).step_by(2).map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok()).collect()
-    };
-    let (key, iv, tag) = (hex("key")?, hex("iv")?, hex("tag")?);
-    if key.len() != 32 || iv.len() != 12 || tag.len() != 16 {
-        return None;
-    }
-    let cipher = aes_gcm::Aes256Gcm::new_from_slice(&key).ok()?;
-    let mut sealed = ciphertext.to_vec();
-    sealed.extend_from_slice(&tag);
-    cipher.decrypt(aes_gcm::Nonce::from_slice(&iv), sealed.as_slice()).ok()
 }
 
 fn internal(error: anyhow::Error) -> Response {
@@ -1414,11 +1379,11 @@ mod tests {
         let (ciphertext, tag) = sealed.split_at(sealed.len() - 16);
         let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let ciphering = json!({ "algorithm": "aes-256-gcm", "parameters": { "key": hex(&key), "iv": hex(&iv), "tag": hex(tag) } });
-        assert_eq!(open(ciphertext, &ciphering).as_deref(), Some(b"a picture".as_slice()));
+        assert_eq!(crate::files::open_sealed(ciphertext, &ciphering).as_deref(), Some(b"a picture".as_slice()));
         let mut changed = ciphertext.to_vec();
         changed[0] ^= 1;
-        assert_eq!(open(&changed, &ciphering), None, "changed at the host: refused");
-        assert_eq!(open(ciphertext, &json!({ "algorithm": "rot13" })), None);
+        assert_eq!(crate::files::open_sealed(&changed, &ciphering), None, "changed at the host: refused");
+        assert_eq!(crate::files::open_sealed(ciphertext, &json!({ "algorithm": "rot13" })), None);
     }
 
     #[test]

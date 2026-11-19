@@ -28,7 +28,73 @@ pub struct Files {
     uploads: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
+/// A file a post carries, as a member's app would open it.
+pub enum Carried {
+    Opened { bytes: Vec<u8>, media_type: String, name: String },
+    /// There is no such file, it is kept somewhere else (a link elsewhere is never
+    /// fetched), or it is bigger than was asked for.
+    NotHere,
+    /// Kept here, and not what the post says it is.
+    Unreadable,
+}
+
+/// A file encrypted as wyvrn-chat encrypts what it puts at a host: AES-256-GCM,
+/// the key, nonce and tag in the post's `ciphering` (hex), the tag not in the file.
+pub fn open_sealed(ciphertext: &[u8], ciphering: &Value) -> Option<Vec<u8>> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    if ciphering["algorithm"] != "aes-256-gcm" {
+        return None;
+    }
+    let hex = |name: &str| -> Option<Vec<u8>> {
+        let text = ciphering["parameters"][name].as_str()?;
+        (0..text.len()).step_by(2).map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok()).collect()
+    };
+    let (key, iv, tag) = (hex("key")?, hex("iv")?, hex("tag")?);
+    if key.len() != 32 || iv.len() != 12 || tag.len() != 16 {
+        return None;
+    }
+    let cipher = aes_gcm::Aes256Gcm::new_from_slice(&key).ok()?;
+    let mut sealed = ciphertext.to_vec();
+    sealed.extend_from_slice(&tag);
+    cipher.decrypt(aes_gcm::Nonce::from_slice(&iv), sealed.as_slice()).ok()
+}
+
 impl Files {
+    /// How big the `n`th file a post carries is, if it is kept here.
+    pub fn carried_size(&self, extra: &Value, n: usize) -> Option<u64> {
+        let item = extra["media"].as_array()?.get(n)?;
+        let attachment = extra["attachments"].as_array()?.iter().find(|a| a["id"] == item["attachment"])?;
+        let link = attachment["data"]["links"].as_array()?.first()?.as_str()?;
+        let file_id = link.strip_prefix(&self.host.download_url("")).filter(|id| !id.is_empty() && !id.contains('/'))?;
+        Some(self.host.stored(file_id, wyvrn_service::now()).ok()?.byte_count)
+    }
+
+    /// The `n`th file a post carries (its `extra`: chat-message/1.0's `media` and
+    /// `attachments`), opened with the key the post gives, if it is kept here and is
+    /// at most `most` bytes. What the web view shows and an announcement sends on.
+    pub async fn carried(&self, extra: &Value, n: usize, most: u64) -> Carried {
+        let Some(item) = extra["media"].as_array().and_then(|m| m.get(n)) else { return Carried::NotHere };
+        let Some(attachment) = extra["attachments"].as_array().into_iter().flatten().find(|a| a["id"] == item["attachment"]) else { return Carried::NotHere };
+        let Some(link) = attachment["data"]["links"].as_array().and_then(|l| l.first()).and_then(Value::as_str) else { return Carried::NotHere };
+        let own = self.host.download_url("");
+        let Some(file_id) = link.strip_prefix(&own).filter(|id| !id.is_empty() && !id.contains('/')) else { return Carried::NotHere };
+        let Ok(stored) = self.host.stored(file_id, wyvrn_service::now()) else { return Carried::NotHere };
+        if stored.byte_count > most {
+            return Carried::NotHere;
+        }
+        let Ok(bytes) = tokio::fs::read(self.host.store.path(file_id)).await else { return Carried::NotHere };
+        let bytes = match item.get("ciphering").filter(|c| !c.is_null()) {
+            Some(ciphering) => match open_sealed(&bytes, ciphering) {
+                Some(plain) => plain,
+                None => return Carried::Unreadable,
+            },
+            None => bytes,
+        };
+        let media_type = attachment["media_type"].as_str().unwrap_or("application/octet-stream").to_string();
+        let name: String = attachment["filename"].as_str().unwrap_or("file").chars().filter(|c| !c.is_control() && *c != '"' && *c != '\\').take(120).collect();
+        Carried::Opened { bytes, media_type, name }
+    }
+
     /// Files whose records are at `location` and bytes in `config.dir`.
     pub fn open(config: &FilesConfig, location: &wyvrn_service::db::Location, public_url: &str) -> anyhow::Result<Self> {
         let store = wyvrn_files::store::Store::open(location, &config.dir)?;

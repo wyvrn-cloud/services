@@ -3891,3 +3891,78 @@ async fn a_long_thread_is_read_a_page_at_a_time_and_counts_are_kept_and_rebuilt(
     let again = member.community("forum-stats-request", json!({ "channel": forum })).await;
     assert_eq!(again["body"]["sections"], stats["body"]["sections"]);
 }
+
+#[tokio::test]
+async fn a_discord_follower_is_sent_the_files_kept_here_opened_is_renamed_and_an_unanswered_follow_is_given_up() {
+    use aes_gcm::aead::{Aead, KeyInit};
+    // A stand-in for Discord that takes a message with files.
+    let (heard, mut hearing) = tokio::sync::mpsc::unbounded_channel::<(Value, Vec<(String, String, Vec<u8>)>)>();
+    let discord = axum::Router::new().route(
+        "/api/webhooks/{id}/{token}",
+        axum::routing::post(move |mut form: axum::extract::Multipart| {
+            let heard = heard.clone();
+            async move {
+                let (mut payload, mut files) = (Value::Null, Vec::new());
+                while let Some(field) = form.next_field().await.unwrap() {
+                    let name = field.name().unwrap_or_default().to_string();
+                    let file = field.file_name().map(str::to_string);
+                    let kind = field.content_type().unwrap_or_default().to_string();
+                    let bytes = field.bytes().await.unwrap().to_vec();
+                    match file {
+                        Some(file) => files.push((format!("{name} {file}"), kind, bytes)),
+                        None => payload = serde_json::from_slice(&bytes).unwrap(),
+                    }
+                }
+                let _ = heard.send((payload, files));
+                axum::Json(json!({ "id": "9002" }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let webhook = format!("http://{}/api/webhooks/123/secret-token", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, discord).await.unwrap() });
+
+    let server = start_server_with("outgoing_private = true", true).await;
+    tokio::spawn(wyvrn_community::outgoing::run_outgoing(server.state.clone()));
+    let owner = Peer::start(&server).await;
+    server.admit(&[&owner]);
+    owner.community("join", json!({})).await;
+    let news = owner.community("create-channel", json!({ "name": "news", "announcement": true })).await["body"]["created"].as_str().unwrap().to_string();
+    owner.workflow("start", json!({ "template_id": "announcements", "instance_id": "d1" })).await;
+    let added = advance(&owner, "d1", "add", json!({ "channel": news, "kind": "discord", "url": webhook, "name": "Our Discord's #news" })).await;
+    assert!(added["body"]["ui"].to_string().contains("Our Discord's #news"), "{added}");
+    let follower = server.state.community.store.followers().unwrap()[0].id.clone();
+    let renamed = advance(&owner, "d1", "rename", json!({ "follower": follower, "name": "The fan server" })).await;
+    assert!(renamed["body"]["ui"].to_string().contains("The fan server"), "{renamed}");
+
+    // A picture put here, sealed as the app seals one.
+    let picture = b"\x89PNG a picture".to_vec();
+    let (key, iv) = ([7u8; 32], [3u8; 12]);
+    let mut sealed = aes_gcm::Aes256Gcm::new_from_slice(&key).unwrap().encrypt(aes_gcm::Nonce::from_slice(&iv), picture.as_slice()).unwrap();
+    let tag = sealed.split_off(sealed.len() - 16);
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let granted = owner.ask("https://wyvrn.app/files/1.0/upload", json!({ "name": "file.bin", "media_type": "application/octet-stream", "byte_count": sealed.len(), "hash": wyvrn_files::hash::of_bytes(&sealed) })).await;
+    reqwest::Client::new().put(granted["body"]["upload_url"].as_str().unwrap()).header("upload-offset", "0").body(sealed).send().await.unwrap();
+    let link = owner.ask("https://wyvrn.app/files/1.0/complete", json!({ "file": granted["body"]["file"] })).await["body"]["url"].as_str().unwrap().to_string();
+    let ciphering = json!({ "algorithm": "aes-256-gcm", "parameters": { "key": hex(&key), "iv": hex(&iv), "tag": hex(&tag) } });
+    owner.community("post", json!({ "channel": news, "id": "n1", "content": "Look", "media": [{ "attachment": "a1", "ciphering": ciphering }, { "attachment": "a2" }], "attachments": [
+        { "id": "a1", "media_type": "image/png", "filename": "chart.png", "data": { "links": [link], "hash": "Qm1" } },
+        { "id": "a2", "media_type": "image/png", "filename": "far.png", "data": { "links": ["https://files.example/f/x"], "hash": "Qm2" } }
+    ] })).await;
+    owner.community("publish", json!({ "channel": news, "post": "n1" })).await;
+    let (payload, files) = tokio::time::timeout(Duration::from_secs(15), hearing.recv()).await.expect("Discord asked").unwrap();
+    // The one kept here goes with it, opened; the one elsewhere is said.
+    assert_eq!(files, vec![("files[0] chart.png".to_string(), "image/png".to_string(), picture)]);
+    assert_eq!(payload["content"], "Look\n📎 1 more file, in Wyvrn", "{payload}");
+    assert_eq!(payload["attachments"], json!([{ "id": 0, "filename": "chart.png" }]));
+
+    // A follow of a community that never answers is given up a week on, and whoever asked is told.
+    let here = owner.community("create-channel", json!({ "name": "elsewhere" })).await["body"]["created"].as_str().unwrap().to_string();
+    let asked = owner.community("follow", json!({ "channel": here, "source": { "community": "did:example:nobody", "code": "abc" } })).await;
+    assert!(asked["body"]["following"].is_string(), "{asked}");
+    let now = wyvrn_service::now();
+    assert!(server.state.community.give_up_unanswered(now).unwrap().is_empty());
+    let told = server.state.community.give_up_unanswered(now + wyvrn_community::announcements::UNANSWERED_FOLLOW + 1).unwrap();
+    assert!(told.iter().any(|(_, m)| m["body"]["code"] == "e.p.msg.follow-unanswered"), "{told:?}");
+    assert!(server.state.community.store.follows().unwrap().is_empty());
+}

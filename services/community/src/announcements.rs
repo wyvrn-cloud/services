@@ -45,6 +45,8 @@ pub const UNSUBSCRIBE: &str = "https://wyvrn.app/community/1.0/unsubscribe";
 pub const ANNOUNCEMENT: &str = "https://wyvrn.app/community/1.0/announcement";
 
 pub const ANNOUNCEMENTS_FLOW: &str = "announcements";
+/// How long a follow waits for the other community to answer before it is given up.
+pub const UNANSWERED_FOLLOW: i64 = 7 * 24 * 3600;
 /// How long a follow code is good for.
 const CODE_FOR: i64 = 600;
 /// How many announcement channels one channel follows at most.
@@ -281,6 +283,29 @@ impl Community {
         }
         let notices = self.end_follow(&follow, &member.did, now)?;
         Ok(Outcome { reply: Some(reply_to(message, COMMUNITY, self.community(member)?)), notices, channels_changed: true, ..Outcome::default() })
+    }
+
+    /// Follows the other community never answered, a week on: given up, and
+    /// whoever asked told, as if it had refused (with the channels as they now are).
+    pub fn give_up_unanswered(&self, now: i64) -> anyhow::Result<Vec<(String, Value)>> {
+        let mut notices = Vec::new();
+        for follow in self.store.follows()?.into_iter().filter(|f| f.pending && f.created_at <= now - UNANSWERED_FOLLOW) {
+            self.store.delete_follow(&follow.id)?;
+            self.audit(now, &follow.asked_by, "follow.unanswered", Some(&follow.channel), Some(json!({ "community": follow.source })));
+            let Some(member) = self.store.member(&follow.asked_by)? else { continue };
+            let mut report = json!({ "type": PROBLEM_REPORT, "id": uuid::Uuid::new_v4().to_string(), "body": {
+                "code": "e.p.msg.follow-unanswered",
+                "comment": "That community didn't answer in a week, so the channel doesn't follow it. Ask again once it is about."
+            } });
+            let mut answer = json!({ "type": COMMUNITY, "id": uuid::Uuid::new_v4().to_string(), "body": self.community(&member)? });
+            if let Some(thid) = &follow.asked_thid {
+                report["pthid"] = json!(thid);
+                answer["thid"] = json!(thid);
+            }
+            notices.push((member.did.clone(), report));
+            notices.push((member.did, answer));
+        }
+        Ok(notices)
     }
 
     /// Ends a follow held here, telling the source: what to send it.
@@ -526,6 +551,13 @@ impl Community {
                     }
                     row.push(json!({ "type": "submit-button", "label": "Remove", "event": "remove", "input": { "follower": follower.id } }));
                     items.push(json!({ "type": "row", "children": row }));
+                    // Another community names itself; a webhook is called what its adder says.
+                    if follower.kind != "community" {
+                        items.push(json!({ "type": "form", "children": [
+                            { "type": "text-input", "form-id": "name", "label": "Called", "value": follower.name, "required": true },
+                            { "type": "submit-button", "label": "Rename", "event": "rename", "input": { "follower": follower.id } }
+                        ] }));
+                    }
                 }
             }
             let options: Vec<Value> = channels.iter().map(|c| json!({ "value": c.id, "label": format!("#{}", c.name) })).collect();
@@ -536,6 +568,7 @@ impl Community {
                     { "value": "webhook", "label": "Another service (signed)" }
                 ] },
                 { "type": "text-input", "form-id": "url", "label": "Its URL", "placeholder": "https://discord.com/api/webhooks/...", "required": true },
+                { "type": "text-input", "form-id": "name", "label": "Call it", "placeholder": "Our Discord's #news" },
                 { "type": "submit-button", "label": "Send posts there", "event": "add", "input": {} }
             ] }));
             if let Some(seed) = &self.signing_seed {
@@ -547,7 +580,7 @@ impl Community {
             items.push(json!({ "type": "divider" }));
             items.push(json!({ "type": "title", "text": "Followed here" }));
             for (follow, channel) in &follows {
-                let what = if follow.pending { format!("#{} ← {} (waiting for it to answer)", channel.name, follow.source) } else { format!("#{} ← {} #{}", channel.name, follow.name, follow.channel_name) };
+                let what = if follow.pending { format!("#{} ← {} (waiting for it to answer; given up after a week)", channel.name, follow.source) } else { format!("#{} ← {} #{}", channel.name, follow.name, follow.channel_name) };
                 items.push(json!({ "type": "row", "children": [
                     { "type": "text", "text": what },
                     { "type": "submit-button", "label": "Stop following", "event": "unfollow", "input": { "follow": follow.id } }
@@ -555,7 +588,7 @@ impl Community {
             }
         }
         items.push(json!({ "type": "submit-button", "label": "Done", "event": "done", "input": {} }));
-        Ok((json!(items), vec!["add", "remove", "on", "unfollow", "done"]))
+        Ok((json!(items), vec!["add", "remove", "on", "rename", "unfollow", "done"]))
     }
 
     pub fn advance_announcements(&self, flow: &mut Flow, event: &str, input: &Value, now: i64) -> Result<bool, Refusal> {
@@ -579,6 +612,10 @@ impl Community {
                     let url = check_discord_url(given, self.config.outgoing_private).map_err(|why| Refusal::new("guard_failed", &why))?;
                     ("discord", url.to_string(), "A Discord webhook".to_string(), None)
                 };
+                let name = match follower_name(&input["name"])? {
+                    Some(given) => given,
+                    None => name,
+                };
                 if self.store.followers_of(&channel.id).map_err(failed)?.iter().any(|f| f.target == url) {
                     return Err(Refusal::new("guard_failed", "The channel's posts go there already."));
                 }
@@ -599,6 +636,16 @@ impl Community {
                 self.store.delete_follower(&follower.id).map_err(failed)?;
                 self.audit(now, &flow.owner, "announcement.remove", Some(&follower.channel), Some(json!({ "name": follower.name, "kind": follower.kind })));
                 flow.data["note"] = json!(format!("{} no longer follows it.", follower.name));
+                Ok(false)
+            }
+            "rename" => {
+                let mut follower = follower_of(&input["follower"])?;
+                if follower.kind == "community" {
+                    return Err(Refusal::new("guard_failed", "A community is called what it calls itself."));
+                }
+                follower.name = follower_name(&input["name"])?.ok_or_else(|| Refusal::new("guard_failed", "Give it a name."))?;
+                self.store.save_follower(&follower).map_err(failed)?;
+                flow.data["note"] = json!(format!("Now called {}.", follower.name));
                 Ok(false)
             }
             "on" => {
@@ -625,10 +672,25 @@ impl Community {
     }
 }
 
+/// What a webhook follower is called, as given: one line, 80 characters at most;
+/// `None` for nothing given.
+fn follower_name(given: &Value) -> Result<Option<String>, Refusal> {
+    let name = given.as_str().map(str::trim).unwrap_or_default();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    if name.chars().count() > 80 || name.contains(['\n', '\r']) {
+        return Err(Refusal::new("guard_failed", "A name is one line of 80 characters at most."));
+    }
+    Ok(Some(name.to_string()))
+}
+
 /// Sends what waits to go to other servers (the outbox), queues what changed of
 /// published posts, and sends each follower what is due.
 pub async fn send_due(state: &Arc<AppState>, now: i64) -> anyhow::Result<()> {
     let community = &state.community;
+    let given_up = community.give_up_unanswered(now)?;
+    community.outbox.lock().unwrap_or_else(|p| p.into_inner()).extend(given_up);
     let out: Vec<(String, Value)> = std::mem::take(&mut *community.outbox.lock().unwrap_or_else(|p| p.into_inner()));
     for (did, message) in out {
         if let Err(error) = state.voice.send(&state.agent, &did, &message).await {
@@ -694,17 +756,59 @@ pub async fn send_due(state: &Arc<AppState>, now: i64) -> anyhow::Result<()> {
 }
 
 /// What a post says on Discord: its text, and how many files it has here.
-fn discord_content(post: &Post) -> String {
+/// What a Discord message says of a post: its words, and how many of its files
+/// aren't attached to it (`attached` are).
+fn discord_content(post: &Post, attached: usize) -> String {
     let files = post.extra.as_ref().and_then(|e| e["media"].as_array()).map_or(0, Vec::len);
-    let note = match files {
-        0 => String::new(),
-        1 => "\n📎 1 file, in Wyvrn".to_string(),
-        n => format!("\n📎 {n} files, in Wyvrn"),
+    let note = match (files.saturating_sub(attached), attached) {
+        (0, _) => String::new(),
+        (1, 0) => "\n📎 1 file, in Wyvrn".to_string(),
+        (n, 0) => format!("\n📎 {n} files, in Wyvrn"),
+        (1, _) => "\n📎 1 more file, in Wyvrn".to_string(),
+        (n, _) => format!("\n📎 {n} more files, in Wyvrn"),
     };
     let room = 2000 - note.chars().count();
     let mut content: String = post.content.chars().take(room).collect();
     content.push_str(&note);
     content
+}
+
+/// How many files a Discord message takes, and how much of them in all: under
+/// what Discord takes from a webhook in a server that isn't boosted (10 MiB).
+const DISCORD_FILES: usize = 10;
+const DISCORD_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The files of `post` to attach to its Discord message: those kept here (its
+/// files host), opened, in order, while they fit. Sent to Discord they are public
+/// there, as the words are: the channel's posts are published to it.
+async fn discord_files(community: &Community, post: &Post) -> Vec<(Vec<u8>, String, String)> {
+    let (Some(files), Some(extra)) = (&community.files, &post.extra) else { return Vec::new() };
+    let mut attached = Vec::new();
+    for n in discord_attachable(community, post) {
+        if let crate::files::Carried::Opened { bytes, media_type, name } = files.carried(extra, n, DISCORD_FILE_BYTES).await {
+            attached.push((bytes, media_type, name));
+        }
+    }
+    attached
+}
+
+/// Which of `post`'s files go to Discord with it, by their sizes as kept here: in
+/// order, ten at most, while they fit. The same when the post is first sent and
+/// when it is changed, so its note counts the same files.
+fn discord_attachable(community: &Community, post: &Post) -> Vec<usize> {
+    let (Some(files), Some(extra)) = (&community.files, &post.extra) else { return Vec::new() };
+    let mut chosen = Vec::new();
+    let mut left = DISCORD_FILE_BYTES;
+    for n in 0..extra["media"].as_array().map_or(0, Vec::len) {
+        if chosen.len() == DISCORD_FILES {
+            break;
+        }
+        if let Some(size) = files.carried_size(extra, n).filter(|size| *size <= left) {
+            left -= size;
+            chosen.push(n);
+        }
+    }
+    chosen
 }
 
 /// Sends `post` to a Discord webhook: made, changed or deleted as it stands.
@@ -724,12 +828,30 @@ async fn to_discord(community: &Community, follower: &Follower, channel: &Channe
         }
         url.to_string()
     };
-    let content = discord_content(post);
+    // Its files go with it when it is first sent; an edit changes the words and
+    // leaves them (Discord keeps a message's attachments unless told otherwise).
+    let files = if remote.is_none() && !post.deleted { discord_files(community, post).await } else { Vec::new() };
+    let attached = match &remote {
+        None => files.len(),
+        Some(_) => discord_attachable(community, post).len(),
+    };
+    let content = discord_content(post, attached);
     let (client, _) = crate::outgoing::client_for(base.as_str(), private, "wyvrn-community (announcements)").await?;
     let answer = match (&remote, post.deleted) {
         (None, _) => {
-            let payload = json!({ "content": content, "username": discord_username(&format!("{} #{}", community.name_now(), channel.name)), "allowed_mentions": { "parse": [] } });
-            client.post(at(None, true)).json(&payload).send().await
+            let mut payload = json!({ "content": content, "username": discord_username(&format!("{} #{}", community.name_now(), channel.name)), "allowed_mentions": { "parse": [] } });
+            if files.is_empty() {
+                client.post(at(None, true)).json(&payload).send().await
+            } else {
+                payload["attachments"] = json!(files.iter().enumerate().map(|(n, (_, _, name))| json!({ "id": n, "filename": name })).collect::<Vec<_>>());
+                let mut form = reqwest::multipart::Form::new().text("payload_json", payload.to_string());
+                for (n, (bytes, media_type, name)) in files.into_iter().enumerate() {
+                    let part = reqwest::multipart::Part::bytes(bytes).file_name(name);
+                    let part = part.mime_str(&media_type).map_err(|e| e.to_string())?;
+                    form = form.part(format!("files[{n}]"), part);
+                }
+                client.post(at(None, true)).multipart(form).send().await
+            }
         }
         (Some(id), true) => client.delete(at(Some(id), false)).send().await,
         (Some(id), false) => client.patch(at(Some(id), false)).json(&json!({ "content": content, "allowed_mentions": { "parse": [] } })).send().await,

@@ -9,7 +9,7 @@ publish.workspace = true
 
 [dependencies]
 # The assistant asks Anthropic's Messages API (assistant.rs).
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true, features = ["json", "multipart"] }
 wyvrn-service = { workspace = true }
 # Files members attach, kept here (files/1.0's host, at the community's own DID).
 wyvrn-files = { path = "../files" }
