@@ -206,17 +206,21 @@ impl Community {
         Ok(Outcome::reply(reply_to(message, FOLLOW_CODE, json!({ "channel": channel.id, "code": code, "expires_at": expires }))))
     }
 
-    /// The follows of `channel` as `community` lists them for whoever may manage it.
+    /// The follows of `channel` as `community` lists them for whoever may manage
+    /// it: one asked for and not yet answered says `pending`.
     pub(crate) fn follows_body(follows: &[Follow], channel: &str) -> Vec<Value> {
         follows
             .iter()
-            .filter(|f| f.channel == channel && !f.pending)
-            .map(|f| json!({ "id": f.id, "community": f.source, "name": f.name, "channel_name": f.channel_name }))
+            .filter(|f| f.channel == channel)
+            .map(|f| match f.pending {
+                true => json!({ "id": f.id, "community": f.source, "pending": true }),
+                false => json!({ "id": f.id, "community": f.source, "name": f.name, "channel_name": f.channel_name }),
+            })
             .collect()
     }
 
     /// `follow`: a channel here is to follow another community's announcement
-    /// channel. Answered once that community has.
+    /// channel. Answered at once, the follow pending until that community answers.
     pub fn follow(&self, member: &Member, message: &Value, now: i64) -> anyhow::Result<Outcome> {
         let body = &message["body"];
         let Some(channel) = body["channel"].as_str().map(|id| self.store.channel(id)).transpose()?.flatten().filter(|c| !c.closed) else {
@@ -257,7 +261,9 @@ impl Community {
         };
         self.store.save_follow(&follow)?;
         let subscribe = json!({ "type": SUBSCRIBE, "id": follow.id, "body": { "code": code, "channel": { "id": channel.id, "name": channel.name }, "name": self.name_now() } });
-        Ok(Outcome { notices: vec![(source, subscribe)], ..Outcome::default() })
+        let mut answer = self.community(member)?;
+        answer["following"] = json!(follow.id);
+        Ok(Outcome { reply: Some(reply_to(message, COMMUNITY, answer)), notices: vec![(source, subscribe)], channels_changed: true, ..Outcome::default() })
     }
 
     /// `unfollow`: a channel here stops following.
@@ -350,7 +356,7 @@ impl Community {
                 if let Some(thid) = &follow.asked_thid {
                     report["pthid"] = json!(thid);
                 }
-                Ok(Some(Outcome { notices: vec![(follow.asked_by, report)], ..Outcome::default() }))
+                Ok(Some(Outcome { notices: vec![(follow.asked_by, report)], channels_changed: true, ..Outcome::default() }))
             }
             UNSUBSCRIBE => {
                 let id = body["follow"].as_str().unwrap_or_default();

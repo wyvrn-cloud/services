@@ -3345,16 +3345,31 @@ async fn an_announcement_channel_is_followed_by_another_community_and_a_service_
     let code = fan_there.community("follow-code-request", json!({ "channel": news })).await["body"]["code"].as_str().unwrap().to_string();
     // Given to the Annex by someone who manages a channel there; a member who doesn't may not.
     assert_eq!(reader.community("follow", json!({ "channel": lobby, "source": { "community": source.did, "code": code } })).await["body"]["code"], "e.p.trust.not-authorized");
-    let follow = json!({ "type": format!("{C}follow"), "id": "follow-1", "body": { "channel": lobby, "source": { "community": source.did, "code": code } } });
-    fan.agent.send(&annex.did, &follow).await.expect("sent");
-    let answered = next_in(&fan, &format!("{C}community"), "follow-1").await;
-    let lobby_now = answered["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == lobby).unwrap().clone();
-    assert_eq!(lobby_now["follows"][0]["name"], "The Workshop", "{answered}");
+    // Answered at once, the follow pending until the Workshop answers.
+    let asked = fan.community("follow", json!({ "channel": lobby, "source": { "community": source.did, "code": code } })).await;
+    let following = asked["body"]["following"].as_str().expect("the follow's id").to_string();
+    let lobby_then = asked["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == lobby).unwrap().clone();
+    assert_eq!(lobby_then["follows"][0], json!({ "id": following, "community": source.did, "pending": true }), "{asked}");
+    let lobby_now = loop {
+        let told = fan.next_of(&format!("{C}community")).await;
+        let lobby_now = told["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == lobby).unwrap().clone();
+        if lobby_now["follows"][0].get("pending").is_none() {
+            break lobby_now;
+        }
+    };
+    assert_eq!(lobby_now["follows"][0]["name"], "The Workshop", "{lobby_now}");
     assert_eq!(lobby_now["follows"][0]["channel_name"], "news");
-    // A code is good once.
-    let again = json!({ "type": format!("{C}follow"), "id": "follow-2", "body": { "channel": lobby, "source": { "community": source.did, "code": code } } });
+    // A code is good once: refused, the follow is taken off and whoever asked is told why.
+    let again = json!({ "type": format!("{C}follow"), "id": "follow-2", "return_route": "all", "body": { "channel": lobby, "source": { "community": source.did, "code": code } } });
     fan.agent.send(&annex.did, &again).await.expect("sent");
     assert_eq!(next_in(&fan, PROBLEM, "follow-2").await["body"]["code"], "e.p.msg.invalid-code");
+    for _ in 0..50 {
+        if annex.state.community.store.follows().unwrap().len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(annex.state.community.store.follows().unwrap().len(), 1);
 
     // And a service, through the workflow; Discord takes only Discord's webhook URLs.
     owner.workflow("start", json!({ "template_id": "announcements", "instance_id": "a1" })).await;
