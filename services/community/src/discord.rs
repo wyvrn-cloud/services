@@ -929,6 +929,21 @@ impl Community {
                 let lines = welcome["lines"].as_array().map(|lines| lines.iter().filter_map(Value::as_str).map(str::to_string).collect());
                 self.set_welcome(Some(&channel), lines)?;
             }
+            // The rules channel, unless this community has one: Discord's, where the
+            // template names it (it never has yet: a template leaves out a community
+            // server's rules channel), else a text channel called just "rules"
+            // ("📜rules" too).
+            let rules = self.store.setting(crate::community::RULES_CHANNEL)?;
+            if rules.is_none_or(|id| self.store.channel(&id).ok().flatten().is_none()) {
+                let named = template["serialized_source_guild"]["rules_channel_id"].as_i64().and_then(|sid| ids.get(&format!("new:channel:{sid}")).cloned()).filter(|id| !id.is_empty());
+                let called = || -> anyhow::Result<Option<String>> {
+                    let rules = |name: &str| name.chars().filter(|c| c.is_alphanumeric()).collect::<String>() == "rules";
+                    Ok(self.store.channels()?.into_iter().find(|c| c.voice.is_none() && c.forum.is_none() && rules(&c.name)).map(|c| c.id))
+                };
+                if let Some(id) = named.map_or_else(called, |id| Ok(Some(id)))? {
+                    self.store.set_setting(crate::community::RULES_CHANNEL, &id)?;
+                }
+            }
             Ok(())
         })?;
         let Counts { made, changed, removed, no_room_channels, no_room_roles } = counts;

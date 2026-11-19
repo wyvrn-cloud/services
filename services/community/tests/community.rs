@@ -2613,6 +2613,8 @@ async fn an_owner_imports_a_discord_template_and_again_once_it_has_changed() {
     assert_eq!(channel(&told, "general")["topic"], "Say hi");
     assert_eq!(channel(&told, "general")["slow_mode"], 30);
     assert_eq!(channel(&told, "📜rules")["read_only"], true);
+    // A template never names its rules channel, so the one called "rules" is it.
+    assert_eq!(told["rules_channel"], channel(&told, "📜rules")["id"], "{told}");
     assert_eq!(channel(&told, "Town Hall")["kind"], "voice");
     // A stage on Discord is a stage here.
     assert_eq!(channel(&told, "Town Hall")["voice"]["stage"], true);
