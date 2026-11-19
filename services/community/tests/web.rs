@@ -917,3 +917,33 @@ async fn a_public_wiki_shows_its_pages_as_they_now_read() {
     assert!(html.contains(">Rules</a>") && html.contains("<h1>Be kind</h1>"), "{html}");
     assert!(!html.contains("<script>alert"), "{html}");
 }
+
+#[tokio::test]
+async fn a_public_calendar_lists_the_events_and_a_gallery_is_a_grid() {
+    let server = start(Options { voice: true, ..Options::default() }).await;
+    let (admin, _) = with_channels(&server).await;
+    let created = |reply: Value| reply["body"]["created"].as_str().unwrap().to_string();
+    let calendar = created(admin.community("create-channel", json!({ "name": "events", "kind": "calendar" })).await);
+    let hidden = created(admin.community("create-channel", json!({ "name": "Back room", "kind": "voice" })).await);
+    let soon = chrono::Utc::now() + chrono::Duration::days(2);
+    let iso = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let made = admin.community("create-event", json!({ "title": "Board games", "description": "Bring **snacks** <script>x</script>", "start": iso(soon), "location": "The pub" })).await;
+    assert!(made["body"]["event"]["event_id"].is_string(), "{made}");
+    admin.community("create-event", json!({ "title": "Secret call", "start": iso(soon), "channel": hidden })).await;
+    admin.community("update-channel", json!({ "channel": calendar, "web": { "public": true, "history": true } })).await;
+    let (status, html) = server.text(&format!("ch/{calendar}/events")).await;
+    assert_eq!(status, 200, "{html}");
+    assert!(html.contains("<h2>Board games</h2>") && html.contains("The pub") && html.contains("<strong>snacks</strong>"), "{html}");
+    // Its time is a <time> the page writes in the reader's zone.
+    assert!(html.contains(&format!("datetime=\"{}\"", iso(soon))), "{html}");
+    // An event in a voice channel the web doesn't show isn't there; nor is what it says run.
+    assert!(!html.contains("Secret call") && !html.contains("<script>x"), "{html}");
+
+    let gallery = created(admin.community("create-channel", json!({ "name": "art", "kind": "gallery" })).await);
+    let picture = json!({ "channel": gallery, "id": "g1", "title": "Sunset", "content": "My drawing", "media": [{ "attachment": "f1" }], "attachments": [{ "id": "f1", "media_type": "image/png", "data": { "links": ["https://files.example/f/x"], "hash": "Qm1" } }] });
+    admin.community("post", picture).await;
+    admin.community("update-channel", json!({ "channel": gallery, "web": { "public": true, "history": true } })).await;
+    let (status, html) = server.text(&format!("ch/{gallery}/art")).await;
+    assert_eq!(status, 200, "{html}");
+    assert!(html.contains("class=\"gallery\"") && html.contains("<strong>Sunset</strong>") && html.contains("<img src="), "{html}");
+}

@@ -35,6 +35,7 @@ pub mod logging;
 pub mod mediator;
 pub mod named;
 pub mod profile;
+pub mod timestamps;
 pub mod voice;
 
 pub use voice::Voice;

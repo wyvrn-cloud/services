@@ -299,6 +299,8 @@ struct ChannelPage {
     quick: &'static [&'static str],
     /// Where the page hears that the channel moved on (posting.rs's `live`).
     live: Option<String>,
+    /// A gallery: its posts as a grid of their first picture or video.
+    gallery: bool,
 }
 
 /// The form a member signed in posts with.
@@ -776,6 +778,107 @@ struct WikiView {
     html: String,
 }
 
+/// One of the community's events, as a calendar channel's page shows it.
+struct EventView {
+    title: String,
+    /// When it (next) starts and ends, as `<time>`s the page writes in the reader's zone.
+    starts: String,
+    ends: String,
+    repeats: bool,
+    cancelled: bool,
+    happening: bool,
+    /// Where: a place, or a voice channel by name (linked where the web shows it).
+    place: Option<String>,
+    voice: Option<String>,
+    voice_href: Option<String>,
+    going: i64,
+    maybe: i64,
+    html: String,
+}
+
+#[derive(Template)]
+#[template(path = "web/calendar.html")]
+struct CalendarView {
+    site: Site,
+    groups: Vec<Group>,
+    title: String,
+    description: String,
+    json_ld: String,
+    noindex: bool,
+    heading: String,
+    topic: String,
+    events: Vec<EventView>,
+}
+
+/// A calendar channel on the web: the community's events this viewer may see (an
+/// event in a voice channel only where the web shows that channel), happening or
+/// to come first, then those just past, as the app lists them.
+fn calendar_page(state: &AppState, viewer: &Viewer, channel: &Channel, private: bool) -> Response {
+    let Some(web) = web_of(state) else { return nothing() };
+    let root = "../../";
+    let readable = match readable(state, viewer) {
+        Ok(readable) => readable,
+        Err(error) => return internal(error),
+    };
+    let store = &state.community.store;
+    let now = chrono::Utc::now().timestamp();
+    let listed = match state.community.events_listed(now) {
+        Ok(listed) => listed,
+        Err(error) => return internal(error),
+    };
+    let mut events = Vec::new();
+    let mut schema = Vec::new();
+    for (start, end, event) in listed {
+        let voice = event.data["channel"].as_str();
+        if voice.is_some_and(|id| !readable.contains_key(id)) {
+            continue;
+        }
+        let voice_channel = voice.and_then(|id| store.channel(id).ok().flatten());
+        let title = event.data["title"].as_str().unwrap_or("An event").to_string();
+        let place = event.data["location"].as_str().map(str::to_string);
+        schema.push(json!({ "@type": "Event", "name": title, "startDate": render::iso(start), "endDate": render::iso(end), "eventStatus": if event.cancelled { "https://schema.org/EventCancelled" } else { "https://schema.org/EventScheduled" }, "location": match (&place, &voice_channel) {
+            (Some(place), _) => json!({ "@type": "Place", "name": place }),
+            _ => json!({ "@type": "VirtualLocation", "url": web.absolute("") }),
+        } }));
+        let rsvps = store.event_rsvps(&event.id).unwrap_or_default();
+        events.push(EventView {
+            title,
+            starts: render::time_html(start, 'F'),
+            ends: render::time_html(end, 't'),
+            repeats: event.data["recurrence"].is_object(),
+            cancelled: event.cancelled,
+            happening: !event.cancelled && start <= now && now < end,
+            place,
+            voice: voice_channel.as_ref().map(|c| c.name.clone()),
+            voice_href: voice_channel.as_ref().filter(|c| readable.contains_key(&c.id)).map(|c| format!("{root}{}", channel_path(&c.id, &c.name))),
+            going: rsvps.iter().filter(|(_, s)| s == "accepted").count() as i64,
+            maybe: rsvps.iter().filter(|(_, s)| s == "tentative").count() as i64,
+            html: render::markdown(event.data["description"].as_str().unwrap_or_default()),
+        });
+    }
+    let site = site(state, viewer, root, web.absolute(&channel_path(&channel.id, &channel.name)));
+    let groups = match groups(state, viewer, root, Some(&channel.id)) {
+        Ok(groups) => groups,
+        Err(error) => return internal(error),
+    };
+    let title = format!("#{} · {}", channel.name, site.name);
+    page(
+        CalendarView {
+            json_ld: render::json_ld(&json!({ "@context": "https://schema.org", "@type": "CollectionPage", "name": title, "hasPart": schema })),
+            description: if channel.topic.is_empty() { format!("Events in {}", site.name) } else { render::excerpt(&channel.topic, 200) },
+            site,
+            groups,
+            title,
+            noindex: private,
+            heading: format!("📅 {}", channel.name),
+            topic: channel.topic.clone(),
+            events,
+        }
+        .render(),
+        private || viewer.signed_in(),
+    )
+}
+
 /// A wiki on the web: its pages as a tree, and the one chosen as it now reads.
 fn wiki_page(state: &AppState, viewer: &Viewer, channel: &Channel, chosen: Option<&str>, private: bool) -> Response {
     let Some(web) = web_of(state) else { return nothing() };
@@ -849,6 +952,11 @@ async fn channel(State(state): State<Arc<AppState>>, Path((id, name)): Path<(Str
     if name != wanted && url::form_urlencoded::byte_serialize(name.as_bytes()).collect::<String>() != wanted {
         return as_page(Redirect::permanent(&format!("../../{}", channel_path(&channel.id, &channel.name))).into_response());
     }
+    // A calendar: the community's events, not posts.
+    if channel.calendar {
+        let private = since.is_none() && !is_public(&state, &channel.id);
+        return calendar_page(&state, &viewer, &channel, private);
+    }
     // A wiki: its pages, not posts.
     if channel.wiki {
         let private = since.is_none() && !is_public(&state, &channel.id);
@@ -908,6 +1016,7 @@ async fn channel(State(state): State<Arc<AppState>>, Path((id, name)): Path<(Str
             quick: super::posting::QUICK_REACTIONS,
             // The newest page only: an older one doesn't change at its foot.
             live: before.is_none().then(|| format!("{root}ch/{}/live", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>())),
+            gallery: channel.gallery,
         }
         .render(),
         private || viewer.signed_in(),
@@ -1003,6 +1112,7 @@ async fn post_page(State(state): State<Arc<AppState>>, Path((id, seq)): Path<(St
             react_base: react_base(&viewer, &channel, root),
             quick: super::posting::QUICK_REACTIONS,
             live: None,
+            gallery: false,
         }
         .render(),
         private || viewer.signed_in(),
@@ -1060,6 +1170,7 @@ async fn thread_page(State(state): State<Arc<AppState>>, Path((id, thread)): Pat
             react_base: react_base(&viewer, &channel, root),
             quick: super::posting::QUICK_REACTIONS,
             live: None,
+            gallery: false,
         }
         .render(),
         private || viewer.signed_in(),

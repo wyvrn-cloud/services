@@ -220,6 +220,29 @@ impl Community {
         }
     }
 
+    /// Every event still listed (not over a week since), each with when it (next)
+    /// happens, in the order the app lists them: by that start.
+    pub fn events_listed(&self, now: i64) -> anyhow::Result<Vec<(i64, i64, StoredEvent)>> {
+        let at = DateTime::from_timestamp(now, 0).unwrap_or_default();
+        let mut listed = Vec::new();
+        for event in self.store.events()? {
+            if ended_long_ago(&event, at) {
+                continue;
+            }
+            let (_, next) = standing(&event, at);
+            let (start, end) = match next {
+                Some((start, end)) => (start.timestamp(), end.timestamp()),
+                None => match (parse_time(&event.data["start"]), parse_time(&event.data["end"])) {
+                    (Some(start), Some(end)) => (start.timestamp(), end.timestamp()),
+                    _ => continue,
+                },
+            };
+            listed.push((start, end, event));
+        }
+        listed.sort_by_key(|(start, _, _)| *start);
+        Ok(listed)
+    }
+
     /// `event` as `did` is shown it.
     pub fn event_body(&self, event: &StoredEvent, did: &str, now: i64) -> anyhow::Result<Value> {
         let mut body = event.data.clone();

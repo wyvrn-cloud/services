@@ -29,12 +29,44 @@ pub fn escape(text: &str) -> String {
 /// a day.
 pub fn render_markdown(content: &str) -> String {
     let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
-    let events = Parser::new_ext(content, options).map(|event| match event {
-        Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
-        other => other,
-    });
+    // Raw HTML is shown as the text it is; text side by side made one, so a time
+    // (`<t:1767225600:F>`, which the parser may cut up) is found whole, outside code.
+    let mut joined: Vec<Event> = Vec::new();
+    for event in Parser::new_ext(content, options) {
+        let event = match event {
+            Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
+            other => other,
+        };
+        match (joined.last_mut(), event) {
+            (Some(Event::Text(held)), Event::Text(more)) => *held = format!("{held}{more}").into(),
+            (_, event) => joined.push(event),
+        }
+    }
+    let mut events = Vec::new();
+    let mut in_code = 0;
+    for event in joined {
+        match event {
+            Event::Start(pulldown_cmark::Tag::CodeBlock(kind)) => {
+                in_code += 1;
+                events.push(Event::Start(pulldown_cmark::Tag::CodeBlock(kind)));
+            }
+            Event::End(pulldown_cmark::TagEnd::CodeBlock) => {
+                in_code -= 1;
+                events.push(Event::End(pulldown_cmark::TagEnd::CodeBlock));
+            }
+            Event::Text(said) if in_code == 0 && said.contains("<t:") => {
+                for piece in wyvrn_service::timestamps::pieces(&said) {
+                    match piece {
+                        wyvrn_service::timestamps::Piece::Text(words) => events.push(Event::Text(words.to_string().into())),
+                        wyvrn_service::timestamps::Piece::Time(seconds, style) => events.push(Event::Html(wyvrn_service::timestamps::html(seconds, style).into())),
+                    }
+                }
+            }
+            other => events.push(other),
+        }
+    }
     let mut rendered = String::new();
-    html::push_html(&mut rendered, events);
+    html::push_html(&mut rendered, events.into_iter());
     rendered
 }
 
@@ -107,7 +139,8 @@ fn page(info: &ChannelInfo, title: &str, body: &str) -> String {
 <meta name=\"description\" content=\"{description}\">\
 <link rel=\"alternate\" type=\"application/atom+xml\" title=\"{name}\" href=\"/feed.xml\">\
 <style>{STYLE}</style></head><body><main>{body}\
-<footer><a href=\"/feed.xml\">Feed</a></footer></main></body></html>\n",
+<footer><a href=\"/feed.xml\">Feed</a></footer></main><script>{SCRIPT}</script></body></html>\n",
+        SCRIPT = wyvrn_service::timestamps::SCRIPT,
         title = escape(title),
         description = escape(&info.description),
         name = escape(&info.name),
@@ -240,6 +273,13 @@ mod tests {
         assert!(!rendered.contains("<script"));
         assert!(!rendered.contains("<b onclick"));
         assert!(rendered.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn a_time_written_in_a_post_is_a_time_the_page_writes_in_the_readers_zone() {
+        let rendered = render_markdown("Live at <t:1767225600:F>, see `<t:1767225600>`");
+        assert!(rendered.contains("<time class=\"timestamp\" datetime=\"2026-01-01T00:00:00Z\" data-style=\"F\">"), "{rendered}");
+        assert!(rendered.contains("<code>&lt;t:1767225600&gt;</code>"), "{rendered}");
     }
 
     #[test]

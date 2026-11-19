@@ -1,0 +1,24 @@
+{% extends "web/base.html" %}
+{% block content %}
+<header class="channel-head">
+  <h1>{{ heading }}</h1>
+  {% if !topic.is_empty() %}<p class="topic">{{ topic }}</p>{% endif %}
+</header>
+<ol class="events">
+{% for event in events %}
+  <li class="event{% if event.cancelled %} cancelled{% endif %}{% if event.happening %} happening{% endif %}">
+    <article>
+      <h2>{{ event.title }}</h2>
+      <p class="event-when">{% if event.happening %}<span class="note">Happening now</span> {% endif %}{% if event.cancelled %}<span class="note">Cancelled</span> {% endif %}{{ event.starts|safe }} to {{ event.ends|safe }}{% if event.repeats %} <span class="note">repeats</span>{% endif %}</p>
+      {% if let Some(place) = event.place %}<p class="event-where">📍 {{ place }}</p>{% endif %}
+      {% if let Some(voice) = event.voice %}<p class="event-where">🔊 {% if let Some(href) = event.voice_href %}<a href="{{ href }}">{{ voice }}</a>{% else %}{{ voice }}{% endif %}</p>{% endif %}
+      {% if !event.html.is_empty() %}<div class="content">{{ event.html|safe }}</div>{% endif %}
+      {% if event.going > 0 || event.maybe > 0 %}<p class="note">{{ event.going }} going{% if event.maybe > 0 %}, {{ event.maybe }} maybe{% endif %}</p>{% endif %}
+    </article>
+  </li>
+{% else %}
+  <li class="empty">No events coming up.</li>
+{% endfor %}
+</ol>
+<p class="note">Answer, and be reminded, in Wyvrn.</p>
+{% endblock %}

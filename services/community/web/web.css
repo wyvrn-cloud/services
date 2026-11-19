@@ -200,3 +200,16 @@ form.reactions button { display: inline-flex; gap: .25rem; align-items: center; 
 .wiki-pages ul { list-style: none; margin: 0; padding: 0; }
 .wiki-pages a[aria-current="page"] { font-weight: 700; }
 @media (max-width: 720px) { .wiki { grid-template-columns: 1fr; } }
+
+/* A gallery: its posts as a grid. */
+.gallery { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
+.gallery a { display: flex; flex-direction: column; gap: 6px; color: inherit; text-decoration: none; }
+.gallery img, .gallery video, .gallery-file { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: var(--radius); background: var(--surface, rgba(127,127,127,.12)); display: flex; align-items: center; justify-content: center; font-size: 2.5rem; }
+.gallery-caption { font-size: .9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A calendar channel's events. */
+.events { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+.event article { padding: .85rem 1rem; border-radius: var(--radius); background: var(--surface, rgba(127,127,127,.08)); }
+.event h2 { margin: 0 0 .3rem; font-size: 1.1rem; }
+.event p { margin: .25rem 0; }
+.event.cancelled h2 { text-decoration: line-through; opacity: .7; }
+.event.happening article { outline: 2px solid var(--accent, currentColor); }

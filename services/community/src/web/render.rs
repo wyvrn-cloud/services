@@ -85,40 +85,7 @@ fn push_text<'a>(events: &mut Vec<Event<'a>>, said: &str, in_link: usize) {
     }
 }
 
-/// What a timestamp written in a post says (`<t:seconds>` or `<t:seconds:style>`,
-/// the style one of Discord's `tTdDfFR`, `f` when none): its seconds and style.
-pub fn timestamp(written: &str) -> Option<(i64, char)> {
-    let inside = written.strip_prefix("<t:")?.strip_suffix('>')?;
-    let (seconds, style) = match inside.split_once(':') {
-        Some((seconds, style)) => {
-            let mut chars = style.chars();
-            let style = chars.next().filter(|c| "tTdDfFR".contains(*c) && chars.next().is_none())?;
-            (seconds, style)
-        }
-        None => (inside, 'f'),
-    };
-    if seconds.is_empty() || seconds.len() > 13 || !seconds.trim_start_matches('-').chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    Some((seconds.parse().ok()?, style))
-}
-
-/// A timestamp as the page draws it: a `<time>` web.js writes in the reader's zone
-/// and way, saying it in UTC until then (and to whoever runs no script).
-fn time_html(seconds: i64, style: char) -> String {
-    let Some(when) = chrono::DateTime::from_timestamp(seconds, 0) else {
-        return escape(&format!("<t:{seconds}:{style}>"));
-    };
-    let shown = match style {
-        't' => when.format("%H:%M UTC").to_string(),
-        'T' => when.format("%H:%M:%S UTC").to_string(),
-        'd' => when.format("%Y-%m-%d").to_string(),
-        'D' => when.format("%B %-d, %Y").to_string(),
-        'F' => when.format("%A, %B %-d, %Y %H:%M UTC").to_string(),
-        _ => when.format("%B %-d, %Y %H:%M UTC").to_string(),
-    };
-    format!("<time class=\"timestamp\" datetime=\"{}\" data-style=\"{style}\">{}</time>", when.to_rfc3339_opts(chrono::SecondsFormat::Secs, true), escape(&shown))
-}
+pub use wyvrn_service::timestamps::{html as time_html, parse as timestamp};
 
 /// A post's Markdown, as HTML that runs nothing and fetches nothing.
 pub fn markdown(text: &str) -> String {
@@ -183,19 +150,12 @@ pub fn markdown_with(text: &str, shown: &dyn Fn(&str, &str) -> Option<String>) -
             // A time (`<t:1767225600:F>`, as the app and Discord write one): in
             // UTC until web.js shows it in the reader's own zone.
             Event::Text(said) if in_code == 0 && said.contains("<t:") => {
-                let mut rest: &str = &said;
-                while let Some(at) = rest.find("<t:") {
-                    let found = rest[at..].find('>').and_then(|end| timestamp(&rest[at..at + end + 1]).map(|t| (t, end)));
-                    let Some(((seconds, style), end)) = found else {
-                        push_text(&mut events, &rest[..at + 3], in_link);
-                        rest = &rest[at + 3..];
-                        continue;
-                    };
-                    push_text(&mut events, &rest[..at], in_link);
-                    events.push(Event::Html(CowStr::from(time_html(seconds, style))));
-                    rest = &rest[at + end + 1..];
+                for piece in wyvrn_service::timestamps::pieces(&said) {
+                    match piece {
+                        wyvrn_service::timestamps::Piece::Text(words) => push_text(&mut events, words, in_link),
+                        wyvrn_service::timestamps::Piece::Time(seconds, style) => events.push(Event::Html(CowStr::from(time_html(seconds, style)))),
+                    }
                 }
-                push_text(&mut events, rest, in_link);
             }
             Event::Text(said) if in_code == 0 => push_text(&mut events, &said, in_link),
             Event::Start(Tag::Link { link_type, dest_url, .. }) => {

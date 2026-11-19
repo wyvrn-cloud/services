@@ -6,6 +6,20 @@
   {% if !topic.is_empty() %}<p class="topic">{{ topic }}</p>{% endif %}
 </header>
 {% if let Some(older) = older %}<p class="paging"><a class="button quiet" href="{{ older }}" rel="prev">Older posts</a></p>{% endif %}
+{% if gallery %}
+<ul class="gallery">
+{% for post in posts %}
+  <li id="{{ post.anchor }}">
+    <a href="{% if let Some(thread) = post.thread_href %}{{ thread }}{% else %}{{ post.href }}{% endif %}">
+      {% if let Some(item) = post.media.first() %}{% if item.kind == "video" %}<video src="{{ item.href }}" preload="metadata" muted></video>{% else if item.kind == "image" %}<img src="{{ item.href }}" alt="{{ item.name }}" loading="lazy">{% else %}<span class="gallery-file" aria-hidden="true">📄</span>{% endif %}{% else %}<span class="gallery-file" aria-hidden="true">🖼</span>{% endif %}
+      <span class="gallery-caption">{% if let Some(title) = post.title %}<strong>{{ title }}</strong>{% else %}{{ post.author }}{% endif %}{% if post.thread_count > 0 %} <span class="quiet">· {{ post.thread_count }} {% if post.thread_count == 1 %}reply{% else %}replies{% endif %}</span>{% endif %}</span>
+    </a>
+  </li>
+{% else %}
+  <li class="empty">Nothing here yet.</li>
+{% endfor %}
+</ul>
+{% else %}
 <ol class="posts">
 {% for post in posts %}
   <li class="post{% if post.focus %} focus{% endif %}{% if post.continued %} continued{% endif %}" id="{{ post.anchor }}">
@@ -69,6 +83,7 @@
   <li class="empty">Nothing here yet.</li>
 {% endfor %}
 </ol>
+{% endif %}
 {% if let Some(newer) = newer %}<p class="paging"><a class="button quiet" href="{{ newer }}" rel="next">Newer posts</a></p>{% endif %}
 {% if let Some(compose) = compose %}
 <form class="compose" id="compose" method="post" action="{{ compose.action }}">
