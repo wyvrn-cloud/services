@@ -162,40 +162,58 @@ fn unmapped(bits: u64) -> Vec<&'static str> {
     PERMISSIONS.iter().filter(|(bit, _, ours)| bits >> bit & 1 == 1 && ours.is_empty()).map(|(_, name, _)| *name).collect()
 }
 
-/// What Discord left out of the template, said for the owner: a template numbers
-/// the server's channels 1, 2, 3, ... and skips those it leaves out (a community
-/// server's announcement channels, at least), saying nothing else of them. So
-/// the skipped numbers are how many, and the channels around each where.
+/// What Discord left out of the template, said for the owner. A template leaves
+/// out a community server's announcement and stage channels, saying nothing of
+/// them, but it keeps every other channel's place: text-like channels (text,
+/// forum, media) are numbered 0, 1, 2, ... in one run and voice-like ones in
+/// another, so a number missing from a run is a channel left out there (an
+/// announcement channel among the text, a stage among the voice). Its ids, 1, 2,
+/// 3, ..., skip those too, and sometimes more, which have no place to tell.
 fn left_out(template: &Value) -> Option<String> {
     let channels = template["serialized_source_guild"]["channels"].as_array()?;
     let by_id: HashMap<i64, &Value> = channels.iter().filter_map(|c| Some((c["id"].as_i64()?, c))).collect();
-    let last = *by_id.keys().max()?;
-    let mut places: Vec<(String, usize)> = Vec::new();
-    let mut skipped = 0;
-    for id in 1..last {
-        if by_id.contains_key(&id) {
-            continue;
-        }
-        skipped += 1;
-        // Where: after the channel numbered before it, or at the top of its category.
-        let before = (1..id).rev().find_map(|i| by_id.get(&i));
-        let place = match before {
-            Some(c) if kind_of(c).0 == "category" => format!("at the top of {}", c["name"].as_str().unwrap_or("a category")),
-            Some(c) => format!("after #{}", c["name"].as_str().unwrap_or("?")),
-            None => "at the top".to_string(),
-        };
-        match places.last_mut() {
-            Some((at, n)) if *at == place => *n += 1,
-            _ => places.push((place, 1)),
+    let skipped = (1..*by_id.keys().max()?).filter(|id| !by_id.contains_key(id)).count();
+    let name = |c: &Value| c["name"].as_str().unwrap_or("?").to_string();
+    let category = |c: &Value| c["parent_id"].as_i64().and_then(|p| by_id.get(&p)).map(|p| name(p));
+    let mut places = Vec::new();
+    let mut placed = 0;
+    for (voice, mark, likely) in [(false, "#", "announcement"), (true, "🔊", "stage")] {
+        let mut run: Vec<(i64, &Value)> = channels
+            .iter()
+            .filter(|c| { let kind = kind_of(c).0; kind != "category" && (kind == "voice") == voice })
+            .filter_map(|c| Some((c["position"].as_i64()?, c)))
+            .collect();
+        run.sort_by_key(|(at, _)| *at);
+        let mut expected = 0;
+        let mut before: Option<&Value> = None;
+        for (at, c) in run {
+            if at > expected {
+                let n = (at - expected) as usize;
+                placed += n;
+                let after = format!("{mark}{}", name(c));
+                let place = match (before, category(c)) {
+                    (Some(b), cat) if category(b) == cat => format!("between {mark}{} and {after}", name(b)),
+                    (_, Some(cat)) => format!("in {cat}, above {after}"),
+                    (_, None) => format!("above {after}"),
+                };
+                let what = if n == 1 { format!("1 {place} (an {likely} channel, most likely)") } else { format!("{n} {place} ({likely} channels, most likely)") };
+                places.push(what);
+            }
+            expected = expected.max(at + 1);
+            before = Some(c);
         }
     }
-    if skipped == 0 {
+    let total = skipped.max(placed);
+    if total == 0 {
         return None;
     }
-    let places: Vec<String> = places.into_iter().map(|(at, n)| if n == 1 { at } else { format!("{n} {at}") }).collect();
-    let them = if skipped == 1 { "1 channel".to_string() } else { format!("{skipped} channels") };
+    if total > placed {
+        let n = total - placed;
+        places.push(if n == 1 { "and 1 more it gives no place to".to_string() } else { format!("and {n} more it gives no place to") });
+    }
+    let them = if total == 1 { "1 channel".to_string() } else { format!("{total} channels") };
     Some(format!(
-        "Discord left {them} out of this template ({}), and says nothing of what they were: it leaves out a community server's announcement channels. Make them here by hand (New channel, Announcements).",
+        "Discord left {them} out of this template, and says nothing of what they were but where: {}. It leaves out a community server's announcement and stage channels, so make them here by hand (New channel, then Announcements or Stage).",
         places.join("; ")
     ))
 }
@@ -1375,25 +1393,28 @@ mod tests {
 
     #[test]
     fn says_where_discord_left_channels_out_of_a_template() {
-        let channel = |id: i64, kind: i64, name: &str| json!({ "id": id, "type": kind, "name": name });
+        let channel = |id: i64, kind: i64, at: i64, name: &str, parent: Option<i64>| json!({ "id": id, "type": kind, "position": at, "name": name, "parent_id": parent });
         let template = |channels: Vec<Value>| json!({ "serialized_source_guild": { "channels": channels } });
-        // As the Frosty Pillow Fort's: 2, 4, 5 and 9, 10 skipped.
+        // As the Frosty Pillow Fort's: two announcement channels after
+        // #unlock-all-channels (text places 2 and 3), two stages above 🔊Nyaflix
+        // in Special VCs (voice places 1 and 2), and id 2 skipped with no place.
         let fort = template(vec![
-            channel(1, 0, "newcomers"),
-            channel(3, 0, "unlock-all-channels"),
-            channel(6, 0, "📜rules"),
-            channel(7, 4, "Special VCs"),
-            channel(8, 0, "nyaflix"),
-            channel(11, 2, "Nyaflix"),
+            channel(1, 0, 0, "newcomers", None),
+            channel(3, 0, 1, "unlock-all-channels", None),
+            channel(6, 0, 4, "📜rules", None),
+            channel(7, 2, 0, "Sub Voice", None),
+            channel(8, 4, 0, "Special VCs", None),
+            channel(9, 0, 5, "special-mute", Some(8)),
+            channel(12, 2, 3, "Nyaflix", Some(8)),
         ]);
-        // (8 is after the category; 9 and 10 follow #nyaflix.)
         assert_eq!(
             left_out(&fort).unwrap(),
-            "Discord left 5 channels out of this template (after #newcomers; 2 after #unlock-all-channels; 2 after #nyaflix), and says nothing of what they were: it leaves out a community server's announcement channels. Make them here by hand (New channel, Announcements)."
+            "Discord left 5 channels out of this template, and says nothing of what they were but where: 2 between #unlock-all-channels and #📜rules (announcement channels, most likely); 2 in Special VCs, above 🔊Nyaflix (stage channels, most likely); and 1 more it gives no place to. It leaves out a community server's announcement and stage channels, so make them here by hand (New channel, then Announcements or Stage)."
         );
-        let top = template(vec![channel(2, 4, "Info"), channel(4, 0, "general")]);
-        assert_eq!(left_out(&top).unwrap().split(" (").nth(1).unwrap().split(')').next().unwrap(), "at the top; at the top of Info");
-        assert_eq!(left_out(&template(vec![channel(1, 0, "general"), channel(2, 2, "Lounge")])), None);
+        // One missing at the very top, which the ids alone wouldn't show.
+        let top = template(vec![channel(1, 0, 1, "general", None)]);
+        assert!(left_out(&top).unwrap().contains(": 1 above #general (an announcement channel, most likely)."));
+        assert_eq!(left_out(&template(vec![channel(1, 0, 0, "general", None), channel(2, 2, 0, "Lounge", None)])), None);
     }
 
     #[test]
