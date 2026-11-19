@@ -273,6 +273,44 @@ pub struct Mention {
     pub name: String,
 }
 
+/// The kinds of count kept in `cached_counts`.
+pub const COUNT_THREAD: &str = "thread";
+pub const COUNT_FORUM_POSTS: &str = "forum_posts";
+pub const COUNT_SECTION: &str = "section";
+/// Between a forum's id and a section's in a section count's `subject`.
+const SECTION_MARK: char = '\u{1f}';
+/// A post in a forum that counts towards its author's posts.
+const IN_FORUMS: &str = "channel IN (SELECT channel FROM channel_forum) AND channel NOT IN (SELECT channel FROM gallery_channels) \
+    AND channel NOT IN (SELECT channel FROM channel_trash)";
+
+fn section_subject(channel: &str, section: Option<&str>) -> String {
+    format!("{channel}{SECTION_MARK}{}", section.unwrap_or_default())
+}
+
+/// `?1, ?2, ...` for `count` values.
+fn marks(count: usize) -> String {
+    (1..=count).map(|n| format!("?{n}")).collect::<Vec<_>>().join(", ")
+}
+
+/// What is counted of a thread: its posts (taken back ones too: they stay in it
+/// as gaps), and its last.
+#[derive(Debug, Clone)]
+pub struct ThreadTally {
+    pub count: i64,
+    pub last_at: Option<i64>,
+    pub last_by: Option<String>,
+}
+
+/// What is counted of a forum's section (`None`: the threads in none).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SectionTally {
+    pub section: Option<String>,
+    pub threads: i64,
+    pub posts: i64,
+    pub last_at: Option<i64>,
+    pub last_thread: Option<String>,
+}
+
 /// A thread: a side conversation grown from one post of a channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Thread {
@@ -1022,6 +1060,19 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         did TEXT PRIMARY KEY,
         signature TEXT NOT NULL
     );
+    -- Counts kept rather than worked out on every ask (the store's kept counts):
+    -- a thread's posts, a member's forum posts, a forum section's threads and
+    -- posts. Any row may be deleted at any time; it is worked out again when
+    -- next asked for.
+    CREATE TABLE IF NOT EXISTS cached_counts (
+        kind TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        n INTEGER NOT NULL,
+        m INTEGER,
+        at INTEGER,
+        ref_id TEXT,
+        PRIMARY KEY (kind, subject)
+    );
     CREATE TABLE IF NOT EXISTS wiki_pages (
         id TEXT PRIMARY KEY,
         channel TEXT NOT NULL,
@@ -1589,6 +1640,15 @@ fn schema() -> Schema {
                 did {MYSQL_DID} NOT NULL PRIMARY KEY,
                 signature TEXT NOT NULL
             ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS cached_counts (
+                kind VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                subject {MYSQL_DID} NOT NULL,
+                n BIGINT NOT NULL,
+                m BIGINT,
+                at BIGINT,
+                ref_id {MYSQL_DID},
+                PRIMARY KEY (kind, subject)
+            ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS wiki_pages (
                 id VARCHAR(64) NOT NULL PRIMARY KEY,
                 channel VARCHAR(255) NOT NULL,
@@ -2067,6 +2127,9 @@ impl Store {
                 // What they wrote, and what they were answering, is theirs under the new DID.
                 tx.execute("UPDATE posts SET author_did = ?2 WHERE author_did = ?1", params![prior, new])?;
                 tx.execute("UPDATE posts SET answered_by = ?2 WHERE answered_by = ?1", params![prior, new])?;
+                // (Their counts are worked out again under the new DID.)
+                tx.execute(&format!("DELETE FROM cached_counts WHERE kind = '{COUNT_FORUM_POSTS}' AND subject IN (?1, ?2)"), params![prior, new])?;
+                tx.execute(&format!("DELETE FROM cached_counts WHERE kind = '{COUNT_THREAD}' AND ref_id = ?1"), params![prior])?;
                 tx.execute("UPDATE answering SET owner = ?2 WHERE owner = ?1", params![prior, new])?;
                 // Their voice preferences follow them.
                 tx.execute("UPDATE OR IGNORE voice_prefs SET did = ?2 WHERE did = ?1", params![prior, new])?;
@@ -2753,13 +2816,18 @@ impl Store {
     /// Puts a channel in the trash: listed to nobody, and gone for good once
     /// [`Self::purge_trashed`] passes it.
     pub fn trash_channel(&self, id: &str, by: &str, now: i64) -> Result<()> {
-        self.db.lock().execute("INSERT OR REPLACE INTO channel_trash (channel, trashed_at, trashed_by) VALUES (?1, ?2, ?3)", params![id, now, by])?;
+        let mut db = self.db.lock();
+        db.execute("INSERT OR REPLACE INTO channel_trash (channel, trashed_at, trashed_by) VALUES (?1, ?2, ?3)", params![id, now, by])?;
+        Self::forget_forum_posts(&mut db)?;
         Ok(())
     }
 
     /// Takes a channel out of the trash, as it was.
     pub fn restore_channel(&self, id: &str) -> Result<bool> {
-        Ok(self.db.lock().execute("DELETE FROM channel_trash WHERE channel = ?1", params![id])? > 0)
+        let mut db = self.db.lock();
+        let restored = db.execute("DELETE FROM channel_trash WHERE channel = ?1", params![id])? > 0;
+        Self::forget_forum_posts(&mut db)?;
+        Ok(restored)
     }
 
     /// Deletes for good every channel put in the trash before `before`: its posts
@@ -2773,6 +2841,8 @@ impl Store {
                     tx.execute(&format!("DELETE FROM {table} WHERE post IN (SELECT id FROM posts WHERE channel = ?1)"), params![id])?;
                 }
                 tx.execute("DELETE FROM thread_follows WHERE thread IN (SELECT id FROM threads WHERE channel = ?1)", params![id])?;
+                tx.execute(&format!("DELETE FROM cached_counts WHERE kind = '{COUNT_THREAD}' AND subject IN (SELECT id FROM threads WHERE channel = ?1)"), params![id])?;
+                Self::forget_sections(tx, id)?;
                 for table in ["threads", "posts", "held", "channel_voice", "channel_overrides", "channel_slow", "channel_order", "channel_forum", "web_channels", "webhooks"] {
                     tx.execute(&format!("DELETE FROM {table} WHERE channel = ?1"), params![id])?;
                 }
@@ -2846,7 +2916,6 @@ impl Store {
             return posts.into_iter().map(|post| self.filled(post)).collect();
         }
         let ids: Vec<wyvrn_service::db::Value> = posts.iter().map(|post| wyvrn_service::db::ToValue::to_value(&post.id)).collect();
-        let marks = |count: usize| (1..=count).map(|n| format!("?{n}")).collect::<Vec<_>>().join(", ");
         let place: std::collections::HashMap<String, usize> = posts.iter().enumerate().map(|(n, post)| (post.id.clone(), n)).collect();
         let at = |id: &str| place.get(id).copied();
         let mut db = self.db.lock();
@@ -2880,10 +2949,7 @@ impl Store {
         }
         let threads = db.query(
             &format!(
-                "SELECT id, channel, name, created_by, created_at, (SELECT COUNT(*) FROM post_state WHERE post_state.thread = threads.id), \
-                 (SELECT MAX(posted_at) FROM posts WHERE posts.id IN (SELECT post FROM post_state WHERE post_state.thread = threads.id)), \
-                 (SELECT author_did FROM posts WHERE posts.id IN (SELECT post FROM post_state WHERE post_state.thread = threads.id) ORDER BY serial DESC LIMIT 1), \
-                 (SELECT sticky FROM thread_flags WHERE thread_flags.thread = threads.id), (SELECT locked FROM thread_flags WHERE thread_flags.thread = threads.id), \
+                "SELECT id, channel, name, created_by, created_at, (SELECT sticky FROM thread_flags WHERE thread_flags.thread = threads.id), (SELECT locked FROM thread_flags WHERE thread_flags.thread = threads.id), \
                  (SELECT section FROM thread_flags WHERE thread_flags.thread = threads.id) FROM threads WHERE id IN ({})",
                 marks(ids.len())
             ),
@@ -2895,16 +2961,21 @@ impl Store {
                     name: row.get(2)?,
                     created_by: row.get(3)?,
                     created_at: row.get(4)?,
-                    count: row.get(5)?,
-                    last_at: row.get(6)?,
-                    last_by: row.get(7)?,
-                    sticky: row.get::<Option<i64>>(8)?.unwrap_or(0) != 0,
-                    locked: row.get::<Option<i64>>(9)?.unwrap_or(0) != 0,
-                    section: row.get(10)?,
+                    count: 0,
+                    last_at: None,
+                    last_by: None,
+                    sticky: row.get::<Option<i64>>(5)?.unwrap_or(0) != 0,
+                    locked: row.get::<Option<i64>>(6)?.unwrap_or(0) != 0,
+                    section: row.get(7)?,
                 })
             },
         )?;
-        for thread in threads {
+        let grown: Vec<String> = threads.iter().map(|thread| thread.id.clone()).collect();
+        let mut tallies = Self::thread_tallies(&mut db, &grown)?;
+        for mut thread in threads {
+            if let Some(tally) = tallies.remove(&thread.id) {
+                (thread.count, thread.last_at, thread.last_by) = (tally.count, tally.last_at, tally.last_by);
+            }
             if let Some(n) = at(&thread.id) {
                 posts[n].grew = Some(thread);
             }
@@ -2957,6 +3028,9 @@ impl Store {
             "UPDATE post_state SET reply_to = ?2, thread = ?3, mentions = ?4, reply_author = ?5, reply_snippet = ?6 WHERE post = ?1",
             params![id, reply_to, thread, mentions, author, snippet],
         )?;
+        if let Some(thread) = thread {
+            Self::forget_thread(&mut db, thread)?;
+        }
         Ok(())
     }
 
@@ -2983,6 +3057,7 @@ impl Store {
         db.execute("DELETE FROM votes WHERE post = ?1", params![id])?;
         Self::touch(&mut db, id)?;
         db.execute("UPDATE post_state SET deleted = 1, pinned = 0, mentions = NULL WHERE post = ?1", params![id])?;
+        db.execute(&format!("DELETE FROM cached_counts WHERE kind = '{COUNT_FORUM_POSTS}' AND subject = (SELECT author_did FROM posts WHERE id = ?1)"), params![id])?;
         Ok(())
     }
 
@@ -3030,11 +3105,9 @@ impl Store {
     // --- Threads ---------------------------------------------------------------
 
     pub fn thread(&self, id: &str) -> Result<Option<Thread>> {
-        self.db.lock().query_row(
-            "SELECT id, channel, name, created_by, created_at, (SELECT COUNT(*) FROM post_state WHERE post_state.thread = threads.id), \
-             (SELECT MAX(posted_at) FROM posts WHERE posts.id IN (SELECT post FROM post_state WHERE post_state.thread = threads.id)), \
-             (SELECT author_did FROM posts WHERE posts.id IN (SELECT post FROM post_state WHERE post_state.thread = threads.id) ORDER BY serial DESC LIMIT 1), \
-             (SELECT sticky FROM thread_flags WHERE thread_flags.thread = threads.id), (SELECT locked FROM thread_flags WHERE thread_flags.thread = threads.id), \
+        let mut db = self.db.lock();
+        let found = db.query_row(
+            "SELECT id, channel, name, created_by, created_at, (SELECT sticky FROM thread_flags WHERE thread_flags.thread = threads.id), (SELECT locked FROM thread_flags WHERE thread_flags.thread = threads.id), \
              (SELECT section FROM thread_flags WHERE thread_flags.thread = threads.id) FROM threads WHERE id = ?1",
             params![id],
             |row| {
@@ -3044,20 +3117,27 @@ impl Store {
                     name: row.get(2)?,
                     created_by: row.get(3)?,
                     created_at: row.get(4)?,
-                    count: row.get(5)?,
-                    last_at: row.get(6)?,
-                    last_by: row.get(7)?,
-                    sticky: row.get::<Option<i64>>(8)?.unwrap_or(0) != 0,
-                    locked: row.get::<Option<i64>>(9)?.unwrap_or(0) != 0,
-                    section: row.get(10)?,
+                    count: 0,
+                    last_at: None,
+                    last_by: None,
+                    sticky: row.get::<Option<i64>>(5)?.unwrap_or(0) != 0,
+                    locked: row.get::<Option<i64>>(6)?.unwrap_or(0) != 0,
+                    section: row.get(7)?,
                 })
             },
-        )
+        )?;
+        let Some(mut thread) = found else { return Ok(None) };
+        if let Some(tally) = Self::thread_tallies(&mut db, std::slice::from_ref(&thread.id))?.remove(&thread.id) {
+            (thread.count, thread.last_at, thread.last_by) = (tally.count, tally.last_at, tally.last_by);
+        }
+        Ok(Some(thread))
     }
 
     /// A thread's standing in a forum: sticky, locked, its section.
     pub fn set_thread_flags(&self, thread: &str, sticky: bool, locked: bool, section: Option<&str>) -> Result<()> {
-        self.db.lock().execute("INSERT OR REPLACE INTO thread_flags (thread, sticky, locked, section) VALUES (?1, ?2, ?3, ?4)", params![thread, sticky as i64, locked as i64, section])?;
+        let mut db = self.db.lock();
+        db.execute("INSERT OR REPLACE INTO thread_flags (thread, sticky, locked, section) VALUES (?1, ?2, ?3, ?4)", params![thread, sticky as i64, locked as i64, section])?;
+        Self::forget_thread(&mut db, thread)?;
         Ok(())
     }
 
@@ -3079,19 +3159,182 @@ impl Store {
         Ok(())
     }
 
-    /// How many posts each member made in `channels` (the community's forums), of
-    /// those who posted in `in_channel`.
-    pub fn forum_post_counts(&self, channels: &[String], in_channel: &str) -> Result<Vec<(String, i64)>> {
-        let mut out = Vec::new();
-        let authors: Vec<String> = self.db.lock().query("SELECT DISTINCT author_did FROM posts WHERE channel = ?1 LIMIT 500", params![in_channel], |row| row.get(0))?;
-        for author in authors {
-            let mut count = 0i64;
-            for channel in channels {
-                count += self.db.lock().query_value::<i64>("SELECT COUNT(*) FROM posts WHERE channel = ?1 AND author_did = ?2", params![channel, author])?;
+    /// How many posts each of the first 500 to post in `in_channel` has in the
+    /// community's forums, from the kept counts ([`Self::rebuild_counts`]).
+    pub fn forum_post_counts(&self, in_channel: &str) -> Result<Vec<(String, i64)>> {
+        let mut db = self.db.lock();
+        let authors: Vec<String> = db.query("SELECT DISTINCT author_did FROM posts WHERE channel = ?1 LIMIT 500", params![in_channel], |row| row.get(0))?;
+        let mut kept = std::collections::HashMap::new();
+        for chunk in authors.chunks(200) {
+            let values: Vec<wyvrn_service::db::Value> = chunk.iter().map(wyvrn_service::db::ToValue::to_value).collect();
+            for (did, n) in db.query(
+                &format!("SELECT subject, n FROM cached_counts WHERE kind = '{COUNT_FORUM_POSTS}' AND subject IN ({})", marks(chunk.len())),
+                &values,
+                |row| Ok((row.get::<String>(0)?, row.get::<i64>(1)?)),
+            )? {
+                kept.insert(did, n);
             }
-            out.push((author, count));
+        }
+        let mut out = Vec::new();
+        for author in authors {
+            let n = match kept.get(&author) {
+                Some(n) => *n,
+                None => Self::count_forum_posts(&mut db, &author)?,
+            };
+            out.push((author, n));
         }
         Ok(out)
+    }
+
+    /// Each of `sections` of the forum `channel` (and `None`, the threads in no
+    /// section): its threads, posts and newest thread, from the kept counts.
+    pub fn section_tallies(&self, channel: &str, sections: &[String]) -> Result<Vec<SectionTally>> {
+        let mut db = self.db.lock();
+        let mut out = Vec::new();
+        for section in std::iter::once(None).chain(sections.iter().map(|s| Some(s.as_str()))) {
+            out.push(Self::section_tally(&mut db, channel, section)?);
+        }
+        Ok(out)
+    }
+
+    /// Clears every kept count and works each out again from what is stored:
+    /// for when they are thought wrong. Returns how many threads, members and
+    /// sections were counted.
+    pub fn rebuild_counts(&self) -> Result<(usize, usize, usize)> {
+        let forums: Vec<(String, Vec<String>)> = self
+            .channels()?
+            .into_iter()
+            .filter(|channel| channel.forum.is_some())
+            .map(|channel| {
+                let sections = channel.sections.as_ref().and_then(Value::as_array).map(|list| list.iter().filter_map(|s| s["id"].as_str().map(str::to_string)).collect()).unwrap_or_default();
+                (channel.id, sections)
+            })
+            .collect();
+        let mut db = self.db.lock();
+        db.execute("DELETE FROM cached_counts", params![])?;
+        let threads: Vec<String> = db.query("SELECT id FROM threads", params![], |row| row.get(0))?;
+        for chunk in threads.chunks(200) {
+            Self::thread_tallies(&mut db, chunk)?;
+        }
+        let authors: Vec<String> = db.query(&format!("SELECT DISTINCT author_did FROM posts WHERE {IN_FORUMS}"), params![], |row| row.get(0))?;
+        for author in &authors {
+            Self::count_forum_posts(&mut db, author)?;
+        }
+        let mut sections = 0;
+        for (channel, ids) in &forums {
+            for section in std::iter::once(None).chain(ids.iter().map(|s| Some(s.as_str()))) {
+                Self::section_tally(&mut db, channel, section)?;
+                sections += 1;
+            }
+        }
+        Ok((threads.len(), authors.len(), sections))
+    }
+
+    /// The threads `ids`' counts, kept or else worked out (and then kept).
+    fn thread_tallies(db: &mut wyvrn_service::db::Session<'_>, ids: &[String]) -> Result<std::collections::HashMap<String, ThreadTally>> {
+        let mut out = std::collections::HashMap::new();
+        for chunk in ids.chunks(200) {
+            let values: Vec<wyvrn_service::db::Value> = chunk.iter().map(wyvrn_service::db::ToValue::to_value).collect();
+            for (id, tally) in db.query(
+                &format!("SELECT subject, n, at, ref_id FROM cached_counts WHERE kind = '{COUNT_THREAD}' AND subject IN ({})", marks(chunk.len())),
+                &values,
+                |row| Ok((row.get::<String>(0)?, ThreadTally { count: row.get(1)?, last_at: row.get(2)?, last_by: row.get(3)? })),
+            )? {
+                out.insert(id, tally);
+            }
+        }
+        for id in ids {
+            if out.contains_key(id) {
+                continue;
+            }
+            const IN: &str = "SELECT post FROM post_state WHERE thread = ?1";
+            let count: i64 = db.query_value("SELECT COUNT(*) FROM post_state WHERE thread = ?1", params![id])?;
+            let last = db.query_row(&format!("SELECT posted_at, author_did FROM posts WHERE id IN ({IN}) ORDER BY serial DESC LIMIT 1"), params![id], |row| {
+                Ok((row.get::<i64>(0)?, row.get::<String>(1)?))
+            })?;
+            let tally = ThreadTally { count, last_at: last.as_ref().map(|(at, _)| *at), last_by: last.map(|(_, by)| by) };
+            db.execute(
+                &format!("INSERT OR REPLACE INTO cached_counts (kind, subject, n, m, at, ref_id) VALUES ('{COUNT_THREAD}', ?1, ?2, NULL, ?3, ?4)"),
+                params![id, tally.count, tally.last_at, tally.last_by.clone()],
+            )?;
+            out.insert(id.clone(), tally);
+        }
+        Ok(out)
+    }
+
+    /// How many posts `did` has in the forums (not galleries, not the trash, not
+    /// taken back), worked out and kept.
+    fn count_forum_posts(db: &mut wyvrn_service::db::Session<'_>, did: &str) -> Result<i64> {
+        let n: i64 = db.query_value(
+            &format!("SELECT COUNT(*) FROM posts WHERE author_did = ?1 AND {IN_FORUMS} AND NOT EXISTS (SELECT 1 FROM post_state WHERE post_state.post = posts.id AND post_state.deleted = 1)"),
+            params![did],
+        )?;
+        db.execute(&format!("INSERT OR REPLACE INTO cached_counts (kind, subject, n) VALUES ('{COUNT_FORUM_POSTS}', ?1, ?2)"), params![did, n])?;
+        Ok(n)
+    }
+
+    /// A section's counts, kept or else worked out (and then kept). A section's
+    /// posts are its threads' first posts and every post in them.
+    fn section_tally(db: &mut wyvrn_service::db::Session<'_>, channel: &str, section: Option<&str>) -> Result<SectionTally> {
+        let subject = section_subject(channel, section);
+        let kept = db.query_row(
+            &format!("SELECT n, m, at, ref_id FROM cached_counts WHERE kind = '{COUNT_SECTION}' AND subject = ?1"),
+            params![subject],
+            |row| Ok((row.get::<i64>(0)?, row.get::<Option<i64>>(1)?, row.get::<Option<i64>>(2)?, row.get::<Option<String>>(3)?)),
+        )?;
+        let (threads, posts, last_at, last_thread) = match kept {
+            Some((n, m, at, newest)) => (n, m.unwrap_or(n), at, newest),
+            None => {
+                const IN_SECTION: &str = "threads.channel = ?1 AND COALESCE((SELECT section FROM thread_flags WHERE thread_flags.thread = threads.id), '') = ?2";
+                let given = section.unwrap_or_default();
+                let threads: i64 = db.query_value(&format!("SELECT COUNT(*) FROM threads WHERE {IN_SECTION}"), params![channel, given])?;
+                let answers: i64 = db.query_value(&format!("SELECT COUNT(*) FROM post_state WHERE thread IN (SELECT id FROM threads WHERE {IN_SECTION})"), params![channel, given])?;
+                let newest = db.query_row(
+                    &format!(
+                        "SELECT id, COALESCE((SELECT MAX(posted_at) FROM posts WHERE posts.id IN (SELECT post FROM post_state WHERE post_state.thread = threads.id)), created_at) AS last \
+                         FROM threads WHERE {IN_SECTION} ORDER BY last DESC LIMIT 1"
+                    ),
+                    params![channel, given],
+                    |row| Ok((row.get::<String>(0)?, row.get::<i64>(1)?)),
+                )?;
+                let (last_thread, last_at) = match newest {
+                    Some((id, at)) => (Some(id), Some(at)),
+                    None => (None, None),
+                };
+                db.execute(
+                    &format!("INSERT OR REPLACE INTO cached_counts (kind, subject, n, m, at, ref_id) VALUES ('{COUNT_SECTION}', ?1, ?2, ?3, ?4, ?5)"),
+                    params![subject, threads, threads + answers, last_at, last_thread.clone()],
+                )?;
+                (threads, threads + answers, last_at, last_thread)
+            }
+        };
+        Ok(SectionTally { section: section.map(str::to_string), threads, posts, last_at, last_thread })
+    }
+
+    /// Forgets the kept counts a change to `thread` makes wrong: its own, and its
+    /// forum's sections'.
+    fn forget_thread(db: &mut wyvrn_service::db::Session<'_>, thread: &str) -> Result<()> {
+        db.execute(&format!("DELETE FROM cached_counts WHERE kind = '{COUNT_THREAD}' AND subject = ?1"), params![thread])?;
+        if let Some(channel) = db.query_row("SELECT channel FROM threads WHERE id = ?1", params![thread], |row| row.get::<String>(0))? {
+            Self::forget_sections(db, &channel)?;
+        }
+        Ok(())
+    }
+
+    /// Forgets the kept counts of every section of the forum `channel`.
+    fn forget_sections(db: &mut wyvrn_service::db::Session<'_>, channel: &str) -> Result<()> {
+        db.execute(
+            &format!("DELETE FROM cached_counts WHERE kind = '{COUNT_SECTION}' AND subject >= ?1 AND subject < ?2"),
+            params![format!("{channel}{SECTION_MARK}"), format!("{channel}{}", char::from(SECTION_MARK as u8 + 1))],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets every member's forum post count: for when which channels are
+    /// forums, or in the trash, changes.
+    fn forget_forum_posts(db: &mut wyvrn_service::db::Session<'_>) -> Result<()> {
+        db.execute(&format!("DELETE FROM cached_counts WHERE kind = '{COUNT_FORUM_POSTS}'"), params![])?;
+        Ok(())
     }
 
     /// Grows a thread from the post `id`. `false` if one had grown from it already.
@@ -3100,6 +3343,7 @@ impl Store {
         let made = db.execute("INSERT OR IGNORE INTO threads (id, channel, name, created_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![id, channel, name, by, now])? > 0;
         if made {
             Self::touch(&mut db, id)?;
+            Self::forget_sections(&mut db, channel)?;
         }
         Ok(made)
     }
@@ -3153,6 +3397,7 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![channel, seq, id, content, now, author.did, author.name, question.map(Value::to_string), answer.map(Value::to_string)],
         )?;
+        db.execute(&format!("DELETE FROM cached_counts WHERE kind = '{COUNT_FORUM_POSTS}' AND subject = ?1"), params![author.did])?;
         db.query_row(&format!("SELECT {POST_COLUMNS} FROM posts WHERE id = ?1"), params![id], post_from)?
             .ok_or_else(|| wyvrn_service::db::Error::Other("a post just written is not there".into()))
     }
@@ -3198,6 +3443,27 @@ impl Store {
             )?,
         };
         self.all_filled(posts)
+    }
+
+    /// A page of the thread `thread` of `channel`, oldest first: `limit` posts
+    /// from the `offset`th.
+    pub fn thread_page(&self, channel: &str, thread: &str, offset: usize, limit: usize) -> Result<Vec<Post>> {
+        const IN_THREAD: &str = "(SELECT thread FROM post_state WHERE post_state.post = posts.id)";
+        let posts = self.db.lock().query(
+            &format!("SELECT {POST_COLUMNS} FROM posts WHERE channel = ?1 AND {IN_THREAD} = ?2 ORDER BY seq LIMIT ?3 OFFSET ?4"),
+            params![channel, thread, limit as i64, offset as i64],
+            post_from,
+        )?;
+        self.all_filled(posts)
+    }
+
+    /// How many posts of the thread `thread` of `channel` are at or before `seq`:
+    /// where the first after it is, counting from 0.
+    pub fn thread_posts_through(&self, channel: &str, thread: &str, seq: i64) -> Result<i64> {
+        self.db.lock().query_value(
+            "SELECT COUNT(*) FROM posts WHERE channel = ?1 AND seq <= ?3 AND (SELECT thread FROM post_state WHERE post_state.post = posts.id) = ?2",
+            params![channel, thread, seq],
+        )
     }
 
     /// The posts of `channel` (in `thread`, or in none) around the time `at`: up to
@@ -3539,6 +3805,7 @@ impl Store {
         if on {
             db.execute("INSERT INTO gallery_channels (channel) VALUES (?1)", params![channel])?;
         }
+        Self::forget_forum_posts(&mut db)?;
         Ok(())
     }
 
@@ -3758,7 +4025,9 @@ impl Store {
 
     /// Makes `channel` a forum with `tags`, or changes them.
     pub fn set_forum(&self, channel: &str, tags: &Value) -> Result<()> {
-        self.db.lock().execute("INSERT OR REPLACE INTO channel_forum (channel, tags) VALUES (?1, ?2)", params![channel, tags.to_string()])?;
+        let mut db = self.db.lock();
+        db.execute("INSERT OR REPLACE INTO channel_forum (channel, tags) VALUES (?1, ?2)", params![channel, tags.to_string()])?;
+        Self::forget_forum_posts(&mut db)?;
         Ok(())
     }
 
@@ -3898,4 +4167,55 @@ fn event_hook_from(row: &Row) -> Result<EventHook> {
 
 fn webhook_from(row: &Row) -> Result<Webhook> {
     Ok(Webhook { id: row.get(0)?, channel: row.get(1)?, name: row.get(2)?, avatar: row.get(3)?, token: row.get(4)?, created_by: row.get(5)?, created_at: row.get(6)? })
+}
+
+#[cfg(test)]
+mod kept_counts {
+    use super::*;
+
+    fn post(store: &Store, author: &Member, id: &str, thread: Option<&str>) {
+        store.add_post("board", id, "words", author, None, None, 10).unwrap();
+        store.set_written_with(id, None, thread, &[]).unwrap();
+    }
+
+    #[test]
+    fn counts_are_kept_forgotten_as_posts_change_and_rebuilt_when_wrong() {
+        let store = Store::in_memory().unwrap();
+        store.set_member("did:example:bea", Role::Member, 1).unwrap();
+        let bea = store.member("did:example:bea").unwrap().unwrap();
+        store.add_channel("board", "board", "", "did:example:bea", 1).unwrap();
+        store.set_forum("board", &serde_json::json!([])).unwrap();
+        post(&store, &bea, "t1", None);
+        store.add_thread("t1", "board", Some("Help"), &bea.did, 10).unwrap();
+        store.set_thread_flags("t1", false, false, Some("help")).unwrap();
+        post(&store, &bea, "r1", Some("t1"));
+        post(&store, &bea, "r2", Some("t1"));
+
+        let help = |store: &Store| store.section_tallies("board", &["help".to_string()]).unwrap()[1].clone();
+        assert_eq!(store.thread("t1").unwrap().unwrap().count, 2);
+        assert_eq!(store.forum_post_counts("board").unwrap(), vec![(bea.did.clone(), 3)]);
+        assert_eq!((help(&store).threads, help(&store).posts, help(&store).last_thread.as_deref()), (1, 3, Some("t1")));
+
+        // A new post, and one taken back, are counted at once.
+        post(&store, &bea, "r3", Some("t1"));
+        store.delete_post("r1", None).unwrap();
+        assert_eq!(store.thread("t1").unwrap().unwrap().count, 3, "a post taken back stays in its thread");
+        assert_eq!(store.forum_post_counts("board").unwrap(), vec![(bea.did.clone(), 3)]);
+        assert_eq!(help(&store).posts, 4);
+        // Moved out of the section, it is counted in none.
+        store.set_thread_flags("t1", false, false, None).unwrap();
+        assert_eq!((help(&store).threads, store.section_tallies("board", &[]).unwrap()[0].threads), (0, 1));
+
+        // Counts gone wrong (by hand, here) are put right by a rebuild.
+        store.thread("t1").unwrap();
+        store.db.lock().execute("UPDATE cached_counts SET n = 99", params![]).unwrap();
+        assert_eq!(store.thread("t1").unwrap().unwrap().count, 99);
+        assert_eq!(store.rebuild_counts().unwrap(), (1, 1, 1));
+        assert_eq!(store.thread("t1").unwrap().unwrap().count, 3);
+        assert_eq!(store.forum_post_counts("board").unwrap(), vec![(bea.did.clone(), 3)]);
+
+        // A gallery's posts aren't forum posts.
+        store.set_gallery("board", true).unwrap();
+        assert_eq!(store.forum_post_counts("board").unwrap(), vec![(bea.did.clone(), 0)]);
+    }
 }

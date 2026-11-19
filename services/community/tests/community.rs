@@ -3836,3 +3836,51 @@ async fn a_forum_is_a_board_with_sections_sticky_and_locked_threads_signatures_a
     let of = |peer: &Peer| stats["body"]["stats"].as_array().unwrap().iter().find(|s| s["member"] == server.id(peer).as_str()).unwrap()["posts"].as_i64().unwrap();
     assert_eq!((of(&member), of(&owner)), (1, 2), "{stats}");
 }
+
+#[tokio::test]
+async fn a_long_thread_is_read_a_page_at_a_time_and_counts_are_kept_and_rebuilt() {
+    let server = start_server("").await;
+    let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member]);
+    for peer in [&owner, &member] {
+        peer.community("join", json!({})).await;
+    }
+    let forum = owner.community("create-channel", json!({ "name": "board", "kind": "forum" })).await["body"]["created"].as_str().unwrap().to_string();
+    owner.community("update-channel", json!({ "channel": forum, "sections": [{ "id": "help", "name": "Help" }] })).await;
+    member.community("post", json!({ "channel": forum, "id": "t1", "title": "Long", "content": "Go", "section": "help" })).await;
+    let mut seqs = Vec::new();
+    for n in 0..45 {
+        let posted = owner.community("post", json!({ "channel": forum, "content": format!("reply {n}"), "thread": "t1" })).await;
+        seqs.push(posted["body"]["seq"].as_i64().unwrap());
+    }
+
+    // Twenty at a time, from the start; the last page has what is left.
+    let first = member.community("history-request", json!({ "channel": forum, "thread": "t1", "offset": 0, "limit": 20 })).await;
+    let contents = |page: &Value| page["body"]["messages"].as_array().unwrap().iter().map(|m| m["content"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!((first["body"]["offset"].as_i64(), first["body"]["total"].as_i64(), first["body"]["more"].as_bool()), (Some(0), Some(45), Some(true)), "{first}");
+    assert_eq!(contents(&first).first().map(String::as_str), Some("reply 0"));
+    assert_eq!(contents(&first).len(), 20);
+    let last = member.community("history-request", json!({ "channel": forum, "thread": "t1", "offset": 40, "limit": 20 })).await;
+    assert_eq!((contents(&last).len(), last["body"]["more"].as_bool()), (5, Some(false)));
+    // The page with the first post after one read: having read reply 24, reply 25's.
+    let unread = member.community("history-request", json!({ "channel": forum, "thread": "t1", "page_after": seqs[24], "limit": 20 })).await;
+    assert_eq!((unread["body"]["offset"].as_i64(), contents(&unread).first().map(String::as_str)), (Some(20), Some("reply 20")), "{unread}");
+    // Everything read: the last page.
+    let all_read = member.community("history-request", json!({ "channel": forum, "thread": "t1", "page_after": seqs[44], "limit": 20 })).await;
+    assert_eq!(all_read["body"]["offset"].as_i64(), Some(40));
+
+    // The sections' counts, and each member's posts.
+    let stats = member.community("forum-stats-request", json!({ "channel": forum })).await;
+    let help = stats["body"]["sections"].as_array().unwrap().iter().find(|s| s["section"] == "help").unwrap().clone();
+    assert_eq!((help["threads"].as_i64(), help["posts"].as_i64(), help["last_thread"].as_str()), (Some(1), Some(46), Some("t1")), "{stats}");
+    let of = |peer: &Peer| stats["body"]["stats"].as_array().unwrap().iter().find(|s| s["member"] == server.id(peer).as_str()).unwrap()["posts"].as_i64().unwrap();
+    assert_eq!((of(&member), of(&owner)), (1, 45));
+
+    // Recounting is the admins'; it changes nothing that was right.
+    assert_eq!(member.community("rebuild-counts", json!({})).await["body"]["code"], "e.p.trust.not-authorized");
+    let rebuilt = owner.community("rebuild-counts", json!({})).await;
+    assert_eq!(kind(&rebuilt), "counts-rebuilt");
+    assert_eq!((rebuilt["body"]["threads"].as_i64(), rebuilt["body"]["members"].as_i64()), (Some(1), Some(2)), "{rebuilt}");
+    let again = member.community("forum-stats-request", json!({ "channel": forum })).await;
+    assert_eq!(again["body"]["sections"], stats["body"]["sections"]);
+}

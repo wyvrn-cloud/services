@@ -1,6 +1,7 @@
 //! Forums as message boards (community/1.0's "Forum channels", asked
 //! 2026-11-18): a forum's sections, a thread's standing (sticky, locked, its
-//! section), and how much each member has posted in the forums.
+//! section), how much each member has posted in the forums, and each
+//! section's counts; and recounting what is kept of them (asked the same day).
 
 use serde_json::{json, Value};
 
@@ -10,6 +11,8 @@ use crate::store::Member;
 pub const SET_THREAD: &str = "https://wyvrn.app/community/1.0/set-thread";
 pub const FORUM_STATS_REQUEST: &str = "https://wyvrn.app/community/1.0/forum-stats-request";
 pub const FORUM_STATS: &str = "https://wyvrn.app/community/1.0/forum-stats";
+pub const REBUILD_COUNTS: &str = "https://wyvrn.app/community/1.0/rebuild-counts";
+pub const COUNTS_REBUILT: &str = "https://wyvrn.app/community/1.0/counts-rebuilt";
 
 /// A forum's sections as an admin gives them, checked; a new one gets an id.
 pub fn read_sections(given: &Value) -> Result<Value, &'static str> {
@@ -70,9 +73,8 @@ impl Community {
                 if !self.sees_id(did, &channel.id)? {
                     return refuse(message, "e.p.msg.unknown-channel", "There is no such forum.").map(Some);
                 }
-                let forums: Vec<String> = self.store.channels()?.into_iter().filter(|c| c.forum.is_some()).map(|c| c.id).collect();
                 let mut stats = Vec::new();
-                for (author, posts) in self.store.forum_post_counts(&forums, &channel.id)? {
+                for (author, posts) in self.store.forum_post_counts(&channel.id)? {
                     let since = self.store.member(&author)?.map(|m| m.since);
                     let mut entry = json!({ "member": author, "posts": posts });
                     if let Some(since) = since {
@@ -80,7 +82,29 @@ impl Community {
                     }
                     stats.push(entry);
                 }
-                Ok(Some(Outcome::reply(reply_to(message, FORUM_STATS, json!({ "channel": channel.id, "stats": stats })))))
+                let ids: Vec<String> = channel.sections.as_ref().and_then(Value::as_array).map(|list| list.iter().filter_map(|s| s["id"].as_str().map(str::to_string)).collect()).unwrap_or_default();
+                let sections: Vec<Value> = self
+                    .store
+                    .section_tallies(&channel.id, &ids)?
+                    .into_iter()
+                    .map(|tally| {
+                        let mut entry = json!({ "section": tally.section, "threads": tally.threads, "posts": tally.posts });
+                        if let (Some(at), Some(thread)) = (tally.last_at, tally.last_thread) {
+                            entry["last_at"] = json!(at);
+                            entry["last_thread"] = json!(thread);
+                        }
+                        entry
+                    })
+                    .collect();
+                Ok(Some(Outcome::reply(reply_to(message, FORUM_STATS, json!({ "channel": channel.id, "stats": stats, "sections": sections })))))
+            }
+            REBUILD_COUNTS => {
+                if !self.powers(did)?.has("manage_community") {
+                    return refuse(message, "e.p.trust.not-authorized", "Recounting takes Manage the community.").map(Some);
+                }
+                let (threads, members, sections) = self.store.rebuild_counts()?;
+                self.audit(crate::gates::now(), did, "counts.rebuilt", None, Some(json!({ "threads": threads, "members": members, "sections": sections })));
+                Ok(Some(Outcome::reply(reply_to(message, COUNTS_REBUILT, json!({ "threads": threads, "members": members, "sections": sections })))))
             }
             _ => Ok(None),
         }

@@ -1880,6 +1880,26 @@ impl Community {
                 };
                 let limit = body["limit"].as_u64().map_or(DEFAULT_HISTORY_LIMIT, |limit| (limit as usize).clamp(1, MAX_HISTORY_LIMIT));
                 let thread = body["thread"].as_str().filter(|id| !id.is_empty());
+                // A thread read a page at a time, as a forum's is: from a place in
+                // it, or the page holding the first post after one already read.
+                if let Some(thread) = thread.filter(|_| body.get("offset").is_some() || body.get("page_after").is_some()) {
+                    let total = self.store.thread(thread)?.filter(|t| t.channel == channel.id).map_or(0, |t| t.count.max(0) as usize);
+                    let offset = match body["page_after"].as_i64() {
+                        Some(seq) => {
+                            let first_unread = self.store.thread_posts_through(&channel.id, thread, seq)?.max(0) as usize;
+                            first_unread.min(total.saturating_sub(1)) / limit * limit
+                        }
+                        None => body["offset"].as_u64().map_or(0, |offset| offset as usize).min(total),
+                    };
+                    let posts = self.store.thread_page(&channel.id, thread, offset, limit)?;
+                    let messages: Vec<Value> = posts.iter().map(Self::message_body).collect();
+                    let more = offset + posts.len() < total;
+                    return Ok(Outcome::reply(reply_to(
+                        message,
+                        HISTORY,
+                        json!({ "channel": channel.id, "thread": thread, "messages": messages, "more": more, "offset": offset, "total": total }),
+                    )));
+                }
                 let mut posts = self.store.channel_posts_before(&channel.id, thread, body["before"].as_i64(), limit + 1)?;
                 let more = posts.len() > limit;
                 posts.truncate(limit);
