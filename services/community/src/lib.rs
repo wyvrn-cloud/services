@@ -17,6 +17,7 @@ pub mod announcements;
 pub mod assistant;
 pub mod automod;
 pub mod discord;
+pub mod events;
 pub mod filters;
 pub mod community;
 pub mod config;

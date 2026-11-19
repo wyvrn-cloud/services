@@ -249,6 +249,10 @@ pub async fn run_outgoing(state: Arc<AppState>) {
         if let Err(error) = crate::announcements::send_due(&state, now).await {
             tracing::warn!(%error, "couldn't send announcements");
         }
+        // Events' reminders (events.rs).
+        if let Err(error) = crate::events::send_reminders(&state, now).await {
+            tracing::warn!(%error, "couldn't send reminders");
+        }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }

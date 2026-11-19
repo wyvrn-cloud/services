@@ -63,6 +63,8 @@ pub struct Channel {
     pub announcement: bool,
     /// Whether it is a gallery: a forum each of whose posts is a picture or video.
     pub gallery: bool,
+    /// Whether it is a calendar channel: no posts, the community's events.
+    pub calendar: bool,
     /// Its place in the order an admin set, if one did, and its category.
     pub position: Option<i64>,
     pub category: Option<String>,
@@ -100,6 +102,18 @@ pub struct Follow {
     pub asked_thid: Option<String>,
     pub pending: bool,
     pub created_at: i64,
+}
+
+/// A community event (events.rs): its fields as JSON, who made it (a DID).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredEvent {
+    pub id: String,
+    pub data: Value,
+    pub organizer: String,
+    pub sequence: i64,
+    pub cancelled: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 /// A webhook (`webhooks`): what posts into `channel` as `name`, from whoever
@@ -388,7 +402,8 @@ const CHANNEL_COLUMNS: &str = "id, name, topic, closed, created_at, created_by, 
     (SELECT category FROM channel_order WHERE channel_order.channel = channels.id), \
     (SELECT tags FROM channel_forum WHERE channel_forum.channel = channels.id), \
     (SELECT COUNT(*) FROM announce_channels WHERE announce_channels.channel = channels.id), \
-    (SELECT COUNT(*) FROM gallery_channels WHERE gallery_channels.channel = channels.id)";
+    (SELECT COUNT(*) FROM gallery_channels WHERE gallery_channels.channel = channels.id), \
+    (SELECT COUNT(*) FROM calendar_channels WHERE calendar_channels.channel = channels.id)";
 
 fn member_from(row: &Row) -> Result<Member> {
     let role: String = row.get(1)?;
@@ -457,6 +472,7 @@ fn channel_from(row: &Row) -> Result<Channel> {
         forum: json_from(row.get(11)?),
         announcement: row.get::<Option<i64>>(12)?.unwrap_or(0) > 0,
         gallery: row.get::<Option<i64>>(13)?.unwrap_or(0) > 0,
+        calendar: row.get::<Option<i64>>(14)?.unwrap_or(0) > 0,
     })
 }
 
@@ -884,6 +900,36 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
     -- Forums that are galleries: each post a picture or video (community/1.0's
     -- Gallery channels).
     CREATE TABLE IF NOT EXISTS gallery_channels (
+        channel TEXT PRIMARY KEY
+    );
+    -- Events (events.rs): each its fields as JSON, who made it, its sequence and
+    -- whether it was cancelled; who answered what; which reminders went; each
+    -- member's calendar feed address; and the calendar channels.
+    CREATE TABLE IF NOT EXISTS events (
+        id TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        organizer TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        cancelled INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS event_rsvps (
+        event TEXT NOT NULL,
+        did TEXT NOT NULL,
+        status TEXT NOT NULL,
+        at INTEGER NOT NULL,
+        PRIMARY KEY (event, did)
+    );
+    CREATE TABLE IF NOT EXISTS event_reminders (
+        reminder TEXT PRIMARY KEY,
+        at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS calendar_feeds (
+        did TEXT PRIMARY KEY,
+        token TEXT NOT NULL UNIQUE
+    );
+    CREATE TABLE IF NOT EXISTS calendar_channels (
         channel TEXT PRIMARY KEY
     );
     CREATE TABLE IF NOT EXISTS announce_published (
@@ -1352,6 +1398,33 @@ fn schema() -> Schema {
                 channel VARCHAR(255) NOT NULL PRIMARY KEY
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS gallery_channels (
+                channel VARCHAR(255) NOT NULL PRIMARY KEY
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS events (
+                id VARCHAR(64) NOT NULL PRIMARY KEY,
+                data MEDIUMTEXT NOT NULL,
+                organizer VARCHAR(3000) NOT NULL,
+                sequence BIGINT NOT NULL,
+                cancelled BIGINT NOT NULL DEFAULT 0,
+                created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS event_rsvps (
+                event VARCHAR(64) NOT NULL,
+                did {MYSQL_DID} NOT NULL,
+                status VARCHAR(16) NOT NULL,
+                at BIGINT NOT NULL,
+                PRIMARY KEY (event, did(255))
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS event_reminders (
+                reminder VARCHAR(128) NOT NULL PRIMARY KEY,
+                at BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS calendar_feeds (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                token VARCHAR(64) NOT NULL UNIQUE
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS calendar_channels (
                 channel VARCHAR(255) NOT NULL PRIMARY KEY
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS announce_published (
@@ -2993,6 +3066,67 @@ impl Store {
         Ok(self.db.lock().query_row("SELECT channel FROM announce_channels WHERE channel = ?1", params![channel], |row| row.get::<String>(0))?.is_some())
     }
 
+    // --- Events (events.rs) -----------------------------------------------------
+
+    pub fn events(&self) -> Result<Vec<StoredEvent>> {
+        self.db.lock().query("SELECT id, data, organizer, sequence, cancelled, created_at, updated_at FROM events ORDER BY created_at, id", params![], event_from)
+    }
+
+    pub fn event(&self, id: &str) -> Result<Option<StoredEvent>> {
+        self.db.lock().query_row("SELECT id, data, organizer, sequence, cancelled, created_at, updated_at FROM events WHERE id = ?1", params![id], event_from)
+    }
+
+    pub fn save_event(&self, e: &StoredEvent) -> Result<()> {
+        self.db.lock().execute(
+            "INSERT OR REPLACE INTO events (id, data, organizer, sequence, cancelled, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![e.id, e.data.to_string(), e.organizer, e.sequence, e.cancelled as i64, e.created_at, e.updated_at],
+        )?;
+        Ok(())
+    }
+
+    /// Who answered `event` with what (`accepted`, `tentative`, `declined`).
+    pub fn event_rsvps(&self, event: &str) -> Result<Vec<(String, String)>> {
+        self.db.lock().query("SELECT did, status FROM event_rsvps WHERE event = ?1 ORDER BY at, did", params![event], |row| Ok((row.get(0)?, row.get(1)?)))
+    }
+
+    pub fn set_event_rsvp(&self, event: &str, did: &str, status: &str, now: i64) -> Result<()> {
+        let mut db = self.db.lock();
+        db.execute("DELETE FROM event_rsvps WHERE event = ?1 AND did = ?2", params![event, did])?;
+        db.execute("INSERT INTO event_rsvps (event, did, status, at) VALUES (?1, ?2, ?3, ?4)", params![event, did, status, now])?;
+        Ok(())
+    }
+
+    /// Notes a reminder as sent: whether it wasn't already. Those over a week old are let go.
+    pub fn mark_reminder(&self, key: &str, now: i64) -> Result<bool> {
+        let mut db = self.db.lock();
+        if db.query_row("SELECT at FROM event_reminders WHERE reminder = ?1", params![key], |row| row.get::<i64>(0))?.is_some() {
+            return Ok(false);
+        }
+        db.execute("DELETE FROM event_reminders WHERE at < ?1", params![now - 8 * 24 * 3600])?;
+        db.execute("INSERT INTO event_reminders (reminder, at) VALUES (?1, ?2)", params![key, now])?;
+        Ok(true)
+    }
+
+    pub fn calendar_feed_of(&self, did: &str) -> Result<Option<String>> {
+        self.db.lock().query_row("SELECT token FROM calendar_feeds WHERE did = ?1", params![did], |row| row.get(0))
+    }
+
+    pub fn calendar_feed_by_token(&self, token: &str) -> Result<Option<String>> {
+        self.db.lock().query_row("SELECT did FROM calendar_feeds WHERE token = ?1", params![token], |row| row.get(0))
+    }
+
+    pub fn set_calendar_feed(&self, did: &str, token: &str) -> Result<()> {
+        let mut db = self.db.lock();
+        db.execute("DELETE FROM calendar_feeds WHERE did = ?1", params![did])?;
+        db.execute("INSERT INTO calendar_feeds (did, token) VALUES (?1, ?2)", params![did, token])?;
+        Ok(())
+    }
+
+    pub fn set_calendar_channel(&self, channel: &str) -> Result<()> {
+        self.db.lock().execute("INSERT INTO calendar_channels (channel) VALUES (?1)", params![channel])?;
+        Ok(())
+    }
+
     /// Makes a forum a gallery, or an ordinary forum again.
     pub fn set_gallery(&self, channel: &str, on: bool) -> Result<()> {
         let mut db = self.db.lock();
@@ -3270,6 +3404,12 @@ impl Store {
     pub fn prune_answering(&self, before: i64) -> Result<usize> {
         self.db.lock().execute("DELETE FROM answering WHERE updated < ?1 AND status != 'completed'", params![before])
     }
+}
+
+fn event_from(row: &Row) -> Result<StoredEvent> {
+    let data: String = row.get(1)?;
+    let cancelled: i64 = row.get(4)?;
+    Ok(StoredEvent { id: row.get(0)?, data: serde_json::from_str(&data).unwrap_or(Value::Null), organizer: row.get(2)?, sequence: row.get(3)?, cancelled: cancelled != 0, created_at: row.get(5)?, updated_at: row.get(6)? })
 }
 
 const FOLLOWER_COLUMNS: &str = "id, channel, kind, target, name, secret, created_by, created_at, failures, off_at";

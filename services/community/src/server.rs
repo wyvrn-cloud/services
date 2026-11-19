@@ -1026,6 +1026,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Members' pictures, at the addresses members are given (member_ids.rs).
         .route("/m/{member}/{kind}/{hash}", get(member_picture))
         .route("/healthz", get(|| async { "ok" }))
+        // A member's calendar feed (events.rs), at the address only they were given.
+        .route("/calendar/{file}", get(crate::events::feed))
         // Webhooks, as Discord's are reached (webhooks.rs).
         .route(
             "/api/webhooks/{id}/{token}",

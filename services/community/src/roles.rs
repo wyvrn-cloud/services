@@ -41,6 +41,8 @@ pub const COMMUNITY_PERMISSIONS: &[(&str, &str)] = &[
     ("view_insights", "Read insights"),
     ("manage_automod", "Set AutoMod's rules"),
     ("manage_expressions", "Manage the community's emoji and stickers"),
+    ("create_events", "Make events, and change their own"),
+    ("manage_events", "Change and cancel anyone's events"),
 ];
 
 /// The permissions a channel can also give or withhold.
@@ -65,7 +67,7 @@ const MODERATING: &[&str] = &["manage_messages", "admit_members", "kick_members"
 
 const EVERYONE_DEFAULT: &[&str] = &["view_channel", "post", "react", "create_threads", "attach_files", "connect", "speak", "video"];
 const MODERATOR_DEFAULT: &[&str] =
-    &["admit_members", "kick_members", "timeout_members", "manage_reports", "view_audit_log", "manage_messages", "bypass_slow_mode", "moderate_voice"];
+    &["admit_members", "kick_members", "timeout_members", "manage_reports", "view_audit_log", "manage_messages", "bypass_slow_mode", "moderate_voice", "create_events", "manage_events"];
 
 pub fn is_permission(name: &str) -> bool {
     COMMUNITY_PERMISSIONS.iter().chain(CHANNEL_PERMISSIONS).any(|(known, _)| *known == name)
@@ -189,9 +191,23 @@ impl Community {
                 self.set_everyone("view_channel", true)?;
                 self.store.set_setting("view_channel_given", "true")?;
             }
+            // A store from before events: Moderator makes and manages them, as a
+            // new community's does.
+            if self.store.setting("events_given")?.is_none() {
+                if let Some(mut moderator) = self.store.role("moderator")? {
+                    for permission in ["create_events", "manage_events"] {
+                        if !moderator.permissions.iter().any(|p| p == permission) {
+                            moderator.permissions.push(permission.into());
+                        }
+                    }
+                    self.store.save_role(&moderator)?;
+                }
+                self.store.set_setting("events_given", "true")?;
+            }
             return Ok(());
         }
         self.store.set_setting("view_channel_given", "true")?;
+        self.store.set_setting("events_given", "true")?;
         let mut everyone = strings(EVERYONE_DEFAULT);
         if self.config.members_may_create_channels {
             everyone.push("create_channels".into());

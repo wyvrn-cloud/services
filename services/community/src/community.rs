@@ -450,6 +450,9 @@ impl Community {
         if channel.announcement {
             body["announcement"] = json!(true);
         }
+        if channel.calendar {
+            body["kind"] = json!("calendar");
+        }
         body
     }
 
@@ -1160,6 +1163,9 @@ impl Community {
         if channel.voice.is_some() {
             return refuse(message, "e.p.msg.voice-channel", "A voice channel takes no posts.");
         }
+        if channel.calendar {
+            return refuse(message, "e.p.msg.calendar-channel", "A calendar channel takes no posts: it shows the community's events.");
+        }
         if !self.may_in(sender, &channel, "post")? {
             return refuse(message, "e.p.trust.not-authorized", "You can't post in this channel.");
         }
@@ -1375,6 +1381,9 @@ impl Community {
         if let Some(outcome) = self.handle_posting(&member, message_type, message, now)? {
             return Ok(outcome);
         }
+        if let Some(outcome) = self.handle_event_message(&member, message, now)? {
+            return Ok(outcome);
+        }
 
         match message_type {
             JOIN | LEAVE => {
@@ -1413,13 +1422,13 @@ impl Community {
                             Err(why) => return refuse(message, "e.p.msg.invalid-voice", why),
                         }
                     }
-                    Some("forum") | Some("gallery") => {
+                    Some("forum") | Some("gallery") | Some("calendar") => {
                         if !self.powers(sender)?.has("manage_channels") {
-                            return refuse(message, "e.p.trust.not-authorized", "Opening a forum or a gallery takes Manage channels.");
+                            return refuse(message, "e.p.trust.not-authorized", "Opening a forum, a gallery or a calendar channel takes Manage channels.");
                         }
                         None
                     }
-                    Some(_) => return refuse(message, "e.p.msg.invalid-kind", "A channel is a text channel, a forum, a gallery or a voice channel."),
+                    Some(_) => return refuse(message, "e.p.msg.invalid-kind", "A channel is a text channel, a forum, a gallery, a calendar or a voice channel."),
                 };
                 let gallery = body["kind"].as_str() == Some("gallery");
                 let forum = gallery || body["kind"].as_str() == Some("forum");
@@ -1464,6 +1473,9 @@ impl Community {
                 }
                 if announcement {
                     self.store.set_announcement(&id, true)?;
+                }
+                if body["kind"].as_str() == Some("calendar") {
+                    self.store.set_calendar_channel(&id)?;
                 }
                 let mut community = self.community(&member)?;
                 community["created"] = json!(id);

@@ -46,6 +46,8 @@ url = "2"
 hmac = "0.12"
 # And what announcement channels send other services, with the community's own key.
 ed25519-dalek = { workspace = true }
+# Events that repeat in their own time zone, across changes of clocks (events.rs).
+chrono-tz = "0.10"
 # Signing in to the web view (website-sign-in/1.0), and the identity provider's
 # ES256 id tokens (community-sign-in/1.0).
 wyvrn-sign-in = { path = "../../../wyvrn-sign-in" }

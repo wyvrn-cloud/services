@@ -2668,18 +2668,18 @@ async fn an_import_past_the_channel_limit_says_what_it_left_out_and_brings_it_ne
     owner.workflow("start", json!({ "template_id": "discord-import", "instance_id": "l1" })).await;
     let read = advance(&owner, "l1", "read", json!({ "link": "TESTCODE1234" })).await;
     let review = read["body"]["ui"].to_string();
-    assert!(review.contains("may have 4 channels and has 0, so only 4 of the template's 6 new channels can be made"), "{review}");
+    assert!(review.contains("may have 4 channels and has 0, so only 4 of the template's 7 new channels can be made"), "{review}");
     let done = advance(&owner, "l1", "import", json!({ "choose-community-guild": "template", "choose-role-0": "template" })).await;
     assert_eq!(done["body"]["state"], "done", "{done}");
     let said = done["body"]["ui"].to_string();
-    assert!(said.contains("2 channels weren't made: this community may have only 4 channels"), "{said}");
+    assert!(said.contains("3 channels weren't made: this community may have only 4 channels"), "{said}");
     assert_eq!(owner.community("join", json!({})).await["body"]["channels"].as_array().unwrap().len(), 4);
 
     // Those left out are still to be made, next time.
     owner.workflow("start", json!({ "template_id": "discord-import", "instance_id": "l2" })).await;
     let review = advance(&owner, "l2", "read", json!({ "link": "TESTCODE1234" })).await["body"]["ui"].to_string();
-    assert!(review.contains("To be made: 0 roles, 0 categories, 2 channels"), "{review}");
-    assert!(review.contains("has 4, so only 0 of the template's 2 new channels"), "{review}");
+    assert!(review.contains("To be made: 0 roles, 0 categories, 3 channels"), "{review}");
+    assert!(review.contains("has 4, so only 0 of the template's 3 new channels"), "{review}");
 }
 
 #[tokio::test]
@@ -3543,4 +3543,81 @@ async fn a_gallery_is_a_forum_of_pictures_each_post_with_one_and_its_title_optio
     let first = posts.iter().find(|p| p["id"] == "g1").unwrap();
     assert!(first.get("title").is_none() && first["grew"]["count"] == 1, "{first}");
     assert_eq!(posts.iter().find(|p| p["id"] == "g2").unwrap()["title"], "Sunset");
+}
+
+#[tokio::test]
+async fn events_are_made_answered_reminded_changed_cancelled_and_fed_to_other_calendars() {
+    const CAL: &str = "https://didcomm.org/calendar/1.0/";
+    let server = start_server("[voice]\nrelay_url = \"https://voice.example/\"").await;
+    tokio::spawn(wyvrn_community::outgoing::run_outgoing(server.state.clone()));
+    let (owner, member, other) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member, &other]);
+    for peer in [&owner, &member, &other] {
+        peer.community("join", json!({})).await;
+    }
+    let stage = owner.community("create-channel", json!({ "name": "Town Hall", "kind": "voice", "voice": { "stage": true } })).await["body"]["created"].as_str().unwrap().to_string();
+
+    // Making one takes Create events.
+    let soon = chrono::Utc::now() + chrono::Duration::minutes(10);
+    let iso = |t: chrono::DateTime<chrono::Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let party = json!({ "title": "New Year stream", "description": "Ball drop!", "start": iso(soon), "timezone": "America/Chicago", "channel": stage, "reminders": [{ "offset_minutes": -15 }] });
+    assert_eq!(member.community("create-event", party.clone()).await["body"]["code"], "e.p.trust.not-authorized");
+    assert_eq!(owner.community("create-event", json!({ "title": "x", "start": "soon" })).await["body"]["code"], "e.p.msg.invalid-event");
+    let made = owner.community("create-event", party).await;
+    let event = made["body"]["event"].clone();
+    let id = event["event_id"].as_str().unwrap().to_string();
+    assert!(id.starts_with("evt-"), "{made}");
+    assert_eq!((event["type"].as_str(), event["status"].as_str(), event["sequence"].as_i64()), (Some("call"), Some("scheduled"), Some(0)));
+    assert_eq!(event["end"], iso(soon + chrono::Duration::hours(1)));
+    assert_eq!(event["going"], json!({ "accepted": 0, "tentative": 0, "declined": 0 }));
+    // Everyone joined is told.
+    assert_eq!(member.next_of(&format!("{C}event")).await["body"]["event"]["event_id"], id.as_str());
+
+    // Answered as calendar/1.0 answers: going, maybe, can't go.
+    let going = member.ask(&format!("{CAL}accept"), json!({ "event_id": id, "sequence": 0 })).await;
+    assert_eq!((going["body"]["event"]["mine"].as_str(), going["body"]["event"]["going"]["accepted"].as_i64()), (Some("accepted"), Some(1)), "{going}");
+    other.ask(&format!("{CAL}decline"), json!({ "event_id": id })).await;
+    let rsvps = owner.community("event-rsvps-request", json!({ "event_id": id })).await;
+    assert_eq!(rsvps["body"]["accepted"], json!([server.id(&member)]));
+    assert_eq!(rsvps["body"]["declined"], json!([server.id(&other)]));
+
+    // Its reminder (15 minutes before, so now) reaches whoever is going, not whoever isn't.
+    let reminded = member.next_of(&format!("{CAL}reminder")).await;
+    assert_eq!((reminded["body"]["event_id"].as_str(), reminded["body"]["action"].as_str()), (Some(id.as_str()), Some("join_call")), "{reminded}");
+
+    // Moved: calendar/1.0's update to whoever answered, and the old sequence is stale.
+    let moved = owner.community("update-event", json!({ "event_id": id, "start": iso(soon + chrono::Duration::days(1)), "recurrence": { "rrule": "FREQ=WEEKLY;COUNT=3" } })).await;
+    assert_eq!(moved["body"]["event"]["sequence"], 1, "{moved}");
+    assert_eq!(moved["body"]["event"]["end"], iso(soon + chrono::Duration::days(1) + chrono::Duration::hours(1)));
+    assert!(moved["body"]["event"]["next"]["start"].is_string());
+    assert_eq!(member.next_of(&format!("{CAL}update")).await["body"]["sequence"], 1);
+    assert_eq!(member.ask(&format!("{CAL}tentative"), json!({ "event_id": id, "sequence": 0 })).await["body"]["code"], "sequence_stale");
+    // Only its maker, or whoever manages events, changes it.
+    assert_eq!(member.community("update-event", json!({ "event_id": id, "title": "Mine now" })).await["body"]["code"], "e.p.trust.not-authorized");
+
+    // One occurrence cancelled; then all of it.
+    let second = iso(soon + chrono::Duration::days(8));
+    let skipped = owner.community("cancel-event", json!({ "event_id": id, "recurrence_id": second })).await;
+    assert_eq!(skipped["body"]["event"]["recurrence"]["exdates"], json!([second]), "{skipped}");
+    let listed = member.community("events-request", json!({})).await;
+    assert_eq!(listed["body"]["events"].as_array().unwrap().len(), 1);
+
+    // A feed for other calendars, at an address of this member's alone.
+    let feed = member.community("calendar-feed-request", json!({})).await["body"]["url"].as_str().unwrap().to_string();
+    let ics = reqwest::get(&feed).await.unwrap().text().await.unwrap();
+    assert!(ics.contains("BEGIN:VEVENT") && ics.contains("SUMMARY:New Year stream") && ics.contains("RRULE:FREQ=WEEKLY;COUNT=3") && ics.contains(&format!("UID:{id}@")), "{ics}");
+    let renewed = member.community("calendar-feed-request", json!({ "new": true })).await["body"]["url"].as_str().unwrap().to_string();
+    assert_ne!(renewed, feed);
+    assert_eq!(reqwest::get(&feed).await.unwrap().status(), 404);
+
+    let cancelled = owner.community("cancel-event", json!({ "event_id": id })).await;
+    assert_eq!(cancelled["body"]["event"]["status"], "cancelled");
+    assert_eq!(member.next_of(&format!("{CAL}cancel")).await["body"]["event_id"], id.as_str());
+    assert!(reqwest::get(&renewed).await.unwrap().text().await.unwrap().contains("STATUS:CANCELLED"));
+
+    // A calendar channel takes no posts.
+    let calendar = owner.community("create-channel", json!({ "name": "events", "kind": "calendar" })).await;
+    let calendar_id = calendar["body"]["created"].as_str().unwrap().to_string();
+    assert_eq!(calendar["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == calendar_id.as_str()).unwrap()["kind"], "calendar");
+    assert_eq!(owner.community("post", json!({ "channel": calendar_id, "content": "hi" })).await["body"]["code"], "e.p.msg.calendar-channel");
 }
