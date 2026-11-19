@@ -3486,9 +3486,9 @@ impl Store {
     /// A page of the thread `thread` of `channel`, oldest first: `limit` posts
     /// from the `offset`th.
     pub fn thread_page(&self, channel: &str, thread: &str, offset: usize, limit: usize) -> Result<Vec<Post>> {
-        const IN_THREAD: &str = "(SELECT thread FROM post_state WHERE post_state.post = posts.id)";
+        // (Found from the thread's posts, by post_state_by_thread, not from the channel's.)
         let posts = self.db.lock().query(
-            &format!("SELECT {POST_COLUMNS} FROM posts WHERE channel = ?1 AND {IN_THREAD} = ?2 ORDER BY seq LIMIT ?3 OFFSET ?4"),
+            &format!("SELECT {POST_COLUMNS} FROM posts WHERE channel = ?1 AND id IN (SELECT post FROM post_state WHERE thread = ?2) ORDER BY seq LIMIT ?3 OFFSET ?4"),
             params![channel, thread, limit as i64, offset as i64],
             post_from,
         )?;
@@ -3499,8 +3499,17 @@ impl Store {
     /// where the first after it is, counting from 0.
     pub fn thread_posts_through(&self, channel: &str, thread: &str, seq: i64) -> Result<i64> {
         self.db.lock().query_value(
-            "SELECT COUNT(*) FROM posts WHERE channel = ?1 AND seq <= ?3 AND (SELECT thread FROM post_state WHERE post_state.post = posts.id) = ?2",
+            "SELECT COUNT(*) FROM posts WHERE channel = ?1 AND seq <= ?3 AND id IN (SELECT post FROM post_state WHERE thread = ?2)",
             params![channel, thread, seq],
+        )
+    }
+
+    /// Where the post `post` is in `channel`'s thread `thread` (its `seq`), if it is in it.
+    pub fn thread_post_seq(&self, channel: &str, thread: &str, post: &str) -> Result<Option<i64>> {
+        self.db.lock().query_row(
+            "SELECT seq FROM posts WHERE id = ?1 AND channel = ?2 AND id IN (SELECT post FROM post_state WHERE thread = ?3)",
+            params![post, channel, thread],
+            |row| row.get(0),
         )
     }
 

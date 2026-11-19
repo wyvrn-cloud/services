@@ -3848,10 +3848,11 @@ async fn a_long_thread_is_read_a_page_at_a_time_and_counts_are_kept_and_rebuilt(
     let forum = owner.community("create-channel", json!({ "name": "board", "kind": "forum" })).await["body"]["created"].as_str().unwrap().to_string();
     owner.community("update-channel", json!({ "channel": forum, "sections": [{ "id": "help", "name": "Help" }] })).await;
     member.community("post", json!({ "channel": forum, "id": "t1", "title": "Long", "content": "Go", "section": "help" })).await;
-    let mut seqs = Vec::new();
+    let (mut seqs, mut ids) = (Vec::new(), Vec::new());
     for n in 0..45 {
         let posted = owner.community("post", json!({ "channel": forum, "content": format!("reply {n}"), "thread": "t1" })).await;
         seqs.push(posted["body"]["seq"].as_i64().unwrap());
+        ids.push(posted["body"]["id"].as_str().unwrap().to_string());
     }
 
     // Twenty at a time, from the start; the last page has what is left.
@@ -3868,6 +3869,12 @@ async fn a_long_thread_is_read_a_page_at_a_time_and_counts_are_kept_and_rebuilt(
     // Everything read: the last page.
     let all_read = member.community("history-request", json!({ "channel": forum, "thread": "t1", "page_after": seqs[44], "limit": 20 })).await;
     assert_eq!(all_read["body"]["offset"].as_i64(), Some(40));
+    // Named by the post's id, as a read mark from another device names it.
+    let by_id = member.community("history-request", json!({ "channel": forum, "thread": "t1", "page_after_post": ids[24], "limit": 20 })).await;
+    assert_eq!(by_id["body"]["offset"].as_i64(), Some(20), "{by_id}");
+    // A post that isn't in the thread: its start.
+    let elsewhere = member.community("history-request", json!({ "channel": forum, "thread": "t1", "page_after_post": "t1", "limit": 20 })).await;
+    assert_eq!(elsewhere["body"]["offset"].as_i64(), Some(0), "{elsewhere}");
 
     // The sections' counts, and each member's posts.
     let stats = member.community("forum-stats-request", json!({ "channel": forum })).await;

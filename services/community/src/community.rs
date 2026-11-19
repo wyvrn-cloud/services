@@ -1881,10 +1881,16 @@ impl Community {
                 let limit = body["limit"].as_u64().map_or(DEFAULT_HISTORY_LIMIT, |limit| (limit as usize).clamp(1, MAX_HISTORY_LIMIT));
                 let thread = body["thread"].as_str().filter(|id| !id.is_empty());
                 // A thread read a page at a time, as a forum's is: from a place in
-                // it, or the page holding the first post after one already read.
-                if let Some(thread) = thread.filter(|_| body.get("offset").is_some() || body.get("page_after").is_some()) {
+                // it, or the page holding the first post after one already read (by
+                // its seq, or by its id: what a read mark synced between a member's
+                // devices names, on a device that holds none of the thread).
+                if let Some(thread) = thread.filter(|_| ["offset", "page_after", "page_after_post"].iter().any(|key| body.get(key).is_some())) {
                     let total = self.store.thread(thread)?.filter(|t| t.channel == channel.id).map_or(0, |t| t.count.max(0) as usize);
-                    let offset = match body["page_after"].as_i64() {
+                    let after = match body["page_after_post"].as_str() {
+                        Some(post) => self.store.thread_post_seq(&channel.id, thread, post)?,
+                        None => body["page_after"].as_i64(),
+                    };
+                    let offset = match after {
                         Some(seq) => {
                             let first_unread = self.store.thread_posts_through(&channel.id, thread, seq)?.max(0) as usize;
                             first_unread.min(total.saturating_sub(1)) / limit * limit
