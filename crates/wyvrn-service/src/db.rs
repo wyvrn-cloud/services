@@ -738,6 +738,21 @@ pub fn copy_store_held(from: &Location, to: &Location, service: &str, skip: &[&s
     copy_tables(from, to, service, skip, true)
 }
 
+/// Empties `tables` of the store at `to`, in one transaction: undoing a copy
+/// ([`copy_store`]) that a later step of the same move didn't get past, so that
+/// trying again finds them empty.
+pub fn empty_tables(to: &Location, service: &str, tables: &[String]) -> Result<()> {
+    const NOTHING: Schema = Schema { sqlite: "", mysql: "" };
+    let target = Db::open(to, &NOTHING, service)?;
+    let mut writing = target.lock();
+    writing.transaction(|writing| {
+        for table in tables {
+            writing.execute(&format!("DELETE FROM \"{table}\""), &[])?;
+        }
+        Ok(())
+    })
+}
+
 fn copy_tables(from: &Location, to: &Location, service: &str, skip: &[&str], only_held: bool) -> Result<Copied> {
     const NOTHING: Schema = Schema { sqlite: "", mysql: "" };
     let (source, target) = (Db::open(from, &NOTHING, service)?, Db::open(to, &NOTHING, service)?);
@@ -1532,6 +1547,13 @@ mod tests {
         check(&to);
         // Never over what is there.
         assert!(copy_store(&from, &to, "community", &[]).is_err());
+        // Emptied again (a move that failed at a later store), it can be copied into.
+        let wrote_three = |location: &Location| Db::open(location, &SCHEMA, "community").unwrap().lock().query_value::<i64>("SELECT COUNT(*) FROM things", params![]).unwrap();
+        assert_eq!(wrote_three(&to), 3);
+        empty_tables(&to, "community", &["things".to_string()]).unwrap();
+        assert_eq!(wrote_three(&to), 0);
+        copy_store(&from, &to, "community", &[]).unwrap();
+        assert_eq!(wrote_three(&to), 2);
 
         // Into MySQL tables of its own, and back out, where there is a server.
         if let Some(url) = server() {

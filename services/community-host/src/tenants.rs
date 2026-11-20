@@ -34,8 +34,17 @@ use crate::config::Config;
 use crate::registry::{Record, Registry, State, Storage};
 
 /// How long an unloaded community that owes someone a delivery waits to be
-/// opened again and try.
+/// opened again and try, the first time.
 const RETRY_AFTER: i64 = 60;
+/// The longest it waits: each time it is closed still owing, the wait doubles, so
+/// a member whose mediator stays down doesn't wake it every minute for good.
+const RETRY_AT_MOST: i64 = 6 * 60 * 60;
+
+/// The wait before the next try, after one of `waited` that still left something
+/// owed (`None`: the first).
+fn next_retry(waited: Option<i64>) -> i64 {
+    waited.map_or(RETRY_AFTER, |waited| (waited * 2).min(RETRY_AT_MOST))
+}
 
 /// One community, open.
 pub struct Tenant {
@@ -65,11 +74,14 @@ impl Tenant {
         !self.state.live.lock().unwrap_or_else(|p| p.into_inner()).is_empty() || self.state.rooms.occupied()
     }
 
-    /// When it has to be opened next to do what it owes, if anything.
-    fn next_wake(&self, now: i64) -> Option<i64> {
-        let owed = server::deliveries_owed(&self.state).unwrap_or(false).then_some(now + RETRY_AFTER);
+    /// When it has to be opened next to do what it owes, if anything, and the
+    /// wait for deliveries that came into it: `retry` seconds from now if it owes
+    /// any (`None` if it owes none).
+    fn next_wake(&self, now: i64, retry: i64) -> (Option<i64>, Option<i64>) {
+        let owed = server::deliveries_owed(&self.state).unwrap_or(false);
         let poll = self.state.community.store.next_poll_end().ok().flatten().map(|end| end.max(now));
-        owed.into_iter().chain(poll).min()
+        let delivery = owed.then_some(now + retry);
+        (delivery.into_iter().chain(poll).min(), owed.then_some(retry))
     }
 }
 
@@ -86,11 +98,22 @@ pub struct Host {
     open: Mutex<HashMap<String, Arc<Tenant>>>,
     /// One community opened at a time: two requests for one that isn't open open it once.
     opening: tokio::sync::Mutex<()>,
+    /// For each community closed while still owing someone a delivery, the wait
+    /// it was last given (`next_retry`). Forgotten once it owes nothing.
+    retrying: Mutex<HashMap<String, i64>>,
 }
 
 impl Host {
     pub fn new(config: Config, registry: Registry) -> Arc<Self> {
-        Arc::new_cyclic(|me| Self { config, registry, exports: Default::default(), me: me.clone(), open: Mutex::default(), opening: tokio::sync::Mutex::new(()) })
+        Arc::new_cyclic(|me| Self {
+            config,
+            registry,
+            exports: Default::default(),
+            me: me.clone(),
+            open: Mutex::default(),
+            opening: tokio::sync::Mutex::new(()),
+            retrying: Mutex::default(),
+        })
     }
 
     fn open_map(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Tenant>>> {
@@ -258,7 +281,13 @@ impl Host {
         for task in &tenant.tasks {
             task.abort();
         }
-        let wake = tenant.next_wake(now());
+        let mut retrying = self.retrying.lock().unwrap_or_else(|p| p.into_inner());
+        let (wake, waiting) = tenant.next_wake(now(), next_retry(retrying.get(name).copied()));
+        match waiting {
+            Some(wait) => retrying.insert(name.to_string(), wait),
+            None => retrying.remove(name),
+        };
+        drop(retrying);
         if let Err(error) = self.registry.set_wake(name, wake) {
             tracing::warn!(community = %name, %error, "couldn't note when to open a community again");
         }
@@ -381,15 +410,36 @@ impl Host {
         wyvrn_community::store::Store::open(&target.community)?;
         wyvrn_service::profile::Kept::open(&target.community, "community")?;
         wyvrn_service::hosted_address::Kept::open(&target.community, "community")?;
-        let mut copied = wyvrn_service::db::copy_store(&from.community, &target.community, "community", &["wyvrn_identity"])?;
-        if let (Some(from), Some(target)) = (&from.stickers, &target.stickers) {
-            wyvrn_stickers::store::Store::open(target)?;
-            copied.extend(wyvrn_service::db::copy_store(from, target, "stickers", &[])?);
-        }
-        if let (Some(from), Some(target)) = (&from.files, &target.files) {
-            wyvrn_files::store::Store::open(target, &folder.join("files"))?;
-            copied.extend(wyvrn_service::db::copy_store(from, target, "files", &[])?);
-        }
+        // Each store is copied in a transaction of its own: one that fails leaves
+        // nothing, but those copied before it stay. They are emptied again, so that
+        // trying again doesn't find them full and refuse.
+        let mut done: Vec<(Location, &str, Vec<String>)> = Vec::new();
+        let copied = (|| -> anyhow::Result<wyvrn_service::db::Copied> {
+            let mut copied = wyvrn_service::db::copy_store(&from.community, &target.community, "community", &["wyvrn_identity"])?;
+            done.push((target.community.clone(), "community", copied.iter().map(|(table, _)| table.clone()).collect()));
+            if let (Some(from), Some(target)) = (&from.stickers, &target.stickers) {
+                wyvrn_stickers::store::Store::open(target)?;
+                let these = wyvrn_service::db::copy_store(from, target, "stickers", &[])?;
+                done.push((target.clone(), "stickers", these.iter().map(|(table, _)| table.clone()).collect()));
+                copied.extend(these);
+            }
+            if let (Some(from), Some(target)) = (&from.files, &target.files) {
+                wyvrn_files::store::Store::open(target, &folder.join("files"))?;
+                copied.extend(wyvrn_service::db::copy_store(from, target, "files", &[])?);
+            }
+            Ok(copied)
+        })();
+        let copied = match copied {
+            Ok(copied) => copied,
+            Err(error) => {
+                for (target, service, tables) in done.iter().rev() {
+                    if let Err(undoing) = wyvrn_service::db::empty_tables(target, service, tables) {
+                        tracing::warn!(community = %name, %service, error = %undoing, "couldn't empty a store a failed move had copied into");
+                    }
+                }
+                return Err(error.context(format!("moving {name} to {} failed; it is still kept in {}", to.as_str(), record.storage.as_str())));
+            }
+        };
         self.registry.set_storage(name, to)?;
         let rows: usize = copied.iter().map(|(_, rows)| rows).sum();
         tracing::info!(community = %name, from = record.storage.as_str(), to = to.as_str(), tables = copied.len(), rows, "moved a community's storage");
@@ -408,5 +458,21 @@ impl Host {
             server::set_moving(&tenant.state, state == State::Moving)?;
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_community_still_owing_waits_longer_each_time_up_to_six_hours() {
+        let mut waits = vec![next_retry(None)];
+        while waits.len() < 12 {
+            waits.push(next_retry(waits.last().copied()));
+        }
+        assert_eq!(&waits[..5], [60, 120, 240, 480, 960]);
+        assert_eq!(*waits.last().unwrap(), RETRY_AT_MOST);
+        assert!(waits.windows(2).all(|pair| pair[1] >= pair[0]));
     }
 }
