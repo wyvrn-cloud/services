@@ -210,7 +210,7 @@ impl Community {
     }
 
     /// The DIDs that are the community itself, never a person's: what it writes as.
-    fn own_dids(&self) -> Vec<String> {
+    pub(crate) fn own_dids(&self) -> Vec<String> {
         self.own.iter().chain(self.speaks_as.iter()).cloned().collect()
     }
 

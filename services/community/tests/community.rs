@@ -199,8 +199,29 @@ async fn an_admin_changes_what_the_community_is_called_and_everyone_who_joined_i
     let changed = admin.community("set-profile", json!({ "profile": { "displayName": "The Workshop, Reopened", "description": "Tools and talk." } })).await;
     assert_eq!(kind(&changed), "community");
     assert_eq!((changed["body"]["name"].as_str(), changed["body"]["description"].as_str()), (Some("The Workshop, Reopened"), Some("Tools and talk.")));
-    let told = member.next_of(&format!("{C}community")).await;
+    // Told what it is called now, and who it is as a contact says it, picture and
+    // all (none here): the `community` message carries no picture. In either order.
+    let (mut told, mut profile) = (Value::Null, Value::Null);
+    while told.is_null() || profile.is_null() {
+        let got = tokio::time::timeout(Duration::from_secs(10), member.inbox.lock().await.recv()).await.expect("both within ten seconds").expect("open");
+        if got["type"] == format!("{C}community") {
+            told = got;
+        } else if got["type"] == "https://didcomm.org/user-profile/1.0/profile" {
+            profile = got;
+        }
+    }
     assert_eq!(told["body"]["name"], "The Workshop, Reopened");
+    assert_eq!(profile["body"]["profile"], json!({ "displayName": "The Workshop, Reopened", "description": "Tools and talk.", "displayPicture": null }));
+    // Asked, it says the same.
+    let asked = member.ask("https://didcomm.org/user-profile/1.0/request-profile", json!({})).await;
+    assert_eq!(asked["body"]["profile"]["displayName"], "The Workshop, Reopened");
+
+    // The community itself, kept as a member so that what it posts has an author
+    // (a welcome, AutoMod's alerts), isn't in its member list.
+    server.state.community.store.admit(&server.did, wyvrn_community::store::Role::Member, 1).unwrap();
+    let listed = admin.community("members-request", json!({})).await;
+    assert!(!listed["body"]["members"].to_string().contains(&server.did), "{listed}");
+    assert_eq!(listed["body"]["members"].as_array().unwrap().len(), 2, "{listed}");
 
     // A name emptied is what the settings say again; the description is as it was.
     let back = admin.community("set-profile", json!({ "profile": { "displayName": null } })).await;

@@ -525,6 +525,15 @@ impl Community {
         Ok(())
     }
 
+    /// Who the community is, as user-profile/1.0 says it: its name, description
+    /// and picture now, a picture that is gone said to be gone.
+    pub fn profile_message(&self) -> Value {
+        let changed = self.changed();
+        let name = changed.name.clone().unwrap_or_else(|| self.config.name.clone());
+        let description = changed.description.clone().unwrap_or_else(|| self.config.description.clone());
+        Changed::profile_message(&name, &description, changed.picture.as_ref())
+    }
+
     /// What an admin has changed of the community's name, description and picture.
     pub fn changed(&self) -> Changed {
         self.changed.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
@@ -1112,8 +1121,13 @@ impl Community {
 
     fn members_body(&self) -> anyhow::Result<Value> {
         let online = self.seen_online()?;
+        // Not the community itself: it is kept as a member so that what it posts
+        // (a welcome, AutoMod's alerts, a webhook's or the assistant's posts) has an
+        // author, but it is nobody in the list (found 2026-11-20: it was listed by
+        // its DID).
+        let own = self.own_dids();
         let mut members = Vec::new();
-        for member in self.store.members()? {
+        for member in self.store.members()?.into_iter().filter(|member| !own.contains(&member.did)) {
             let powers = self.powers(&member.did)?;
             members.push((member, powers));
         }
@@ -2283,6 +2297,14 @@ impl Community {
                 // change to its channels.
                 outcome.channels_changed = true;
                 outcome.profile_changed = true;
+                // And who it is, picture and all, as a contact tells of a changed
+                // profile: `community` carries no picture, so a picture changed
+                // after someone joined never reached their app (found 2026-11-20).
+                let told = self.profile_message();
+                let own = self.own_dids();
+                for joined in self.store.joined()?.into_iter().filter(|joined| !own.contains(&joined.did)) {
+                    outcome.notices.push((joined.did, told.clone()));
+                }
                 Ok(outcome)
             }
 
@@ -2414,6 +2436,15 @@ impl Community {
                         Ok(outcome)
                     }
                 }
+            }
+
+            // A member's app asking who the community is: its profile, picture and all.
+            REQUEST_PROFILE => {
+                let mut told = self.profile_message();
+                if let Some(thid) = thread_of(message) {
+                    told["thid"] = json!(thid);
+                }
+                Ok(Outcome::reply(told))
             }
 
             PROFILE => {
