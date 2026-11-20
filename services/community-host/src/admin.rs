@@ -154,6 +154,18 @@ impl Pages for AppState {
                 State::Deleted | State::Moved => row.push(button("Restore", "restore", named.clone())),
             }
             items.push(json!({ "type": "row", "children": row }));
+            // Its DIDs, to copy (asked 2026-11-18: only the URL was shown, and
+            // the DID had to be worked out from it). `copyable` is Wyvrn's own:
+            // another app shows the text.
+            let at = format!("{}c/{}/", host.config.server.public_url, record.name);
+            if host.config.server.did_method == wyvrn_service::address::DidMethod::Web {
+                if let Ok(did) = wyvrn_service::address::did_web_for(&at) {
+                    items.push(json!({ "type": "text", "text": did, "copyable": true, "label": "Its DID" }));
+                }
+            }
+            if let Ok(Some(address)) = host.address(&record.name) {
+                items.push(json!({ "type": "text", "text": address.did_web, "copyable": true, "label": "Its public address" }));
+            }
             let limits = record.limits.unwrap_or(defaults);
             items.push(json!({ "type": "form", "children": [
                 { "type": "text", "text": format!("What {} may hold", record.name) },
