@@ -240,6 +240,12 @@ impl Community {
                     _ => return refuse(message, "e.p.msg.invalid-update", "That isn't a Yjs update.").map(Some),
                 };
                 let Ok(update) = Update::decode_v1(&bytes) else { return refuse(message, "e.p.msg.invalid-update", "That isn't a Yjs update.").map(Some) };
+                // One change at a time: each reads the page, applies itself and writes
+                // it back whole (and takes its client id on the first), so two at once
+                // would both be numbered next and the later would write over the
+                // earlier (seen: a fast typist's second send refused as a duplicate,
+                // and those keys lost).
+                let _writing = self.wiki_writing.lock().unwrap_or_else(|p| p.into_inner());
                 // Every client whose text it brings is the sender's on this page.
                 let clients: Vec<u64> = update.state_vector().iter().map(|(client, _)| client.get()).collect();
                 for client in &clients {
@@ -315,7 +321,9 @@ impl Community {
                 if !self.may_in(did, &channel, "manage_messages")? {
                     return not_allowed("Restoring a version takes managing posts in the wiki.");
                 }
-                // As a change of the restorer's, by a client id of theirs alone.
+                // As a change of the restorer's, by a client id of theirs alone; one
+                // change at a time, as an edit is.
+                let _writing = self.wiki_writing.lock().unwrap_or_else(|p| p.into_inner());
                 let (state, last) = self.store.wiki_state(&page.id)?.unwrap_or_default();
                 let doc = doc_from((!state.is_empty()).then_some(state.as_slice()))?;
                 let client = loop {

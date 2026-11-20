@@ -4055,3 +4055,41 @@ async fn a_discord_follower_is_sent_the_files_kept_here_opened_is_renamed_and_an
     assert!(told.iter().any(|(_, m)| m["body"]["code"] == "e.p.msg.follow-unanswered"), "{told:?}");
     assert!(server.state.community.store.follows().unwrap().is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wiki_changes_sent_at_once_are_each_kept() {
+    use base64::Engine;
+    use yrs::{Doc, ReadTxn, StateVector, Text, Transact, Xml, XmlTextPrelim};
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let server = start_server("").await;
+    let owner = Peer::start(&server).await;
+    server.admit(&[&owner]);
+    owner.community("join", json!({})).await;
+    let wiki = owner.community("create-channel", json!({ "name": "handbook", "kind": "wiki" })).await["body"]["created"].as_str().unwrap().to_string();
+    let page = owner.community("wiki-create-page", json!({ "channel": wiki, "title": "Busy" })).await["body"]["created"].as_str().unwrap().to_string();
+    // Twenty changes at once, as a fast typist's sends can overlap: each from a
+    // client of its own, so none waits on another to apply.
+    let updates: Vec<(u64, String)> = (1..=20u64)
+        .map(|n| {
+            let doc = Doc::with_client_id(1000 + n);
+            let root = doc.get_or_insert_text("content");
+            let mut txn = doc.transact_mut();
+            let p = root.insert_embed(&mut txn, 0, XmlTextPrelim::new(format!("line {n}")));
+            p.insert_attribute(&mut txn, "type", "paragraph");
+            drop(txn);
+            let update = doc.transact().encode_state_as_update_v1(&StateVector::default());
+            (1000 + n, b64.encode(update))
+        })
+        .collect();
+    let answers = futures_util::future::join_all(
+        updates.iter().map(|(client, update)| owner.community("wiki-update", json!({ "page": page, "update": update, "client": client }))),
+    )
+    .await;
+    let mut seqs: Vec<i64> = answers.iter().map(|a| a["body"]["seq"].as_i64().unwrap_or_else(|| panic!("{a}"))).collect();
+    seqs.sort();
+    assert_eq!(seqs, (1..=20).collect::<Vec<_>>());
+    let text = server.state.community.wiki_text(&page).unwrap();
+    for n in 1..=20 {
+        assert!(text.lines().any(|l| l == format!("line {n}")), "line {n} lost: {text}");
+    }
+}

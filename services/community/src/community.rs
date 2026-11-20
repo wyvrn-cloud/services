@@ -262,6 +262,10 @@ pub struct Community {
     pub outbox: std::sync::Mutex<Vec<(String, Value)>>,
     /// Wiki pages open now, and who has each open (wiki.rs).
     pub wiki_open: crate::wiki::OpenPages,
+    /// Held while a change is made to a wiki page (wiki.rs): each is read, applied
+    /// and written back whole, and two at once both wrote the same number and one
+    /// change was lost.
+    pub wiki_writing: std::sync::Mutex<()>,
 }
 
 /// What handling a message came to.
@@ -501,7 +505,7 @@ impl Community {
             Some(kept) => kept.load()?,
             None => Changed::default(),
         };
-        let community = Self { store, config, used_bytes: Default::default(), changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, expressions: None, live: Default::default(), web_url: None, public_url: String::new(), speaks_as: None, importing: Default::default(), signing_seed: None, outbox: Default::default(), wiki_open: Default::default() };
+        let community = Self { store, config, used_bytes: Default::default(), changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, expressions: None, live: Default::default(), web_url: None, public_url: String::new(), speaks_as: None, importing: Default::default(), signing_seed: None, outbox: Default::default(), wiki_open: Default::default(), wiki_writing: Default::default() };
         community.ensure_roles()?;
         Ok(community)
     }
