@@ -171,6 +171,8 @@ pub async fn of_address(did: &str, fetch: &dyn Fetch, config: &Config) -> Result
 const INVITATION: &str = "https://didcomm.org/out-of-band/2.0/invitation";
 const PROFILE: &str = "https://didcomm.org/user-profile/1.0/profile";
 const CONTACT_GOAL: &str = "app.wyvrn.contact";
+/** A contact invite from one of the account's devices (multi-device/1.0). */
+const CONTACT_VIA_DEVICE_GOAL: &str = "app.wyvrn.contact.device";
 
 fn text(value: &Value, limit: usize) -> Option<String> {
     value.as_str().map(|s| s.trim().chars().take(limit).collect::<String>()).filter(|s| !s.is_empty())
@@ -183,7 +185,7 @@ pub fn of_invite(oob: &str) -> Option<Who> {
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let bytes = b64.decode(oob.trim_end_matches('=')).or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(oob.trim_end_matches('='))).ok()?;
     let invitation: Value = serde_json::from_slice(&bytes).ok()?;
-    if invitation["type"] != INVITATION || invitation["body"]["goal_code"] != CONTACT_GOAL {
+    if invitation["type"] != INVITATION || (invitation["body"]["goal_code"] != CONTACT_GOAL && invitation["body"]["goal_code"] != CONTACT_VIA_DEVICE_GOAL) {
         return None;
     }
     let did = invitation["from"].as_str().filter(|did| did.len() <= 4000 && did.starts_with("did:") && !did.contains(char::is_whitespace))?;
