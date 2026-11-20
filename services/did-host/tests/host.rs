@@ -1046,10 +1046,13 @@ async fn a_service_holds_an_address_and_is_found_by_it_from_its_own_domain() {
     let published = published.unwrap().with_profile(&profile).unwrap();
 
     let address = Address::parse(&format!("did:web:{DOMAIN}:official:news")).unwrap();
+    // What the service asks its host, by kind.
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let ask = {
-        let (asking, host_did) = (asking.clone(), host.did.clone());
+        let (asking, host_did, asked) = (asking.clone(), host.did.clone(), asked.clone());
         Box::new(move |_to: String, mut message: Value| {
             let (asking, host_did) = (asking.clone(), host_did.clone());
+            asked.lock().unwrap().push(message["type"].as_str().unwrap_or_default().rsplit('/').next().unwrap_or_default().to_string());
             Box::pin(async move {
                 message["return_route"] = json!("all");
                 // (The host under test is a did:peer:4 at a local port, not the did:web the address names.)
@@ -1103,10 +1106,16 @@ async fn a_service_holds_an_address_and_is_found_by_it_from_its_own_domain() {
     let alone = wyvrn_hosted_did::resolve("did:web:impostor.example", &impostor).await.unwrap();
     assert_eq!((alone.did.as_str(), alone.standing), ("did:web:impostor.example", Standing::HostsWord));
 
-    // Held again, nothing is written: the log already says what the document says.
+    // Held again, nothing is written: the log already says what the document says,
+    // and the whois was published already, the same.
     let before = fetch(&host, "official/news/did.jsonl").await.text().await.unwrap();
+    asked.lock().unwrap().clear();
     assert_eq!(holding.hold(1_800_000_100).await.unwrap(), did);
     assert_eq!(fetch(&host, "official/news/did.jsonl").await.text().await.unwrap(), before);
+    assert_eq!(asked.lock().unwrap().as_slice(), [] as [String; 0]);
+    // A day on, published again all the same.
+    assert_eq!(holding.hold(1_800_000_000 + 24 * 60 * 60).await.unwrap(), did);
+    assert_eq!(asked.lock().unwrap().as_slice(), ["publish-whois"]);
 
     // An admin changes what the service is called: the address says so too.
     published.changed(&wyvrn_service::profile::Changed { name: Some("Wyvrn Updates".into()), ..Default::default() });

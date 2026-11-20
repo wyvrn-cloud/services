@@ -16,6 +16,7 @@
 //! The name has to be free, or set aside for this service by one of the host's
 //! admins (`wyvrn-did-host assign official:news did:web:news.example`).
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -149,6 +150,13 @@ fn rfc3339(seconds: i64) -> String {
     chrono::DateTime::from_timestamp(seconds, 0).unwrap_or_default().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
+/// The whois this process last published for each address (by its `did:web`):
+/// what it said (the DID and the profile) and when.
+static PUBLISHED_WHOIS: std::sync::Mutex<Option<HashMap<String, (String, i64)>>> = std::sync::Mutex::new(None);
+/// How long a whois published unchanged is left before it is published again
+/// anyway: a host that lost it gets it back within a day.
+const WHOIS_AGAIN_AFTER: i64 = 24 * 60 * 60;
+
 /// A service's hold on its address.
 pub struct Holding {
     pub address: Address,
@@ -235,8 +243,25 @@ impl Holding {
         };
         self.published.known_also_as(Some(did.clone()));
         self.tell_held(&did).await;
-        self.publish_whois(&did, now).await?;
+        self.publish_whois_if_changed(&did, now).await?;
         Ok(did)
+    }
+
+    /// Publishes the whois unless this process last published the very same one
+    /// for this address (same DID, same profile) within `WHOIS_AGAIN_AFTER`. A host
+    /// running many communities wakes each one again and again (community-host
+    /// unloads idle ones), and each wake used to sign and publish it afresh.
+    async fn publish_whois_if_changed(&self, did: &str, now: i64) -> anyhow::Result<()> {
+        let said = format!("{did}\n{:?}", self.published.profile_now());
+        let same = |published: &HashMap<String, (String, i64)>| {
+            published.get(&self.address.did_web).is_some_and(|(before, at)| before == &said && now - at < WHOIS_AGAIN_AFTER)
+        };
+        if same(PUBLISHED_WHOIS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get_or_insert_with(HashMap::new)) {
+            return Ok(());
+        }
+        self.publish_whois(did, now).await?;
+        PUBLISHED_WHOIS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get_or_insert_with(HashMap::new).insert(self.address.did_web.clone(), (said, now));
+        Ok(())
     }
 
     /// Publishes who the service says it is, as the address: the same profile its
@@ -279,7 +304,7 @@ impl Holding {
         };
         loop {
             self.published.profile_changed().await;
-            if let Err(error) = self.publish_whois(&did, crate::now()).await {
+            if let Err(error) = self.publish_whois_if_changed(&did, crate::now()).await {
                 tracing::warn!(%did, error = %format!("{error:#}"), "couldn't publish this service's changed profile at its public address");
             }
         }
