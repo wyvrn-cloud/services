@@ -515,6 +515,13 @@ impl CommunityService {
                     profile.remove("publicAddress");
                     profile.remove("linkedAccounts");
                 }
+            } else if checked["body"]["profile"].get("banner").is_none() {
+                // Theirs, and their app sent no banner (one that said "none" has
+                // `banner: null`): the one their address publishes, for the
+                // member list (address_banner.rs).
+                if let Some(banner) = crate::address_banner::banner_of_address(&address).await {
+                    crate::address_banner::with_banner(&mut checked, banner);
+                }
             }
             &checked
         } else {
