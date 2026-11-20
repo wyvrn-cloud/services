@@ -173,6 +173,13 @@ pub fn turns_of(posts: &[Post], own: &str) -> Vec<Turn> {
     turns
 }
 
+/// A member, named shortly enough to be part of a setting's name: the first 16
+/// bytes of the SHA-256 of their DID, in hex.
+pub fn member_key(did: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(did.as_bytes()).iter().take(16).map(|b| format!("{b:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

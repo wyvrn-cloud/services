@@ -599,7 +599,11 @@ async fn answer_post(state: &Arc<AppState>, id: &str) -> anyhow::Result<()> {
     }
     let Some(channel) = store.channel(&asked.channel)? else { return Ok(()) };
     let at = now();
-    let day = format!("assistant:day:{}:{}", at / 86_400, asked.author_did);
+    // Each member's count for the day, under a setting named for them by a digest
+    // of their DID: a setting's name is at most 64 characters on MySQL, and a DID
+    // (a did:peer:4) runs to over a thousand, which MySQL refused, so on MySQL the
+    // assistant never answered.
+    let day = format!("assistant:day:{}:{}", at / 86_400, crate::assistant::member_key(&asked.author_did));
     let period = format!("assistant:period:{}", at / crate::assistant::PERIOD_SECS);
     let used: u32 = store.setting(&day)?.and_then(|v| v.parse().ok()).unwrap_or(0);
     let spent: u64 = store.setting(&period)?.and_then(|v| v.parse().ok()).unwrap_or(0);
