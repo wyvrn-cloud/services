@@ -2497,6 +2497,18 @@ async fn a_private_channel_is_not_there_for_whoever_may_not_see_it() {
     // The moderator finds it all.
     assert_eq!(moderator.community("history-request", json!({ "channel": staff })).await["body"]["messages"].as_array().unwrap().len(), 2);
 
+    // Who can see it, for its member list and who can be called on there: the
+    // owner and the moderator, not the member; every one of them in `general`.
+    let seeing = moderator.community("members-request", json!({ "channel": staff })).await;
+    assert_eq!(seeing["body"]["channel"], staff.as_str(), "{seeing}");
+    let dids: Vec<&str> = seeing["body"]["members"].as_array().unwrap().iter().filter_map(|m| m["did"].as_str()).collect();
+    assert_eq!(dids.len(), 2, "{seeing}");
+    assert!(dids.contains(&owner.did().as_str()) && dids.contains(&moderator.did().as_str()) && !dids.contains(&member.did().as_str()), "{seeing}");
+    assert_eq!(moderator.community("members-request", json!({ "channel": general })).await["body"]["members"].as_array().unwrap().len(), 3);
+    // Asked of a channel one can't see, it is as unknown as any other way.
+    assert_eq!(member.community("members-request", json!({ "channel": staff })).await["body"]["code"], "e.p.msg.unknown-channel");
+    assert_eq!(member.community("members-request", json!({})).await["body"]["members"].as_array().unwrap().len(), 3);
+
     // Let everyone see it again, and it is there for the member, all of it.
     advance(&owner, "cp", "done", json!({})).await;
     owner.workflow("start", json!({ "template_id": "channel-permissions", "instance_id": "cp2", "context": { "channel": staff } })).await;

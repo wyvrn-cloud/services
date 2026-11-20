@@ -1919,7 +1919,33 @@ impl Community {
                 Ok(Outcome::reply(reply_to(message, HISTORY, history)))
             }
 
-            MEMBERS_REQUEST => Ok(Outcome::reply(reply_to(message, MEMBERS, self.members_for(&member)?))),
+            MEMBERS_REQUEST => {
+                // Those who can see one channel (its member list, who can be
+                // called on there): asked of a channel the asker can see.
+                let channel = match message["body"]["channel"].as_str() {
+                    Some(id) => match self.channel_for(sender, id)? {
+                        Some(channel) => Some(channel),
+                        None => return refuse(message, "e.p.msg.unknown-channel", "There is no such channel."),
+                    },
+                    None => None,
+                };
+                let mut body = self.members_for(&member)?;
+                if let Some(channel) = channel {
+                    let mut seeing = Vec::new();
+                    for listed in body["members"].as_array().into_iter().flatten() {
+                        let did = listed["did"].as_str().unwrap_or_default();
+                        if self.sees(did, &self.powers(did)?, &channel)? {
+                            seeing.push(listed.clone());
+                        }
+                    }
+                    body["members"] = json!(seeing);
+                    body["channel"] = json!(channel.id);
+                    if let Some(object) = body.as_object_mut() {
+                        object.remove("waiting");
+                    }
+                }
+                Ok(Outcome::reply(reply_to(message, MEMBERS, body)))
+            }
 
             SET_ADMISSION => {
                 if !self.powers(sender)?.has("manage_community") {
