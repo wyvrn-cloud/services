@@ -3792,6 +3792,29 @@ async fn a_wiki_page_is_edited_together_each_change_kept_with_who_made_it_restor
     assert_eq!(server.state.community.wiki_text(&page).unwrap(), "Be kind");
     live.next_typed(&reader, &format!("{C}wiki-update")).await;
 
+    // A restore is a version of its own: the owner's edit just before it, undone by
+    // it, stays in the history to go back to, and so does what follows it.
+    let held = owner.community("wiki-page-request", json!({ "page": page })).await;
+    let mine = Doc::with_client_id(2222);
+    mine.transact_mut().apply_update(Update::decode_v1(&b64.decode(held["body"]["state"].as_str().unwrap()).unwrap()).unwrap()).unwrap();
+    let before = mine.transact().state_vector();
+    {
+        let content = mine.get_or_insert_text("content");
+        let mut txn = mine.transact_mut();
+        let p = content.insert_embed(&mut txn, 1, XmlTextPrelim::new("Be brief"));
+        p.insert_attribute(&mut txn, "type", "paragraph");
+    }
+    let edit = mine.transact().encode_state_as_update_v1(&before);
+    assert_eq!(owner.community("wiki-update", json!({ "page": page, "update": b64.encode(&edit), "client": 2222 })).await["body"]["seq"], 4);
+    live.next_typed(&reader, &format!("{C}wiki-update")).await;
+    assert_eq!(owner.community("wiki-restore", json!({ "page": page, "seq": 2 })).await["body"]["seq"], 5);
+    live.next_typed(&reader, &format!("{C}wiki-update")).await;
+    let history = reader.community("wiki-history-request", json!({ "page": page })).await;
+    let seqs: Vec<i64> = history["body"]["versions"].as_array().unwrap().iter().map(|v| v["seq"].as_i64().unwrap()).collect();
+    assert_eq!(seqs, vec![5, 4, 3, 2], "{history}");
+    assert_eq!(reader.community("wiki-version-request", json!({ "page": page, "seq": 4 })).await["body"]["text"], "Be kind\nBe brief");
+    assert_eq!(server.state.community.wiki_text(&page).unwrap(), "Be kind\nNo spam");
+
     // Comments on a stretch of text, answered and resolved.
     let commented = reader.community("wiki-comment", json!({ "page": page, "start": "AQID", "end": "BAUG", "quote": "kind", "text": "Kinder?" })).await;
     let comment = commented["body"]["comments"][0]["id"].as_str().unwrap().to_string();

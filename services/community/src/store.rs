@@ -1092,6 +1092,13 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         at INTEGER NOT NULL,
         PRIMARY KEY (page, seq)
     );
+    -- Which of a page's changes were restores (wiki.rs): each stands as a version
+    -- of its own in the history, not run together with the edits around it.
+    CREATE TABLE IF NOT EXISTS wiki_restores (
+        page TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        PRIMARY KEY (page, seq)
+    );
     CREATE TABLE IF NOT EXISTS wiki_state (
         page TEXT PRIMARY KEY,
         state TEXT NOT NULL,
@@ -1687,6 +1694,11 @@ fn schema() -> Schema {
                 data MEDIUMTEXT NOT NULL,
                 did VARCHAR(3000) NOT NULL,
                 at BIGINT NOT NULL,
+                PRIMARY KEY (page, seq)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS wiki_restores (
+                page VARCHAR(64) NOT NULL,
+                seq BIGINT NOT NULL,
                 PRIMARY KEY (page, seq)
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS wiki_state (
@@ -3768,6 +3780,17 @@ impl Store {
     /// Each change to a page: its number, who sent it, and when, in order.
     pub fn wiki_update_heads(&self, page: &str) -> Result<Vec<(i64, String, i64)>> {
         self.db.lock().query("SELECT seq, did, at FROM wiki_updates WHERE page = ?1 ORDER BY seq", params![page], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+    }
+
+    /// That the change numbered `seq` on `page` was a restore.
+    pub fn add_wiki_restore(&self, page: &str, seq: i64) -> Result<()> {
+        self.db.lock().execute("INSERT INTO wiki_restores (page, seq) VALUES (?1, ?2)", params![page, seq])?;
+        Ok(())
+    }
+
+    /// The numbers of the changes to `page` that were restores.
+    pub fn wiki_restores(&self, page: &str) -> Result<Vec<i64>> {
+        self.db.lock().query("SELECT seq FROM wiki_restores WHERE page = ?1 ORDER BY seq", params![page], |row| row.get(0))
     }
 
     /// A page's changes up to and with `seq`, in order.

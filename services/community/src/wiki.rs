@@ -275,10 +275,18 @@ impl Community {
             }
             "wiki-history-request" => {
                 let Some((page, _)) = self.wiki_page(did, body["page"].as_str())? else { return no_page() };
+                // One member's changes close together are one version; but a restore
+                // is a version of its own, so what it undid stays in the history to go
+                // back to, and what is written after it isn't hidden in it either.
+                let restores = self.store.wiki_restores(&page.id)?;
                 let mut versions: Vec<(i64, i64, String)> = Vec::new();
+                let mut after_restore = false;
                 for (seq, who, at) in self.store.wiki_update_heads(&page.id)? {
+                    let restore = restores.contains(&seq);
+                    let joins = !restore && !after_restore;
+                    after_restore = restore;
                     match versions.last_mut() {
-                        Some((last_seq, last_at, last_who)) if *last_who == who && at - *last_at < VERSION_GAP => {
+                        Some((last_seq, last_at, last_who)) if joins && *last_who == who && at - *last_at < VERSION_GAP => {
                             (*last_seq, *last_at) = (seq, at);
                         }
                         _ => versions.push((seq, at, who)),
@@ -319,6 +327,7 @@ impl Community {
                 doc.transact_mut().apply_update(Update::decode_v1(&change)?)?;
                 let seq_now = last + 1;
                 self.store.add_wiki_update(&page.id, seq_now, &change, did, now)?;
+                self.store.add_wiki_restore(&page.id, seq_now)?;
                 self.store.set_wiki_state(&page.id, &encoded(&doc), seq_now)?;
                 page.updated_at = now;
                 self.store.save_wiki_page(&page)?;
