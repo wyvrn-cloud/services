@@ -789,8 +789,13 @@ impl Community {
             items.push(json!({ "type": "text", "text": "Everything here is made as the template has it, as if imported for the first time: whatever differs is changed to the template's, even what was changed here on purpose; what's missing is made, what was deleted here too; and what isn't in the template is removed, below." }));
         }
         let count = |kind: &str, new: bool| plan.items.iter().filter(|i| i.kind == kind && i.is_new() == new && !i.deleted_here).count();
+        let order = if exact || first_import(plan) {
+            "Channels and roles are put in the template's order."
+        } else {
+            "What is here stays in the order it has here; what is new goes after it. (Make it match exactly to put everything in the template's order.)"
+        };
         items.push(json!({ "type": "text", "text": format!(
-            "To be made: {} roles, {} categories, {} channels. Already here: {} roles, {} categories, {} channels. Channels and roles are put in the template's order.",
+            "To be made: {} roles, {} categories, {} channels. Already here: {} roles, {} categories, {} channels. {order}",
             count("role", true), count("category", true), count("channel", true), count("role", false), count("category", false), count("channel", false)
         ) }));
         if let Some(warning) = self.room_warning(plan) {
@@ -935,7 +940,7 @@ impl Community {
                         };
                     }
                 }
-                let report = self.import(&flow.owner, &template, &plan, &choice, input, now).map_err(failed)?;
+                let report = self.import(&flow.owner, &template, &plan, &choice, input, exact, now).map_err(failed)?;
                 flow.data["report"] = json!(report);
                 flow.data.as_object_mut().map(|data| data.remove("template"));
                 flow.state = "done".into();
@@ -948,7 +953,8 @@ impl Community {
 
     /// Imports `template` as the owner chose (`input`: `choose-*` and `remove-*`).
     /// What was done, in a sentence or two.
-    fn import(&self, owner: &str, template: &Value, plan: &Plan, choice: &HashMap<String, bool>, input: &Value, now: i64) -> anyhow::Result<String> {
+    #[allow(clippy::too_many_arguments)]
+    fn import(&self, owner: &str, template: &Value, plan: &Plan, choice: &HashMap<String, bool>, input: &Value, exact: bool, now: i64) -> anyhow::Result<String> {
         let mut ids: HashMap<String, String> = HashMap::new();
         let mut counts = Counts::default();
 
@@ -979,7 +985,13 @@ impl Community {
             // Then roles and categories, and then channels, which name roles and
             // categories by the ids they now have.
             self.import_items(owner, plan, choice, &["role", "category", "channel"], &mut ids, &mut counts, now)?;
-            self.order_as_template(plan, &ids)?;
+            // The template's order the first time, and when made to match exactly.
+            // Imported again, what is here stays where the owner put it, and what
+            // is new goes after it (asked 2026-11-16: an owner's arrangement was
+            // put back without asking).
+            if exact || first_import(plan) {
+                self.order_as_template(plan, &ids)?;
+            }
             // Discord's system messages channel, where it says who joined, is where
             // newcomers are welcomed, unless this community has a welcome channel.
             let system = template["serialized_source_guild"]["system_channel_id"].as_i64().and_then(|sid| ids.get(&format!("new:channel:{sid}")).cloned()).filter(|id| !id.is_empty());
@@ -1353,6 +1365,11 @@ impl Community {
         self.store.order_channels(&keyed.into_iter().map(|(_, id, category)| (id, category)).collect::<Vec<_>>())?;
         Ok(())
     }
+}
+
+/// Whether nothing of the template has been imported here before.
+fn first_import(plan: &Plan) -> bool {
+    plan.items.iter().all(|item| item.record.is_none()) && plan.removed.is_empty()
 }
 
 /// Where a channel goes: its category's place (-1 for none), whether it was made

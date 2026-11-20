@@ -2662,12 +2662,26 @@ async fn an_owner_imports_a_discord_template_and_again_once_it_has_changed() {
     assert!(told["channels"].as_array().unwrap().iter().any(|c| c["name"] == "news"));
     assert!(!told["channels"].as_array().unwrap().iter().any(|c| c["name"] == "old-stuff" || c["name"] == "announcements"));
 
-    // Again, with nothing changed in the template: nothing to ask, what's here kept.
+    // The owner arranges the channels their own way: #art before #help.
+    let here = owner.community("join", json!({})).await["body"].clone();
+    let mut arranged: Vec<Value> = here["channels"].as_array().unwrap().iter().filter(|c| c["kind"] != "voice").map(|c| json!({ "id": c["id"], "category": c["category"] })).collect();
+    let (art, help) = (arranged.iter().position(|c| c["id"] == channel(&here, "art")["id"]).unwrap(), arranged.iter().position(|c| c["id"] == channel(&here, "help")["id"]).unwrap());
+    arranged.swap(art, help);
+    let categories: Vec<Value> = here["categories"].as_array().unwrap().iter().map(|c| json!({ "id": c["id"], "name": c["name"] })).collect();
+    owner.community("arrange", json!({ "categories": categories, "channels": arranged })).await;
+    let names = |body: &Value| body["channels"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let ours = names(&owner.community("join", json!({})).await["body"]);
+    assert!(ours.iter().position(|n| n == "art") < ours.iter().position(|n| n == "help"), "{ours:?}");
+
+    // Again, with nothing changed in the template: nothing to ask, what's here
+    // kept, the owner's order too.
     owner.workflow("start", json!({ "template_id": "discord-import", "instance_id": "d3" })).await;
     let read = advance(&owner, "d3", "read", json!({ "link": "TESTCODE1234" })).await;
     assert!(!read["body"]["ui"].to_string().contains("which stays"), "{read}");
+    assert!(read["body"]["ui"].to_string().contains("stays in the order it has here"), "{read}");
     assert_eq!(advance(&owner, "d3", "import", json!({})).await["body"]["state"], "done");
     assert_eq!(channel(&member.community("join", json!({})).await["body"], "general")["topic"], "Ours now");
+    assert_eq!(names(&owner.community("join", json!({})).await["body"]), ours);
 }
 
 #[tokio::test]
