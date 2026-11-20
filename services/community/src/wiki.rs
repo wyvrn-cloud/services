@@ -111,12 +111,16 @@ impl Community {
         Ok(json!({ "channel": channel.id, "pages": pages }))
     }
 
-    /// Who has `page` open now, but `except`.
-    fn open_on(&self, page: &str, except: &str, now: i64) -> Vec<String> {
+    /// Who has `page` open now. Whoever made the change too: an account's devices
+    /// share its DID, so leaving it out left their other devices behind (seen on a
+    /// phone and a second device of its account). The device it came from gets it
+    /// back, which changes nothing there: Yjs takes an update or an awareness state
+    /// it already has as nothing new, and comments come whole.
+    fn open_on(&self, page: &str, now: i64) -> Vec<String> {
         let mut open = self.wiki_open.lock().unwrap_or_else(|p| p.into_inner());
         let Some(here) = open.get_mut(page) else { return Vec::new() };
         here.retain(|_, at| *at > now - OPEN_FOR);
-        here.keys().filter(|d| d.as_str() != except).cloned().collect()
+        here.keys().cloned().collect()
     }
 
     fn comments_body(&self, page: &str, now: i64) -> anyhow::Result<Value> {
@@ -257,7 +261,7 @@ impl Community {
                 self.store.save_wiki_page(&page)?;
                 let by = self.store.member_id(did, now)?;
                 let mut outcome = Outcome::reply(reply_to(message, &format!("{P}wiki-updated"), json!({ "page": page.id, "seq": seq })));
-                for other in self.open_on(&page.id, did, now) {
+                for other in self.open_on(&page.id, now) {
                     outcome.live_to.push((other, json!({ "type": format!("{P}wiki-update"), "id": uuid::Uuid::new_v4().to_string(), "body": { "page": page.id, "update": body["update"], "seq": seq, "by": by, "clients": clients } })));
                 }
                 Ok(Some(outcome))
@@ -268,7 +272,7 @@ impl Community {
                 self.wiki_open.lock().unwrap_or_else(|p| p.into_inner()).entry(page.id.clone()).or_default().insert(did.to_string(), now);
                 let by = self.store.member_id(did, now)?;
                 let mut outcome = Outcome::default();
-                for other in self.open_on(&page.id, did, now) {
+                for other in self.open_on(&page.id, now) {
                     outcome.live_to.push((other, json!({ "type": format!("{P}wiki-awareness"), "id": uuid::Uuid::new_v4().to_string(), "body": { "page": page.id, "state": state, "by": by } })));
                 }
                 Ok(Some(outcome))
@@ -335,7 +339,7 @@ impl Community {
                 let by = self.store.member_id(did, now)?;
                 let encoded_change = b64().encode(&change);
                 let mut outcome = Outcome::reply(reply_to(message, &format!("{P}wiki-updated"), json!({ "page": page.id, "seq": seq_now, "update": encoded_change })));
-                for other in self.open_on(&page.id, did, now) {
+                for other in self.open_on(&page.id, now) {
                     outcome.live_to.push((other, json!({ "type": format!("{P}wiki-update"), "id": uuid::Uuid::new_v4().to_string(), "body": { "page": page.id, "update": encoded_change, "seq": seq_now, "by": by, "clients": [client] } })));
                 }
                 Ok(Some(outcome))
@@ -395,7 +399,7 @@ impl Community {
                 let comments = self.comments_body(&page.id, now)?;
                 let mut outcome = Outcome::reply(reply_to(message, &format!("{P}wiki-comments"), comments.clone()));
                 if kind != "wiki-comments-request" {
-                    for other in self.open_on(&page.id, did, now) {
+                    for other in self.open_on(&page.id, now) {
                         outcome.live_to.push((other, json!({ "type": format!("{P}wiki-comments"), "id": uuid::Uuid::new_v4().to_string(), "body": comments })));
                     }
                 }

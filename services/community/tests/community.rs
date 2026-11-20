@@ -3745,6 +3745,11 @@ async fn a_wiki_page_is_edited_together_each_change_kept_with_who_made_it_restor
     let mut live = Live::open(&reader, &server).await;
     live.send_as(&reader, &format!("{C}watch"), json!({})).await;
     live.send_as(&reader, &format!("{C}wiki-awareness"), json!({ "page": page, "state": "AA==" })).await;
+    // And the writer, on another device of theirs (the same DID): their own changes
+    // reach it too.
+    let mut elsewhere = Live::open(&writer, &server).await;
+    elsewhere.send_as(&writer, &format!("{C}watch"), json!({})).await;
+    elsewhere.send_as(&writer, &format!("{C}wiki-awareness"), json!({ "page": page, "state": "AA==" })).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // The writer types, as slate-yjs does: a paragraph embedded in `content`.
@@ -3761,6 +3766,7 @@ async fn a_wiki_page_is_edited_together_each_change_kept_with_who_made_it_restor
     assert_eq!(sent["body"]["seq"], 1, "{sent}");
     let arrived = live.next_typed(&reader, &format!("{C}wiki-update")).await;
     assert_eq!((arrived["body"]["by"].as_str(), arrived["body"]["seq"].as_i64()), (Some(server.id(&writer).as_str()), Some(1)));
+    assert_eq!(elsewhere.next_typed(&writer, &format!("{C}wiki-update")).await["body"]["seq"], 1);
     assert_eq!(server.state.community.wiki_text(&page).unwrap(), "Be kind");
     // Another can't write as that client: who wrote what stays true.
     assert_eq!(reader.community("wiki-update", json!({ "page": page, "update": b64.encode(&first), "client": 1111 })).await["body"]["code"], "e.p.msg.not-your-client");
