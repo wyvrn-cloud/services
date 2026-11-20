@@ -1040,6 +1040,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Members' pictures, at the addresses members are given (member_ids.rs).
         .route("/m/{member}/{kind}/{hash}", get(member_picture))
         .route("/picture/{hash}", get(own_picture))
+        .route("/invite/{code}", get(short_invite))
         .route("/healthz", get(|| async { "ok" }))
         // A member's calendar feed (events.rs), at the address only they were given.
         .route("/calendar/{file}", get(crate::events::feed))
@@ -1078,6 +1079,49 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 /// A member's picture, banner or picture here, by the address `members` gave:
 /// a capability, the same for as long as the picture is, and so kept for good.
+/// One of the community's short invite links (DIDComm's "Short URL Message
+/// Retrieval", the link a path rather than `?_oobid=`): a browser (asking for
+/// HTML) is sent to the page that shows the community and how to take the invite
+/// up (`invite_landing`); anything else -- an app, an agent -- is given the
+/// out-of-band invitation itself, made now, so one link stays good as the
+/// community's DID or picture changes. Nothing for a code that wouldn't let anyone
+/// in now (used up, run out, revoked).
+async fn short_invite(State(state): State<Arc<AppState>>, axum::extract::Path(code): axum::extract::Path<String>, headers: axum::http::HeaderMap) -> Response {
+    use axum::http::{header, StatusCode};
+    let community = &state.community;
+    let valid = code.len() <= 128 && community.store.invite(&code).ok().flatten().is_some_and(|invite| invite.valid(now()));
+    if !valid {
+        return (StatusCode::NOT_FOUND, [(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")], "This invite isn't good any more.").into_response();
+    }
+    let did = state.voice.speaking_as().unwrap_or_else(|| state.agent.did());
+    let wants_page = headers.get(header::ACCEPT).and_then(|accept| accept.to_str().ok()).is_some_and(|accept| accept.contains("text/html"));
+    if wants_page {
+        let link = format!("{}/invite/{code}", community.public_url.trim_end_matches('/'));
+        if let Some(landing) = invite_landing(&community.config.invite_landing, &did, &link) {
+            return (StatusCode::FOUND, [(header::LOCATION, landing)]).into_response();
+        }
+    }
+    let invitation = community.invitation(&did, &code);
+    (
+        [(header::CONTENT_TYPE, "application/json"), (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"), (header::CACHE_CONTROL, "no-store")],
+        invitation.to_string(),
+    )
+        .into_response()
+}
+
+/// Where a browser opening the short invite `link` is sent: `landing` (the
+/// app's page for an address, `https://chat.wyvrn.app/dl/`) at the community's
+/// `did`, the link passed on. Only for a DID the page can look up (did:web,
+/// did:webvh); `None` otherwise.
+pub(crate) fn invite_landing(landing: &str, did: &str, link: &str) -> Option<String> {
+    if !(did.starts_with("did:web:") || did.starts_with("did:webvh:")) {
+        return None;
+    }
+    let mut url = reqwest::Url::parse(&format!("{landing}{did}")).ok()?;
+    url.query_pairs_mut().append_pair("invite", link);
+    Some(url.to_string())
+}
+
 /// The community's own picture, as small as Discord takes it, at the address
 /// `own_picture_url` gave while it is still that picture: public, as its DID
 /// document's whois already makes it.
@@ -1134,4 +1178,16 @@ async fn index(State(state): State<Arc<AppState>>) -> String {
         state.agent.did(),
         community::PIURI
     )
+}
+
+#[cfg(test)]
+mod invite_landing_tests {
+    #[test]
+    fn a_browser_is_sent_to_the_communitys_page_with_the_link() {
+        assert_eq!(
+            super::invite_landing("https://chat.wyvrn.app/dl/", "did:web:c.wyvrn.app:c:frosty", "https://c.wyvrn.app/c/frosty/invite/k3J9xQ2mAbCdEf").as_deref(),
+            Some("https://chat.wyvrn.app/dl/did:web:c.wyvrn.app:c:frosty?invite=https%3A%2F%2Fc.wyvrn.app%2Fc%2Ffrosty%2Finvite%2Fk3J9xQ2mAbCdEf")
+        );
+        assert!(super::invite_landing("https://chat.wyvrn.app/dl/", "did:peer:4zQm", "https://x/invite/a").is_none());
+    }
 }

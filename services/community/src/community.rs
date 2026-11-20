@@ -219,8 +219,18 @@ impl Admission {
 }
 
 /// A new invite's code: 256 bits of randomness, in hex.
+/// A new invite code: 14 letters and digits (about 80 bits), short enough for a
+/// link that fits a small QR code (`/invite/<code>`) and too many to guess. Codes
+/// made before were 64 hex digits, and still work.
 fn new_code() -> String {
-    format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    let mut random = [0u8; 32];
+    random[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    random[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    // (Bytes past the largest multiple of the alphabet's length are skipped, so
+    // each letter is as likely as the next.)
+    let most = 256 - 256 % ALPHABET.len();
+    random.iter().filter(|b| (**b as usize) < most).take(14).map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char).collect()
 }
 
 pub struct Community {
@@ -525,6 +535,30 @@ impl Community {
         Ok(())
     }
 
+    /// An out-of-band/2.0 invitation to join, from `did`, under invite `code` (its
+    /// id, which joining names): what a short invite link gives an app. Carries
+    /// who the community is (user-profile/1.0's profile, picture and all), as an
+    /// invite the app makes itself does.
+    pub fn invitation(&self, did: &str, code: &str) -> Value {
+        let profile = self.profile_message();
+        let name = profile["body"]["profile"]["displayName"].as_str().unwrap_or_default().to_string();
+        let mut attached = json!({ "id": uuid::Uuid::new_v4().to_string(), "type": PROFILE, "body": profile["body"].clone() });
+        if let Some(attachments) = profile.get("attachments") {
+            attached["attachments"] = attachments.clone();
+        }
+        json!({
+            "type": "https://didcomm.org/out-of-band/2.0/invitation",
+            "id": code,
+            "from": did,
+            "body": {
+                "goal_code": "wyvrn.community.join",
+                "goal": if name.is_empty() { "Join this community".to_string() } else { format!("Join {name}") },
+                "accept": ["didcomm/v2+cbor", "didcomm/v2"],
+            },
+            "attachments": [{ "id": "profile", "media_type": "application/json", "data": { "json": attached } }],
+        })
+    }
+
     /// Who the community is, as user-profile/1.0 says it: its name, description
     /// and picture now, a picture that is gone said to be gone.
     pub fn profile_message(&self) -> Value {
@@ -612,6 +646,8 @@ impl Community {
             "owners": self.owners()?,
             "you": member.did,
             "message_requests": self.store.member_here(&member.did)?.is_none_or(|here| here.requests),
+            // Where its short invite links are: an invite's code after it.
+            "invite_url": format!("{}/invite/", self.public_url.trim_end_matches('/')),
             "roles": self.roles_body()?,
             "my_roles": powers.roles,
             "permissions": powers.listed(),

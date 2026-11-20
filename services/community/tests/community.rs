@@ -703,6 +703,27 @@ async fn an_invite_lets_in_while_it_lasts_when_admission_is_by_invite() {
     assert_eq!(kind(&made), "invites", "{made}");
     let code = made["body"]["created"].as_str().unwrap().to_string();
     assert_eq!(made["body"]["invites"][0]["note"], "for Alice");
+    // Short enough for a link that fits a small QR code.
+    assert_eq!(code.len(), 14, "{code}");
+    assert!(code.chars().all(|c| c.is_ascii_alphanumeric()), "{code}");
+
+    // Its short link: the community says where they are, and the link gives an
+    // app the invitation itself, made now, its id the code.
+    let base = admin.community("join", json!({})).await["body"]["invite_url"].as_str().unwrap().to_string();
+    assert_eq!(base, format!("{}/invite/", server.url.trim_end_matches('/')));
+    let http = reqwest::Client::new();
+    let fetched = http.get(format!("{base}{code}")).header("accept", "application/json").send().await.unwrap();
+    assert_eq!(fetched.headers()["access-control-allow-origin"], "*");
+    let invitation: Value = fetched.json().await.unwrap();
+    assert_eq!(invitation["type"], "https://didcomm.org/out-of-band/2.0/invitation");
+    assert_eq!((invitation["id"].as_str(), invitation["from"].as_str()), (Some(code.as_str()), Some(server.did.as_str())));
+    assert_eq!(invitation["body"]["goal_code"], "wyvrn.community.join");
+    assert_eq!(invitation["attachments"][0]["data"]["json"]["body"]["profile"]["displayName"], "The Workshop");
+    // (A community at a did:peer has no page to send a browser to: it is given the same.)
+    let browsing = http.get(format!("{base}{code}")).header("accept", "text/html").send().await.unwrap();
+    assert_eq!(browsing.json::<Value>().await.unwrap()["id"], code.as_str());
+    // A code nobody made: nothing.
+    assert_eq!(http.get(format!("{base}NotACode12345")).send().await.unwrap().status(), 404);
     assert_eq!(kind(&alice.community("join", json!({ "invite": code })).await), "waiting");
     let waiting = admin.community("members-request", json!({})).await["body"]["waiting"][0].clone();
     assert_eq!((waiting["invite"]["code"].as_str(), waiting["invite"]["created_by"]["member"].as_str()), (Some(code.as_str()), Some(server.id(&admin).as_str())));
@@ -716,8 +737,9 @@ async fn an_invite_lets_in_while_it_lasts_when_admission_is_by_invite() {
     assert!(server.state.community.store.waiting().unwrap().is_empty());
     assert_eq!(kind(&bob.community("join", json!({ "invite": code })).await), "waiting");
     assert_eq!(kind(&carol.community("join", json!({})).await), "waiting");
-    // Used up, it is no longer listed.
+    // Used up, it is no longer listed, and its link gives nothing.
     assert_eq!(admin.community("invites-request", json!({})).await["body"]["invites"], json!([]));
+    assert_eq!(http.get(format!("{base}{code}")).send().await.unwrap().status(), 404);
 
     // One that has expired lets nobody in, and can't be made.
     let past = admin.community("create-invite", json!({ "expires_at": 1 })).await;

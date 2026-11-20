@@ -151,6 +151,10 @@ pub struct CommunityConfig {
     pub members_may_create_channels: bool,
     /// The longest a post may be, in characters.
     pub max_post_length: usize,
+    /// Where a browser that opens one of the community's short invite links
+    /// (`/invite/<code>`) is sent: the page that shows the community and how to
+    /// take the invite up, given `<its DID>?invite=<the link>`.
+    pub invite_landing: String,
     /// How many channels there may be that aren't closed.
     pub max_channels: usize,
     /// Who a `join` from someone who isn't a member lets in, until an admin says
@@ -217,6 +221,7 @@ impl Default for CommunityConfig {
             members: Vec::new(),
             members_may_create_channels: false,
             max_post_length: 16_000,
+            invite_landing: "https://chat.wyvrn.app/dl/".to_string(),
             max_channels: 500,
             admission: DEFAULT_ADMISSION.to_string(),
             members_may_invite: false,
