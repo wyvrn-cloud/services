@@ -176,7 +176,7 @@ impl Host {
     /// read from its configuration file, made here.
     pub fn settings(&self, record: &Record) -> CommunityServerConfig {
         let folder = self.folder(&record.name);
-        let limits = record.limits.unwrap_or(self.config.limits);
+        let limits = record.limits.clone().unwrap_or_else(|| self.config.limits.clone());
         let mut settings = CommunityServerConfig {
             server: ServerConfig { bind: String::new(), public_url: format!("{}c/{}/", self.config.server.public_url, record.name), did_method: self.config.server.did_method },
             identity: PathConfig { path: folder.join("identity.json") },
@@ -195,6 +195,7 @@ impl Host {
                 max_stickers_per_pack: limits.stickers_per_pack,
                 max_emoji_packs: limits.emoji_packs,
                 max_emoji_per_pack: limits.emoji_per_pack,
+                disabled_channel_kinds: limits.disabled_kinds(&self.config.limits),
                 ..CommunityConfig::default()
             },
             mediator: None,

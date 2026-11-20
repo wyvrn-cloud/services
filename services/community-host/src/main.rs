@@ -98,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
         ["limits", name, members, channels] => {
             let registry = registry(&config)?;
             let record = registry.get(name)?.with_context(|| format!("there is no community called {name}"))?;
-            let limits = Limits { members: members.parse()?, channels: channels.parse()?, ..record.limits.unwrap_or(config.limits) };
+            let limits = Limits { members: members.parse()?, channels: channels.parse()?, ..record.limits.unwrap_or_else(|| config.limits.clone()) };
             registry.set_limits(name, Some(&limits))?;
             println!("{name} may hold {members} members and {channels} channels");
             Ok(())

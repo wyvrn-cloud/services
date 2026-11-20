@@ -964,6 +964,46 @@ async fn a_member_reports_a_post_or_a_member_and_only_admins_are_told() {
 }
 
 #[tokio::test]
+async fn kinds_of_channel_the_host_turned_off_are_not_opened_and_those_there_are_read_only() {
+    let server = start_server("disabled_channel_kinds = [\"wiki\", \"announcement\"]").await;
+    let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member]);
+    member.community("join", json!({})).await;
+
+    // Not opened, even by its owner; what may be is said.
+    for asked in [json!({ "name": "handbook", "kind": "wiki" }), json!({ "name": "news", "announcement": true })] {
+        assert_eq!(owner.community("create-channel", asked).await["body"]["code"], "e.p.msg.kind-off");
+    }
+    let general = open_channel(&owner, "general").await;
+    assert_eq!(owner.community("update-channel", json!({ "channel": general, "announcement": true })).await["body"]["code"], "e.p.msg.kind-off");
+    let joined = owner.community("join", json!({})).await;
+    assert_eq!(joined["body"]["channel_kinds"], json!(["text", "voice", "stage", "forum", "gallery", "calendar", "form"]), "{joined}");
+
+    // One there from before (the host turned wikis off after) is read-only.
+    let store = &server.state.community.store;
+    store.add_channel("old-wiki", "handbook", "", &owner.did(), 1).unwrap();
+    store.set_wiki_channel("old-wiki").unwrap();
+    store.add_channel("old-news", "news", "", &owner.did(), 1).unwrap();
+    store.set_announcement("old-news", true).unwrap();
+    let joined = member.community("join", json!({})).await;
+    for id in ["old-wiki", "old-news"] {
+        let listed = joined["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == id).unwrap().clone();
+        assert_eq!((listed["read_only"].as_bool(), listed["kind_off"].as_bool()), (Some(true), Some(true)), "{listed}");
+        assert_eq!(listed["permissions"], json!(["view_channel"]), "{listed}");
+    }
+    for peer in [&owner, &member] {
+        assert_eq!(peer.community("post", json!({ "channel": "old-news", "content": "hi" })).await["body"]["code"], "e.p.trust.not-authorized");
+        assert_eq!(peer.community("wiki-create-page", json!({ "channel": "old-wiki", "title": "Rules" })).await["body"]["code"], "e.p.trust.not-authorized");
+    }
+    // The owner still keeps order there.
+    let owners = owner.community("join", json!({})).await;
+    let listed = owners["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == "old-news").unwrap().clone();
+    assert_eq!(listed["permissions"], json!(["manage_messages", "moderate_voice", "view_channel"]), "{listed}");
+    // And a text channel takes posts as ever.
+    assert_eq!(kind(&member.community("post", json!({ "channel": general, "content": "hi" })).await), "posted");
+}
+
+#[tokio::test]
 async fn an_admin_opens_voice_channels_which_take_no_posts() {
     let server = start_server("[voice]\nrelay_url = \"https://voice.example/\"").await;
     let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);

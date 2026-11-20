@@ -232,6 +232,24 @@ fn kind_of(channel: &Value) -> (&'static str, Option<&'static str>) {
     }
 }
 
+/// The kind of channel a template's channel would be here, as
+/// [`crate::community::channel_kind`] names it.
+fn wanted_kind(want: &Value) -> &'static str {
+    match want["kind"].as_str() {
+        Some("voice") if want["stage"] == true => "stage",
+        Some("voice") => "voice",
+        Some("forum") if want["gallery"] == true => "gallery",
+        Some("forum") => "forum",
+        _ if want["announcement"] == true => "announcement",
+        _ => "text",
+    }
+}
+
+fn capitalised(word: &str) -> String {
+    let mut letters = word.chars();
+    letters.next().map(|first| first.to_uppercase().chain(letters).collect()).unwrap_or_default()
+}
+
 /// A Discord name, as a text channel here may be called: in lowercase, spaces as
 /// `-`, without what a name here can't hold.
 fn text_name(name: &str) -> String {
@@ -675,6 +693,12 @@ impl Community {
                 }
                 None => (Vec::new(), Vec::new()),
             };
+            // One of a kind this community's host turned off isn't made.
+            let wanted = wanted_kind(&want);
+            if local.is_none() && self.kind_off(wanted) {
+                miss(format!("{} channels: whoever hosts this community has turned them off", capitalised(wanted)));
+                continue;
+            }
             let deleted_here = record.is_some() && local.is_none();
             plan.items.push(Planned { kind: "channel", source_id, source: (*channel).clone(), label: shown_name, local, record, want, here, take, conflicts, deleted_here });
         }
@@ -1172,7 +1196,7 @@ impl Community {
                 Ok(Some(id))
             }
             "channel" => {
-                if self.store.open_channel_count()? >= self.config.max_channels {
+                if self.store.open_channel_count()? >= self.config.max_channels || self.kind_off(wanted_kind(want)) {
                     return Ok(None);
                 }
                 let voice = want["kind"] == "voice";

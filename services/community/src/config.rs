@@ -157,6 +157,12 @@ pub struct CommunityConfig {
     pub invite_landing: String,
     /// How many channels there may be that aren't closed.
     pub max_channels: usize,
+    /// The kinds of channel that may not be opened here, as
+    /// [`crate::community::channel_kind`] names them (a host's, for each community
+    /// it keeps): `announcement`, `voice`, `stage`, `forum`, `gallery`, `calendar`,
+    /// `form`, `wiki`. A text channel can't be turned off. One of these already
+    /// here is read-only: seen, and moderated, but nothing new is added to it.
+    pub disabled_channel_kinds: Vec<String>,
     /// Who a `join` from someone who isn't a member lets in, until an admin says
     /// otherwise (`set-admission`): `admin` (nobody), `invite` or `open`.
     pub admission: String,
@@ -223,6 +229,7 @@ impl Default for CommunityConfig {
             max_post_length: 16_000,
             invite_landing: "https://chat.wyvrn.app/dl/".to_string(),
             max_channels: 500,
+            disabled_channel_kinds: Vec::new(),
             admission: DEFAULT_ADMISSION.to_string(),
             members_may_invite: false,
             max_waiting: 500,

@@ -581,6 +581,28 @@ async fn a_hosted_community_is_held_to_its_posts_a_minute_and_the_room_its_store
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn kinds_of_channel_are_turned_off_for_every_community_or_for_one() {
+    let running = start_host_with_extra(600, "", "[limits]\ndisabled_channel_kinds = [\"wiki\"]").await;
+    let owner = Peer::start().await;
+    // One that follows the host's, and one with its own: wikis, but no stages.
+    running.host.registry.create("plain", "Plain", Storage::Sqlite, &owner.did(), "test", 1).unwrap();
+    running.host.registry.create("wikis", "Wikis", Storage::Sqlite, &owner.did(), "test", 1).unwrap();
+    let own = wyvrn_community_host::config::Limits { disabled_channel_kinds: Some(vec!["stage".into()]), ..Default::default() };
+    running.host.registry.set_limits("wikis", Some(&own)).unwrap();
+    let (plain, wikis) = (running.did_of("plain").await, running.did_of("wikis").await);
+    for did in [&plain, &wikis] {
+        owner.community(did, "join", json!({})).await;
+    }
+    let wiki = json!({ "name": "handbook", "kind": "wiki" });
+    let stage = json!({ "name": "town-hall", "kind": "voice", "voice": { "stage": true } });
+    assert_eq!(owner.community(&plain, "create-channel", wiki.clone()).await["body"]["code"], "e.p.msg.kind-off");
+    assert_eq!(kind(&owner.community(&plain, "create-channel", stage.clone()).await), "community");
+    assert_eq!(kind(&owner.community(&wikis, "create-channel", wiki).await), "community");
+    let refused = owner.community(&wikis, "create-channel", stage).await;
+    assert_eq!(refused["body"]["code"], "e.p.msg.kind-off", "{refused}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_community_is_backed_up_sealed_with_the_hosts_key_and_opens_whole() {
     let dir = std::env::temp_dir().join(format!("wyvrn-host-backup-test-{}", unique()));
     std::fs::create_dir_all(&dir).unwrap();

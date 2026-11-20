@@ -35,9 +35,38 @@ fn field<'a>(input: &'a Value, name: &str) -> &'a str {
     input[name].as_str().map_or("", str::trim)
 }
 
+/// The kinds of channel a host may turn off, as its admin page names them.
+const KINDS: &[(&str, &str)] = &[
+    ("announcement", "Announcement channels"),
+    ("voice", "Voice channels"),
+    ("stage", "Stages"),
+    ("forum", "Forums"),
+    ("gallery", "Galleries"),
+    ("calendar", "Calendars"),
+    ("form", "Forms"),
+    ("wiki", "Wikis"),
+];
+
+/// The kinds of channel a form turns off: each `allow_<kind>` box left unticked.
+/// One the form doesn't have (an app that draws no check box) stays as `base`
+/// has it. The same as the host's, `None`: it follows the host's from then on.
+fn kinds_from(input: &Value, base: &[String], host: &[String]) -> Option<Vec<String>> {
+    let off: Vec<String> = KINDS
+        .iter()
+        .filter(|(kind, _)| match input[format!("allow_{kind}")].as_bool() {
+            Some(allowed) => !allowed,
+            None => base.iter().any(|off| off == kind),
+        })
+        .map(|(kind, _)| kind.to_string())
+        .collect();
+    (off != host).then_some(off)
+}
+
 /// The limits a form gives, over `base`: a number of members and channels, sizes
-/// as written ("25 MB").
-fn limits_from(input: &Value, base: Limits) -> Result<Limits, String> {
+/// as written ("25 MB"), and the kinds of channel allowed (over the `host`'s).
+fn limits_from(input: &Value, base: Limits, host: &Limits) -> Result<Limits, String> {
+    let host_kinds = host.disabled_kinds(host);
+    let disabled_channel_kinds = kinds_from(input, &base.disabled_kinds(host), &host_kinds);
     let count = |name: &str, otherwise: usize| -> Result<usize, String> {
         match field(input, name) {
             "" => Ok(otherwise),
@@ -68,6 +97,7 @@ fn limits_from(input: &Value, base: Limits) -> Result<Limits, String> {
         stickers_per_pack: count("stickers_per_pack", base.stickers_per_pack)?.max(1),
         emoji_packs: count("emoji_packs", base.emoji_packs)?,
         emoji_per_pack: count("emoji_per_pack", base.emoji_per_pack)?.max(1),
+        disabled_channel_kinds,
     })
 }
 
@@ -83,7 +113,7 @@ impl Pages for AppState {
 
     fn view(&self, _page: &str, _admin: &str, now: i64) -> anyhow::Result<Vec<Value>> {
         let host = &self.host;
-        let defaults = host.config.limits;
+        let defaults = &host.config.limits;
         let mut items = vec![json!({ "type": "form", "children": [
             { "type": "text", "text": "Make a community. Its name is its address here (c/<name>/) and at the DID host (community:<name>); its owner is its first admin, who can then hand it on." },
             { "type": "text-input", "form-id": "name", "label": "Name (lowercase letters, digits and -)", "value": "" },
@@ -114,8 +144,10 @@ impl Pages for AppState {
                 items.push(json!({ "type": "row", "children": [{ "type": "text", "text": said }, button("Revoke", "revoke_code", json!({ "code": code }))] }));
             }
         }
+        let off: Vec<&str> = KINDS.iter().filter(|(kind, _)| defaults.disabled_kinds(defaults).iter().any(|o| o == kind)).map(|(_, label)| *label).collect();
+        let off = if off.is_empty() { String::new() } else { format!(" Turned off, unless set for it: {}.", off.join(", ").to_lowercase()) };
         items.push(json!({ "type": "text", "text": format!(
-            "Each may hold, unless set for it: {} members, {} channels, files up to {} ({} a member, {} in all). {} open now.",
+            "Each may hold, unless set for it: {} members, {} channels, files up to {} ({} a member, {} in all).{off} {} open now.",
             defaults.members, defaults.channels, bytes(defaults.file_bytes), bytes(defaults.files_quota), bytes(defaults.files_total), host.loaded_count()
         ) }));
         let records = host.registry.all()?;
@@ -166,8 +198,13 @@ impl Pages for AppState {
             if let Ok(Some(address)) = host.address(&record.name) {
                 items.push(json!({ "type": "text", "text": address.did_web, "copyable": true, "label": "Its public address" }));
             }
-            let limits = record.limits.unwrap_or(defaults);
-            items.push(json!({ "type": "form", "children": [
+            let limits = record.limits.clone().unwrap_or_else(|| defaults.clone());
+            let off = limits.disabled_kinds(defaults);
+            let mut kinds = vec![json!({ "type": "text", "text": "Kinds of channel it may open (text channels always). One it has of a kind turned off is read-only." })];
+            for (kind, label) in KINDS {
+                kinds.push(json!({ "type": "check-box", "form-id": format!("allow_{kind}"), "label": label, "value": !off.iter().any(|o| o == kind) }));
+            }
+            let mut form = json!({ "type": "form", "children": [
                 { "type": "text", "text": format!("What {} may hold", record.name) },
                 { "type": "text-input", "form-id": "members", "label": "Members", "value": limits.members.to_string() },
                 { "type": "text-input", "form-id": "channels", "label": "Channels", "value": limits.channels.to_string() },
@@ -181,8 +218,12 @@ impl Pages for AppState {
                 { "type": "text-input", "form-id": "stickers_per_pack", "label": "Stickers in a pack", "value": limits.stickers_per_pack.to_string() },
                 { "type": "text-input", "form-id": "emoji_packs", "label": "Emoji packs", "value": limits.emoji_packs.to_string() },
                 { "type": "text-input", "form-id": "emoji_per_pack", "label": "Emoji in a pack", "value": limits.emoji_per_pack.to_string() },
-                button("Set", "limits", named.clone()),
-            ]}));
+            ]});
+            if let Some(children) = form["children"].as_array_mut() {
+                children.extend(kinds);
+                children.push(button("Set", "limits", named.clone()));
+            }
+            items.push(form);
             if record.state.served() {
                 let others: Vec<Value> = storage_options(!host.config.storage.mysql.is_empty())
                     .as_array()
@@ -290,7 +331,7 @@ impl Pages for AppState {
                 format!("{name} is stopped here, and kept for 30 days.")
             }
             "limits" => {
-                let limits = limits_from(input, record.limits.unwrap_or(host.config.limits))?;
+                let limits = limits_from(input, record.limits.clone().unwrap_or_else(|| host.config.limits.clone()), &host.config.limits)?;
                 host.registry.set_limits(&name, Some(&limits)).map_err(failed)?;
                 // Taken up the next time it is opened.
                 host.unload(&name);
@@ -300,5 +341,24 @@ impl Pages for AppState {
         };
         tracing::info!(community = %name, event, by = %admin, "an admin page changed a community");
         Ok(Some(said))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_form_turns_kinds_of_channel_off_and_back_to_the_hosts() {
+        let host = Limits { disabled_channel_kinds: Some(vec!["wiki".into()]), ..Limits::default() };
+        let every_box = |off: &[&str]| -> Value { KINDS.iter().map(|(kind, _)| (format!("allow_{kind}"), json!(!off.contains(kind)))).collect::<serde_json::Map<_, _>>().into() };
+        // Forms and wikis off for this one.
+        let set = limits_from(&every_box(&["form", "wiki"]), host.clone(), &host).unwrap();
+        assert_eq!(set.disabled_channel_kinds, Some(vec!["form".to_string(), "wiki".to_string()]));
+        assert_eq!(set.disabled_kinds(&host), ["form", "wiki"]);
+        // Ticked as the host has them: it follows the host's again.
+        assert_eq!(limits_from(&every_box(&["wiki"]), set.clone(), &host).unwrap().disabled_channel_kinds, None);
+        // A form without the boxes leaves them as they were.
+        assert_eq!(limits_from(&json!({ "members": "10" }), set.clone(), &host).unwrap().disabled_channel_kinds, set.disabled_channel_kinds);
     }
 }

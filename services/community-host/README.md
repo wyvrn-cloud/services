@@ -51,7 +51,8 @@ Called off before then, it is open here again as it was.
 `[limits]` sets what each community may hold, and an admin can change them for one community. Each limit is refused where it is met, with community/1.0's codes:
 - members: `e.p.req.community-full`;
 - channels: `e.p.msg.too-many`;
-- files: files/1.0's `e.p.msg.quota`.
+- files: files/1.0's `e.p.msg.quota`;
+- kinds of channel: `disabled_channel_kinds = ["wiki", "stage"]` turns those off (any of `announcement`, `voice`, `stage`, `forum`, `gallery`, `calendar`, `form`, `wiki`; a text channel can't be). A new one is refused with `e.p.msg.kind-off`, and one a community has already is read-only: seen and moderated, but nothing new is posted, answered or joined in it. A community's own setting, on the admin page, takes the place of the host's; set back to the host's, it follows the host's again.
 
 ## Voice
 

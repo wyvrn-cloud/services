@@ -278,7 +278,7 @@ impl Community {
                 if response["response_type"] != "data" {
                     return Ok(Some(Outcome::default()));
                 }
-                if form["closes_at"].as_i64().is_some_and(|at| at <= now) {
+                if form["closes_at"].as_i64().is_some_and(|at| at <= now) || self.channel_off(&channel) {
                     return refuse(message, "e.p.msg.form-closed", "This form no longer takes answers.").map(Some);
                 }
                 let answers = self.store.form_answers(&channel.id)?;

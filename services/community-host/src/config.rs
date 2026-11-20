@@ -146,7 +146,7 @@ impl Default for StorageConfig {
 
 /// What one community may hold. Each refused where it is met, as community/1.0's
 /// "Hosted communities, and moving" says.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct Limits {
     /// Members, those who left included.
@@ -172,11 +172,24 @@ pub struct Limits {
     /// Its own custom emoji packs, and emoji in each.
     pub emoji_packs: usize,
     pub emoji_per_pack: usize,
+    /// The kinds of channel it may not open (wyvrn-community's
+    /// `disabled_channel_kinds`): `announcement`, `voice`, `stage`, `forum`,
+    /// `gallery`, `calendar`, `form`, `wiki`. One it has already is read-only.
+    /// Unset for one community, the host's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_channel_kinds: Option<Vec<String>>,
+}
+
+impl Limits {
+    /// The kinds of channel turned off, with `host`'s where these don't say.
+    pub fn disabled_kinds(&self, host: &Limits) -> Vec<String> {
+        self.disabled_channel_kinds.clone().or_else(|| host.disabled_channel_kinds.clone()).unwrap_or_default()
+    }
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { members: 1000, channels: 500, file_bytes: 25 * 1024 * 1024, files_quota: 1024 * 1024 * 1024, files_total: 5 * 1024 * 1024 * 1024, roles: 250, posts_per_minute: 0, store_bytes: 0, sticker_packs: 1, stickers_per_pack: 25, emoji_packs: 1, emoji_per_pack: 75 }
+        Self { members: 1000, channels: 500, file_bytes: 25 * 1024 * 1024, files_quota: 1024 * 1024 * 1024, files_total: 5 * 1024 * 1024 * 1024, roles: 250, posts_per_minute: 0, store_bytes: 0, sticker_packs: 1, stickers_per_pack: 25, emoji_packs: 1, emoji_per_pack: 75, disabled_channel_kinds: None }
     }
 }
 

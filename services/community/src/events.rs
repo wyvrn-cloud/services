@@ -427,6 +427,10 @@ impl Community {
                 if data["channel"].as_str().is_some_and(|c| !self.sees_id(did, c).unwrap_or(false)) {
                     return refuse(message, "e.p.msg.invalid-event", "An event's channel is one you can see.").map(Some);
                 }
+                // Not in a calendar channel its host turned calendars off for.
+                if let Some(channel) = data["channel"].as_str().map(|c| self.store.channel(c)).transpose()?.flatten().filter(|c| c.calendar && self.channel_off(c)) {
+                    return refuse(message, "e.p.msg.kind-off", &format!("#{} is read-only: whoever hosts this community has turned off calendar channels.", channel.name)).map(Some);
+                }
                 let event = StoredEvent { id: format!("evt-{}", uuid::Uuid::new_v4()), data, organizer: did.to_string(), sequence: 0, cancelled: false, created_at: now, updated_at: now };
                 self.store.save_event(&event)?;
                 self.audit(now, did, "event.create", Some(&event.id), Some(json!({ "title": event.data["title"] })));

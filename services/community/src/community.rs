@@ -112,6 +112,38 @@ const MAX_RULES: usize = 20_000;
 /// The most a voice channel's `limit` may be.
 const MAX_VOICE_LIMIT: i64 = 500;
 
+/// The kinds of channel a host may turn off (`disabled_channel_kinds`): every
+/// kind but a plain text channel.
+pub const CHANNEL_KINDS: &[&str] = &["announcement", "voice", "stage", "forum", "gallery", "calendar", "form", "wiki"];
+
+/// What kind of channel `channel` is, as `create-channel`'s `kind` names it, with
+/// an announcement channel's and a stage's own: `text`, `announcement`, `voice`,
+/// `stage`, `forum`, `gallery`, `calendar`, `form` or `wiki`.
+pub fn channel_kind(channel: &crate::store::Channel) -> &'static str {
+    if channel.voice.is_some() {
+        if crate::voice::is_stage(channel) { "stage" } else { "voice" }
+    } else if channel.gallery {
+        "gallery"
+    } else if channel.forum.is_some() {
+        "forum"
+    } else if channel.calendar {
+        "calendar"
+    } else if channel.form.is_some() {
+        "form"
+    } else if channel.wiki {
+        "wiki"
+    } else if channel.announcement {
+        "announcement"
+    } else {
+        "text"
+    }
+}
+
+/// The permissions in a channel that add to it, or join it: what a channel of a
+/// kind its host turned off is without, whoever holds them. Seeing it, and
+/// keeping order in it (`manage_messages`, `moderate_voice`), stay.
+pub const ADDING: &[&str] = &["post", "react", "create_threads", "attach_files", "mention_everyone", "bypass_slow_mode", "connect", "speak", "video", "manage_webhooks"];
+
 /// A voice channel's settings as an admin gives them (community-voice/1.0, "A voice
 /// channel"), laid over what it had: checked, and with nothing in them the protocol
 /// doesn't name. `Err` says what is wrong.
@@ -619,7 +651,11 @@ impl Community {
                     body["web"] = json!({ "public": true, "since": since });
                 }
             }
-            if self.read_only(&channel.id)? {
+            // Of a kind its host turned off: read-only, and why.
+            if self.channel_off(&channel) {
+                body["read_only"] = json!(true);
+                body["kind_off"] = json!(true);
+            } else if self.read_only(&channel.id)? {
                 body["read_only"] = json!(true);
             }
             if let Some(entry) = self.form_entry(&channel, &member.did)? {
@@ -654,6 +690,8 @@ impl Community {
             "members_may_create_channels": self.everyone_has("create_channels")?,
             "admission": self.admission()?.as_str(),
             "members_may_invite": self.members_may_invite()?,
+            // The kinds of channel that may be opened here (its host's say).
+            "channel_kinds": self.channel_kinds(),
             "channels": channels,
             // Where the last change to any post stands: an app holding less asks for
             // what it missed (`changes-request`).
@@ -1206,6 +1244,26 @@ impl Community {
         Ok(Outcome { reply: Some(reply_to(message, CHANGED, Self::message_body(&post))), changed: vec![post.id], ..Outcome::default() })
     }
 
+    /// Whether the kind of channel `kind` is turned off here by its host.
+    pub fn kind_off(&self, kind: &str) -> bool {
+        kind != "text" && self.config.disabled_channel_kinds.iter().any(|off| off == kind)
+    }
+
+    /// Whether `channel` is of a kind its host turned off: read-only, then.
+    pub fn channel_off(&self, channel: &crate::store::Channel) -> bool {
+        self.kind_off(channel_kind(channel))
+    }
+
+    /// The kinds of channel that may be opened here, a text channel first.
+    pub fn channel_kinds(&self) -> Vec<&'static str> {
+        std::iter::once("text").chain(CHANNEL_KINDS.iter().copied().filter(|kind| !self.kind_off(kind))).collect()
+    }
+
+    /// The refusal of a kind of channel its host turned off.
+    fn kind_off_refusal(message: &Value, kind: &str) -> anyhow::Result<Outcome> {
+        refuse(message, "e.p.msg.kind-off", &format!("Whoever hosts this community has turned off {kind} channels."))
+    }
+
     fn may_open_channels(&self, member: &Member) -> anyhow::Result<bool> {
         let powers = self.powers(&member.did)?;
         Ok(powers.has("create_channels") || powers.has("manage_channels"))
@@ -1553,6 +1611,15 @@ impl Community {
                 let forum = gallery || body["kind"].as_str() == Some("forum");
                 // An announcement channel is a text channel others follow.
                 let announcement = body["announcement"] == true;
+                // What kind it would be, as its host may have turned off.
+                let asked_kind = match body["kind"].as_str().unwrap_or("text") {
+                    "voice" if voice.as_ref().is_some_and(|v| v["stage"] == true) => "stage",
+                    "text" if announcement => "announcement",
+                    kind => kind,
+                };
+                if self.kind_off(asked_kind) {
+                    return Self::kind_off_refusal(message, asked_kind);
+                }
                 if announcement && (voice.is_some() || forum) {
                     return refuse(message, "e.p.msg.invalid-announcement", "An announcement channel is a text channel.");
                 }
@@ -1734,6 +1801,9 @@ impl Community {
                     }
                     if !self.powers(sender)?.has("manage_channels") {
                         return refuse(message, "e.p.trust.not-authorized", "Making an announcement channel takes Manage channels.");
+                    }
+                    if announcement && !channel.announcement && self.kind_off("announcement") {
+                        return Self::kind_off_refusal(message, "announcement");
                     }
                     if announcement != channel.announcement {
                         if !announcement {

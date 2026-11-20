@@ -362,7 +362,11 @@ impl Community {
     /// What someone with `powers` (`did`) may do in `channel`, of the permissions
     /// a channel gives, worked out as "A channel's permissions" says.
     pub fn channel_permissions(&self, did: &str, powers: &Powers, channel: &Channel) -> anyhow::Result<BTreeSet<String>> {
-        let every: BTreeSet<String> = CHANNEL_PERMISSIONS.iter().map(|(name, _)| name.to_string()).collect();
+        let mut every: BTreeSet<String> = CHANNEL_PERMISSIONS.iter().map(|(name, _)| name.to_string()).collect();
+        // A channel of a kind its host turned off is read-only, to everyone.
+        if self.channel_off(channel) {
+            every.retain(|permission| !crate::community::ADDING.contains(&permission.as_str()));
+        }
         if powers.all() {
             return Ok(every);
         }
@@ -383,6 +387,8 @@ impl Community {
         if channel.created_by == did {
             have.insert("manage_messages".into());
         }
+        // (Overrides may allow only what a channel gives.)
+        have.retain(|permission| every.contains(permission));
         Ok(have)
     }
 

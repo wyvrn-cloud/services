@@ -382,6 +382,10 @@ fn post_sent(state: &Arc<AppState>, hook: &Webhook, sent: Sent, query: &ExecuteQ
     let Some(channel) = community.store.channel(&hook.channel).ok().flatten().filter(|c| !c.closed && c.voice.is_none()) else {
         return problem(StatusCode::NOT_FOUND, 10003, "Unknown Channel");
     };
+    // A channel of a kind its host turned off takes nothing new.
+    if community.channel_off(&channel) {
+        return problem(StatusCode::FORBIDDEN, 50013, "Missing Permissions");
+    }
     if community.moving().unwrap_or(false) {
         return problem(StatusCode::FORBIDDEN, 50001, "This community is moving, and takes no posts until it has.");
     }

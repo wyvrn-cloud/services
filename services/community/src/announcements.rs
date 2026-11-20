@@ -327,7 +327,7 @@ impl Community {
                 let Some((channel_id, asked_by)) = self.store.take_follow_code(code, now)? else {
                     return refuse(message, "e.p.msg.invalid-code", "That follow code is unknown, used or too old. Ask for a new one.").map(Some);
                 };
-                let Some(channel) = self.store.channel(&channel_id)?.filter(|c| c.announcement && !c.closed) else {
+                let Some(channel) = self.store.channel(&channel_id)?.filter(|c| c.announcement && !c.closed && !self.channel_off(c)) else {
                     return refuse(message, "e.p.msg.not-announcement", "That channel is no longer an announcement channel.").map(Some);
                 };
                 // Whoever asked for the code still sees the channel.
@@ -417,6 +417,10 @@ impl Community {
             return Ok(Outcome::reply(json!({ "type": UNSUBSCRIBE, "id": uuid::Uuid::new_v4().to_string(), "body": { "follow": id } })));
         };
         let Some(channel) = self.store.channel(&follow.channel)? else { return Ok(Outcome::default()) };
+        // Following into a channel of a kind its host turned off: nothing comes in.
+        if self.channel_off(&channel) {
+            return Ok(Outcome::default());
+        }
         let post = &body["post"];
         let Some(source_post) = post["id"].as_str().filter(|id| !id.is_empty() && id.len() <= 64) else { return Ok(Outcome::default()) };
         let deleted = post["deleted"] == true;

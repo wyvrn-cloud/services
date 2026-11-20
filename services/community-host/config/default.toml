@@ -40,6 +40,9 @@ channels = 500
 file_bytes = 26214400
 files_quota = 1073741824
 files_total = 5368709120
+# Kinds of channel no community here may open: any of announcement, voice, stage,
+# forum, gallery, calendar, form, wiki. One a community has already is read-only.
+# disabled_channel_kinds = ["stage"]
 
 # How many communities are kept open at once, and for how long after the last request.
 [loading]

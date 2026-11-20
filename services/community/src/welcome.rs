@@ -74,7 +74,7 @@ impl Community {
     pub fn welcome(&self, did: &str, now: i64) -> anyhow::Result<bool> {
         let set = self.welcome_setting()?;
         let Some(channel) = set["channel"].as_str().map(|id| self.store.channel(id)).transpose()?.flatten() else { return Ok(false) };
-        if channel.closed || channel.voice.is_some() {
+        if channel.closed || channel.voice.is_some() || self.channel_off(&channel) {
             return Ok(false);
         }
         let Some(own) = self.own.clone() else { return Ok(false) };
