@@ -47,8 +47,13 @@ const REMEMBERED: Duration = Duration::from_secs(300);
 /// A DID's keys, and when they were read.
 type Remembered = HashMap<String, (Instant, Vec<String>)>;
 
+static KEYS: Mutex<Option<Remembered>> = Mutex::new(None);
+
+fn remember(did: &str, keys: &[String]) {
+    KEYS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get_or_insert_with(HashMap::new).insert(did.to_string(), (Instant::now(), keys.to_vec()));
+}
+
 async fn keys_of(resolver: &dyn DIDResolver, did: &str) -> Vec<String> {
-    static KEYS: Mutex<Option<Remembered>> = Mutex::new(None);
     let remembered = |did: &str| {
         let keys = KEYS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         keys.as_ref().and_then(|keys| keys.get(did)).filter(|(at, _)| at.elapsed() < REMEMBERED).map(|(_, keys)| keys.clone())
@@ -59,7 +64,7 @@ async fn keys_of(resolver: &dyn DIDResolver, did: &str) -> Vec<String> {
     match resolver.resolve(did).await {
         Ok(document) => {
             let keys = keys_for(&document, "keyAgreement");
-            KEYS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get_or_insert_with(HashMap::new).insert(did.to_string(), (Instant::now(), keys.clone()));
+            remember(did, &keys);
             keys
         }
         Err(error) => {
@@ -78,9 +83,26 @@ pub async fn holder_among<'a>(resolver: &dyn DIDResolver, named: &'a [String], s
         return None;
     }
     let key = key_written_with(&resolver.resolve(sender).await.ok()?, kid?)?;
-    for did in hosted {
+    for did in &hosted {
         if keys_of(resolver, did).await.contains(&key) {
             return Some(did.as_str());
+        }
+    }
+    // None lists it as held: an address whose holder has since added a device
+    // lists the new key only in a newer document. Asked again past what the
+    // resolver keeps (it says when it has nothing fresher, or fetched too
+    // recently to fetch again).
+    for did in hosted {
+        match resolver.resolve_fresh(did).await {
+            Ok(Some(document)) => {
+                let keys = keys_for(&document, "keyAgreement");
+                remember(did, &keys);
+                if keys.contains(&key) {
+                    return Some(did.as_str());
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::debug!(%did, %error, "couldn't read a named DID afresh"),
         }
     }
     None
@@ -89,6 +111,7 @@ pub async fn holder_among<'a>(resolver: &dyn DIDResolver, named: &'a [String], s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use didcomm_core::resolver::ResolutionError;
     use serde_json::json;
 
     fn document(did: &str, agreement: &[(&str, &str)], other: &[(&str, &str)]) -> Value {
@@ -115,5 +138,40 @@ mod tests {
     fn only_a_did_fetched_from_a_host_is_looked_into() {
         assert!(is_hosted("did:webvh:QmScid:id.example:alice") && is_hosted("did:web:id.example:alice"));
         assert!(!is_hosted("did:peer:4zQm") && !is_hosted("did:key:z6Mk"));
+    }
+
+    /// A resolver that holds an old document for the address, and has a newer
+    /// one when asked afresh.
+    struct Held {
+        sender: Value,
+        held: Value,
+        fresh: Option<Value>,
+    }
+
+    #[async_trait::async_trait]
+    impl DIDResolver for Held {
+        async fn resolve(&self, did: &str) -> Result<Value, ResolutionError> {
+            Ok(if did.starts_with("did:peer:") { self.sender.clone() } else { self.held.clone() })
+        }
+        async fn is_resolvable(&self, _did: &str) -> bool {
+            true
+        }
+        async fn resolve_fresh(&self, _did: &str) -> Result<Option<Value>, ResolutionError> {
+            Ok(self.fresh.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_holder_with_a_new_device_is_found_in_the_addresss_newer_document() {
+        let address = "did:webvh:QmScid:id.example:newdevice";
+        let sender = document("did:peer:4zNew", &[("key-2", "z6LSnewphone")], &[]);
+        let held = document(address, &[("key-1", "z6LSoldphone")], &[]);
+        let named = vec![address.to_string()];
+        // Only the held document, and nothing fresher: not recognised.
+        let stale = Held { sender: sender.clone(), held: held.clone(), fresh: None };
+        assert_eq!(holder_among(&stale, &named, "did:peer:4zNew", Some("did:peer:4zNew#key-2")).await, None);
+        // The address read afresh lists the new device's key.
+        let fresh = Held { sender, held, fresh: Some(document(address, &[("key-1", "z6LSoldphone"), ("key-2", "z6LSnewphone")], &[])) };
+        assert_eq!(holder_among(&fresh, &named, "did:peer:4zNew", Some("did:peer:4zNew#key-2")).await, Some(address));
     }
 }

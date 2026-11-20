@@ -1216,7 +1216,7 @@ dependencies = [
 [[package]]
 name = "didcomm-agent"
 version = "0.0.1"
-source = "git+https://github.com/wyvrn-cloud/didcomm#daa87e7293c892b0f2be6e143a0026da52e4ad02"
+source = "git+https://github.com/wyvrn-cloud/didcomm#a780da5d510afd7c25ab840c415f220a80bbc421"
 dependencies = [
  "askar-crypto",
  "base64 0.22.1",
@@ -1238,7 +1238,7 @@ dependencies = [
 [[package]]
 name = "didcomm-core"
 version = "0.0.1"
-source = "git+https://github.com/wyvrn-cloud/didcomm#daa87e7293c892b0f2be6e143a0026da52e4ad02"
+source = "git+https://github.com/wyvrn-cloud/didcomm#a780da5d510afd7c25ab840c415f220a80bbc421"
 dependencies = [
  "async-trait",
  "ciborium",
@@ -1255,7 +1255,7 @@ dependencies = [
 [[package]]
 name = "didcomm-crypto-askar"
 version = "0.0.1"
-source = "git+https://github.com/wyvrn-cloud/didcomm#daa87e7293c892b0f2be6e143a0026da52e4ad02"
+source = "git+https://github.com/wyvrn-cloud/didcomm#a780da5d510afd7c25ab840c415f220a80bbc421"
 dependencies = [
  "askar-crypto",
  "async-trait",
@@ -1272,7 +1272,7 @@ dependencies = [
 [[package]]
 name = "didcomm-diddoc"
 version = "0.0.1"
-source = "git+https://github.com/wyvrn-cloud/didcomm#daa87e7293c892b0f2be6e143a0026da52e4ad02"
+source = "git+https://github.com/wyvrn-cloud/didcomm#a780da5d510afd7c25ab840c415f220a80bbc421"
 dependencies = [
  "serde",
  "serde_json",
@@ -1282,7 +1282,7 @@ dependencies = [
 [[package]]
 name = "didcomm-multiformats"
 version = "0.0.1"
-source = "git+https://github.com/wyvrn-cloud/didcomm#daa87e7293c892b0f2be6e143a0026da52e4ad02"
+source = "git+https://github.com/wyvrn-cloud/didcomm#a780da5d510afd7c25ab840c415f220a80bbc421"
 dependencies = [
  "multibase",
  "thiserror 1.0.69",
@@ -1291,7 +1291,7 @@ dependencies = [
 [[package]]
 name = "didcomm-quickstart"
 version = "0.0.1"
-source = "git+https://github.com/wyvrn-cloud/didcomm#daa87e7293c892b0f2be6e143a0026da52e4ad02"
+source = "git+https://github.com/wyvrn-cloud/didcomm#a780da5d510afd7c25ab840c415f220a80bbc421"
 dependencies = [
  "askar-crypto",
  "didcomm-core",
@@ -1310,7 +1310,7 @@ dependencies = [
 [[package]]
 name = "didcomm-resolver-jwk"
 version = "0.0.1"
-source = "git+https://github.com/wyvrn-cloud/didcomm#daa87e7293c892b0f2be6e143a0026da52e4ad02"
+source = "git+https://github.com/wyvrn-cloud/didcomm#a780da5d510afd7c25ab840c415f220a80bbc421"
 dependencies = [
  "async-trait",
  "didcomm-core",
@@ -1322,7 +1322,7 @@ dependencies = [
 [[package]]
 name = "didcomm-resolver-key"
 version = "0.0.1"
-source = "git+https://github.com/wyvrn-cloud/didcomm#daa87e7293c892b0f2be6e143a0026da52e4ad02"
+source = "git+https://github.com/wyvrn-cloud/didcomm#a780da5d510afd7c25ab840c415f220a80bbc421"
 dependencies = [
  "async-trait",
  "didcomm-core",
@@ -1334,7 +1334,7 @@ dependencies = [
 [[package]]
 name = "didcomm-resolver-peer"
 version = "0.0.1"
-source = "git+https://github.com/wyvrn-cloud/didcomm#daa87e7293c892b0f2be6e143a0026da52e4ad02"
+source = "git+https://github.com/wyvrn-cloud/didcomm#a780da5d510afd7c25ab840c415f220a80bbc421"
 dependencies = [
  "async-trait",
  "didcomm-core",
@@ -1347,7 +1347,7 @@ dependencies = [
 [[package]]
 name = "didcomm-resolver-web"
 version = "0.0.1"
-source = "git+https://github.com/wyvrn-cloud/didcomm#daa87e7293c892b0f2be6e143a0026da52e4ad02"
+source = "git+https://github.com/wyvrn-cloud/didcomm#a780da5d510afd7c25ab840c415f220a80bbc421"
 dependencies = [
  "async-trait",
  "didcomm-core",
@@ -1360,11 +1360,12 @@ dependencies = [
 [[package]]
 name = "didcomm-resolver-webvh"
 version = "0.0.1"
-source = "git+https://github.com/wyvrn-cloud/didcomm#daa87e7293c892b0f2be6e143a0026da52e4ad02"
+source = "git+https://github.com/wyvrn-cloud/didcomm#a780da5d510afd7c25ab840c415f220a80bbc421"
 dependencies = [
  "async-trait",
  "didcomm-core",
- "didwebvh-rs 0.7.0",
+ "didwebvh-rs",
+ "js-sys",
  "reqwest",
  "serde_json",
  "thiserror 1.0.69",
@@ -1373,7 +1374,7 @@ dependencies = [
 [[package]]
 name = "didcomm-v1"
 version = "0.0.1"
-source = "git+https://github.com/wyvrn-cloud/didcomm#daa87e7293c892b0f2be6e143a0026da52e4ad02"
+source = "git+https://github.com/wyvrn-cloud/didcomm#a780da5d510afd7c25ab840c415f220a80bbc421"
 dependencies = [
  "askar-crypto",
  "didcomm-core",
@@ -1382,33 +1383,6 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "uuid",
-]
-
-[[package]]
-name = "didwebvh-rs"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1aa08dc5af02f6bc159c10271195f467a894b3b4fe67da9796009ee2da785043"
-dependencies = [
- "affinidi-data-integrity 0.7.14",
- "affinidi-did-common",
- "affinidi-secrets-resolver",
- "ahash",
- "async-trait",
- "base58",
- "chrono",
- "getrandom 0.4.3",
- "percent-encoding",
- "reqwest",
- "serde",
- "serde_json",
- "serde_json_canonicalizer",
- "serde_with",
- "sha2 0.11.0",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "url",
 ]
 
 [[package]]
@@ -1426,6 +1400,7 @@ dependencies = [
  "chrono",
  "getrandom 0.4.3",
  "percent-encoding",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
@@ -5402,7 +5377,7 @@ dependencies = [
  "didcomm-core",
  "didcomm-quickstart",
  "didcomm-resolver-peer",
- "didwebvh-rs 0.8.0",
+ "didwebvh-rs",
  "ed25519-dalek 2.2.0",
  "reqwest",
  "serde",
@@ -5449,7 +5424,7 @@ dependencies = [
  "base64 0.22.1",
  "bs58",
  "chrono",
- "didwebvh-rs 0.8.0",
+ "didwebvh-rs",
  "ed25519-dalek 2.2.0",
  "flate2",
  "serde",
@@ -5497,6 +5472,7 @@ name = "wyvrn-service"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",
