@@ -223,6 +223,24 @@ async fn an_admin_changes_what_the_community_is_called_and_everyone_who_joined_i
     assert!(!listed["body"]["members"].to_string().contains(&server.did), "{listed}");
     assert_eq!(listed["body"]["members"].as_array().unwrap().len(), 2, "{listed}");
 
+    // A picture: sent to members with the profile, and served at an address that
+    // names it (a Discord webhook's avatar_url).
+    let pictured = json!({
+        "type": format!("{C}set-profile"),
+        "body": { "profile": { "displayPicture": "#pic" } },
+        "attachments": [{ "id": "pic", "media_type": "image/png", "data": { "base64": PIXEL } }],
+        "return_route": "all",
+    });
+    admin.agent.send(&admin.server, &pictured).await.expect("sent").expect("an answer");
+    let profile = member.next_of("https://didcomm.org/user-profile/1.0/profile").await;
+    assert_eq!(profile["body"]["profile"]["displayPicture"], "#picture");
+    assert_eq!(profile["attachments"][0]["data"]["base64"].as_str().unwrap().trim_end_matches('='), PIXEL.trim_end_matches('='));
+    let at = server.state.community.own_picture_url().expect("a picture's address");
+    let served = reqwest::get(&at).await.unwrap();
+    assert_eq!(served.headers()["content-type"], "image/png");
+    assert!(!served.bytes().await.unwrap().is_empty());
+    assert_eq!(reqwest::get(format!("{}x", at)).await.unwrap().status(), 404);
+
     // A name emptied is what the settings say again; the description is as it was.
     let back = admin.community("set-profile", json!({ "profile": { "displayName": null } })).await;
     assert_eq!((back["body"]["name"].as_str(), back["body"]["description"].as_str()), (Some("The Workshop"), Some("Tools and talk.")));
@@ -3514,6 +3532,16 @@ async fn an_announcement_channels_posts_go_to_a_discord_webhook_as_discord_takes
                         axum::Json(json!({ "id": "9001", "content": "" }))
                     }
                 }
+            })
+            .patch({
+                let heard = heard.clone();
+                move |body: String| {
+                    let heard = heard.clone();
+                    async move {
+                        let _ = heard.send(("AVATAR".into(), String::new(), serde_json::from_str(&body).unwrap()));
+                        axum::Json(json!({ "id": "123" }))
+                    }
+                }
             }),
         )
         .route(
@@ -3553,9 +3581,24 @@ async fn an_announcement_channels_posts_go_to_a_discord_webhook_as_discord_takes
     let added = advance(&owner, "d1", "add", json!({ "channel": news, "kind": "discord", "url": webhook })).await;
     assert!(added["body"]["ui"].to_string().contains("A Discord webhook"), "{added}");
 
+    // The community has a picture: the webhook is given it, as a data URI (no
+    // address Discord could reach is needed), before the first post.
+    let pictured = json!({
+        "type": format!("{C}set-profile"),
+        "body": { "profile": { "displayPicture": "#pic" } },
+        "attachments": [{ "id": "pic", "media_type": "image/png", "data": { "base64": PIXEL } }],
+        "return_route": "all",
+    });
+    owner.agent.send(&owner.server, &pictured).await.expect("sent").expect("an answer");
+
     owner.community("post", json!({ "channel": news, "id": "n1", "content": "We're live @everyone" })).await;
     owner.community("publish", json!({ "channel": news, "post": "n1" })).await;
+    let (method, _, body) = next().await;
+    assert_eq!(method, "AVATAR");
+    assert_eq!(body["avatar"], format!("data:image/png;base64,{PIXEL}"));
     let (method, query, body) = next().await;
+    // (Its address isn't https here, so no avatar_url beside it.)
+    assert!(body.get("avatar_url").is_none(), "{body}");
     assert_eq!((method.as_str(), query.as_str()), ("POST", "wait=true"));
     assert_eq!(body["content"], "We're live @everyone");
     assert_eq!(body["username"], "The Workshop #news");
@@ -3566,6 +3609,11 @@ async fn an_announcement_channels_posts_go_to_a_discord_webhook_as_discord_takes
     owner.ask("https://wyvrn.app/message-edits/1.0/delete", json!({ "to": { "id": "n1" } })).await;
     let (method, message, _) = next().await;
     assert_eq!((method.as_str(), message.as_str()), ("DELETE", "9001"));
+    // The picture unchanged, the next post goes without giving it again.
+    owner.community("post", json!({ "channel": news, "id": "n2", "content": "Again" })).await;
+    owner.community("publish", json!({ "channel": news, "post": "n2" })).await;
+    let (method, _, body) = next().await;
+    assert_eq!((method.as_str(), body["content"].as_str()), ("POST", Some("Again")));
 }
 
 #[tokio::test]

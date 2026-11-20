@@ -811,6 +811,37 @@ fn discord_attachable(community: &Community, post: &Post) -> Vec<usize> {
     chosen
 }
 
+/// Gives the webhook the community's picture as its own, when that picture isn't
+/// what it was last given: Modify Webhook with Token, `avatar` as a data URI, which
+/// needs no address Discord can reach (a community that isn't public). Discord
+/// takes PNG, JPEG and GIF only; a WebP picture is left to `avatar_url`, where the
+/// community has a public address. Best effort: a post goes out regardless.
+async fn discord_avatar(community: &Community, client: &reqwest::Client, base: &reqwest::Url, follower: &Follower) {
+    let Some(picture) = community.changed().picture else { return };
+    if !matches!(picture.media_type.as_str(), "image/png" | "image/jpeg" | "image/gif") {
+        return;
+    }
+    // Named by a digest of the webhook (a setting's name is at most 64 characters).
+    let key = format!("discord_avatar:{}", crate::assistant::member_key(&follower.target));
+    let now_said = crate::member_ids::picture_hash(&picture.base64);
+    if community.store.setting(&key).ok().flatten().as_deref() == Some(now_said.as_str()) {
+        return;
+    }
+    // (Kept without its padding; a data URI is read with it.)
+    let mut padded = picture.base64.trim_end_matches('=').to_string();
+    while padded.len() % 4 != 0 {
+        padded.push('=');
+    }
+    let data = format!("data:{};base64,{padded}", picture.media_type);
+    match client.patch(base.as_str()).json(&json!({ "avatar": data })).send().await {
+        Ok(answer) if answer.status().is_success() => {
+            let _ = community.store.set_setting(&key, &now_said);
+        }
+        Ok(answer) => tracing::warn!(status = %answer.status(), "Discord didn't take the community's picture for its webhook"),
+        Err(error) => tracing::warn!(%error, "couldn't give a Discord webhook the community's picture"),
+    }
+}
+
 /// Sends `post` to a Discord webhook: made, changed or deleted as it stands.
 /// What Discord calls the message it made, when it made one.
 async fn to_discord(community: &Community, follower: &Follower, channel: &Channel, post: &Post, remote: Option<String>) -> Result<Option<String>, String> {
@@ -837,9 +868,17 @@ async fn to_discord(community: &Community, follower: &Follower, channel: &Channe
     };
     let content = discord_content(post, attached);
     let (client, _) = crate::outgoing::client_for(base.as_str(), private, "wyvrn-community (announcements)").await?;
+    if remote.is_none() && !post.deleted {
+        discord_avatar(community, &client, &base, follower).await;
+    }
     let answer = match (&remote, post.deleted) {
         (None, _) => {
             let mut payload = json!({ "content": content, "username": discord_username(&format!("{} #{}", community.name_now(), channel.name)), "allowed_mentions": { "parse": [] } });
+            // The community's picture beside it, as Discord shows a webhook's: a
+            // link, which Discord fetches (so only from an address it can reach).
+            if let Some(picture) = community.own_picture_url().filter(|url| url.starts_with("https://")) {
+                payload["avatar_url"] = json!(picture);
+            }
             if files.is_empty() {
                 client.post(at(None, true)).json(&payload).send().await
             } else {

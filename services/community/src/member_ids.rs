@@ -241,6 +241,14 @@ impl Community {
 
     /// The address a member's picture is at (community/1.0's "A picture is an
     /// address"): `kind` is `picture`, `banner` or `here`.
+    /// Where the community's own picture is, if it has one: an address that names
+    /// this picture, so a new one is at a new address. For what can only be given
+    /// a link (a Discord webhook's `avatar_url`).
+    pub fn own_picture_url(&self) -> Option<String> {
+        let picture = self.changed().picture?;
+        Some(format!("{}/picture/{}", self.public_url.trim_end_matches('/'), picture_hash(&picture.base64)))
+    }
+
     pub fn picture_url(&self, member: &str, kind: &str, data: &str) -> String {
         let base = self.public_url.trim_end_matches('/');
         format!("{base}/m/{member}/{kind}/{}", picture_hash(data))

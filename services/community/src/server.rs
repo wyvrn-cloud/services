@@ -1039,6 +1039,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/s/drafts/{instance}/{file}", get(crate::expressions::draft_file))
         // Members' pictures, at the addresses members are given (member_ids.rs).
         .route("/m/{member}/{kind}/{hash}", get(member_picture))
+        .route("/picture/{hash}", get(own_picture))
         .route("/healthz", get(|| async { "ok" }))
         // A member's calendar feed (events.rs), at the address only they were given.
         .route("/calendar/{file}", get(crate::events::feed))
@@ -1077,11 +1078,25 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 /// A member's picture, banner or picture here, by the address `members` gave:
 /// a capability, the same for as long as the picture is, and so kept for good.
+/// The community's own picture, at the address `own_picture_url` gave while it is
+/// still that picture: public, as its DID document's whois already makes it.
+async fn own_picture(State(state): State<Arc<AppState>>, axum::extract::Path(hash): axum::extract::Path<String>) -> Response {
+    match state.community.changed().picture {
+        Some(picture) if crate::member_ids::picture_hash(&picture.base64) == hash => picture_bytes(picture.media_type, &picture.base64),
+        _ => axum::http::StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 async fn member_picture(State(state): State<Arc<AppState>>, axum::extract::Path((member, kind, hash)): axum::extract::Path<(String, String, String)>) -> Response {
-    use base64::Engine;
     let Ok(Some((media_type, data))) = state.community.picture_at(&member, &kind, &hash) else {
         return axum::http::StatusCode::NOT_FOUND.into_response();
     };
+    picture_bytes(media_type, &data)
+}
+
+/// A picture kept as base64, served for good under an address that names it.
+fn picture_bytes(media_type: String, data: &str) -> Response {
+    use base64::Engine;
     let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data.trim_end_matches('=')).or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(data.trim_end_matches('='))) else {
         return axum::http::StatusCode::NOT_FOUND.into_response();
     };
