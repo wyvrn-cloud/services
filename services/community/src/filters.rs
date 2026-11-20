@@ -216,6 +216,30 @@ static BARE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static DISGUISED_DOT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\[\.\]|\(\.\)|\[dot\]|\(dot\)| dot ").expect("a valid pattern"));
 
+/// The endings a domain written bare (`example.com`, no `https://`) is taken as a
+/// link by: the common ones. Anything else with a dot in it (`e.g.`, `file.txt`,
+/// `shit.x`) stays text, its words looked at like any other.
+const LINK_ENDINGS: &[&str] = &[
+    "com", "net", "org", "io", "co", "app", "dev", "gg", "tv", "me", "ly", "xyz", "info", "biz", "us", "uk", "ca", "au", "de", "fr", "nl", "eu", "jp", "ru",
+    "cn", "in", "br", "it", "es", "se", "no", "fi", "pl", "ch", "at", "be", "nz", "ai", "to", "cc", "fm", "live", "site", "online", "shop", "store", "fun",
+    "club", "link", "click", "porn", "xxx", "sex", "adult", "wtf", "lol",
+];
+
+/// Where `content` has a domain written bare with a common ending, its path and
+/// all: a link to the reader, so never dotted (`shit.com` as `••••.com` is
+/// neither). Not those within a link written out in full.
+fn bare_links(content: &str) -> Vec<Range<usize>> {
+    BARE.find_iter(content)
+        .map(|found| trimmed(content, found.range()))
+        .filter(|range| !content[range.clone()].contains(['[', '(', ' ']))
+        .filter(|range| {
+            let host = host_of(&content[range.clone()]);
+            host.rsplit('.').next().is_some_and(|ending| host.contains('.') && LINK_ENDINGS.contains(&ending))
+        })
+        .filter(|range| !LINK.find_iter(content).any(|l| l.start() <= range.start && range.start < l.end()))
+        .collect()
+}
+
 /// The host a link is to, in lower case and without `www.`.
 fn host_of(link: &str) -> String {
     let link = DISGUISED_DOT.replace_all(link, ".").to_lowercase();
@@ -311,7 +335,8 @@ pub fn inspect(rule: &Value, content: &str, mentions: usize) -> Option<Found> {
     // tenor.com/…/oh-shit-cat.gif no longer loads), and an address is full of
     // letters that are no word (Xw9a55QkDicK). A rule may instead cover the whole
     // link when the words in its address are what it looks for.
-    let links: Vec<Range<usize>> = LINK.find_iter(content).map(|link| trimmed(content, link.range())).collect();
+    let mut links: Vec<Range<usize>> = LINK.find_iter(content).map(|link| trimmed(content, link.range())).collect();
+    links.extend(bare_links(content));
     if rule["link_words"] == true {
         for link in &links {
             if spans.iter().any(|(s, _)| s.start < link.end && link.start < s.end) {
@@ -359,16 +384,42 @@ fn find_text(rule: &Value, content: &str) -> Vec<Range<usize>> {
 /// The words in a link's address, one space between each: what is between its
 /// slashes, dashes, dots and the like, leaving out what looks like an id rather
 /// than a word (a digit in it, or capitals in the middle: xT9IgG50Fb7Mi0prBC).
+/// Words run together with a capital each (`OhShit`, `freeScam`) are words, each
+/// a capital and then small letters; a lone capital among them (`AsSdIcKfOoBaR`)
+/// makes it an id.
 fn address_words(link: &str) -> String {
     link.split(|c: char| !c.is_alphabetic() && !c.is_numeric())
         .filter(|piece| !piece.is_empty())
         .filter(|piece| !piece.chars().any(char::is_numeric))
-        .filter(|piece| {
+        .flat_map(|piece| {
             let rest: Vec<char> = piece.chars().skip(1).collect();
-            rest.iter().all(|c| c.is_lowercase()) || rest.iter().all(|c| c.is_uppercase())
+            if rest.iter().all(|c| c.is_lowercase()) || rest.iter().all(|c| c.is_uppercase()) {
+                return vec![piece.to_string()];
+            }
+            camel_words(piece).unwrap_or_default()
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// `piece` as the words it runs together, each starting at a capital
+/// (`OhShit`: Oh, Shit; `freeScam`: free, Scam), if every one is a capital and
+/// then small letters (the first may be all small).
+fn camel_words(piece: &str) -> Option<Vec<String>> {
+    let mut words: Vec<String> = Vec::new();
+    for c in piece.chars() {
+        if c.is_uppercase() || words.is_empty() {
+            words.push(String::new());
+        }
+        words.last_mut()?.push(c);
+    }
+    let clean = |(i, word): (usize, &String)| {
+        let mut chars = word.chars();
+        let first = chars.next();
+        let rest: Vec<char> = chars.collect();
+        !rest.is_empty() && rest.iter().all(|c| c.is_lowercase()) && first.is_some_and(|c| c.is_uppercase() || (i == 0 && c.is_lowercase()))
+    };
+    (words.len() > 1 && words.iter().enumerate().all(clean)).then_some(words)
 }
 
 /// `content` with what was found covered: words as dots (spaces and line breaks
@@ -421,6 +472,9 @@ mod tests {
         assert_eq!(censored(&whole, "lol https://media.tenor.com/AbC123/oh-shit-cat.gif!"), "lol <UNSAFE URL BLOCKED>!");
         assert_eq!(censored(&whole, "https://example.com/free-scam-here"), "<UNSAFE URL BLOCKED>");
         assert_eq!(inspect(&whole, "https://media.tenor.com/AbC123/oh-shit-cat.gif", 0).unwrap().what, "a link with “shit” in it");
+        // Words run together in it are found too.
+        assert_eq!(censored(&whole, "https://example.com/OhShitCat"), "<UNSAFE URL BLOCKED>");
+        assert_eq!(censored(&whole, "https://example.com/freeScam"), "<UNSAFE URL BLOCKED>");
         // ...but not for the letters of an id, nor for a word it is told to let be.
         for fine in [
             "https://media.tenor.com/Xw9a55QkDicK/cockatoo-dancing.gif",
@@ -431,6 +485,21 @@ mod tests {
         ] {
             assert!(inspect(&whole, fine, 0).is_none(), "{fine} is let be");
         }
+    }
+
+    #[test]
+    fn a_domain_written_bare_is_a_link_too() {
+        let family = json!({ "filters": { "profanity": "mild" }, "words": ["shit"] });
+        // Not dotted: ••••.com is no link, and no less what it was.
+        assert_eq!(censored(&family, "go to shit.com now, shit"), "go to shit.com now, ••••");
+        assert_eq!(censored(&family, "shit.com/page."), "shit.com/page.");
+        // With an ending no domain has, or disguised, it is text.
+        assert_eq!(censored(&family, "shit.x"), "••••.x");
+        assert_eq!(censored(&family, "shit[.]com"), "••••[.]com");
+        // A rule that covers links for their words covers it whole.
+        let whole = json!({ "filters": { "profanity": "mild" }, "link_words": true });
+        assert_eq!(censored(&whole, "see shit.com!"), "see <UNSAFE URL BLOCKED>!");
+        assert!(inspect(&whole, "see example.com/news", 0).is_none());
     }
 
     #[test]
