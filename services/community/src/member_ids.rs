@@ -49,6 +49,35 @@ fn new_member_id() -> String {
 }
 
 /// The address part a picture's data gives it: a new picture, a new address.
+/// The most a side of the picture given to Discord may be, in pixels.
+pub const SMALL_PICTURE: u32 = 256;
+
+/// A picture (`media_type`, base64) made fit for Discord's webhook avatar: kept as
+/// it is when it is a PNG, JPEG or GIF no bigger than `SMALL_PICTURE` a side;
+/// otherwise scaled down to fit (never up) and written as PNG where it has
+/// see-through parts, else JPEG. `None` if it can't be read.
+pub fn small_picture(media_type: &str, base64_data: &str) -> Option<(String, Vec<u8>)> {
+    use base64::Engine;
+    use image::GenericImageView;
+    let trimmed = base64_data.trim_end_matches('=');
+    let bytes = base64::engine::general_purpose::STANDARD_NO_PAD.decode(trimmed).ok()?;
+    let read = image::load_from_memory(&bytes).ok()?;
+    let (width, height) = read.dimensions();
+    let small = width <= SMALL_PICTURE && height <= SMALL_PICTURE;
+    if small && matches!(media_type, "image/png" | "image/jpeg" | "image/gif") {
+        return Some((media_type.to_string(), bytes));
+    }
+    let fitted = if small { read } else { read.thumbnail(SMALL_PICTURE, SMALL_PICTURE) };
+    let mut out = std::io::Cursor::new(Vec::new());
+    if fitted.color().has_alpha() {
+        fitted.write_to(&mut out, image::ImageFormat::Png).ok()?;
+        Some(("image/png".into(), out.into_inner()))
+    } else {
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85).encode_image(&fitted.to_rgb8()).ok()?;
+        Some(("image/jpeg".into(), out.into_inner()))
+    }
+}
+
 pub fn picture_hash(data: &str) -> String {
     let digest = Sha256::digest(data.as_bytes());
     digest.iter().take(10).map(|byte| format!("{byte:02x}")).collect()
@@ -241,9 +270,16 @@ impl Community {
 
     /// The address a member's picture is at (community/1.0's "A picture is an
     /// address"): `kind` is `picture`, `banner` or `here`.
-    /// Where the community's own picture is, if it has one: an address that names
-    /// this picture, so a new one is at a new address. For what can only be given
-    /// a link (a Discord webhook's `avatar_url`).
+    /// The community's picture as Discord's webhook avatar takes it: at most
+    /// `SMALL_PICTURE` pixels a side, and a PNG, JPEG or GIF (`media type, bytes`).
+    pub fn own_picture_small(&self) -> Option<(String, Vec<u8>)> {
+        let picture = self.changed().picture?;
+        small_picture(&picture.media_type, &picture.base64)
+    }
+
+    /// Where the community's own picture is, if it has one, as `own_picture_small`
+    /// makes it: an address that names this picture, so a new one is at a new
+    /// address. For what can only be given a link (a Discord webhook's `avatar_url`).
     pub fn own_picture_url(&self) -> Option<String> {
         let picture = self.changed().picture?;
         Some(format!("{}/picture/{}", self.public_url.trim_end_matches('/'), picture_hash(&picture.base64)))
@@ -575,5 +611,42 @@ impl Community {
         }
         outcome.notices.push((to, json!({ "type": MESSAGE_REQUEST, "id": uuid::Uuid::new_v4().to_string(), "body": passed })));
         Ok(outcome)
+    }
+}
+
+#[cfg(test)]
+mod small_picture_tests {
+    use super::*;
+    use base64::Engine;
+    use image::GenericImageView;
+
+    fn encoded(picture: image::DynamicImage, format: image::ImageFormat) -> String {
+        let mut out = std::io::Cursor::new(Vec::new());
+        picture.write_to(&mut out, format).unwrap();
+        base64::engine::general_purpose::STANDARD.encode(out.into_inner())
+    }
+
+    #[test]
+    fn a_picture_is_made_at_most_256_a_side_and_of_a_kind_discord_takes() {
+        // Big, and solid: scaled to fit, its shape kept, as JPEG.
+        let big = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(600, 300, image::Rgb([200, 30, 30])));
+        let (media_type, bytes) = small_picture("image/png", &encoded(big, image::ImageFormat::Png)).unwrap();
+        assert_eq!(media_type, "image/jpeg");
+        assert_eq!(image::load_from_memory(&bytes).unwrap().dimensions(), (256, 128));
+
+        // Small and already a PNG: as it was.
+        let small = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(64, 64, image::Rgba([0, 0, 0, 0])));
+        let png = encoded(small.clone(), image::ImageFormat::Png);
+        let (media_type, bytes) = small_picture("image/png", &png).unwrap();
+        assert_eq!((media_type.as_str(), base64::engine::general_purpose::STANDARD.encode(&bytes)), ("image/png", png));
+
+        // Small but a WebP, which Discord's avatar doesn't take: a PNG, its
+        // see-through parts kept.
+        let (media_type, bytes) = small_picture("image/webp", &encoded(small, image::ImageFormat::WebP)).unwrap();
+        assert_eq!(media_type, "image/png");
+        assert_eq!(image::load_from_memory(&bytes).unwrap().dimensions(), (64, 64));
+
+        // Not a picture at all.
+        assert!(small_picture("image/png", "bm90IGEgcGljdHVyZQ").is_none());
     }
 }

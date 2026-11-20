@@ -8,6 +8,9 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The community's picture made small enough, and of a kind, for Discord's webhook
+# avatar (announcements.rs): read whatever it is, written as PNG or JPEG.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 # The assistant asks Anthropic's Messages API (assistant.rs).
 reqwest = { workspace = true, features = ["json", "multipart"] }
 wyvrn-service = { workspace = true }

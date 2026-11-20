@@ -813,26 +813,19 @@ fn discord_attachable(community: &Community, post: &Post) -> Vec<usize> {
 
 /// Gives the webhook the community's picture as its own, when that picture isn't
 /// what it was last given: Modify Webhook with Token, `avatar` as a data URI, which
-/// needs no address Discord can reach (a community that isn't public). Discord
-/// takes PNG, JPEG and GIF only; a WebP picture is left to `avatar_url`, where the
-/// community has a public address. Best effort: a post goes out regardless.
+/// needs no address Discord can reach (a community that isn't public). Made at
+/// most 256 pixels a side and a PNG, JPEG or GIF first, which is what Discord
+/// takes (`own_picture_small`). Best effort: a post goes out regardless.
 async fn discord_avatar(community: &Community, client: &reqwest::Client, base: &reqwest::Url, follower: &Follower) {
     let Some(picture) = community.changed().picture else { return };
-    if !matches!(picture.media_type.as_str(), "image/png" | "image/jpeg" | "image/gif") {
-        return;
-    }
     // Named by a digest of the webhook (a setting's name is at most 64 characters).
     let key = format!("discord_avatar:{}", crate::assistant::member_key(&follower.target));
     let now_said = crate::member_ids::picture_hash(&picture.base64);
     if community.store.setting(&key).ok().flatten().as_deref() == Some(now_said.as_str()) {
         return;
     }
-    // (Kept without its padding; a data URI is read with it.)
-    let mut padded = picture.base64.trim_end_matches('=').to_string();
-    while padded.len() % 4 != 0 {
-        padded.push('=');
-    }
-    let data = format!("data:{};base64,{padded}", picture.media_type);
+    let Some((media_type, bytes)) = community.own_picture_small() else { return };
+    let data = format!("data:{media_type};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
     match client.patch(base.as_str()).json(&json!({ "avatar": data })).send().await {
         Ok(answer) if answer.status().is_success() => {
             let _ = community.store.set_setting(&key, &now_said);

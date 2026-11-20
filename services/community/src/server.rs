@@ -1078,11 +1078,16 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 /// A member's picture, banner or picture here, by the address `members` gave:
 /// a capability, the same for as long as the picture is, and so kept for good.
-/// The community's own picture, at the address `own_picture_url` gave while it is
-/// still that picture: public, as its DID document's whois already makes it.
+/// The community's own picture, as small as Discord takes it, at the address
+/// `own_picture_url` gave while it is still that picture: public, as its DID
+/// document's whois already makes it.
 async fn own_picture(State(state): State<Arc<AppState>>, axum::extract::Path(hash): axum::extract::Path<String>) -> Response {
+    use base64::Engine;
     match state.community.changed().picture {
-        Some(picture) if crate::member_ids::picture_hash(&picture.base64) == hash => picture_bytes(picture.media_type, &picture.base64),
+        Some(picture) if crate::member_ids::picture_hash(&picture.base64) == hash => match state.community.own_picture_small() {
+            Some((media_type, bytes)) => picture_bytes(media_type, &base64::engine::general_purpose::STANDARD.encode(bytes)),
+            None => axum::http::StatusCode::NOT_FOUND.into_response(),
+        },
         _ => axum::http::StatusCode::NOT_FOUND.into_response(),
     }
 }
