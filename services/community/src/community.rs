@@ -1818,6 +1818,18 @@ impl Community {
                     if announcement != channel.announcement {
                         if !announcement {
                             notices = self.drop_followers(&channel.id)?;
+                            // Read-only for its kind's being turned off by the host: made an
+                            // ordinary channel, it stays read-only, now through its permissions
+                            // (`everyone` denied `post`), which an admin can lift there.
+                            if self.channel_off(&channel) {
+                                let said = self.store.overrides(&channel.id)?.into_iter().find(|o| o.role == crate::roles::EVERYONE_ROLE);
+                                let (mut allow, mut deny) = said.map(|o| (o.allow, o.deny)).unwrap_or_default();
+                                allow.retain(|p| p != "post");
+                                if !deny.iter().any(|p| p == "post") {
+                                    deny.push("post".into());
+                                }
+                                self.store.set_override(&channel.id, crate::roles::EVERYONE_ROLE, &allow, &deny)?;
+                            }
                         }
                         self.store.set_announcement(&channel.id, announcement)?;
                         self.audit(now, sender, "channel.announcement", Some(&channel.id), Some(json!({ "announcement": announcement })));

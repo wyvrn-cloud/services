@@ -1001,6 +1001,17 @@ async fn kinds_of_channel_the_host_turned_off_are_not_opened_and_those_there_are
     assert_eq!(listed["permissions"], json!(["manage_messages", "moderate_voice", "view_channel"]), "{listed}");
     // And a text channel takes posts as ever.
     assert_eq!(kind(&member.community("post", json!({ "channel": general, "content": "hi" })).await), "posted");
+
+    // Made an ordinary channel, the turned-off announcement channel stays read-only,
+    // now by its permissions, and its admin can open it up there.
+    let made = owner.community("update-channel", json!({ "channel": "old-news", "announcement": false })).await;
+    let listed = made["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == "old-news").unwrap().clone();
+    assert_eq!((listed["read_only"].as_bool(), listed.get("kind_off")), (Some(true), None), "{listed}");
+    assert_eq!(member.community("post", json!({ "channel": "old-news", "content": "hi" })).await["body"]["code"], "e.p.trust.not-authorized");
+    let everyone = store.overrides("old-news").unwrap().into_iter().find(|o| o.role == "everyone").unwrap();
+    assert_eq!(everyone.deny, vec!["post".to_string()]);
+    store.set_override("old-news", "everyone", &[], &[]).unwrap();
+    assert_eq!(kind(&member.community("post", json!({ "channel": "old-news", "content": "hi" })).await), "posted");
 }
 
 #[tokio::test]
