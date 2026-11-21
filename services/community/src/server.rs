@@ -893,6 +893,15 @@ pub fn sweep_once(state: &Arc<AppState>) {
     }
 }
 
+/// Ends every voice room of a kind of channel just turned off (`kinds`: `voice`,
+/// `stage`), telling whoever is in one and watches why (`ended: "kind-off"`).
+/// For a host about to close the community and open it again with its new limits.
+pub fn end_voice_of_kinds(state: &Arc<AppState>, kinds: &[String]) {
+    let off = |channel: &crate::store::Channel| kinds.iter().any(|kind| kind == crate::community::channel_kind(channel));
+    let presence = state.rooms.end_rooms(&state.community, off, "kind-off");
+    voice_send(state, &VoiceOutcome { live: presence, ..VoiceOutcome::default() });
+}
+
 /// The voice rooms swept every 15 seconds.
 pub async fn run_voice_sweep(state: Arc<AppState>) {
     loop {

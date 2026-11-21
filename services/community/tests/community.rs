@@ -1364,6 +1364,39 @@ async fn keys_are_passed_on_as_they_are_to_those_in_the_room_and_invitations_rin
     assert_eq!(posted["mentions"][0]["who"], server.id(&dave));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn voice_turned_off_ends_the_rooms_saying_why_and_none_is_joined_after() {
+    let server = voice_server().await;
+    let (alice, carol) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&alice, &carol]);
+    let lounge = voice_channel(&alice, "lounge", json!({})).await;
+    let mut live = Live::open(&carol, &server).await;
+    live.send(&carol, "watch-presence", json!({})).await;
+    live.next_of(&carol, "presence").await;
+    let joined = voice(&alice, "join", json!({ "channel": lounge })).await;
+    let token = joined["body"]["transport"]["token"].as_str().unwrap().to_string();
+    live.next_of(&carol, "presence").await;
+
+    // The host turns voice off: the room ends, and whoever watches is told why.
+    wyvrn_community::server::end_voice_of_kinds(&server.state, &["voice".to_string()]);
+    let ended = live.next_of(&carol, "presence").await;
+    assert_eq!(ended["body"]["channels"], json!([{ "channel": lounge, "participants": [], "ended": "kind-off" }]), "{ended}");
+    // Nothing more for the forwarding service to let through.
+    assert!(server.state.rooms.grant(&server.state.community, &server.did, &token, wyvrn_service::now()).is_none());
+    // A stage is another kind: not ended by voice alone.
+    wyvrn_community::server::end_voice_of_kinds(&server.state, &["stage".to_string()]);
+
+    // Opened again with voice off, the channel can't be joined, and says why.
+    let off = start_server("disabled_channel_kinds = [\"voice\"]\n[voice]\nrelay_url = \"https://voice.example/\"").await;
+    let dave = Peer::start(&off).await;
+    off.admit(&[&dave]);
+    let store = &off.state.community.store;
+    store.add_channel("old-lounge", "lounge", "", &dave.did(), 1).unwrap();
+    store.set_channel_voice("old-lounge", &json!({})).unwrap();
+    let refused = voice(&dave, "join", json!({ "channel": "old-lounge" })).await;
+    assert_eq!((refused["body"]["code"].as_str(), refused["body"]["comment"].as_str()), (Some("e.p.msg.kind-off"), Some("Voice was turned off for this community.")), "{refused}");
+}
+
 #[tokio::test]
 async fn a_voice_channel_has_a_limit_and_one_room_at_a_time() {
     let server = voice_server().await;

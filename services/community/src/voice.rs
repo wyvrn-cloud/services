@@ -343,6 +343,35 @@ impl Rooms {
         inner.live.iter().filter(|(_, live)| live.watching && community.sees_id(&live.did, channel).unwrap_or(false)).map(|(id, _)| (*id, json!({ "type": PRESENCE, "body": body.clone() }))).collect()
     }
 
+    /// Empties every room whose channel `off` names: a kind of channel its host has
+    /// just turned off (`disabled_channel_kinds`). Each one's presence says why
+    /// (`ended`), so that the apps in it leave and say so, rather than lose the
+    /// room without a word when the forwarding service next asks. Returns the
+    /// presence to send.
+    pub fn end_rooms(&self, community: &Community, off: impl Fn(&crate::store::Channel) -> bool, reason: &str) -> Vec<(u64, Value)> {
+        let ended: Vec<String> = {
+            let mut inner = self.lock();
+            let mut ended = Vec::new();
+            for (channel, room) in inner.rooms.iter_mut() {
+                if room.participants.is_empty() || !community.store.channel(channel).ok().flatten().is_some_and(|held| off(&held)) {
+                    continue;
+                }
+                room.participants.clear();
+                ended.push(channel.clone());
+            }
+            ended
+        };
+        ended
+            .iter()
+            .flat_map(|channel| {
+                self.presence_for_watchers(community, channel).into_iter().map(|(id, mut presence)| {
+                    presence["body"]["channels"][0]["ended"] = json!(reason);
+                    (id, presence)
+                })
+            })
+            .collect()
+    }
+
     /// Those who have said nothing for too long, taken out. Returns the presence
     /// to send.
     pub fn sweep(&self, community: &Community, now: i64) -> Vec<(u64, Value)> {
@@ -462,6 +491,9 @@ impl Rooms {
                 };
                 if channel.closed {
                     return refuse(message, "e.p.msg.closed", "That voice channel is closed.");
+                }
+                if community.channel_off(&channel) {
+                    return refuse(message, "e.p.msg.kind-off", "Voice was turned off for this community.");
                 }
                 if community.rules_owed_by(sender)? {
                     return refuse(message, "e.p.msg.rules-not-accepted", "Accept this community's rules first.");

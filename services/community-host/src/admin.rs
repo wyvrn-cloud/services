@@ -334,9 +334,7 @@ impl Pages for AppState {
             }
             "limits" => {
                 let limits = limits_from(input, record.limits.clone().unwrap_or_else(|| host.config.limits.clone()), &host.config.limits)?;
-                host.registry.set_limits(&name, Some(&limits)).map_err(failed)?;
-                // Taken up the next time it is opened.
-                host.unload(&name);
+                host.change_limits(&name, record.limits.as_ref(), &limits).map_err(failed)?;
                 format!("{name} may hold {} members and {} channels.", limits.members, limits.channels)
             }
             _ => return Err("That can't be done to it now.".into()),

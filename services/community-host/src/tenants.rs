@@ -280,6 +280,21 @@ impl Host {
         Ok(Tenant { name: record.name.clone(), router: server::router(state.clone()), state, tasks, last_used: AtomicI64::new(now()) })
     }
 
+    /// Gives the community called `name` new limits (`before`: what it had, `None`
+    /// for the host's), taken up as it is opened again. Voice turned off with people
+    /// talking ends their rooms first, and tells them why, rather than leave them
+    /// to be cut off without a word.
+    pub fn change_limits(&self, name: &str, before: Option<&crate::config::Limits>, limits: &crate::config::Limits) -> anyhow::Result<()> {
+        self.registry.set_limits(name, Some(limits))?;
+        let was_off = before.unwrap_or(&self.config.limits).disabled_kinds(&self.config.limits);
+        let now_off: Vec<String> = limits.disabled_kinds(&self.config.limits).into_iter().filter(|kind| (kind == "voice" || kind == "stage") && !was_off.contains(kind)).collect();
+        if let Some(tenant) = self.loaded(name).filter(|_| !now_off.is_empty()) {
+            wyvrn_community::server::end_voice_of_kinds(&tenant.state, &now_off);
+        }
+        self.unload(name);
+        Ok(())
+    }
+
     /// Closes the community called `name`, if it is open, noting when it has to be
     /// opened again.
     pub fn unload(&self, name: &str) {

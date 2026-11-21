@@ -603,6 +603,26 @@ async fn kinds_of_channel_are_turned_off_for_every_community_or_for_one() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn voice_turned_off_ends_a_room_under_way_and_it_cant_be_joined_again() {
+    let running = start_host(600).await;
+    let ann = Peer::start().await;
+    running.host.registry.create("alpha", "Alpha", Storage::Sqlite, &ann.did(), "test", 1).unwrap();
+    let alpha = running.did_of("alpha").await;
+    let lounge = ann.community(&alpha, "create-channel", json!({ "name": "lounge", "kind": "voice" })).await["body"]["created"].as_str().unwrap().to_string();
+    let joined = ann.ask(&alpha, &format!("{V}join"), json!({ "channel": lounge })).await;
+    let token = joined["body"]["transport"]["token"].as_str().expect("a token").to_string();
+    assert_eq!(running.voice_auth(&token).await.0, 200);
+
+    let off = wyvrn_community_host::config::Limits { disabled_channel_kinds: Some(vec!["voice".into()]), ..Default::default() };
+    running.host.change_limits("alpha", None, &off).unwrap();
+    assert!(running.host.loaded("alpha").is_none());
+    // Ended: the forwarding service is told no, and joining again is refused, saying why.
+    assert_eq!(running.voice_auth(&token).await.0, 403);
+    let again = ann.ask(&alpha, &format!("{V}join"), json!({ "channel": lounge })).await;
+    assert_eq!(again["body"]["code"], "e.p.msg.kind-off", "{again}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_community_is_backed_up_sealed_with_the_hosts_key_and_opens_whole() {
     let dir = std::env::temp_dir().join(format!("wyvrn-host-backup-test-{}", unique()));
     std::fs::create_dir_all(&dir).unwrap();
