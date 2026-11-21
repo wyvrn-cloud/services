@@ -2543,7 +2543,7 @@ fn what_automod_censored_is_kept_in_mysql_too() {
     assert_eq!(store.censored_original("p1").unwrap().as_deref(), Some("oh sh#t"));
     store.set_censored("p1", Some(("oh sh!t", &["Again".to_string()]))).unwrap();
     assert_eq!(store.censored_original("p1").unwrap().as_deref(), Some("oh sh!t"));
-    store.delete_post("p1", None).unwrap();
+    store.delete_post("p1", None, true).unwrap();
     assert_eq!(store.censored_original("p1").unwrap(), None);
     assert_eq!(store.post_by_id("p1").unwrap().unwrap().censored, None);
 }
