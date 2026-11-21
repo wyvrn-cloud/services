@@ -174,6 +174,10 @@ pub struct CommunityConfig {
     /// As many posts as one member makes in a minute, in all channels; 0 for no
     /// limit. Whoever holds `administrator` isn't held to it.
     pub max_posts_per_minute: usize,
+    /// How many days what a deleted post said is kept, for whoever manages posts
+    /// in its channel to see (`original-request`); 0 keeps nothing. 30 unless set
+    /// (`COMMUNITY_DELETED_TEXT_DAYS`).
+    pub deleted_text_days: u32,
     /// As many members as there may be, those who left included; 0 for no limit.
     /// Past it nobody more is let in (`e.p.req.community-full`).
     pub max_members: usize,
@@ -235,6 +239,7 @@ impl Default for CommunityConfig {
             max_waiting: 500,
             max_posts_per_minute: 30,
             max_members: 0,
+            deleted_text_days: 30,
             discord_api: "https://discord.com/api/v10".to_string(),
             outgoing_private: false,
             max_roles: 250,
@@ -286,6 +291,9 @@ impl Config {
             config.community.owners = dids(&owners);
         }
         config.community.owners_are_admins();
+        if let Some(days) = env("COMMUNITY_DELETED_TEXT_DAYS") {
+            config.community.deleted_text_days = days.trim().parse().map_err(|_| anyhow::anyhow!("COMMUNITY_DELETED_TEXT_DAYS: a whole number of days"))?;
+        }
         if let Some(members) = env("COMMUNITY_MEMBERS") {
             config.community.members = dids(&members);
         }

@@ -667,7 +667,7 @@ pub async fn delete_message(State(state): State<Arc<AppState>>, Path((id, token,
         Ok(post) => post,
         Err(response) => return response,
     };
-    if community.store.delete_post(&post.id, None).is_err() {
+    if community.store.delete_post(&post.id, None, community.keeps_deleted_text()).is_err() {
         return problem(StatusCode::INTERNAL_SERVER_ERROR, 0, "500: Internal Server Error");
     }
     crate::server::send_changed_later(&state, post.id);

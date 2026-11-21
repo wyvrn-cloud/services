@@ -235,9 +235,16 @@ impl Community {
             return refuse(message, "e.p.msg.unknown-post", "There is no such post.");
         };
         if !self.may_in(&member.did, &channel, "manage_messages")? {
-            return refuse(message, "e.p.trust.not-authorized", "What a censored post said is for whoever manages posts in its channel.");
+            return refuse(message, "e.p.trust.not-authorized", "What a censored or deleted post said is for whoever manages posts in its channel.");
         }
-        let Some(original) = self.store.censored_original(&post.id)?.filter(|_| !post.deleted) else {
+        // A deleted post: what it said, kept a while for moderators.
+        if post.deleted {
+            let Some(content) = self.store.deleted_text(&post.id)? else {
+                return refuse(message, "e.p.msg.not-kept", "What that post said is no longer kept.");
+            };
+            return Ok(Outcome::reply(reply_to(message, ORIGINAL, json!({ "id": post.id, "channel": post.channel, "content": content, "deleted": true }))));
+        }
+        let Some(original) = self.store.censored_original(&post.id)? else {
             return refuse(message, "e.p.msg.not-censored", "AutoMod didn't censor that post.");
         };
         Ok(Outcome::reply(reply_to(message, ORIGINAL, json!({ "id": post.id, "channel": post.channel, "content": original, "rules": post.censored.unwrap_or_default() }))))

@@ -542,6 +542,16 @@ impl Community {
     /// A community as its settings have it, with what an admin changed last time
     /// laid over them. `kept` is where a change is written; without it, one lasts
     /// until the server stops.
+    /// Whether what a deleted post said is kept for moderators (`deleted_text_days`).
+    pub fn keeps_deleted_text(&self) -> bool {
+        self.config.deleted_text_days > 0
+    }
+
+    /// How long what a deleted post said is kept, in seconds.
+    pub fn deleted_text_kept_for(&self) -> i64 {
+        i64::from(self.config.deleted_text_days) * 24 * 60 * 60
+    }
+
     pub fn new(store: Store, config: CommunityConfig, kept: Option<Kept>) -> anyhow::Result<Self> {
         let changed = match &kept {
             Some(kept) => kept.load()?,
@@ -1866,7 +1876,7 @@ impl Community {
                     return refuse(message, "e.p.msg.deleted", "That post was taken back.");
                 }
                 if message_type == DELETE {
-                    self.store.delete_post(&post.id, removal.then_some(sender))?;
+                    self.store.delete_post(&post.id, removal.then_some(sender), self.keeps_deleted_text())?;
                     if removal {
                         self.audit(now, sender, "post.remove", Some(&post.id), Some(json!({ "channel": post.channel, "author": post.author_did })));
                     }

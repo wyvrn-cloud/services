@@ -983,6 +983,13 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         original TEXT NOT NULL,
         rules TEXT NOT NULL
     );
+    -- What a deleted post said, for whoever manages posts in its channel to see
+    -- (original-request), for DELETED_TEXT_KEPT_FOR after it was deleted.
+    CREATE TABLE IF NOT EXISTS post_deleted_text (
+        post TEXT PRIMARY KEY,
+        content TEXT NOT NULL,
+        deleted_at INTEGER NOT NULL
+    );
     -- What a post carries beyond its text, as JSON (media, a poll, a forum title and tags).
     -- When the sender's own device says it sent a post (its message's
     -- created_time): kept beside posts.posted_at, the server's own time, which is
@@ -1831,6 +1838,11 @@ fn schema() -> Schema {
                 post VARCHAR(255) NOT NULL PRIMARY KEY,
                 original MEDIUMTEXT NOT NULL,
                 rules TEXT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS post_deleted_text (
+                post VARCHAR(255) NOT NULL PRIMARY KEY,
+                content MEDIUMTEXT NOT NULL,
+                deleted_at BIGINT NOT NULL
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS votes (
                 post VARCHAR(255) NOT NULL,
@@ -2887,7 +2899,7 @@ impl Store {
         let due: Vec<String> = self.db.lock().query("SELECT channel FROM channel_trash WHERE trashed_at < ?1", params![before], |row| row.get(0))?;
         for id in &due {
             self.db.lock().transaction(|tx| {
-                for table in ["post_state", "reactions", "post_removals", "post_voice_invites", "post_extra", "post_sent", "post_censored", "votes", "polls_ended", "answering"] {
+                for table in ["post_state", "reactions", "post_removals", "post_voice_invites", "post_extra", "post_sent", "post_censored", "post_deleted_text", "votes", "polls_ended", "answering"] {
                     tx.execute(&format!("DELETE FROM {table} WHERE post IN (SELECT id FROM posts WHERE channel = ?1)"), params![id])?;
                 }
                 tx.execute("DELETE FROM thread_follows WHERE thread IN (SELECT id FROM threads WHERE channel = ?1)", params![id])?;
@@ -3095,10 +3107,20 @@ impl Store {
 
     /// Takes a post back: what it said and asked is gone, and so is what was put on it.
     /// `removed_by` is who did, when it wasn't its author.
-    pub fn delete_post(&self, id: &str, removed_by: Option<&str>) -> Result<()> {
+    /// `keep_text`: what it said is kept for moderators (`deleted_text`), for as long
+    /// as the community's `deleted_text_days`.
+    pub fn delete_post(&self, id: &str, removed_by: Option<&str>, keep_text: bool) -> Result<()> {
         let mut db = self.db.lock();
         if let Some(removed_by) = removed_by {
             db.execute("INSERT INTO post_removals (post, removed_by) VALUES (?1, ?2)", params![id, removed_by])?;
+        }
+        // What it said, kept a while for moderators (asked 2026-11-21: "see what was
+        // deleted"); nobody else is ever given it.
+        if keep_text {
+            db.execute(
+                "INSERT OR REPLACE INTO post_deleted_text (post, content, deleted_at) SELECT id, content, ?2 FROM posts WHERE id = ?1 AND content <> ''",
+                params![id, crate::gates::now()],
+            )?;
         }
         db.execute("UPDATE posts SET content = '', question = NULL, answer = NULL WHERE id = ?1", params![id])?;
         db.execute("DELETE FROM reactions WHERE post = ?1", params![id])?;
@@ -4039,6 +4061,23 @@ impl Store {
         Ok(())
     }
 
+    /// What a deleted post said, while it is kept.
+    pub fn deleted_text(&self, id: &str) -> Result<Option<String>> {
+        Ok(self.db.lock().query("SELECT content FROM post_deleted_text WHERE post = ?1", params![id], |row| row.get(0))?.into_iter().next())
+    }
+
+    /// When the text of a deleted post kept longest is next to be forgotten, kept
+    /// `for_seconds`: when to wake a community that sleeps to forget it.
+    pub fn next_deleted_text_due(&self, for_seconds: i64) -> Result<Option<i64>> {
+        let oldest: Vec<Option<i64>> = self.db.lock().query("SELECT MIN(deleted_at) FROM post_deleted_text", params![], |row| row.get(0))?;
+        Ok(oldest.into_iter().flatten().next().map(|at| at + for_seconds))
+    }
+
+    /// Forgets what posts deleted before `before` said. How many.
+    pub fn forget_deleted_texts(&self, before: i64) -> Result<usize> {
+        self.db.lock().execute("DELETE FROM post_deleted_text WHERE deleted_at < ?1", params![before])
+    }
+
     pub fn censored_original(&self, id: &str) -> Result<Option<String>> {
         Ok(self.db.lock().query("SELECT original FROM post_censored WHERE post = ?1", params![id], |row| row.get(0))?.into_iter().next())
     }
@@ -4277,7 +4316,7 @@ mod kept_counts {
 
         // A new post, and one taken back, are counted at once.
         post(&store, &bea, "r3", Some("t1"));
-        store.delete_post("r1", None).unwrap();
+        store.delete_post("r1", None, true).unwrap();
         assert_eq!(store.thread("t1").unwrap().unwrap().count, 3, "a post taken back stays in its thread");
         assert_eq!(store.forum_post_counts("board").unwrap(), vec![(bea.did.clone(), 3)]);
         assert_eq!(help(&store).posts, 4);

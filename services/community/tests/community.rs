@@ -1799,6 +1799,17 @@ async fn automod_censors_disguised_words_and_unsafe_links_and_moderators_see_the
     let refused_edit = member.ask("https://wyvrn.app/message-edits/1.0/edit", json!({ "to": { "id": "c1" }, "content": "pineapple" })).await;
     assert_eq!(refused_edit["body"]["code"], "e.p.msg.automod");
 
+    // Taken back: gone for everyone, but what it said is kept a while for whoever
+    // manages posts ("see what was deleted"), and still for nobody else.
+    let deleted = member.ask("https://wyvrn.app/message-edits/1.0/delete", json!({ "to": { "id": "c1" } })).await;
+    assert_ne!(deleted["body"]["code"], json!("e.p.msg.unknown-post"), "{deleted}");
+    let seen = member.community("history-request", json!({ "channel": channel })).await.to_string();
+    assert!(!seen.contains("all good"), "{seen}");
+    let kept = owner.community("original-request", json!({ "to": { "id": "c1" } })).await;
+    assert_eq!(kept["body"]["content"], "all good", "{kept}");
+    assert_eq!(kept["body"]["deleted"], true);
+    assert_eq!(member.community("original-request", json!({ "to": { "id": "c1" } })).await["body"]["code"], "e.p.trust.not-authorized");
+
     // Whoever manages posts isn't checked.
     assert_eq!(owner.community("post", json!({ "channel": channel, "content": "sh#t" })).await["body"].get("censored"), None);
     let audit = owner.community("audit-request", json!({})).await.to_string();

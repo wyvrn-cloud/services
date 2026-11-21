@@ -172,6 +172,9 @@ pub struct Limits {
     /// Its own custom emoji packs, and emoji in each.
     pub emoji_packs: usize,
     pub emoji_per_pack: usize,
+    /// How many days what a deleted post said is kept for its moderators to see;
+    /// 0 keeps nothing.
+    pub deleted_text_days: u32,
     /// The kinds of channel it may not open (wyvrn-community's
     /// `disabled_channel_kinds`): `announcement`, `voice`, `stage`, `forum`,
     /// `gallery`, `calendar`, `form`, `wiki`. One it has already is read-only.
@@ -189,7 +192,7 @@ impl Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { members: 1000, channels: 500, file_bytes: 25 * 1024 * 1024, files_quota: 1024 * 1024 * 1024, files_total: 5 * 1024 * 1024 * 1024, roles: 250, posts_per_minute: 0, store_bytes: 0, sticker_packs: 1, stickers_per_pack: 25, emoji_packs: 1, emoji_per_pack: 75, disabled_channel_kinds: None }
+        Self { members: 1000, channels: 500, file_bytes: 25 * 1024 * 1024, files_quota: 1024 * 1024 * 1024, files_total: 5 * 1024 * 1024 * 1024, roles: 250, posts_per_minute: 0, store_bytes: 0, sticker_packs: 1, stickers_per_pack: 25, emoji_packs: 1, emoji_per_pack: 75, deleted_text_days: 30, disabled_channel_kinds: None }
     }
 }
 

@@ -97,6 +97,7 @@ fn limits_from(input: &Value, base: Limits, host: &Limits) -> Result<Limits, Str
         stickers_per_pack: count("stickers_per_pack", base.stickers_per_pack)?.max(1),
         emoji_packs: count("emoji_packs", base.emoji_packs)?,
         emoji_per_pack: count("emoji_per_pack", base.emoji_per_pack)?.max(1),
+        deleted_text_days: u32::try_from(count("deleted_text_days", base.deleted_text_days as usize)?).unwrap_or(u32::MAX),
         disabled_channel_kinds,
     })
 }
@@ -218,6 +219,7 @@ impl Pages for AppState {
                 { "type": "text-input", "form-id": "stickers_per_pack", "label": "Stickers in a pack", "value": limits.stickers_per_pack.to_string() },
                 { "type": "text-input", "form-id": "emoji_packs", "label": "Emoji packs", "value": limits.emoji_packs.to_string() },
                 { "type": "text-input", "form-id": "emoji_per_pack", "label": "Emoji in a pack", "value": limits.emoji_per_pack.to_string() },
+                { "type": "text-input", "form-id": "deleted_text_days", "label": "Days moderators may see what a deleted post said (0: none)", "value": limits.deleted_text_days.to_string() },
             ]});
             if let Some(children) = form["children"].as_array_mut() {
                 children.extend(kinds);

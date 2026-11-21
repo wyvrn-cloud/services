@@ -435,7 +435,7 @@ impl Community {
             Some(local) => {
                 let Some(held) = self.store.post_by_id(&local)?.filter(|p| !p.deleted) else { return Ok(Outcome::default()) };
                 if deleted {
-                    self.store.delete_post(&held.id, None)?;
+                    self.store.delete_post(&held.id, None, self.keeps_deleted_text())?;
                 } else if held.content != content || held.extra.as_ref() != Some(&extra) {
                     self.store.edit_post(&held.id, &content, &[], now)?;
                     self.store.set_post_extra(&held.id, &extra)?;

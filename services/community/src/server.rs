@@ -1009,6 +1009,11 @@ pub fn prune_once(state: &AppState) {
     if let Err(error) = state.community.store.prune_web(now()) {
         tracing::warn!(%error, "pruning failed");
     }
+    // What deleted posts said, kept for moderators for `deleted_text_days` (0: none,
+    // and what was kept before goes too).
+    if let Err(error) = state.community.store.forget_deleted_texts(now() - state.community.deleted_text_kept_for()) {
+        tracing::warn!(%error, "forgetting deleted posts' text failed");
+    }
     // Channels deleted 30 days ago, for good.
     match state.community.store.purge_trashed(now() - crate::structure::TRASH_KEPT_FOR) {
         Ok(gone) if !gone.is_empty() => tracing::info!(channels = gone.len(), "deleted channels from the trash for good"),

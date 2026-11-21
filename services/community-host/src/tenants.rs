@@ -80,8 +80,12 @@ impl Tenant {
     fn next_wake(&self, now: i64, retry: i64) -> (Option<i64>, Option<i64>) {
         let owed = server::deliveries_owed(&self.state).unwrap_or(false);
         let poll = self.state.community.store.next_poll_end().ok().flatten().map(|end| end.max(now));
+        // What a deleted post said is forgotten when due even while nobody speaks to
+        // the community: it is woken to prune, then sleeps again (pruning doesn't keep
+        // it awake: nothing it does on its own counts as use).
+        let forget = self.state.community.store.next_deleted_text_due(self.state.community.deleted_text_kept_for()).ok().flatten().map(|due| due.max(now));
         let delivery = owed.then_some(now + retry);
-        (delivery.into_iter().chain(poll).min(), owed.then_some(retry))
+        (delivery.into_iter().chain(poll).chain(forget).min(), owed.then_some(retry))
     }
 }
 
@@ -196,6 +200,7 @@ impl Host {
                 max_emoji_packs: limits.emoji_packs,
                 max_emoji_per_pack: limits.emoji_per_pack,
                 disabled_channel_kinds: limits.disabled_kinds(&self.config.limits),
+                deleted_text_days: limits.deleted_text_days,
                 ..CommunityConfig::default()
             },
             mediator: None,

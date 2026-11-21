@@ -202,7 +202,7 @@ impl Community {
                 if remove > 0 {
                     removed = self.store.recent_posts_by(None, did, now - remove, 10_000)?;
                     for id in &removed {
-                        self.store.delete_post(id, Some(sender))?;
+                        self.store.delete_post(id, Some(sender), self.keeps_deleted_text())?;
                     }
                     outcome.changed.extend(removed.iter().cloned());
                 }
@@ -293,7 +293,7 @@ impl Community {
                 };
                 for id in &ids {
                     let author = self.store.post_by_id(id)?.map(|post| post.author_did).unwrap_or_default();
-                    self.store.delete_post(id, (author != sender).then_some(sender))?;
+                    self.store.delete_post(id, (author != sender).then_some(sender), self.keeps_deleted_text())?;
                 }
                 let mut details = json!({ "count": ids.len() });
                 if let Some(author) = body["author"].as_str() {
