@@ -53,6 +53,8 @@ ed25519-dalek = { workspace = true }
 chrono-tz = "0.10"
 # Wiki pages edited together: Yjs documents, kept and merged here (wiki.rs).
 yrs = "0.28"
+# A wiki page's blame: its versions' lines diffed as git does (Myers).
+similar = "2"
 # Signing in to the web view (website-sign-in/1.0), and the identity provider's
 # ES256 id tokens (community-sign-in/1.0).
 wyvrn-sign-in = { path = "../../../wyvrn-sign-in" }

@@ -83,6 +83,28 @@ fn saying(doc: &Doc, text: &str) -> Vec<u8> {
 }
 
 impl Community {
+    /// A page's versions, oldest first: each the number of its last change, when,
+    /// and whose. One member's changes close together are one version; but a
+    /// restore is a version of its own, so what it undid stays in the history to go
+    /// back to, and what is written after it isn't hidden in it either.
+    fn wiki_versions(&self, page: &str) -> anyhow::Result<Vec<(i64, i64, String)>> {
+        let restores = self.store.wiki_restores(page)?;
+        let mut versions: Vec<(i64, i64, String)> = Vec::new();
+        let mut after_restore = false;
+        for (seq, who, at) in self.store.wiki_update_heads(page)? {
+            let restore = restores.contains(&seq);
+            let joins = !restore && !after_restore;
+            after_restore = restore;
+            match versions.last_mut() {
+                Some((last_seq, last_at, last_who)) if joins && *last_who == who && at - *last_at < VERSION_GAP => {
+                    (*last_seq, *last_at) = (seq, at);
+                }
+                _ => versions.push((seq, at, who)),
+            }
+        }
+        Ok(versions)
+    }
+
     fn wiki_channel(&self, did: &str, id: Option<&str>) -> anyhow::Result<Option<Channel>> {
         let Some(channel) = id.map(|id| self.store.channel(id)).transpose()?.flatten().filter(|c| c.wiki) else { return Ok(None) };
         Ok(self.sees_id(did, &channel.id)?.then_some(channel))
@@ -285,25 +307,26 @@ impl Community {
             }
             "wiki-history-request" => {
                 let Some((page, _)) = self.wiki_page(did, body["page"].as_str())? else { return no_page() };
-                // One member's changes close together are one version; but a restore
-                // is a version of its own, so what it undid stays in the history to go
-                // back to, and what is written after it isn't hidden in it either.
-                let restores = self.store.wiki_restores(&page.id)?;
-                let mut versions: Vec<(i64, i64, String)> = Vec::new();
-                let mut after_restore = false;
-                for (seq, who, at) in self.store.wiki_update_heads(&page.id)? {
-                    let restore = restores.contains(&seq);
-                    let joins = !restore && !after_restore;
-                    after_restore = restore;
-                    match versions.last_mut() {
-                        Some((last_seq, last_at, last_who)) if joins && *last_who == who && at - *last_at < VERSION_GAP => {
-                            (*last_seq, *last_at) = (seq, at);
-                        }
-                        _ => versions.push((seq, at, who)),
-                    }
-                }
-                let versions: Vec<Value> = versions.into_iter().rev().map(|(seq, at, who)| json!({ "seq": seq, "at": at, "by": self.store.member_id(&who, now).unwrap_or_default() })).collect();
+                let versions: Vec<Value> = self
+                    .wiki_versions(&page.id)?
+                    .into_iter()
+                    .rev()
+                    .map(|(seq, at, who)| json!({ "seq": seq, "at": at, "by": self.store.member_id(&who, now).unwrap_or_default() }))
+                    .collect();
                 Ok(Some(Outcome::reply(reply_to(message, &format!("{P}wiki-history"), json!({ "page": page.id, "versions": versions })))))
+            }
+            "wiki-blame-request" => {
+                let Some((page, _)) = self.wiki_page(did, body["page"].as_str())? else { return no_page() };
+                let versions = self.wiki_versions(&page.id)?;
+                let updates = self.store.wiki_updates_numbered(&page.id)?;
+                let lines: Vec<Value> = blame(&versions, &updates)
+                    .into_iter()
+                    .map(|(text, by)| match by {
+                        Some((seq, at, who)) => json!({ "text": text, "seq": seq, "at": at, "by": self.store.member_id(&who, now).unwrap_or_default() }),
+                        None => json!({ "text": text }),
+                    })
+                    .collect();
+                Ok(Some(Outcome::reply(reply_to(message, &format!("{P}wiki-blame"), json!({ "page": page.id, "lines": lines })))))
             }
             "wiki-version-request" | "wiki-restore" => {
                 let Some((mut page, channel)) = self.wiki_page(did, body["page"].as_str())? else { return no_page() };
@@ -427,6 +450,51 @@ impl Community {
 /// Pages open, by page, each with who has it open and since when they last said.
 pub type OpenPages = std::sync::Mutex<HashMap<String, HashMap<String, i64>>>;
 
+/// Who wrote each line of a page, as git blame says it (asked 2026-11-21: Yjs's
+/// own record of which client inserted a piece gave Bob's line to Yuki, since
+/// joining or splitting paragraphs inserts their text again). Each version's text
+/// is diffed by lines against the one before (Myers, as git diff), and a line
+/// added or changed is the version's; a line kept keeps whose it was. `versions`
+/// are `wiki_versions`'s, `updates` every change in order. Each line of the page
+/// now, with the version (number, time, sender) it is from.
+pub fn blame<'v>(versions: &'v [(i64, i64, String)], updates: &[(i64, Vec<u8>)]) -> Vec<(String, Option<&'v (i64, i64, String)>)> {
+    use similar::{capture_diff_slices, Algorithm, DiffOp};
+    let doc = Doc::new();
+    let mut lines: Vec<(String, Option<&(i64, i64, String)>)> = Vec::new();
+    let mut next = versions.iter().peekable();
+    for (seq, data) in updates {
+        if let Ok(update) = Update::decode_v1(data) {
+            let _ = doc.transact_mut().apply_update(update);
+        }
+        let Some(version) = next.peek().copied() else { break };
+        if *seq < version.0 {
+            continue;
+        }
+        next.next();
+        let text = text_of(&doc);
+        let new: Vec<&str> = text.split('\n').collect();
+        let old: Vec<&str> = lines.iter().map(|(line, _)| line.as_str()).collect();
+        let mut blamed: Vec<(String, Option<&(i64, i64, String)>)> = Vec::with_capacity(new.len());
+        for op in capture_diff_slices(Algorithm::Myers, &old, &new) {
+            match op {
+                DiffOp::Equal { old_index, new_index, len } => {
+                    for i in 0..len {
+                        blamed.push((new[new_index + i].to_string(), lines[old_index + i].1));
+                    }
+                }
+                DiffOp::Insert { new_index, new_len, .. } | DiffOp::Replace { new_index, new_len, .. } => {
+                    for i in 0..new_len {
+                        blamed.push((new[new_index + i].to_string(), Some(version)));
+                    }
+                }
+                DiffOp::Delete { .. } => {}
+            }
+        }
+        lines = blamed;
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,5 +538,33 @@ mod tests {
         doc.transact_mut().apply_update(Update::decode_v1(&back).unwrap()).unwrap();
         assert_eq!(text_of(&doc), "# Rules\nBe kind");
         assert_eq!(Update::decode_v1(&back).unwrap().state_vector().iter().map(|(c, _)| c.get()).collect::<Vec<_>>(), vec![3]);
+    }
+
+    #[test]
+    fn blame_credits_each_line_to_the_version_that_last_changed_it_whoever_reinserted_it() {
+        // Bob writes two lines (version 1).
+        let bob = page(&["Welcome to the handbook.", "Bob: say hello in #general first."]);
+        let first = encoded(&bob);
+        // Yuki's edit inserts every line again (as joining or splitting paragraphs
+        // does), and adds one of hers (version 2): to Yjs, all of it is now hers.
+        let yuki = Doc::with_client_id(7);
+        yuki.transact_mut().apply_update(Update::decode_v1(&first).unwrap()).unwrap();
+        let second = saying(&yuki, "Welcome to the handbook.\nBob: say hello in #general first.\nYuki, from the second device.");
+        // Bob changes his first line (version 3).
+        let bob_again = Doc::with_client_id(1);
+        bob_again.transact_mut().apply_update(Update::decode_v1(&first).unwrap()).unwrap();
+        bob_again.transact_mut().apply_update(Update::decode_v1(&second).unwrap()).unwrap();
+        let third = saying(&bob_again, "Welcome! Everyone can edit this page.\nBob: say hello in #general first.\nYuki, from the second device.");
+        let versions = vec![(1, 100, "bob".to_string()), (2, 200, "yuki".to_string()), (3, 300, "bob".to_string())];
+        let updates = vec![(1, first), (2, second), (3, third)];
+        let blamed: Vec<(String, Option<i64>)> = blame(&versions, &updates).into_iter().map(|(text, by)| (text, by.map(|v| v.0))).collect();
+        assert_eq!(
+            blamed,
+            vec![
+                ("Welcome! Everyone can edit this page.".to_string(), Some(3)),
+                ("Bob: say hello in #general first.".to_string(), Some(1)),
+                ("Yuki, from the second device.".to_string(), Some(2)),
+            ]
+        );
     }
 }

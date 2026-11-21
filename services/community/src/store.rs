@@ -3802,6 +3802,15 @@ impl Store {
         })
     }
 
+    /// Every change to a page, in order, with its number.
+    pub fn wiki_updates_numbered(&self, page: &str) -> Result<Vec<(i64, Vec<u8>)>> {
+        use base64::Engine;
+        self.db.lock().query("SELECT seq, data FROM wiki_updates WHERE page = ?1 ORDER BY seq", params![page], |row| {
+            let data: String = row.get(1)?;
+            Ok((row.get(0)?, base64::engine::general_purpose::STANDARD.decode(data).unwrap_or_default()))
+        })
+    }
+
     /// Whose Yjs client id `client` is on `page`.
     pub fn wiki_client(&self, page: &str, client: u64) -> Result<Option<String>> {
         self.db.lock().query_row("SELECT did FROM wiki_clients WHERE page = ?1 AND client = ?2", params![page, client as i64], |row| row.get(0))
