@@ -1332,6 +1332,15 @@ async fn keys_are_passed_on_as_they_are_to_those_in_the_room_and_invitations_rin
     let key = bob.next_of(&format!("{V}keys")).await;
     assert_eq!((key["body"]["from"].as_str(), key["body"]["kid"].as_str(), &key["body"]["jwe"]), (Some(a_id.as_str()), Some("a1"), &jwe));
 
+    // A still of a screen: only from someone sharing one, and passed on to the
+    // others in the room as it was (sealed with the sharer's own key).
+    let refused = tell(&alice, "still", json!({ "channel": lounge, "picture": "c2VhbGVk" })).await.unwrap();
+    assert_eq!(refused["body"]["code"], "e.p.msg.not-sharing", "{refused}");
+    tell(&alice, "state", json!({ "channel": lounge, "sharing": { "screen": true } })).await;
+    assert!(tell(&alice, "still", json!({ "channel": lounge, "picture": "c2VhbGVk" })).await.is_none());
+    let still = bob.next_of(&format!("{V}still")).await;
+    assert_eq!((still["body"]["from"].as_str(), still["body"]["picture"].as_str()), (Some(a_id.as_str()), Some("c2VhbGVk")), "{still}");
+
     // Carol lets the community ring her; Dave doesn't, and is named in a post.
     let set = voice(&dave, "set-preferences", json!({ "ring": false })).await;
     assert_eq!(set["body"]["ring"], false);

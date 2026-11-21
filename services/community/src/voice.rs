@@ -22,6 +22,11 @@ pub const JOINED: &str = "https://wyvrn.app/community-voice/1.0/joined";
 pub const LEAVE: &str = "https://wyvrn.app/community-voice/1.0/leave";
 pub const STATE: &str = "https://wyvrn.app/community-voice/1.0/state";
 pub const KEYS: &str = "https://wyvrn.app/community-voice/1.0/keys";
+/// A still of a screen being shared, sealed with its sharer's own key, for the
+/// others in the room to see before they choose to watch it.
+pub const STILL: &str = "https://wyvrn.app/community-voice/1.0/still";
+/// The longest a sealed still may be, base64url.
+const MOST_STILL_CHARS: usize = 300_000;
 pub const INVITE: &str = "https://wyvrn.app/community-voice/1.0/invite";
 pub const RING: &str = "https://wyvrn.app/community-voice/1.0/ring";
 pub const SET_PREFERENCES: &str = "https://wyvrn.app/community-voice/1.0/set-preferences";
@@ -645,6 +650,33 @@ impl Rooms {
                             json!({ "type": KEYS, "id": uuid::Uuid::new_v4().to_string(), "body": { "channel": channel, "from": from, "to": to, "kid": entry["kid"], "jwe": entry["jwe"] } }),
                         ));
                     }
+                }
+                Ok(outcome)
+            }
+
+            // Passed on as it is, sealed with the sharer's own frame key: the server
+            // can't open it, as it can't the screen's frames.
+            STILL => {
+                let channel = body["channel"].as_str().unwrap_or_default();
+                let picture = body["picture"].as_str().unwrap_or_default();
+                if picture.is_empty() || picture.len() > MOST_STILL_CHARS {
+                    return refuse(message, "e.p.msg.invalid", "A still is a small picture.");
+                }
+                let inner = self.lock();
+                let Some(room) = inner.rooms.get(channel) else {
+                    drop(inner);
+                    return refuse(message, "e.p.msg.not-in-room", "You aren't in that voice channel.");
+                };
+                let Some(from) = room.of(sender, named).filter(|id| room.participants.get(id).is_some_and(|p| p.sharing.screen)) else {
+                    drop(inner);
+                    return refuse(message, "e.p.msg.not-sharing", "Only a screen being shared has a still.");
+                };
+                let mut outcome = VoiceOutcome::default();
+                for p in room.participants.values().filter(|p| p.id != from) {
+                    outcome.notices.push((
+                        p.did.clone(),
+                        json!({ "type": STILL, "id": uuid::Uuid::new_v4().to_string(), "body": { "channel": channel, "from": from, "to": p.id, "picture": picture } }),
+                    ));
                 }
                 Ok(outcome)
             }
