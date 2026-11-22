@@ -37,6 +37,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/ch/{id}/m/{seq}", get(post_page))
         .route("/ch/{id}/t/{thread}", get(thread_page))
         .route("/m/{post}", get(short_link))
+        .route("/ch/{id}/feed.atom", get(feed))
+        .route("/search", get(search))
+        .route("/widget", get(widget))
+        .route("/widget.json", get(widget_json))
         .route("/sitemap.xml", get(sitemap))
         .route("/robots.txt", get(robots))
         .route("/theme.css", get(theme_css))
@@ -121,6 +125,12 @@ pub struct Site {
     /// Opens the community in the app.
     pub in_app: String,
     pub canonical: String,
+    /// A share card's picture (an absolute address), where the page has one of its own.
+    pub og_image: Option<String>,
+    /// `summary`, or `summary_large_image` where there is a picture of its own.
+    pub card: &'static str,
+    /// The page's channel's Atom feed, where it is public.
+    pub feed: Option<String>,
 }
 
 pub struct ChannelLink {
@@ -367,6 +377,9 @@ pub fn site(state: &AppState, viewer: &Viewer, root: &str, canonical: String) ->
         csrf: viewer.csrf.clone().unwrap_or_default(),
         in_app,
         canonical,
+        og_image: None,
+        card: "summary",
+        feed: None,
     }
 }
 
@@ -993,6 +1006,9 @@ async fn channel(State(state): State<Arc<AppState>>, Path((id, name)): Path<(Str
     let json_ld = render::json_ld(&json!({ "@context": "https://schema.org", "@type": "CollectionPage", "name": channel.name, "url": canonical, "hasPart": shown.iter().take(20).map(|p| discussion(p, web, &channel, &p.author_name.clone().unwrap_or_default())).collect::<Vec<_>>() }));
     let mut site = site(&state, &viewer, root, canonical);
     site.in_app.push_str(&format!("&channel={}", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>()));
+    if is_public(&state, &channel.id) {
+        site.feed = Some(web.absolute(&format!("ch/{}/feed.atom", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>())));
+    }
     let groups = match groups(&state, &viewer, root, Some(&channel.id)) {
         Ok(groups) => groups,
         Err(error) => return internal(error),
@@ -1066,7 +1082,7 @@ async fn post_page(State(state): State<Arc<AppState>>, Path((id, seq)): Path<(St
     let viewer = Viewer::of(&state, &headers);
     let Some((channel, since)) = visible_channel(&state, &viewer, &id) else { return nothing() };
     let store = &state.community.store;
-    let Some(post) = store.post_at(&channel.id, seq).ok().flatten() else {
+    let Some(post) = store.post_at(&channel.id, seq).ok().flatten().filter(|p| !in_private_thread(&state, p)) else {
         return nothing();
     };
     if !shows(&post, since) {
@@ -1090,6 +1106,11 @@ async fn post_page(State(state): State<Arc<AppState>>, Path((id, seq)): Path<(St
     ld["@context"] = json!("https://schema.org");
     let mut site = site(&state, &viewer, root, canonical);
     site.in_app.push_str(&format!("&channel={}&seq={seq}", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>()));
+    // Its share card: the post's own picture, large, where it is public and has one.
+    if since.is_some() && first_picture(&post).is_some() {
+        site.og_image = Some(web.absolute(&format!("media/{}/0", url::form_urlencoded::byte_serialize(post.id.as_bytes()).collect::<String>())));
+        site.card = "summary_large_image";
+    }
     let groups = match groups(&state, &viewer, root, Some(&channel.id)) {
         Ok(groups) => groups,
         Err(error) => return internal(error),
@@ -1192,7 +1213,7 @@ async fn short_link(State(state): State<Arc<AppState>>, Path(id): Path<String>, 
         return nothing();
     }
     let viewer = Viewer::of(&state, &headers);
-    let Some(post) = state.community.store.post_by_id(&id).ok().flatten() else { return nothing() };
+    let Some(post) = state.community.store.post_by_id(&id).ok().flatten().filter(|p| !in_private_thread(&state, p)) else { return nothing() };
     let Some((channel, since)) = visible_channel(&state, &viewer, &post.channel) else { return nothing() };
     if !shows(&post, since) {
         return nothing();
@@ -1344,7 +1365,7 @@ async fn media(State(state): State<Arc<AppState>>, Path((post_id, n)): Path<(Str
         return nothing();
     }
     let viewer = Viewer::of(&state, &headers);
-    let Some(post) = state.community.store.post_by_id(&post_id).ok().flatten().filter(|p| !p.deleted) else { return nothing() };
+    let Some(post) = state.community.store.post_by_id(&post_id).ok().flatten().filter(|p| !p.deleted && !in_private_thread(&state, p)) else { return nothing() };
     let Some((_, since)) = visible_channel(&state, &viewer, &post.channel) else { return nothing() };
     if !shows(&post, since) {
         return nothing();
@@ -1404,3 +1425,239 @@ mod tests {
         assert!(!inline_type("application/pdf"));
     }
 }
+
+/// A post in a private thread: never on the web, whoever asks (community/1.0's
+/// "A private thread").
+fn in_private_thread(state: &AppState, post: &Post) -> bool {
+    post.thread.as_deref().is_some_and(|thread| state.community.store.is_private_thread(thread).unwrap_or(true))
+}
+
+/// A post's first picture, if it carries one.
+fn first_picture(post: &Post) -> Option<()> {
+    let extra = post.extra.as_ref()?;
+    let first = extra["media"].as_array()?.first()?;
+    let attachment = extra["attachments"].as_array()?.iter().find(|a| a["id"] == first["attachment"])?;
+    attachment["media_type"].as_str().filter(|t| t.starts_with("image/")).map(|_| ())
+}
+
+/// Someone not signed in: what the feed and the widget show is what anyone sees.
+fn anyone() -> Viewer {
+    Viewer { member: None, csrf: None }
+}
+
+/// `/ch/{id}/feed.atom`: a public channel's newest posts, as an Atom feed.
+async fn feed(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let Some(web) = web_of(&state) else { return nothing() };
+    if !page_on(&state.community.store) {
+        return nothing();
+    }
+    let Some((channel, since)) = visible_channel(&state, &anyone(), &id) else { return nothing() };
+    let posts = match state.community.store.channel_posts_by_time(&channel.id, None, None, 50) {
+        Ok(posts) => posts,
+        Err(error) => return internal(error.into()),
+    };
+    let shown: Vec<&Post> = posts.iter().filter(|p| !p.deleted && shows(p, since)).collect();
+    let previews = HashMap::new();
+    let name = site(&state, &anyone(), "", String::new()).name;
+    let page = web.absolute(&channel_path(&channel.id, &channel.name));
+    let at = |secs: i64| chrono::DateTime::from_timestamp(secs, 0).map(|t| t.to_rfc3339()).unwrap_or_default();
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<feed xmlns=\"http://www.w3.org/2005/Atom\">\n<title>#{} · {}</title>\n<link href=\"{}\"/>\n<link rel=\"self\" href=\"{}\"/>\n<id>{}</id>\n<updated>{}</updated>\n",
+        escape(&channel.name),
+        escape(&name),
+        escape(&page),
+        escape(&web.absolute(&format!("ch/{}/feed.atom", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>()))),
+        escape(&page),
+        at(shown.first().map_or(channel.created_at, |p| p.posted_at)),
+    );
+    for post in shown {
+        let view = post_view(&state, post, &channel, "", None, &previews);
+        let link = web.absolute(&format!("ch/{}/m/{}", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>(), post.seq));
+        let title = render::excerpt(&post.content, 80);
+        xml.push_str(&format!(
+            "<entry>\n<id>{link}</id>\n<link href=\"{link}\"/>\n<title>{}</title>\n<author><name>{}</name></author>\n<updated>{}</updated>\n<content type=\"html\">{}</content>\n</entry>\n",
+            escape(if title.is_empty() { "A post" } else { &title }),
+            escape(&view.author),
+            at(post.edited_at.unwrap_or(post.posted_at)),
+            escape(&view.html),
+            link = escape(&link),
+        ));
+    }
+    xml.push_str("</feed>\n");
+    let mut response = ([(header::CONTENT_TYPE, "application/atom+xml; charset=utf-8"), (header::CACHE_CONTROL, "public, max-age=300")], xml).into_response();
+    response.extensions_mut().insert(super::OpenToAll);
+    response
+}
+
+#[derive(Deserialize, Default)]
+pub struct Searched {
+    q: Option<String>,
+}
+
+/// `/search?q=`: the posts that say it, in what the viewer may read here.
+async fn search(State(state): State<Arc<AppState>>, Query(asked): Query<Searched>, headers: HeaderMap) -> Response {
+    let Some(web) = web_of(&state) else { return nothing() };
+    if !page_on(&state.community.store) {
+        return nothing();
+    }
+    let viewer = Viewer::of(&state, &headers);
+    let query = asked.q.unwrap_or_default().chars().take(100).collect::<String>();
+    let words: Vec<String> = query.split_whitespace().take(8).map(str::to_string).collect();
+    let readable = match readable(&state, &viewer) {
+        Ok(readable) => readable,
+        Err(error) => return internal(error),
+    };
+    let within: Vec<String> = readable.keys().cloned().collect();
+    let found = if query.trim().chars().count() >= 2 && !within.is_empty() {
+        match state.community.store.search(&words, None, None, Some(&within), None, 30) {
+            Ok(found) => found,
+            Err(error) => return internal(error.into()),
+        }
+    } else {
+        Vec::new()
+    };
+    let shown: Vec<&Post> = found.iter().filter(|p| !in_private_thread(&state, p) && readable.get(&p.channel).is_some_and(|since| shows(p, *since))).collect();
+    let previews = super::preview::prepare(&state, &shown).await;
+    let channels: HashMap<String, Channel> = state.community.store.channels().unwrap_or_default().into_iter().map(|c| (c.id.clone(), c)).collect();
+    let root = "./";
+    let mut views: Vec<PostView> = shown.iter().filter_map(|p| channels.get(&p.channel).map(|c| post_view(&state, p, c, root, None, &previews))).collect();
+    mark_runs(&mut views);
+    let canonical = web.absolute("search");
+    let site = site(&state, &viewer, root, canonical);
+    let groups = match groups(&state, &viewer, root, None) {
+        Ok(groups) => groups,
+        Err(error) => return internal(error),
+    };
+    let heading = if query.is_empty() { "Search".to_string() } else { format!("Search: {query}") };
+    page(
+        ChannelPage {
+            title: format!("{heading} · {}", site.name),
+            description: format!("Posts in {} that say what was searched for.", site.name),
+            json_ld: String::new(),
+            channel_name: String::new(),
+            topic: if query.is_empty() { "Search what is public here.".into() } else if views.is_empty() { "Nothing here says that.".into() } else { format!("{} found", views.len()) },
+            posts: views,
+            older: None,
+            newer: None,
+            heading,
+            back: None,
+            site,
+            groups,
+            noindex: true,
+            compose: None,
+            react_base: None,
+            quick: super::posting::QUICK_REACTIONS,
+            live: None,
+            gallery: false,
+        }
+        .render(),
+        true,
+    )
+}
+
+#[derive(Deserialize, Default)]
+pub struct WidgetAsked {
+    channel: Option<String>,
+}
+
+/// What the widget shows: the community, how many are here, its public channels,
+/// how to join, and a public channel's newest posts.
+fn widget_body(state: &AppState, web: &Web, asked: &WidgetAsked) -> anyhow::Result<Value> {
+    let anyone = anyone();
+    let site = site(state, &anyone, "", String::new());
+    let readable = readable(state, &anyone)?;
+    let mut channels: Vec<Channel> = state.community.store.channels()?.into_iter().filter(|c| readable.contains_key(&c.id)).collect();
+    channels.sort_by_key(|c| c.created_at);
+    let online = state.community.seen_online()?.len();
+    let in_voice: usize = state.rooms.in_rooms().values().map(Vec::len).sum();
+    let chosen = asked.channel.as_deref().and_then(|id| channels.iter().find(|c| c.id == id)).or_else(|| channels.first());
+    let mut recent = Vec::new();
+    if let Some(channel) = chosen {
+        let since = readable.get(&channel.id).copied().flatten();
+        for post in state.community.store.channel_posts_by_time(&channel.id, None, None, 10)?.into_iter().filter(|p| !p.deleted && shows(p, since)).take(5) {
+            recent.push(json!({
+                "author": post.author_name.clone().unwrap_or_else(|| "A member".into()),
+                "text": render::excerpt(&post.content, 140),
+                "at": post.posted_at,
+                "url": web.absolute(&format!("ch/{}/m/{}", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>(), post.seq)),
+            }));
+        }
+    }
+    Ok(json!({
+        "name": site.name,
+        "description": site.description,
+        "icon": site.has_icon.then(|| web.absolute("icon")),
+        "url": web.absolute(""),
+        "join": site.in_app,
+        "online": online,
+        "in_voice": in_voice,
+        "channels": channels.iter().map(|c| json!({ "id": c.id, "name": c.name, "url": web.absolute(&channel_path(&c.id, &c.name)) })).collect::<Vec<_>>(),
+        "recent": { "channel": chosen.map(|c| c.name.clone()), "posts": recent },
+    }))
+}
+
+/// `/widget.json`: the widget's facts, for any site to show its own way.
+async fn widget_json(State(state): State<Arc<AppState>>, Query(asked): Query<WidgetAsked>) -> Response {
+    let Some(web) = web_of(&state) else { return nothing() };
+    if !page_on(&state.community.store) {
+        return nothing();
+    }
+    match widget_body(&state, web, &asked) {
+        Ok(body) => {
+            let mut response = ([(header::CACHE_CONTROL, "public, max-age=60")], axum::Json(body)).into_response();
+            response.extensions_mut().insert(super::OpenToAll);
+            response
+        }
+        Err(error) => internal(error),
+    }
+}
+
+/// The widget's own style, allowed by its hash.
+const WIDGET_STYLE: &str = "body{margin:0;font:14px/1.4 system-ui,sans-serif;background:#fff;color:#1a1a1e}@media (prefers-color-scheme:dark){body{background:#16161a;color:#ececee}a{color:#8ab4ff}}.w{padding:12px;display:grid;gap:10px}.h{display:flex;gap:10px;align-items:center}.h img,.l{width:40px;height:40px;border-radius:12px;object-fit:cover}.l{display:grid;place-items:center;background:#4a63e7;color:#fff;font-weight:700}.n{font-weight:700;font-size:16px}.s{opacity:.75;font-size:12px}ul{margin:0;padding:0;list-style:none}li{padding:4px 0;border-top:1px solid #8884}.p b{font-weight:600}.j{display:inline-block;padding:8px 14px;border-radius:8px;background:#4a63e7;color:#fff;text-decoration:none;font-weight:600;text-align:center}";
+
+/// `/widget`: the widget, for any site to put in a frame
+/// (`<iframe src=".../widget" width="320" height="480">`).
+async fn widget(State(state): State<Arc<AppState>>, Query(asked): Query<WidgetAsked>) -> Response {
+    use base64::Engine;
+    use sha2::Digest;
+    let Some(web) = web_of(&state) else { return nothing() };
+    if !page_on(&state.community.store) {
+        return nothing();
+    }
+    let body = match widget_body(&state, web, &asked) {
+        Ok(body) => body,
+        Err(error) => return internal(error),
+    };
+    let text = |v: &Value| escape(v.as_str().unwrap_or_default());
+    let icon = match body["icon"].as_str() {
+        Some(icon) => format!("<img src=\"{}\" alt=\"\">", escape(icon)),
+        None => format!("<span class=\"l\">{}</span>", escape(&body["name"].as_str().unwrap_or_default().chars().next().map(|c| c.to_uppercase().collect::<String>()).unwrap_or_default())),
+    };
+    let channels: String = body["channels"].as_array().into_iter().flatten().take(8).map(|c| format!("<li><a href=\"{}\" target=\"_blank\" rel=\"noopener\">#{}</a></li>", text(&c["url"]), text(&c["name"]))).collect();
+    let posts: String = body["recent"]["posts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| format!("<li class=\"p\"><b>{}</b> <a href=\"{}\" target=\"_blank\" rel=\"noopener\">{}</a></li>", text(&p["author"]), text(&p["url"]), text(&p["text"])))
+        .collect();
+    let recent_heading = body["recent"]["channel"].as_str().map(|c| format!("<div class=\"s\">Lately in #{}</div>", escape(c))).unwrap_or_default();
+    let html = format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{name}</title><style>{style}</style></head><body><div class=\"w\"><div class=\"h\">{icon}<div><div class=\"n\">{name}</div><div class=\"s\">{online} online · {voice} in voice</div></div></div><a class=\"j\" href=\"{join}\" target=\"_blank\" rel=\"noopener\">Join in Wyvrn</a><ul>{channels}</ul>{recent_heading}<ul>{posts}</ul><div class=\"s\"><a href=\"{url}\" target=\"_blank\" rel=\"noopener\">Open on the web</a></div></div></body></html>",
+        name = text(&body["name"]),
+        style = WIDGET_STYLE,
+        online = body["online"],
+        voice = body["in_voice"],
+        join = text(&body["join"]),
+        url = text(&body["url"]),
+    );
+    let hash = base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(WIDGET_STYLE.as_bytes()));
+    let mut response = Html(html).into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=60"));
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    if let Ok(value) = HeaderValue::from_str(&format!("default-src 'none'; style-src 'sha256-{hash}'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors *")) {
+        headers.insert(header::CONTENT_SECURITY_POLICY, value);
+    }
+    response
+}
+

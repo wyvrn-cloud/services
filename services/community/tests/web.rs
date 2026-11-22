@@ -963,3 +963,60 @@ async fn a_public_forum_says_which_section_each_thread_is_in_and_the_sections_it
     assert_eq!(status, 200, "{html}");
     assert!(html.contains("<p class=\"topic\">Help › Android</p>"), "{html}");
 }
+
+#[tokio::test]
+async fn a_public_channel_has_a_feed_its_posts_are_searched_and_the_widget_shows_any_site_what_is_public() {
+    let server = start(Options { public: "everyone", ..Options::default() }).await;
+    let (admin, member) = with_channels(&server).await;
+    // `secret` is for admins only: nothing of it on the web.
+    let secret = server.channel_id("secret");
+    server.state.community.store.set_override(&secret, wyvrn_community::roles::EVERYONE_ROLE, &[], &["view_channel".to_string()]).unwrap();
+    say(&member, &server, "general", "the <dragon> rises").await;
+    say(&admin, &server, "secret", "the dragon is secret").await;
+    let general = server.channel_id("general");
+
+    // An Atom feed, with what was said as text.
+    let response = server.http.get(format!("{}ch/{general}/feed.atom", server.url)).send().await.unwrap();
+    assert_eq!(response.headers()["content-type"], "application/atom+xml; charset=utf-8");
+    let feed = response.text().await.unwrap();
+    assert!(feed.contains("<feed xmlns=\"http://www.w3.org/2005/Atom\">") && feed.contains("the &lt;dragon&gt; rises") || feed.contains("&amp;lt;dragon&amp;gt;"), "{feed}");
+    assert!(!feed.contains("<dragon>"));
+    assert_eq!(server.text(&format!("ch/{secret}/feed.atom")).await.0, 404);
+    // The channel's page names it.
+    let (_, page) = server.text(&format!("ch/{general}/general")).await;
+    assert!(page.contains("application/atom+xml") && page.contains("feed.atom"), "{page}");
+
+    // Search: what anyone may read, and nothing else.
+    let (status, found) = server.text("search?q=dragon").await;
+    assert_eq!(status, 200);
+    assert!(found.contains("rises") && !found.contains("is secret"), "{found}");
+
+    // The widget: its facts open to every site, and a page any site may frame.
+    let response = server.http.get(format!("{}widget.json", server.url)).send().await.unwrap();
+    assert_eq!(response.headers()["access-control-allow-origin"], "*");
+    let widget: Value = response.json().await.unwrap();
+    assert_eq!(widget["name"], "The Workshop");
+    assert!(widget["channels"].as_array().unwrap().iter().all(|c| c["name"] != "secret"));
+    assert!(widget["recent"]["posts"][0]["text"].as_str().unwrap().contains("rises"), "{widget}");
+    let response = server.http.get(format!("{}widget", server.url)).send().await.unwrap();
+    assert!(response.headers().get("x-frame-options").is_none());
+    assert!(response.headers()["content-security-policy"].to_str().unwrap().contains("frame-ancestors *"));
+    let html = response.text().await.unwrap();
+    assert!(html.contains("Join in Wyvrn") && html.contains("rises") && !html.contains("<dragon>"), "{html}");
+}
+
+#[tokio::test]
+async fn a_private_threads_posts_are_never_on_the_web() {
+    let server = start(Options { public: "everyone", ..Options::default() }).await;
+    let (_admin, member) = with_channels(&server).await;
+    let general = server.channel_id("general");
+    member.community("post", json!({ "channel": general, "id": "root", "content": "root post" })).await;
+    member.community("create-thread", json!({ "to": { "id": "root" }, "name": "hush", "private": true })).await;
+    let inside = member.community("post", json!({ "channel": general, "id": "in", "content": "whispered words", "thread": "root" })).await;
+    let seq = inside["body"]["seq"].as_i64().unwrap();
+    for path in [format!("ch/{general}/m/{seq}"), "m/in".to_string(), format!("ch/{general}/t/root"), "media/in/0".to_string()] {
+        assert_eq!(server.text(&path).await.0, 404, "{path}");
+    }
+    let (_, found) = server.text("search?q=whispered").await;
+    assert!(!found.contains("whispered words"));
+}

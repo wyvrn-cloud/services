@@ -12,8 +12,12 @@
 <meta property="og:title" content="{{ title }}">
 <meta property="og:description" content="{{ description }}">
 <meta property="og:url" content="{{ site.canonical }}">
-{% if site.has_icon %}<meta property="og:image" content="{{ site.root }}icon">{% endif %}
-<meta name="twitter:card" content="summary">
+{% if let Some(image) = site.og_image %}<meta property="og:image" content="{{ image }}"><meta name="twitter:image" content="{{ image }}">{% else if site.has_icon %}<meta property="og:image" content="{{ site.root }}icon">{% endif %}
+<meta name="twitter:card" content="{{ site.card }}">
+<meta name="twitter:title" content="{{ title }}">
+<meta name="twitter:description" content="{{ description }}">
+{% if let Some(feed) = site.feed %}<link rel="alternate" type="application/atom+xml" title="{{ title }}" href="{{ feed }}">{% endif %}
+<link rel="search" href="{{ site.root }}search">
 <meta name="color-scheme" content="light dark">
 <link rel="stylesheet" href="{{ site.root }}assets/web.css?v={{ site.assets() }}">
 <link rel="stylesheet" href="{{ site.root }}theme.css?v={{ site.theme }}">
@@ -28,6 +32,7 @@
     {% if site.has_icon %}<img class="brand-icon" src="{{ site.root }}icon" alt="" width="36" height="36">{% else %}<span class="brand-icon brand-letter" aria-hidden="true">{{ site.letter }}</span>{% endif %}
     <span class="brand-name">{{ site.name }}</span>
   </a>
+  <form class="search" role="search" method="get" action="{{ site.root }}search"><input type="search" name="q" placeholder="Search" aria-label="Search the posts"></form>
   <nav class="actions" aria-label="Account">
     <a class="button primary" href="{{ site.in_app }}">Open in Wyvrn</a>
     {% if let Some(name) = site.signed_in %}
