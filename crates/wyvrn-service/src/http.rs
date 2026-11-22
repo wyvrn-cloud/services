@@ -29,7 +29,13 @@ pub async fn receive<S: Service>(service: Arc<S>, body: Bytes) -> Response {
     let agent = service.agent();
     let received = match agent.receive(&body).await {
         Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("unpack failed: {e}")).into_response(),
+        // Said in the log, not to the caller: what went wrong unpacking can be what
+        // a fetch of the sender's document met, which is no stranger's to learn
+        // (security review WYV-15).
+        Err(e) => {
+            tracing::debug!(error = %e, "a message that didn't unpack");
+            return (StatusCode::BAD_REQUEST, "that message couldn't be opened").into_response();
+        }
     };
     tracing::debug!(sender = ?received.sender, message_type = received.message_type(), "received");
     // Which key it was authenticated with: `receive` says whose, and a service
