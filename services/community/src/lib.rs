@@ -13,6 +13,7 @@
 //! posts on a program's behalf (a bot) is a member like any other.
 
 pub mod address_banner;
+pub mod appeals;
 pub mod admin_flows;
 pub mod announcements;
 pub mod assistant;

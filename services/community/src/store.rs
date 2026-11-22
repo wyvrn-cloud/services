@@ -1249,6 +1249,27 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         commands TEXT NOT NULL,
         at INTEGER NOT NULL
     );
+    -- What a ban says to whoever it bans, beside the ban (appeals.rs): whether its
+    -- reason is shown them, whether appeals are closed, and whether it was the
+    -- server's own (an account match).
+    CREATE TABLE IF NOT EXISTS ban_terms (
+        did TEXT PRIMARY KEY,
+        shared INTEGER NOT NULL DEFAULT 0,
+        closed INTEGER NOT NULL DEFAULT 0,
+        auto INTEGER NOT NULL DEFAULT 0
+    );
+    -- Appeals against bans, kept after they are decided (appeals.rs).
+    CREATE TABLE IF NOT EXISTS ban_appeals (
+        id TEXT PRIMARY KEY,
+        did TEXT NOT NULL,
+        ban_at INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        at INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        decided_by TEXT,
+        decided_at INTEGER,
+        reply TEXT
+    );
     -- Imported posts claimed by whoever wrote them (claims.rs).
     CREATE TABLE IF NOT EXISTS discord_claims (
         discord_id TEXT PRIMARY KEY,
@@ -1885,6 +1906,24 @@ fn schema() -> Schema {
                 commands MEDIUMTEXT NOT NULL,
                 at BIGINT NOT NULL,
                 PRIMARY KEY (did(255))
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS ban_terms (
+                did {MYSQL_DID} NOT NULL,
+                shared BIGINT NOT NULL DEFAULT 0,
+                closed BIGINT NOT NULL DEFAULT 0,
+                auto BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (did(255))
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS ban_appeals (
+                id VARCHAR(255) NOT NULL PRIMARY KEY,
+                did {MYSQL_DID} NOT NULL,
+                ban_at BIGINT NOT NULL,
+                text MEDIUMTEXT NOT NULL,
+                at BIGINT NOT NULL,
+                state VARCHAR(16) NOT NULL,
+                decided_by {MYSQL_DID},
+                decided_at BIGINT,
+                reply MEDIUMTEXT
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS private_threads (
                 thread VARCHAR(255) NOT NULL PRIMARY KEY

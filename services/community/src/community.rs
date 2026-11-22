@@ -749,6 +749,11 @@ impl Community {
             if let Some(assistant) = &self.assistant {
                 body["assistant"] = assistant.clone();
             }
+            // Appeals against bans waiting, and how they are taken (appeals.rs).
+            if powers.has("ban_members") || powers.has("manage_community") {
+                let (on, wait, cooldown) = self.appeal_settings()?;
+                body["appeals"] = json!({ "on": on, "wait": wait, "cooldown": cooldown, "waiting": if powers.has("ban_members") { self.open_appeals()? } else { 0 } });
+            }
             if powers.has("admit_members") {
                 body["waiting"] = json!(self.store.waiting_count()?);
                 // Imported posts members asked to have made theirs.
@@ -1637,6 +1642,8 @@ impl Community {
                         },
                     },
                 },
+                // Someone banned may ask how it stands, and appeal (appeals.rs).
+                crate::appeals::BAN_STATUS_REQUEST | crate::appeals::APPEAL => Ok(self.handle_banned(sender, message, now)?.unwrap_or_default()),
                 LEAVE if self.store.remove_waiting(sender)? => Ok(Outcome { notices: self.admins_told()?, ..Outcome::default() }),
                 PROFILE if self.store.waiting_one(sender)?.is_some() => {
                     let profile = &body["profile"];
@@ -1649,6 +1656,12 @@ impl Community {
             };
         };
 
+        if let Some(outcome) = self.handle_banned(sender, message, now)? {
+            return Ok(outcome);
+        }
+        if let Some(outcome) = self.handle_appeals(sender, message_type, message, now)? {
+            return Ok(outcome);
+        }
         if let Some(outcome) = self.handle_moderation(&member, message_type, message, now)? {
             return Ok(outcome);
         }

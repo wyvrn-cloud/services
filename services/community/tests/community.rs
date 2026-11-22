@@ -1738,6 +1738,95 @@ async fn bans_timeouts_slow_mode_and_bulk_removal_are_kept_in_the_audit_log() {
 }
 
 #[tokio::test]
+async fn the_banned_are_told_why_and_may_appeal_once_at_a_time_and_closing_appeals_bans_for_good() {
+    let server = start_server("").await;
+    let (owner, member, other) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member, &other]);
+    for peer in [&owner, &member, &other] {
+        peer.community("join", json!({})).await;
+    }
+
+    // Banned with the reason shared: told it, and when they may first appeal (a day on).
+    owner.community("ban", json!({ "did": member.did(), "reason": "spam", "share_reason": true, "seconds": 7 * 86400 })).await;
+    let removed = member.next_of(&format!("{C}removed")).await;
+    let ban = &removed["body"]["ban"];
+    assert_eq!(ban["banned"], true, "{removed}");
+    assert_eq!(ban["reason"], "spam");
+    assert!(ban["until"].as_i64().is_some());
+    assert_eq!(ban["appeals"]["state"], "wait");
+    assert_eq!(ban["appeals"]["from"].as_i64().unwrap(), ban["at"].as_i64().unwrap() + 86400);
+    assert_eq!(member.community("ban-status-request", json!({})).await["body"]["appeals"]["state"], "wait");
+    let early = member.community("appeal", json!({ "text": "sorry" })).await;
+    assert_eq!(early["body"]["code"], "e.p.msg.appeal-wait", "{early}");
+    assert!(early["body"]["args"]["from"].as_i64().is_some());
+    // Nothing else is theirs to ask.
+    assert_eq!(member.community("post", json!({ "channel": "x", "content": "hi" })).await["body"]["code"], "e.p.trust.not-authorized");
+
+    // The community takes appeals at once, with an hour between refused ones.
+    let set = owner.community("set-appeals", json!({ "wait": 0, "cooldown": 3600 })).await;
+    assert_eq!(set["body"]["appeals"]["wait"], 0, "{set}");
+    assert_eq!(member.community("set-appeals", json!({ "wait": 0 })).await["body"]["code"], "e.p.trust.not-authorized");
+    let sent = member.community("appeal", json!({ "text": "I was hacked,\nit wasn't me" })).await;
+    assert_eq!(sent["body"]["appeals"]["state"], "pending", "{sent}");
+    assert_eq!(sent["body"]["appeal"]["text"], "I was hacked,\nit wasn't me");
+    assert_eq!(member.community("appeal", json!({ "text": "again" })).await["body"]["code"], "e.p.msg.appeal-pending");
+    assert_eq!(owner.community("join", json!({})).await["body"]["appeals"]["waiting"], 1);
+
+    // The moderator sees it with the ban, and refuses it, saying why.
+    let appeals = owner.community("appeals-request", json!({})).await;
+    let appeal = appeals["body"]["appeals"][0].clone();
+    assert_eq!(appeal["member"], server.id(&member), "{appeals}");
+    assert_eq!(appeal["ban"]["reason"], "spam");
+    assert_eq!(other.community("appeals-request", json!({})).await["body"]["code"], "e.p.trust.not-authorized");
+    let refused = owner.community("decide-appeal", json!({ "id": appeal["id"], "decision": "refuse", "reply": "The logs say otherwise." })).await;
+    assert_eq!(refused["body"]["appeals"].as_array().unwrap().len(), 0, "{refused}");
+    let told = member.next_of(&format!("{C}ban-status")).await;
+    assert_eq!(told["body"]["appeal"]["state"], "refused", "{told}");
+    assert_eq!(told["body"]["appeal"]["reply"], "The logs say otherwise.");
+    assert_eq!(told["body"]["appeals"]["state"], "wait");
+    assert!(told["body"]["appeals"]["from"].as_i64().unwrap() >= told["body"]["appeal"]["decided_at"].as_i64().unwrap() + 3600);
+
+    // Refused and closed: banned for good, nothing more to ask.
+    owner.community("set-appeals", json!({ "cooldown": 0 })).await;
+    member.community("appeal", json!({ "text": "please" })).await;
+    let id = owner.community("appeals-request", json!({})).await["body"]["appeals"][0]["id"].clone();
+    owner.community("decide-appeal", json!({ "id": id, "decision": "close" })).await;
+    let closed = member.next_of(&format!("{C}ban-status")).await;
+    assert_eq!(closed["body"]["appeals"]["state"], "closed", "{closed}");
+    assert!(closed["body"].get("until").is_none(), "permanent: {closed}");
+    assert_eq!(member.community("appeal", json!({ "text": "pretty please" })).await["body"]["code"], "e.p.msg.appeal-closed");
+    let bans = owner.community("bans-request", json!({})).await;
+    assert_eq!(bans["body"]["bans"][0]["appeals_closed"], true, "{bans}");
+
+    // A reason not shared isn't told; an appeal accepted lifts the ban, and they may ask in again.
+    owner.community("ban", json!({ "did": other.did(), "reason": "between us" })).await;
+    let removed = other.next_of(&format!("{C}removed")).await;
+    assert!(removed["body"]["ban"].get("reason").is_none(), "{removed}");
+    other.community("appeal", json!({ "text": "what did I do?" })).await;
+    let id = owner.community("appeals-request", json!({})).await["body"]["appeals"][0]["id"].clone();
+    owner.community("decide-appeal", json!({ "id": id, "decision": "accept", "reply": "Fair enough." })).await;
+    let lifted = other.next_of(&format!("{C}ban-status")).await;
+    assert_eq!(lifted["body"]["banned"], false, "{lifted}");
+    assert_eq!(lifted["body"]["reply"], "Fair enough.");
+    assert_eq!(other.community("ban-status-request", json!({})).await["body"]["banned"], false);
+    assert_ne!(other.community("join", json!({})).await["body"]["code"], "e.p.trust.not-authorized");
+
+    // Banned with no appeals at all, and lifted by hand: told so.
+    owner.community("ban", json!({ "did": other.did(), "appeals": false, "seconds": 3600 })).await;
+    let removed = other.next_of(&format!("{C}removed")).await;
+    assert_eq!(removed["body"]["ban"]["appeals"]["state"], "closed", "{removed}");
+    assert!(removed["body"]["ban"].get("until").is_none());
+    owner.community("unban", json!({ "did": other.did() })).await;
+    assert_eq!(other.next_of(&format!("{C}ban-status")).await["body"]["lifted"], true);
+
+    let audit = owner.community("audit-request", json!({})).await;
+    let actions: Vec<&str> = audit["body"]["entries"].as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap()).collect();
+    for expected in ["appeal.send", "appeal.refuse", "appeal.close", "appeal.accept", "community.appeals"] {
+        assert!(actions.contains(&expected), "{expected} in {actions:?}");
+    }
+}
+
+#[tokio::test]
 async fn automod_refuses_holds_and_alerts_and_join_gates_ask_before_letting_in() {
     let server = start_server("").await;
     let (owner, member, newcomer) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);

@@ -5,7 +5,7 @@
 
 use serde_json::{json, Value};
 
-use crate::community::{line, problem, refuse, reply_to, Community, Outcome, MEMBERS, REMOVED};
+use crate::community::{line, problem, refuse, reply_to, Community, Outcome, MEMBERS};
 use crate::store::{AuditEntry, Ban, Channel, Member};
 
 pub const BAN: &str = "https://wyvrn.app/community/1.0/ban";
@@ -95,6 +95,14 @@ impl Community {
         if let Some(reason) = &ban.reason {
             body["reason"] = json!(reason);
         }
+        let terms = self.store.ban_terms(&ban.did)?;
+        body["shared"] = json!(terms.shared);
+        if terms.closed {
+            body["appeals_closed"] = json!(true);
+        }
+        if terms.auto {
+            body["auto"] = json!(true);
+        }
         Ok(body)
     }
 
@@ -161,12 +169,14 @@ impl Community {
                     return refuse(message, "e.p.msg.invalid-ban", "That isn't a DID.").map(Some);
                 };
                 if message_type == UNBAN {
-                    self.store.unban_accounts_of(did)?;
-                    if !self.store.unban(did)? {
+                    if !self.lift_ban(did)? {
                         return refuse(message, "e.p.msg.unknown-ban", "They aren't banned.").map(Some);
                     }
                     self.audit(now, sender, "member.unban", Some(did), None);
-                    return Ok(Some(Outcome::reply(reply_to(message, BANS, self.bans_body(now)?))));
+                    // Told, so their app stops showing the ban (appeals.rs).
+                    let mut outcome = Outcome::reply(reply_to(message, BANS, self.bans_body(now)?));
+                    outcome.notices.push((did.to_string(), json!({ "type": crate::appeals::BAN_STATUS, "body": { "banned": false, "lifted": true } })));
+                    return Ok(Some(outcome));
                 }
                 if did == sender {
                     return refuse(message, "e.p.msg.invalid-ban", "You can't ban yourself.").map(Some);
@@ -197,6 +207,15 @@ impl Community {
                     None => self.store.waiting_one(did)?.and_then(|waiting| waiting.name),
                 };
                 self.store.ban(&Ban { did: did.to_string(), name, by: sender.to_string(), at: now, until, reason: reason.clone() })?;
+                // What it says to them: the reason, where the moderator shares it; and
+                // whether it may be appealed (not: banned for good).
+                let closed = body["appeals"] == false;
+                self.keep_ban_terms(did, &crate::appeals::Terms { shared: body["share_reason"] == true, closed, auto: false })?;
+                if closed {
+                    let mut ban = self.store.banned(did, now)?.expect("just banned");
+                    ban.until = None;
+                    self.store.ban(&ban)?;
+                }
                 // And the linked accounts they were checked to hold: a new DID showing
                 // one is banned as it shows it (protection.rs).
                 self.store.ban_accounts_of(did, until, now)?;
@@ -214,7 +233,7 @@ impl Community {
                     self.store.remove_member(did)?;
                 }
                 if existing.is_some() || was_waiting {
-                    outcome.notices.push((did.to_string(), json!({ "type": REMOVED, "body": { "was": "banned" } })));
+                    outcome.notices.push((did.to_string(), self.removed_banned(did, now)?));
                 }
                 if was_waiting {
                     outcome.notices.extend(self.admins_told()?);

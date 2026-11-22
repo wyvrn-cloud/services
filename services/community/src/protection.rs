@@ -131,6 +131,7 @@ impl Community {
         let name = self.store.member(did)?.and_then(|m| m.name).or(self.store.waiting_one(did)?.and_then(|w| w.name));
         let reason = format!("Holds the {service} account of someone banned here");
         self.store.ban(&crate::store::Ban { did: did.to_string(), name, by: self.own.clone().unwrap_or_default(), at: now, until, reason: Some(reason.clone()) })?;
+        self.keep_ban_terms(did, &crate::appeals::Terms { shared: true, closed: false, auto: true })?;
         self.store.ban_accounts_of(did, until, now)?;
         let was_waiting = self.store.remove_waiting(did)?;
         let was_member = self.store.member(did)?.is_some();
@@ -139,7 +140,7 @@ impl Community {
         }
         let mut outcome = crate::community::Outcome::default();
         if was_member || was_waiting {
-            outcome.notices.push((did.to_string(), json!({ "type": crate::community::REMOVED, "body": { "was": "banned" } })));
+            outcome.notices.push((did.to_string(), self.removed_banned(did, now)?));
         }
         if was_waiting {
             outcome.notices.extend(self.admins_told()?);
