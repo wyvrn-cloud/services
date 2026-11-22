@@ -334,6 +334,8 @@ impl Community {
         };
         let reply = text_of(&body["reply"], MAX_REPLY);
         let decision = body["decision"].as_str().unwrap_or_default();
+        // What they were called, for the audit log: no member, so not otherwise named.
+        let name = self.store.banned(&appeal.did, now)?.and_then(|ban| ban.name);
         let mut outcome = Outcome::default();
         match decision {
             "accept" => {
@@ -366,6 +368,9 @@ impl Community {
             _ => "appeal.close",
         };
         let mut details = json!({ "appeal": appeal.id });
+        if let Some(name) = &name {
+            details["name"] = json!(name);
+        }
         if let Some(reply) = &reply {
             details["reply"] = json!(reply);
         }
