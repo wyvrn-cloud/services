@@ -10,6 +10,11 @@
 //! a stolen database, file or backup alone doesn't make anyone the service. Keys
 //! found unsealed are sealed the first time they are read. Without one, they are
 //! kept as the file holds them: whoever can read the database can be the service.
+//!
+//! **Rotated** by giving the new key and, beside it, the old ones
+//! ([`opens_with_previous`]): keys sealed with an old one still open, and are
+//! sealed again with the new one as they are read. With old keys and no new one,
+//! they are unsealed as they are read: sealing turned off.
 
 use std::path::Path;
 
@@ -22,18 +27,35 @@ use crate::params;
 /// The key keys are sealed with at rest, once the process is given one.
 static SEAL: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
 
-/// Seals every identity this process keeps, from now on, with `key` (32 bytes, or
-/// base64 of them). Once: a second key is refused.
-pub fn seal_with(key: &str) -> anyhow::Result<()> {
+/// Keys sealed with before, which still open what they sealed (to be sealed again).
+static PREVIOUS: std::sync::OnceLock<Vec<[u8; 32]>> = std::sync::OnceLock::new();
+
+fn key_from(text: &str) -> anyhow::Result<[u8; 32]> {
     use base64::Engine;
-    let text = key.trim();
+    let text = text.trim();
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(text)
         .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(text.trim_end_matches('=')))
         .context("the seal key is base64 of 32 bytes")?;
-    let key: [u8; 32] = bytes.try_into().map_err(|_| anyhow::anyhow!("the seal key is base64 of 32 bytes"))?;
+    bytes.try_into().map_err(|_| anyhow::anyhow!("the seal key is base64 of 32 bytes"))
+}
+
+/// Seals every identity this process keeps, from now on, with `key` (32 bytes, or
+/// base64 of them). Once: a second key is refused.
+pub fn seal_with(key: &str) -> anyhow::Result<()> {
+    let key = key_from(key)?;
     anyhow::ensure!(SEAL.get().is_none_or(|held| *held == key), "a different seal key is set already");
     let _ = SEAL.set(key);
+    Ok(())
+}
+
+/// Keys sealed with before (base64, separated by commas, spaces or lines): what
+/// they sealed still opens, and is sealed again with the key given to
+/// [`seal_with`] as it is read, or unsealed where none is. Once.
+pub fn opens_with_previous(keys: &str) -> anyhow::Result<()> {
+    let keys: Vec<[u8; 32]> = keys.split(|c: char| c == ',' || c.is_whitespace()).filter(|k| !k.is_empty()).map(key_from).collect::<anyhow::Result<_>>()?;
+    anyhow::ensure!(PREVIOUS.get().is_none_or(|held| *held == keys), "other previous seal keys are set already");
+    let _ = PREVIOUS.set(keys);
     Ok(())
 }
 
@@ -41,8 +63,12 @@ const SEALED: &str = "wyvrn-sealed-identity/1";
 
 /// `identity` as it is kept: sealed, where there is a key, else as it is.
 fn kept_form(identity: &Identity, at: &str) -> anyhow::Result<String> {
+    kept_form_with(identity, at, SEAL.get())
+}
+
+fn kept_form_with(identity: &Identity, at: &str, key: Option<&[u8; 32]>) -> anyhow::Result<String> {
     let plain = identity.to_json()?;
-    let Some(key) = SEAL.get() else { return Ok(plain) };
+    let Some(key) = key else { return Ok(plain) };
     use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
     use base64::Engine;
     let cipher = aes_gcm::Aes256Gcm::new_from_slice(&derived(key, at)).expect("a 32-byte key");
@@ -55,22 +81,39 @@ fn kept_form(identity: &Identity, at: &str) -> anyhow::Result<String> {
 /// Keys as kept (sealed or not) read back; and whether they were unsealed, to be
 /// sealed now.
 fn read_kept(text: &str, at: &str) -> anyhow::Result<(Identity, bool)> {
+    read_kept_with(text, at, SEAL.get(), PREVIOUS.get().map(Vec::as_slice).unwrap_or_default())
+}
+
+fn read_kept_with(text: &str, at: &str, current: Option<&[u8; 32]>, previous: &[[u8; 32]]) -> anyhow::Result<(Identity, bool)> {
     let value: serde_json::Value = serde_json::from_str(text).context("the keys aren't JSON")?;
     if value["sealed"] != SEALED {
-        return Ok((Identity::from_json(text)?, SEAL.get().is_some()));
+        return Ok((Identity::from_json(text)?, current.is_some()));
     }
-    let key = SEAL.get().context("these keys are sealed: the key they were sealed with is needed (COMMUNITY_HOST_SEAL_KEY)")?;
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;
     let nonce = b64.decode(value["nonce"].as_str().unwrap_or_default()).context("sealed keys' nonce")?;
     let sealed = b64.decode(value["keys"].as_str().unwrap_or_default()).context("sealed keys")?;
     anyhow::ensure!(nonce.len() == 12, "sealed keys' nonce");
-    let cipher = aes_gcm::Aes256Gcm::new_from_slice(&derived(key, at)).expect("a 32-byte key");
-    let plain = cipher
-        .decrypt(aes_gcm::Nonce::from_slice(&nonce), Payload { msg: &sealed, aad: at.as_bytes() })
-        .map_err(|_| anyhow::anyhow!("these keys don't open with this seal key (or were moved from where they were sealed)"))?;
-    Ok((Identity::from_json(std::str::from_utf8(&plain)?)?, false))
+    let open = |key: &[u8; 32]| {
+        let cipher = aes_gcm::Aes256Gcm::new_from_slice(&derived(key, at)).expect("a 32-byte key");
+        cipher.decrypt(aes_gcm::Nonce::from_slice(&nonce), Payload { msg: &sealed, aad: at.as_bytes() }).ok()
+    };
+    anyhow::ensure!(current.is_some() || !previous.is_empty(), "these keys are sealed: the key they were sealed with is needed (COMMUNITY_HOST_SEAL_KEY)");
+    // With the key now, kept as they are; with an old one, sealed again (or unsealed).
+    let (plain, again) = match current.and_then(open) {
+        Some(plain) => (plain, false),
+        None => (
+            previous.iter().find_map(open).ok_or_else(|| anyhow::anyhow!("these keys don't open with this seal key or a previous one (or were moved from where they were sealed)"))?,
+            true,
+        ),
+    };
+    Ok((Identity::from_json(std::str::from_utf8(&plain)?)?, again))
+}
+
+/// What keys read and kept again became: sealed with the key now, or unsealed.
+fn rewritten() -> &'static str {
+    if SEAL.get().is_some() { "sealed" } else { "unsealed" }
 }
 
 fn derived(key: &[u8; 32], at: &str) -> [u8; 32] {
@@ -91,7 +134,7 @@ fn file_load(path: &Path) -> anyhow::Result<Identity> {
     let (identity, reseal) = read_kept(&text, &at)?;
     if reseal {
         write_file(path, &kept_form(&identity, &at)?)?;
-        tracing::info!(path = %path.display(), "keys sealed at rest");
+        tracing::info!(path = %path.display(), "keys {} at rest", rewritten());
     }
     Ok(identity)
 }
@@ -181,7 +224,7 @@ fn in_database(db: &Db, path: &Path, service: &str) -> anyhow::Result<Identity> 
         let (identity, reseal) = read_kept(&held, &at)?;
         if reseal {
             session.execute("UPDATE wyvrn_identity SET identity = ?1 WHERE id = 1", params![kept_form(&identity, &at)?])?;
-            tracing::info!("this service's keys are sealed at rest");
+            tracing::info!("this service's keys are {} at rest", rewritten());
         }
         return Ok(identity);
     }
@@ -204,6 +247,26 @@ mod tests {
 
     fn keys(identity: &Identity) -> String {
         identity.to_json().unwrap()
+    }
+
+    #[test]
+    fn keys_sealed_with_an_old_key_open_and_are_sealed_again_with_the_new_one_or_unsealed() {
+        let identity = Identity::generate().unwrap();
+        let (old, new, other) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let at = "file:den";
+        let under_old = kept_form_with(&identity, at, Some(&old)).unwrap();
+        // The new key alone doesn't open them; with the old one beside it they open, to be sealed again.
+        assert!(read_kept_with(&under_old, at, Some(&new), &[]).is_err());
+        let (read, again) = read_kept_with(&under_old, at, Some(&new), &[other, old]).unwrap();
+        assert_eq!(keys(&read), keys(&identity));
+        assert!(again);
+        let under_new = kept_form_with(&read, at, Some(&new)).unwrap();
+        assert!(!read_kept_with(&under_new, at, Some(&new), &[old]).unwrap().1, "with the key now: kept as they are");
+        // Old keys and no new one: they open, to be kept unsealed.
+        let (read, again) = read_kept_with(&under_new, at, None, &[new]).unwrap();
+        assert!(again);
+        assert!(!kept_form_with(&read, at, None).unwrap().contains(SEALED));
+        assert!(read_kept_with(&under_new, at, None, &[]).is_err());
     }
 
     #[test]

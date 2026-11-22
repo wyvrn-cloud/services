@@ -326,6 +326,10 @@ openssl rand -base64 32   # once; keep it safe: without it no community opens
       COMMUNITY_HOST_SEAL_KEY: ${COMMUNITY_HOST_SEAL_KEY}   # or COMMUNITY_HOST_SEAL_KEY_FILE: /run/secrets/seal
 ```
 
+It is optional: without a key, keys are kept as before (readable by whoever can read the store).
+
+**Rotating it.** Make a new key, set it as `COMMUNITY_HOST_SEAL_KEY` and put the old one in `COMMUNITY_HOST_SEAL_KEY_PREVIOUS` (or `COMMUNITY_HOST_SEAL_KEY_PREVIOUS_FILE`; several, separated by commas). Keys sealed with the old one still open and are sealed with the new one as each community is next opened; `wyvrn-community-host reseal` does all of them (and the host's own) at once, and says if any couldn't be read. Then drop the previous key. To turn sealing off, give only `COMMUNITY_HOST_SEAL_KEY_PREVIOUS` and run `reseal`: everything is kept unsealed again. Keep the old key as long as you keep backups taken under it.
+
 A backup then holds sealed keys: opening one to run elsewhere needs this key too. An owner's move-out export carries its keys readable, for their own server.
 
 **Own domains.** Owners may put their community's web pages at a domain of their own (Admin, "Your own domain": a CNAME to the host and a TXT record `_wyvrn.<domain>` the page gives, checked over DNS-over-HTTPS). Off unless turned on:

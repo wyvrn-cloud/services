@@ -13,6 +13,11 @@ use wyvrn_service::now;
 const USAGE: &str = "\
 wyvrn-community-host [--config <path>] [serve]                    run the host
 wyvrn-community-host [--config <path>] list                       every community
+wyvrn-community-host [--config <path>] reseal                     every community's keys (and the host's)
+                                                                  read and kept again now: sealed with
+                                                                  COMMUNITY_HOST_SEAL_KEY, or unsealed
+                                                                  without one. After rotating the key, so
+                                                                  the previous one can be dropped.
 wyvrn-community-host [--config <path>] create <name> <owner-did> [<storage>] [<title>]
                                                                   make one (storage: sqlite, mysql-db, mysql-shared)
 wyvrn-community-host [--config <path>] suspend|resume <name>      stop answering for one, or start again
@@ -54,6 +59,9 @@ wyvrn-community-host [--config <path>] open-backup <file> <out.tar.gz>
 The config path is --config, else $COMMUNITY_HOST_CONFIG, else config/default.toml.
 COMMUNITY_HOST_SEAL_KEY (base64 of 32 bytes; or COMMUNITY_HOST_SEAL_KEY_FILE) seals every
 community's keys at rest; keys found unsealed are sealed as they are next read.
+To rotate it, give the new one and COMMUNITY_HOST_SEAL_KEY_PREVIOUS (or _PREVIOUS_FILE: the
+old ones, separated by commas): keys sealed with an old one open, and are sealed with the new
+one as they are next read (or all at once, with reseal). Old ones and no new one: sealing off.
 A change made here while the host runs is taken up when the community is next opened.";
 
 fn registry(config: &Config) -> anyhow::Result<Registry> {
@@ -86,6 +94,13 @@ async fn main() -> anyhow::Result<()> {
         let key = std::fs::read_to_string(&path).with_context(|| format!("COMMUNITY_HOST_SEAL_KEY_FILE {path}"))?;
         wyvrn_service::identity::seal_with(&key).context("COMMUNITY_HOST_SEAL_KEY_FILE")?;
     }
+    // Keys sealed with before, while the key is being rotated (or sealing turned off).
+    if let Some(keys) = std::env::var("COMMUNITY_HOST_SEAL_KEY_PREVIOUS").ok().filter(|k| !k.trim().is_empty()) {
+        wyvrn_service::identity::opens_with_previous(&keys).context("COMMUNITY_HOST_SEAL_KEY_PREVIOUS")?;
+    } else if let Some(path) = std::env::var("COMMUNITY_HOST_SEAL_KEY_PREVIOUS_FILE").ok().filter(|p| !p.trim().is_empty()) {
+        let keys = std::fs::read_to_string(&path).with_context(|| format!("COMMUNITY_HOST_SEAL_KEY_PREVIOUS_FILE {path}"))?;
+        wyvrn_service::identity::opens_with_previous(&keys).context("COMMUNITY_HOST_SEAL_KEY_PREVIOUS_FILE")?;
+    }
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let state_of = |name: &str, state: State, sealed: Option<i64>| -> anyhow::Result<()> {
         let registry = registry(&config)?;
@@ -105,6 +120,28 @@ async fn main() -> anyhow::Result<()> {
             let host = Host::new(config.clone(), registry(&config)?);
             let made = tokio::task::block_in_place(|| host.back_up(name, now()))?;
             println!("{}", made.display());
+            Ok(())
+        }
+        ["reseal"] => {
+            // Reading keys keeps them again as this process would: sealed with the
+            // key now (or unsealed), whatever they were sealed with before.
+            let location = wyvrn_service::db::Location::from_env("COMMUNITY_HOST", &config.store.path)?;
+            wyvrn_service::identity::load(&location, &config.identity.path, "community-host").context("the host's own keys")?;
+            let host = Host::new(config.clone(), registry(&config)?);
+            let (mut done, mut failed) = (0, 0);
+            for record in registry(&config)?.all()? {
+                let read = host.stores(&record, record.storage).and_then(|stores| wyvrn_service::identity::load(&stores.community, &host.settings(&record).identity.path, "community"));
+                match read {
+                    Ok(Some(_)) => done += 1,
+                    Ok(None) => println!("{}: no keys yet", record.name),
+                    Err(error) => {
+                        failed += 1;
+                        println!("{}: {error:#}", record.name);
+                    }
+                }
+            }
+            println!("{done} communities' keys kept again, and the host's{}", if failed > 0 { format!("; {failed} couldn't be") } else { String::new() });
+            anyhow::ensure!(failed == 0, "some keys couldn't be read: keep the previous key until they can");
             Ok(())
         }
         ["list"] => {
