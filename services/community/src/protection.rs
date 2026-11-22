@@ -70,6 +70,20 @@ impl Store {
         Ok(None)
     }
 
+    /// Who else was checked to hold one of `accounts`: members, or those asking.
+    pub fn holders_of(&self, accounts: &[(String, String)], except: &str) -> wyvrn_service::db::Result<Vec<String>> {
+        let mut found = Vec::new();
+        for (service, account) in accounts {
+            let dids: Vec<String> = self.db.lock().query("SELECT did FROM member_accounts WHERE service = ?1 AND account = ?2", params![service, account], |row| row.get(0))?;
+            for did in dids {
+                if did != except && !found.contains(&did) {
+                    found.push(did);
+                }
+            }
+        }
+        Ok(found)
+    }
+
     /// How many were let in, or asked to be, since `since`.
     pub fn joined_since(&self, since: i64) -> wyvrn_service::db::Result<i64> {
         // (And those asking: a community where an admin lets people in is raided
@@ -134,6 +148,50 @@ impl Community {
         Ok(outcome)
     }
 
+    /// Bans whoever is here holding one of the accounts `banned` was banned holding:
+    /// a ban reaching what came in before it (another DID of theirs already a
+    /// member), or what it was found to hold since. Not an owner or admin, who is
+    /// left to be looked at, in the audit log.
+    pub fn ban_holders(&self, banned: &str, now: i64) -> anyhow::Result<crate::community::Outcome> {
+        let mut outcome = crate::community::Outcome::default();
+        let accounts = self.store.member_accounts(banned)?;
+        for did in self.store.holders_of(&accounts, banned)? {
+            if self.store.banned(&did, now)?.is_some() || (self.store.member(&did)?.is_none() && self.store.waiting_one(&did)?.is_none()) {
+                continue;
+            }
+            let held: Vec<(String, String)> = self.store.member_accounts(&did)?.into_iter().filter(|a| accounts.contains(a)).collect();
+            let Some((service, account)) = held.first().cloned() else { continue };
+            if self.powers(&did)?.all() {
+                self.audit(now, self.own.as_deref().unwrap_or_default(), "member.ban-evasion-spared", Some(&did), Some(json!({ "as": banned, "service": service, "account": account })));
+                continue;
+            }
+            let more = self.ban_evading(&did, banned, &service, &account, now)?;
+            outcome.notices.extend(more.notices);
+        }
+        Ok(outcome)
+    }
+
+    /// Adds to a running ban accounts the banned person was found to hold since
+    /// (`found`, checked as a profile's are), and bans whoever here holds one.
+    /// `None` when none were new.
+    pub fn banned_now_hold(&self, banned: &str, found: &[(String, String)], now: i64) -> anyhow::Result<Option<crate::community::Outcome>> {
+        let Some(ban) = self.store.banned(banned, now)? else { return Ok(None) };
+        let mut held = self.store.member_accounts(banned)?;
+        let before = held.len();
+        for account in found {
+            if !held.contains(account) {
+                held.push(account.clone());
+            }
+        }
+        if held.len() == before {
+            return Ok(None);
+        }
+        self.store.set_member_accounts(banned, &held, now)?;
+        self.store.ban_accounts_of(banned, ban.until, now)?;
+        self.audit(now, self.own.as_deref().unwrap_or_default(), "member.ban-accounts", Some(banned), Some(json!({ "accounts": held.len() - before })));
+        self.ban_holders(banned, now).map(Some)
+    }
+
     /// Whether `member` is held back as new: no role, and joined within the gates'
     /// `new_member_hours`.
     pub fn is_new_member(&self, member: &Member, now: i64) -> anyhow::Result<bool> {
@@ -196,6 +254,8 @@ mod tests {
         store.unban_accounts_of("did:example:troll").unwrap();
         store.ban_accounts_of("did:example:troll", None, 10).unwrap();
         store.unban_accounts_of("did:example:troll").unwrap();
-        assert_eq!(store.banned_holding(&[twitch], 50).unwrap(), None);
+        assert_eq!(store.banned_holding(std::slice::from_ref(&twitch), 50).unwrap(), None);
+        store.set_member_accounts("did:example:alt", std::slice::from_ref(&twitch), 1).unwrap();
+        assert_eq!(store.holders_of(&[twitch], "did:example:troll").unwrap(), vec!["did:example:alt".to_string()]);
     }
 }

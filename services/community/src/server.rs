@@ -1131,6 +1131,45 @@ pub fn prune_once(state: &AppState) {
     }
 }
 
+/// How often the people banned are looked at again for accounts they linked since.
+pub const BANS_LOOKED_AT_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// A ban follows the linked accounts its person shows after it, too: every few
+/// hours, the public address each banned person's profile named is read again, and
+/// any account it now proves (checked as a profile's are) is banned with them, and
+/// whoever here holds it (protection.rs).
+pub async fn run_ban_watch(state: Arc<AppState>) {
+    loop {
+        tokio::time::sleep(BANS_LOOKED_AT_EVERY).await;
+        look_at_bans_again(&state).await;
+    }
+}
+
+pub async fn look_at_bans_again(state: &Arc<AppState>) {
+    let community = &state.community;
+    let issuers = community.config.linked_account_issuers.clone();
+    if issuers.is_empty() {
+        return;
+    }
+    let bans = match community.store.bans(now()) {
+        Ok(bans) => bans,
+        Err(error) => return tracing::warn!(%error, "couldn't read the bans to look at again"),
+    };
+    for ban in bans {
+        let Ok(Some(address)) = community.store.member_profile(&ban.did).map(|p| p.and_then(|p| p.public_address)) else { continue };
+        let Some(linked) = crate::address_banner::linked_of_address(&address).await else { continue };
+        let now_text = chrono::DateTime::from_timestamp(now(), 0).map(|t| t.to_rfc3339()).unwrap_or_default();
+        let accounts = crate::claims::verified_accounts(&linked, &address, &issuers, &now_text, fetch_small_json).await;
+        match community.banned_now_hold(&ban.did, &accounts, now()) {
+            Ok(Some(outcome)) => {
+                carry_out(state, &ban.did, outcome);
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "a ban's new linked accounts couldn't be kept"),
+        }
+    }
+}
+
 /// Pruned every hour.
 pub async fn run_pruning(state: Arc<AppState>) {
     loop {

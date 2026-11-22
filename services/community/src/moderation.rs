@@ -219,6 +219,9 @@ impl Community {
                 if was_waiting {
                     outcome.notices.extend(self.admins_told()?);
                 }
+                // Another DID of theirs already here, holding one of those accounts:
+                // banned with them.
+                outcome.notices.extend(self.ban_holders(did, now)?.notices);
                 let mut details = json!({ "removed": removed.len() });
                 if let Some(name) = existing.as_ref().and_then(|m| m.name.clone()) {
                     details["name"] = json!(name);

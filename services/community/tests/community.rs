@@ -1034,7 +1034,15 @@ async fn an_admin_opens_voice_channels_with_a_text_chat_of_their_own() {
     assert_eq!(made["body"]["voice"]["transport"], "moq");
     member.next_of(&format!("{C}community")).await;
 
-    // It has a text chat of its own, as Discord's voice channels do.
+    // A text chat of its own, as Discord's voice channels have, once the community
+    // turns it on: off at first.
+    assert_eq!(made["body"]["voice"]["text_chat"], false);
+    let refused = member.community("post", json!({ "channel": id, "content": "hi" })).await;
+    assert_eq!(refused["body"]["code"], "e.p.msg.voice-channel", "{refused}");
+    assert_eq!(member.community("set-voice", json!({ "text_chat": true })).await["body"]["code"], "e.p.trust.not-authorized");
+    let on = admin.community("set-voice", json!({ "text_chat": true })).await;
+    assert_eq!(on["body"]["voice"]["text_chat"], true, "{on}");
+    member.next_of(&format!("{C}community")).await;
     let posted = member.community("post", json!({ "channel": id, "content": "hi" })).await;
     assert_eq!(kind(&posted), "posted", "{posted}");
     let history = member.community("history-request", json!({ "channel": id })).await;
@@ -4496,6 +4504,33 @@ async fn new_accounts_are_held_back_where_the_gates_say_and_a_ban_follows_its_li
     state.community.ban_evading(&again.did(), &banned, &service, &account, wyvrn_service::now()).unwrap();
     assert!(state.community.store.member(&again.did()).unwrap().is_none());
     assert!(state.community.store.banned(&again.did(), wyvrn_service::now()).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_ban_reaches_another_did_already_in_and_accounts_linked_after_it() {
+    let server = start_server("").await;
+    let (admin, troll, alt, later) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &troll, &alt, &later]);
+    for peer in [&troll, &alt, &later] {
+        peer.community("join", json!({})).await;
+    }
+    let store = &server.state.community.store;
+    let twitch = ("https://twitch.tv".to_string(), "4242".to_string());
+    let bsky = ("https://bsky.app".to_string(), "troll.bsky.social".to_string());
+    store.set_member_accounts(&troll.did(), std::slice::from_ref(&twitch), 1).unwrap();
+    // In before the ban, with the same account: banned with it.
+    store.set_member_accounts(&alt.did(), std::slice::from_ref(&twitch), 1).unwrap();
+    store.set_member_accounts(&later.did(), std::slice::from_ref(&bsky), 1).unwrap();
+    admin.community("ban", json!({ "did": troll.did(), "reason": "spam" })).await;
+    let now = wyvrn_service::now();
+    assert!(store.banned(&alt.did(), now).unwrap().is_some(), "the alt already in");
+    assert!(store.member(&alt.did()).unwrap().is_none());
+    assert!(store.banned(&later.did(), now).unwrap().is_none(), "not an account the ban knew of");
+    // The banned person's address proves another account since: it's banned too,
+    // and whoever here holds it.
+    assert!(server.state.community.banned_now_hold(&troll.did(), std::slice::from_ref(&bsky), now).unwrap().is_some());
+    assert!(store.banned(&later.did(), now).unwrap().is_some());
+    assert!(server.state.community.banned_now_hold(&troll.did(), &[bsky], now).unwrap().is_none(), "nothing new the second time");
 }
 
 #[tokio::test]

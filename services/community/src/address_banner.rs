@@ -34,6 +34,23 @@ where
     F: Fn(String) -> Fut,
     Fut: Future<Output = Result<Option<String>, String>>,
 {
+    let banner = profile_of(address, fetch).await?.banner?;
+    let (media_type, data) = banner.url.strip_prefix("data:")?.split_once(";base64,")?;
+    let media_type = media_type.to_ascii_lowercase();
+    if !matches!(media_type.as_str(), "image/webp" | "image/png" | "image/jpeg" | "image/gif") {
+        return None;
+    }
+    base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+    Some((media_type, data.to_string()))
+}
+
+/// What the address `address` publishes about its holder (its whois), read and
+/// checked as an app reads it.
+pub async fn profile_of<F, Fut>(address: &str, fetch: F) -> Option<wyvrn_hosted_did::whois::Profile>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<Option<String>, String>>,
+{
     let mut files = Files::new();
     let found = loop {
         match read::read(address, &files).await {
@@ -47,14 +64,29 @@ where
             Step::Need(_) => return None,
         }
     };
-    let banner = found.profile?.banner?;
-    let (media_type, data) = banner.url.strip_prefix("data:")?.split_once(";base64,")?;
-    let media_type = media_type.to_ascii_lowercase();
-    if !matches!(media_type.as_str(), "image/webp" | "image/png" | "image/jpeg" | "image/gif") {
-        return None;
-    }
-    base64::engine::general_purpose::STANDARD.decode(data).ok()?;
-    Some((media_type, data.to_string()))
+    found.profile
+}
+
+/// The linked-account credentials the address `address` publishes now, over HTTPS.
+pub async fn linked_of_address(address: &str) -> Option<Vec<Value>> {
+    static HTTP: std::sync::LazyLock<reqwest::Client> =
+        std::sync::LazyLock::new(|| reqwest::Client::builder().timeout(Duration::from_secs(5)).build().expect("a client with a timeout builds"));
+    let profile = profile_of(address, |url| async move {
+        let response = HTTP.get(&url).send().await.map_err(|e| e.to_string())?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(format!("{url}: {}", response.status()));
+        }
+        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+        if bytes.len() > MAX_FILE_BYTES {
+            return Err(format!("{url} is too large"));
+        }
+        String::from_utf8(bytes.to_vec()).map(Some).map_err(|e| e.to_string())
+    })
+    .await?;
+    Some(profile.linked)
 }
 
 /// [`banner_of`] over HTTPS, each address at most once an hour.

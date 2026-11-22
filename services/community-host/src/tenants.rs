@@ -276,6 +276,7 @@ impl Host {
             tokio::spawn(server::run_deliveries(state.clone())),
             tokio::spawn(server::run_pruning(state.clone())),
             tokio::spawn(server::run_voice_sweep(state.clone())),
+            tokio::spawn(server::run_ban_watch(state.clone())),
             tokio::spawn(server::run_polls(state.clone())),
             tokio::spawn(wyvrn_community::outgoing::run_outgoing(state.clone())),
         ];

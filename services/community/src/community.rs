@@ -538,11 +538,18 @@ impl Community {
     pub fn voice_defaults(&self) -> anyhow::Result<Option<Value>> {
         let Some(voice) = &self.voice else { return Ok(None) };
         let transport = self.store.setting("voice_transport")?.unwrap_or_else(|| voice.transport.clone());
-        let mut body = json!({ "transport": transport });
+        let mut body = json!({ "transport": transport, "text_chat": self.voice_text_chat()? });
         if let Some(channel) = self.store.setting("voice_invites_to")?.filter(|c| !c.is_empty()) {
             body["invites_to"] = json!(channel);
         }
         Ok(Some(body))
+    }
+
+    /// Whether voice channels (and stages) have a text chat of their own: off unless
+    /// an admin turns it on (`set-voice`'s `text_chat`), since a chat beside a call
+    /// is one more place to keep an eye on.
+    pub fn voice_text_chat(&self) -> anyhow::Result<bool> {
+        Ok(self.store.setting("voice_text")?.as_deref() == Some("true"))
     }
 
     /// A community as its settings have it, with what an admin changed last time
@@ -1380,8 +1387,12 @@ impl Community {
         if channel.closed {
             return refuse(message, "e.p.msg.closed", "That channel is closed.");
         }
-        // A voice channel (and a stage) has a text chat of its own, as Discord's do:
-        // posted in as any channel, by the same permissions.
+        // A voice channel (and a stage) has a text chat of its own, as Discord's do,
+        // where the community turned it on: posted in as any channel, by the same
+        // permissions.
+        if channel.voice.is_some() && !self.voice_text_chat()? {
+            return refuse(message, "e.p.msg.voice-channel", "This community's voice channels have no text chat.");
+        }
         if channel.calendar {
             return refuse(message, "e.p.msg.calendar-channel", "A calendar channel takes no posts: it shows the community's events.");
         }
@@ -2448,6 +2459,11 @@ impl Community {
                     None => {}
                     Some(Value::String(t)) if t == "moq" || t == "webrtc" => self.store.set_setting("voice_transport", t)?,
                     Some(_) => return refuse(message, "e.p.msg.invalid-voice", "The transport is moq or webrtc."),
+                }
+                match body.get("text_chat") {
+                    None => {}
+                    Some(Value::Bool(on)) => self.store.set_setting("voice_text", if *on { "true" } else { "false" })?,
+                    Some(_) => return refuse(message, "e.p.msg.invalid-voice", "text_chat is true or false."),
                 }
                 match body.get("invites_to") {
                     None => {}
