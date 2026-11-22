@@ -161,6 +161,7 @@ impl Community {
                     return refuse(message, "e.p.msg.invalid-ban", "That isn't a DID.").map(Some);
                 };
                 if message_type == UNBAN {
+                    self.store.unban_accounts_of(did)?;
                     if !self.store.unban(did)? {
                         return refuse(message, "e.p.msg.unknown-ban", "They aren't banned.").map(Some);
                     }
@@ -196,6 +197,9 @@ impl Community {
                     None => self.store.waiting_one(did)?.and_then(|waiting| waiting.name),
                 };
                 self.store.ban(&Ban { did: did.to_string(), name, by: sender.to_string(), at: now, until, reason: reason.clone() })?;
+                // And the linked accounts they were checked to hold: a new DID showing
+                // one is banned as it shows it (protection.rs).
+                self.store.ban_accounts_of(did, until, now)?;
                 let was_waiting = self.store.remove_waiting(did)?;
                 let mut outcome = Outcome::reply(reply_to(message, BANS, json!({})));
                 let mut removed = Vec::new();

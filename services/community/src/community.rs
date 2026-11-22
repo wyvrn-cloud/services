@@ -28,6 +28,8 @@ pub const MEMBERS_REQUEST: &str = "https://wyvrn.app/community/1.0/members-reque
 pub const CLAIM_IMPORTED: &str = "https://wyvrn.app/community/1.0/claim-imported";
 /// A moderator's answer to one: `{ member, approve }`.
 pub const DECIDE_CLAIM: &str = "https://wyvrn.app/community/1.0/decide-claim";
+/// Raid mode, turned on for `{ minutes }` or off (`0`).
+pub const SET_RAID: &str = "https://wyvrn.app/community/1.0/set-raid";
 pub const MEMBERS: &str = "https://wyvrn.app/community/1.0/members";
 pub const MEMBER_CHANGED: &str = "https://wyvrn.app/community/1.0/member-changed";
 pub const SET_MEMBER_PROFILE: &str = "https://wyvrn.app/community/1.0/set-member-profile";
@@ -777,8 +779,30 @@ impl Community {
             if let Some(until) = self.store.timed_out_until(&member.did, crate::gates::now())? {
                 body["timed_out_until"] = json!(until);
             }
-            if let Some(wait) = self.post_wait()? {
-                body["gates"] = json!({ "post_wait": wait });
+            {
+                let gates = self.gates()?;
+                let mut said = json!({});
+                if let Some(wait) = self.post_wait()? {
+                    said["post_wait"] = json!(wait);
+                }
+                if gates["linked_account"] == true {
+                    said["linked_account"] = json!(true);
+                }
+                if let Some(hours) = gates["new_member_hours"].as_i64().filter(|h| *h > 0) {
+                    said["new_member_hours"] = json!(hours);
+                }
+                if said.as_object().is_some_and(|o| !o.is_empty()) {
+                    body["gates"] = said;
+                }
+            }
+            // Raid mode, and a burst of joins that may be one, to whoever may stop it.
+            if powers.has("ban_members") || powers.has("manage_community") {
+                let now = crate::gates::now();
+                if let Some(raid) = self.raid(now)? {
+                    body["raid"] = json!({ "until": raid["until"] });
+                } else if let Some(joins) = self.raid_suggested(now)? {
+                    body["raid_suggested"] = json!({ "joins": joins, "minutes": crate::protection::BURST_WINDOW / 60 });
+                }
             }
             // A category with nothing in it they may see isn't there for them either,
             // unless they arrange channels.
@@ -1382,6 +1406,9 @@ impl Community {
             if let Some(refused) = self.posting_refused(member, &channel, now)? {
                 return refused.answer(message);
             }
+            if let Some(refused) = self.protection_refused(member, body, now)? {
+                return refused.answer(message);
+            }
         }
         let content = body["content"].as_str().unwrap_or_default().trim();
         let question = match body.get("question").filter(|question| !question.is_null()) {
@@ -1582,6 +1609,10 @@ impl Community {
             return match message_type {
                 JOIN => match self.rules_before_join(sender, message)? {
                     Some(rules) => Ok(rules),
+                    // Raid mode: nobody new for now.
+                    None if self.raid(now)?.is_some() && self.store.waiting_one(sender)?.is_none() => {
+                        refuse(message, "e.p.req.raid", "This community isn't taking new members for a while. Try again later.")
+                    }
                     None => match self.store.banned(sender, now)?.is_some() {
                         // (Not asked anything: refused as anyone is who isn't let in.)
                         true => self.join_from_outside(sender, message, now),
@@ -2160,6 +2191,26 @@ impl Community {
                     history["thread"] = json!(thread);
                 }
                 Ok(Outcome::reply(reply_to(message, HISTORY, history)))
+            }
+
+            SET_RAID => {
+                let powers = self.powers(sender)?;
+                if !(powers.has("ban_members") || powers.has("manage_community")) {
+                    return refuse(message, "e.p.trust.not-authorized", "Raid mode is for whoever may ban members, or manage the community.");
+                }
+                let Some(minutes) = body["minutes"].as_i64().filter(|m| (0..=crate::protection::RAID_LONGEST / 60).contains(m)) else {
+                    return refuse(message, "e.p.msg.invalid-raid", "Raid mode is on for up to a day (1,440 minutes), or 0 to end it.");
+                };
+                self.set_raid(sender, minutes, now)?;
+                self.audit(now, sender, if minutes > 0 { "raid.on" } else { "raid.off" }, None, Some(json!({ "minutes": minutes })));
+                let mut outcome = Outcome::reply(reply_to(message, COMMUNITY, self.community(&member)?));
+                let mut told = std::collections::HashSet::new();
+                for moderator in self.joined_holding("ban_members")?.into_iter().chain(self.joined_holding("manage_community")?) {
+                    if moderator.did != sender && told.insert(moderator.did.clone()) {
+                        outcome.notices.push((moderator.did.clone(), json!({ "type": COMMUNITY, "body": self.community(&moderator)? })));
+                    }
+                }
+                Ok(outcome)
             }
 
             CLAIM_IMPORTED => {

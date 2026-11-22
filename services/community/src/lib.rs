@@ -33,6 +33,7 @@ pub mod member_ids;
 pub mod moderation;
 pub mod outgoing;
 pub mod posting;
+pub mod protection;
 pub mod questions;
 pub mod roles;
 pub mod serve;

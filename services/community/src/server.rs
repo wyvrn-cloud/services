@@ -543,7 +543,7 @@ impl CommunityService {
             .and_then(|(address, linked)| Some((address?, linked?)));
         let outcome = state.community.handle(&sender, message, now())?;
         if let Some((address, linked)) = linked_with {
-            tokio::spawn(consider_claim(Arc::clone(state), sender.clone(), address, linked, first_profile));
+            tokio::spawn(consider_profile(Arc::clone(state), sender.clone(), address, linked, first_profile));
         }
         if message["type"] != community::PROFILE {
             ask_for_profile(state, &sender);
@@ -556,12 +556,33 @@ impl CommunityService {
 /// where posts were imported under it; and, within a day of joining (or on the
 /// first profile they send), makes those posts theirs at once (claims.rs). Fetches
 /// only from the trusted issuers' own addresses, with a time and size limit.
-async fn consider_claim(state: Arc<AppState>, did: String, address: String, linked: Vec<Value>, first_profile: bool) {
+async fn consider_profile(state: Arc<AppState>, did: String, address: String, linked: Vec<Value>, first_profile: bool) {
     let community = &state.community;
     let issuers = community.config.linked_account_issuers.clone();
     let now_text = chrono::DateTime::from_timestamp(now(), 0).map(|t| t.to_rfc3339()).unwrap_or_default();
-    let Some(discord_id) = crate::claims::verified_discord(&linked, &address, &issuers, &now_text, fetch_small_json).await else { return };
+    let accounts = crate::claims::verified_accounts(&linked, &address, &issuers, &now_text, fetch_small_json).await;
     let store = &community.store;
+    // The accounts they hold, for bans and the gates; and one held by someone banned
+    // is that ban coming back (protection.rs).
+    let evading = (|| -> anyhow::Result<bool> {
+        if store.member(&did)?.is_none() && store.waiting_one(&did)?.is_none() {
+            return Ok(false);
+        }
+        store.set_member_accounts(&did, &accounts, now())?;
+        let Some((banned, service, account)) = store.banned_holding(&accounts, now())? else { return Ok(false) };
+        if banned == did {
+            return Ok(false);
+        }
+        let outcome = community.ban_evading(&did, &banned, &service, &account, now())?;
+        carry_out(&state, &did, outcome);
+        Ok(true)
+    })();
+    match evading {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => tracing::warn!(%error, "a member's linked accounts couldn't be kept"),
+    }
+    let Some(discord_id) = accounts.iter().find(|(service, _)| service == "https://discord.com" || service == "https://discord.gg").map(|(_, id)| id.clone()) else { return };
     let result = (|| -> anyhow::Result<()> {
         if !store.has_imported_from(&discord_id)? {
             return Ok(());

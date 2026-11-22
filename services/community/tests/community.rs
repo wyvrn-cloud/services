@@ -4433,3 +4433,67 @@ async fn posting_in_threads_and_making_polls_are_permissions_of_their_own() {
     assert_eq!(member.community("post", json!({ "channel": channel, "content": "no" })).await["body"]["code"], "e.p.trust.not-authorized");
     assert_eq!(kind(&member.community("post", json!({ "channel": channel, "content": "in it", "thread": "root" })).await), "posted");
 }
+
+#[tokio::test]
+async fn raid_mode_lets_nobody_new_in_slows_everyone_without_a_role_and_is_suggested_at_a_burst() {
+    let server = start_server("").await;
+    let (admin, member, stranger) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member]);
+    member.community("join", json!({})).await;
+    let channel = open_channel(&admin, "general").await;
+    let store = &server.state.community.store;
+    // Burst: a dozen let in within minutes.
+    for n in 0..12 {
+        store.admit(&format!("did:example:raider{n}"), wyvrn_community::store::Role::Member, wyvrn_service::now()).unwrap();
+    }
+    let seen = admin.community("join", json!({})).await;
+    assert!(seen["body"]["raid_suggested"]["joins"].as_i64().unwrap() >= 12, "{seen}");
+    assert!(member.community("join", json!({})).await["body"].get("raid_suggested").is_none(), "only to whoever may stop it");
+    assert_eq!(member.community("set-raid", json!({ "minutes": 60 })).await["body"]["code"], "e.p.trust.not-authorized");
+
+    let on = admin.community("set-raid", json!({ "minutes": 60 })).await;
+    assert!(on["body"]["raid"]["until"].as_i64().is_some(), "{on}");
+    assert!(on["body"].get("raid_suggested").is_none());
+    assert_eq!(stranger.community("join", json!({})).await["body"]["code"], "e.p.req.raid");
+    assert_eq!(kind(&member.community("post", json!({ "channel": channel, "content": "one" })).await), "posted");
+    assert_eq!(member.community("post", json!({ "channel": channel, "content": "two" })).await["body"]["code"], "e.p.msg.slow-mode");
+    // An admin isn't held to it.
+    admin.community("post", json!({ "channel": channel, "content": "a" })).await;
+    assert_eq!(kind(&admin.community("post", json!({ "channel": channel, "content": "b" })).await), "posted");
+
+    admin.community("set-raid", json!({ "minutes": 0 })).await;
+    assert_eq!(kind(&stranger.community("join", json!({})).await), "waiting");
+}
+
+#[tokio::test]
+async fn new_accounts_are_held_back_where_the_gates_say_and_a_ban_follows_its_linked_accounts() {
+    let server = start_server("").await;
+    let (admin, member, again) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member, &again]);
+    member.community("join", json!({})).await;
+    again.community("join", json!({})).await;
+    let channel = open_channel(&admin, "general").await;
+    let state = &server.state;
+    state.community.store.set_setting("gates", &json!({ "new_member_hours": 24, "linked_account": true }).to_string()).unwrap();
+    // No verified linked account: not yet.
+    assert_eq!(member.community("post", json!({ "channel": channel, "content": "hi" })).await["body"]["code"], "e.p.msg.needs-linked-account");
+    let twitch = ("https://twitch.tv".to_string(), "4242".to_string());
+    state.community.store.set_member_accounts(&member.did(), std::slice::from_ref(&twitch), 1).unwrap();
+    assert_eq!(kind(&member.community("post", json!({ "channel": channel, "content": "hi" })).await), "posted");
+    // New (let in just now): no links yet.
+    let newbie = Peer::start(&server).await;
+    state.community.store.admit(&newbie.did(), wyvrn_community::store::Role::Member, wyvrn_service::now()).unwrap();
+    newbie.community("join", json!({})).await;
+    state.community.store.set_member_accounts(&newbie.did(), &[("https://bsky.app".to_string(), "new.bsky.social".to_string())], 1).unwrap();
+    assert_eq!(newbie.community("post", json!({ "channel": channel, "content": "see https://example.com" })).await["body"]["code"], "e.p.msg.too-new");
+    assert_eq!(kind(&newbie.community("post", json!({ "channel": channel, "content": "hello, I'm new" })).await), "posted");
+
+    // Banned, and back with another DID holding the same Twitch account: banned on sight.
+    admin.community("ban", json!({ "did": member.did(), "reason": "spam" })).await;
+    state.community.store.set_member_accounts(&again.did(), std::slice::from_ref(&twitch), 2).unwrap();
+    let (banned, service, account) = state.community.store.banned_holding(&[twitch], wyvrn_service::now()).unwrap().unwrap();
+    assert_eq!(banned, member.did());
+    state.community.ban_evading(&again.did(), &banned, &service, &account, wyvrn_service::now()).unwrap();
+    assert!(state.community.store.member(&again.did()).unwrap().is_none());
+    assert!(state.community.store.banned(&again.did(), wyvrn_service::now()).unwrap().is_some());
+}

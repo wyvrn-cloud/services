@@ -57,17 +57,37 @@ fn origin(url: &str) -> Option<String> {
     (parsed.scheme() == "https").then(|| format!("https://{}", parsed.host_str().unwrap_or_default()))
 }
 
-/// The Discord id a member's profile proves: among its linked-account credentials,
-/// one about `address` (the public address the profile showed to be theirs), for
-/// a Discord account, from one of `issuers`, signed, in date and not revoked.
-/// Nothing is fetched but from the issuer's own origin. `fetch` gets a URL's JSON.
+/// The Discord id a member's profile proves (see [`verified_accounts`]).
 pub async fn verified_discord<F, Fut>(linked: &[Value], address: &str, issuers: &[String], now: &str, fetch: F) -> Option<String>
 where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = Option<Value>>,
 {
-    for credential in linked {
-        let Some(id) = discord_account(credential) else { continue };
+    let discord: Vec<Value> = linked.iter().filter(|c| discord_account(c).is_some()).cloned().collect();
+    verified_accounts(&discord, address, issuers, now, fetch).await.into_iter().find_map(|(service, account)| (service == "https://discord.com" || service == "https://discord.gg").then_some(account))
+}
+
+/// The account a linked-account credential is about: its service's homepage and
+/// its name or id there.
+pub fn account_of(credential: &Value) -> Option<(String, String)> {
+    let account = &credential["credentialSubject"]["account"];
+    let home = account["accountServiceHomepage"].as_str()?.trim_end_matches('/').to_lowercase();
+    let name = account["accountName"].as_str().filter(|n| !n.is_empty() && n.len() <= 200)?;
+    (home.starts_with("https://") && home.len() <= 200).then(|| (home, name.to_string()))
+}
+
+/// The accounts a member's profile proves: of its linked-account credentials, those
+/// about `address` (the public address the profile showed to be theirs), from one of
+/// `issuers`, signed, in date and not revoked, each `(service homepage, account)`.
+/// Nothing is fetched but from an issuer's own origin. `fetch` gets a URL's JSON.
+pub async fn verified_accounts<F, Fut>(linked: &[Value], address: &str, issuers: &[String], now: &str, fetch: F) -> Vec<(String, String)>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Option<Value>>,
+{
+    let mut found = Vec::new();
+    for credential in linked.iter().take(10) {
+        let Some(id) = account_of(credential) else { continue };
         if credential["credentialSubject"]["id"].as_str() != Some(address) {
             continue;
         }
@@ -86,11 +106,11 @@ where
             Some(_) => continue,
             None => None,
         };
-        if wyvrn_hosted_did::linked::check(credential, &document, status.as_ref(), now).is_ok() {
-            return Some(id.to_string());
+        if wyvrn_hosted_did::linked::check(credential, &document, status.as_ref(), now).is_ok() && !found.contains(&id) {
+            found.push(id);
         }
     }
-    None
+    found
 }
 
 impl Store {

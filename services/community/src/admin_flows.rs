@@ -1244,6 +1244,10 @@ impl Community {
         let gates = self.gates()?;
         let questions = gates["questions"].as_array().cloned().unwrap_or_default();
         let mut fields = vec![json!({ "type": "text-input", "form-id": "post_wait", "label": "Minutes a new member waits before posting (empty: none). Anyone with a role doesn't wait.", "value": gates["post_wait"].as_i64().map(|m| m.to_string()).unwrap_or_default() })];
+        // What a new account can't walk through (protection.rs).
+        fields.push(json!({ "type": "check-box", "form-id": "linked_account", "label": "Ask for a verified linked account (Twitch, Discord, Bluesky...) to post. Anyone with a role is let through.", "value": gates["linked_account"] == true }));
+        fields.push(json!({ "type": "text-input", "form-id": "new_member_hours", "label": "Hours before a new member may post links, files or mention everyone (empty: none)", "value": gates["new_member_hours"].as_i64().map(|h| h.to_string()).unwrap_or_default() }));
+        fields.push(json!({ "type": "text-input", "form-id": "raid_threshold", "label": format!("Joins within {} minutes that suggest raid mode to moderators (empty: {})", crate::protection::BURST_WINDOW / 60, crate::protection::BURST_JOINS), "value": gates["raid_threshold"].as_i64().map(|n| n.to_string()).unwrap_or_default() }));
         fields.push(json!({ "type": "title", "text": "Questions on joining" }));
         fields.push(json!({ "type": "text", "text": "Asked of whoever asks to join; their answers are shown beside them on the waiting list." }));
         for n in 0..crate::gates::MAX_QUESTIONS {
@@ -1398,9 +1402,26 @@ impl Community {
                     }
                     questions.push(question);
                 }
+                let number = |key: &str, most: i64, says: &str| -> Result<Option<i64>, crate::questions::Refusal> {
+                    match input[key].as_str().map(str::trim).filter(|t| !t.is_empty()) {
+                        Some(text) => text.parse::<i64>().ok().filter(|n| (0..=most).contains(n)).map(Some).ok_or_else(|| refused(says)),
+                        None => Ok(None),
+                    }
+                };
+                let new_hours = number("new_member_hours", 24 * 30, "New members wait from 0 hours to 30 days (720).")?;
+                let threshold = number("raid_threshold", 10_000, "Raid mode is suggested at from 2 to 10,000 joins.")?;
                 let mut gates = json!({ "questions": questions });
                 if let Some(wait) = post_wait.filter(|w| *w > 0) {
                     gates["post_wait"] = json!(wait);
+                }
+                if ticked(&input["linked_account"]) {
+                    gates["linked_account"] = json!(true);
+                }
+                if let Some(hours) = new_hours.filter(|h| *h > 0) {
+                    gates["new_member_hours"] = json!(hours);
+                }
+                if let Some(n) = threshold.filter(|n| *n > 1) {
+                    gates["raid_threshold"] = json!(n);
                 }
                 self.store.set_setting("gates", &gates.to_string()).map_err(failed)?;
                 self.audit(now, &flow.owner, "community.gates", None, Some(gates));

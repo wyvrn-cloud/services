@@ -1226,6 +1226,23 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         at INTEGER NOT NULL,
         PRIMARY KEY (thread, did)
     );
+    -- Linked accounts a member's profile was checked to prove, and those banned
+    -- with someone (protection.rs).
+    CREATE TABLE IF NOT EXISTS member_accounts (
+        did TEXT NOT NULL,
+        service TEXT NOT NULL,
+        account TEXT NOT NULL,
+        at INTEGER NOT NULL,
+        PRIMARY KEY (did, service, account)
+    );
+    CREATE TABLE IF NOT EXISTS banned_accounts (
+        service TEXT NOT NULL,
+        account TEXT NOT NULL,
+        banned_did TEXT NOT NULL,
+        until INTEGER,
+        at INTEGER NOT NULL,
+        PRIMARY KEY (service, account)
+    );
     -- Imported posts claimed by whoever wrote them (claims.rs).
     CREATE TABLE IF NOT EXISTS discord_claims (
         discord_id TEXT PRIMARY KEY,
@@ -1841,6 +1858,21 @@ fn schema() -> Schema {
                 to_seq BIGINT NOT NULL,
                 at BIGINT NOT NULL,
                 PRIMARY KEY (channel, from_seq)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS member_accounts (
+                did {MYSQL_DID} NOT NULL,
+                service VARCHAR(255) NOT NULL,
+                account VARCHAR(255) NOT NULL,
+                at BIGINT NOT NULL,
+                PRIMARY KEY (did(255), service(100), account(100))
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS banned_accounts (
+                service VARCHAR(255) NOT NULL,
+                account VARCHAR(255) NOT NULL,
+                banned_did {MYSQL_DID} NOT NULL,
+                until BIGINT,
+                at BIGINT NOT NULL,
+                PRIMARY KEY (service(150), account(150))
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS private_threads (
                 thread VARCHAR(255) NOT NULL PRIMARY KEY
@@ -2557,6 +2589,11 @@ impl Store {
     }
 
     /// When `did` last posted in `channel`, threads included.
+    /// When `did` last posted anywhere here.
+    pub fn last_post_by(&self, did: &str) -> Result<Option<i64>> {
+        self.db.lock().query_value("SELECT MAX(posted_at) FROM posts WHERE author_did = ?1", params![did])
+    }
+
     pub fn last_post_in(&self, channel: &str, did: &str) -> Result<Option<i64>> {
         self.db.lock().query_value("SELECT MAX(posted_at) FROM posts WHERE channel = ?1 AND author_did = ?2", params![channel, did])
     }
