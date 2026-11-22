@@ -101,7 +101,9 @@ pub struct Host {
     me: Weak<Host>,
     open: Mutex<HashMap<String, Arc<Tenant>>>,
     /// One community opened at a time: two requests for one that isn't open open it once.
-    opening: tokio::sync::Mutex<()>,
+    /// One lock a community, for opening it: two requests for the same one open it
+    /// once, and one being opened holds up no other (security review WYV-22).
+    opening: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// For each community closed while still owing someone a delivery, the wait
     /// it was last given (`next_retry`). Forgotten once it owes nothing.
     retrying: Mutex<HashMap<String, i64>>,
@@ -115,7 +117,7 @@ impl Host {
             exports: Default::default(),
             me: me.clone(),
             open: Mutex::default(),
-            opening: tokio::sync::Mutex::new(()),
+            opening: std::sync::Mutex::default(),
             retrying: Mutex::default(),
         })
     }
@@ -242,13 +244,24 @@ impl Host {
         Ok(Some(Address::parse(&format!("did:web:{did_host}:community:{name}"))?))
     }
 
+    /// The lock that opening `name` takes. (Kept while a name is asked for; the
+    /// map is cleared of ones nobody holds once it grows.)
+    fn opening_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.opening.lock().unwrap_or_else(|p| p.into_inner());
+        if locks.len() > 1000 {
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
+        locks.entry(name.to_string()).or_default().clone()
+    }
+
     /// The community called `name`, opened if it is served and isn't open yet.
     pub async fn tenant(&self, name: &str) -> anyhow::Result<Option<Arc<Tenant>>> {
         if let Some(tenant) = self.loaded(name) {
             tenant.touch();
             return Ok(Some(tenant));
         }
-        let _opening = self.opening.lock().await;
+        let lock = self.opening_lock(name);
+        let _opening = lock.lock().await;
         if let Some(tenant) = self.loaded(name) {
             return Ok(Some(tenant));
         }
@@ -413,7 +426,8 @@ impl Host {
     pub fn move_storage(&self, name: &str, to: Storage) -> anyhow::Result<String> {
         let record = self.registry.get(name)?.ok_or_else(|| anyhow::anyhow!("there is no community called {name}"))?;
         anyhow::ensure!(record.storage != to, "{name} is kept in {} already", to.as_str());
-        let _opening = self.opening.blocking_lock();
+        let lock = self.opening_lock(name);
+        let _opening = lock.blocking_lock();
         self.unload(name);
         // (Whatever was under way when it closed has a moment to finish.)
         std::thread::sleep(std::time::Duration::from_millis(500));

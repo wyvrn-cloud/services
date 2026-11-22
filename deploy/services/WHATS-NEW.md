@@ -358,3 +358,20 @@ https:// {
 ```
 
 The community's DID stays as it is (members' apps know it by it); its web view and the links it gives use the domain.
+
+## Hardening after the security review (2026-11-22)
+
+**Community host limits (WYV-22).** A community whose limits aren't set now gets `posts_per_minute = 600` and `store_bytes = 10 GiB` (they were unlimited). Set them per community (`wyvrn-community-host limits`) or in `[limits]` if yours need more. Opening one community no longer holds up opening others. Rate-limit `/c/*` at Caddy too, so a client walking through many names can't keep the host busy opening and closing them; with the `caddy-ratelimit` module:
+
+```caddy
+rate_limit {
+    zone communities {
+        match { path /c/* }
+        key {remote_host}
+        events 300
+        window 1m
+    }
+}
+```
+
+**Mediator (WYV-05, WYV-13/14).** socketdock's webhooks are now on a listener of their own: set `WEBHOOK_BIND=0.0.0.0:8081` (not published) and `SOCKETDOCK_URL=http://socketdock:8765` on the mediator, and point socketdock's `--connect-uri`/`--message-uri`/`--disconnect-uri` at `http://mediator:8081/webhooks/...`. Until you do, live delivery stops. New, all optional: `QUEUE_MAX_MESSAGES` (10000), `QUEUE_MAX_MB` (256), `FORWARD_MAX_MB` (10), `FORWARDS_PER_MINUTE` (600), `QUEUE_TTL_DAYS` (30), `REQUESTS_PER_MINUTE_PER_IP` (1200; behind Caddy set `TRUST_FORWARDED_FOR=true`).

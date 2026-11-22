@@ -195,7 +195,7 @@ impl Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { members: 1000, channels: 500, file_bytes: 25 * 1024 * 1024, files_quota: 1024 * 1024 * 1024, files_total: 5 * 1024 * 1024 * 1024, roles: 250, posts_per_minute: 0, store_bytes: 0, sticker_packs: 1, stickers_per_pack: 25, emoji_packs: 1, emoji_per_pack: 75, deleted_text_days: 30, disabled_channel_kinds: None }
+        Self { members: 1000, channels: 500, file_bytes: 25 * 1024 * 1024, files_quota: 1024 * 1024 * 1024, files_total: 5 * 1024 * 1024 * 1024, roles: 250, posts_per_minute: 600, store_bytes: 10 * 1024 * 1024 * 1024, sticker_packs: 1, stickers_per_pack: 25, emoji_packs: 1, emoji_per_pack: 75, deleted_text_days: 30, disabled_channel_kinds: None }
     }
 }
 
