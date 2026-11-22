@@ -100,6 +100,8 @@ pub struct Relay {
     /// For WebSockets: the same, without the whole-request timeout, which would cap
     /// how long a socket may stay open.
     sockets: reqwest::Client,
+    /// What each client did this minute: so many sends and sockets a minute (WYV-23).
+    used: std::sync::Mutex<std::collections::HashMap<String, (i64, u32)>>,
 }
 
 /// What a `send` came to: the `sent` body, and the answer's bytes to attach.
@@ -133,8 +135,14 @@ impl Relay {
             .timeout(Duration::from_secs(config.timeout_seconds))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        let sockets = reqwest::Client::builder().dns_resolver(resolver).connect_timeout(Duration::from_secs(config.timeout_seconds)).build()?;
-        Ok(Self { config, store, guard, http, sockets })
+        // No redirects for sockets either: one followed would go wherever it said,
+        // past the guard's check of the address asked for (security review WYV-23).
+        let sockets = reqwest::Client::builder()
+            .dns_resolver(resolver)
+            .connect_timeout(Duration::from_secs(config.timeout_seconds))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        Ok(Self { config, store, guard, http, sockets, used: std::sync::Mutex::default() })
     }
 
     /// Whether `did` may register at all.
@@ -144,9 +152,28 @@ impl Relay {
 
     pub fn granted(&self, did: &str) -> Result<(), Refusal> {
         match self.store.granted(did) {
-            Ok(true) if self.takes(did) => Ok(()),
+            Ok(true) if self.takes(did) => self.within_rate(did),
             _ => Err(Refusal::not_granted()),
         }
+    }
+
+    /// At most `PER_MINUTE` sends and sockets a minute from one client (WYV-23).
+    fn within_rate(&self, did: &str) -> Result<(), Refusal> {
+        const PER_MINUTE: u32 = 120;
+        let minute = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64 / 60);
+        let mut used = self.used.lock().unwrap_or_else(|p| p.into_inner());
+        if used.len() > 10_000 {
+            used.retain(|_, (at, _)| *at == minute);
+        }
+        let entry = used.entry(did.to_string()).or_insert((minute, 0));
+        if entry.0 != minute {
+            *entry = (minute, 0);
+        }
+        entry.1 += 1;
+        if entry.1 > PER_MINUTE {
+            return Err(Refusal::new("e.p.req.rate-limited", "more than this relay carries a minute: wait a moment"));
+        }
+        Ok(())
     }
 
     pub fn request(&self, did: &str, now: i64) -> Result<Value, Refusal> {

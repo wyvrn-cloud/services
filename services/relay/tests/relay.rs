@@ -47,7 +47,7 @@ async fn start_relay(carries: Carries) -> String {
     // A did:peer whose one endpoint is the socket, so a client finds it there.
     let agent = Agent::with_endpoint(Identity::generate().unwrap(), &ws).unwrap().with_features(Features::standard().with_protocol(PIURI, &["relay"]));
     let did = agent.did();
-    let config = RelayConfig { carries, allow: vec!["127.0.0.1".into()], max_bytes: 1024 * 1024, ..Default::default() };
+    let config = RelayConfig { carries, open: true, allow: vec!["127.0.0.1".into()], max_bytes: 1024 * 1024, ..Default::default() };
     let state = Arc::new(AppState { agent, relay: Relay::new(config, Store::scratch().unwrap()).unwrap(), did_document: None });
     let app = server::router(state);
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

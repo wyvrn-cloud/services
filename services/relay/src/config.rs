@@ -45,7 +45,9 @@ pub struct RelayConfig {
 
 impl Default for RelayConfig {
     fn default() -> Self {
-        Self { carries: Carries::All, open: true, clients: Vec::new(), allow: Vec::new(), max_bytes: 16 * 1024 * 1024, timeout_seconds: 30 }
+        // Closed unless said otherwise (WYV-23): `open = true` (RELAY_OPEN) for a
+        // relay anyone may use.
+        Self { carries: Carries::All, open: false, clients: Vec::new(), allow: Vec::new(), max_bytes: 16 * 1024 * 1024, timeout_seconds: 30 }
     }
 }
 
