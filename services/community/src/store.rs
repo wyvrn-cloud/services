@@ -469,6 +469,9 @@ pub struct Store {
     pub(crate) db: Db,
 }
 
+/// Not a post brought in from elsewhere (`imported_ranges`).
+const NOT_IMPORTED: &str = "NOT EXISTS (SELECT 1 FROM imported_ranges r WHERE r.channel = posts.channel AND posts.seq BETWEEN r.from_seq AND r.to_seq)";
+
 const MEMBER_COLUMNS: &str = "did, role, name, joined, since, delivered, (SELECT at FROM member_left WHERE member_left.did = members.did)";
 // A post's author is called what they are called now, where they are still a
 // member; what they were called when they wrote it, otherwise.
@@ -1199,6 +1202,16 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         post TEXT PRIMARY KEY,
         extra TEXT NOT NULL
     );
+    -- Posts brought in from elsewhere (a Discord server's history): each run's
+    -- numbers in a channel. Read by time among the rest, never sent out as new,
+    -- and not a hole for an app to fill.
+    CREATE TABLE IF NOT EXISTS imported_ranges (
+        channel TEXT NOT NULL,
+        from_seq INTEGER NOT NULL,
+        to_seq INTEGER NOT NULL,
+        at INTEGER NOT NULL,
+        PRIMARY KEY (channel, from_seq)
+    );
     -- Each member's vote on a poll, and the polls whose end everyone has been told of.
     CREATE TABLE IF NOT EXISTS votes (
         post TEXT NOT NULL,
@@ -1396,6 +1409,7 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
     CREATE INDEX IF NOT EXISTS posts_by_author ON posts (author_did, posted_at);
     CREATE INDEX IF NOT EXISTS posts_by_answerer ON posts (answered_by);
     CREATE INDEX IF NOT EXISTS posts_by_time ON posts (posted_at);
+    CREATE INDEX IF NOT EXISTS posts_by_channel_time ON posts (channel, posted_at, seq);
     CREATE INDEX IF NOT EXISTS reactions_by_time ON reactions (at);
     CREATE INDEX IF NOT EXISTS threads_by_channel ON threads (channel);
     CREATE INDEX IF NOT EXISTS answering_by_owner ON answering (owner, post);
@@ -1799,6 +1813,13 @@ fn schema() -> Schema {
                 post VARCHAR(255) NOT NULL PRIMARY KEY,
                 extra MEDIUMTEXT NOT NULL
             ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS imported_ranges (
+                channel VARCHAR(255) NOT NULL,
+                from_seq BIGINT NOT NULL,
+                to_seq BIGINT NOT NULL,
+                at BIGINT NOT NULL,
+                PRIMARY KEY (channel, from_seq)
+            ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS webhooks (
                 id VARCHAR(64) NOT NULL PRIMARY KEY,
                 channel VARCHAR(255) NOT NULL,
@@ -2010,6 +2031,7 @@ fn schema() -> Schema {
             CREATE INDEX IF NOT EXISTS posts_by_author ON posts (author_did(255), posted_at);
             CREATE INDEX IF NOT EXISTS posts_by_answerer ON posts (answered_by(255));
             CREATE INDEX IF NOT EXISTS posts_by_time ON posts (posted_at);
+            CREATE INDEX IF NOT EXISTS posts_by_channel_time ON posts (channel, posted_at, seq);
             CREATE INDEX IF NOT EXISTS reactions_by_time ON reactions (at);
             CREATE INDEX IF NOT EXISTS threads_by_channel ON threads (channel);
             CREATE INDEX IF NOT EXISTS answering_by_owner ON answering (owner(255), post);
@@ -3492,7 +3514,12 @@ impl Store {
 
     /// Every post after `serial`, oldest first: what is still to send to someone.
     pub fn posts_after(&self, serial: i64, limit: usize) -> Result<Vec<Post>> {
-        let posts = self.db.lock().query(&format!("SELECT {POST_COLUMNS} FROM posts WHERE serial > ?1 ORDER BY serial LIMIT ?2"), params![serial, limit as i64], post_from)?;
+        // Imported history is read back, never sent as new.
+        let posts = self.db.lock().query(
+            &format!("SELECT {POST_COLUMNS} FROM posts WHERE serial > ?1 AND {NOT_IMPORTED} ORDER BY serial LIMIT ?2"),
+            params![serial, limit as i64],
+            post_from,
+        )?;
         self.all_filled(posts)
     }
 
@@ -3515,6 +3542,39 @@ impl Store {
             )?,
         };
         self.all_filled(posts)
+    }
+
+    /// A channel's posts by time (then number, for posts at the same second):
+    /// those before `before`, `(posted_at, seq)`, or its newest with none given,
+    /// newest first. As history is read where posts were brought in from elsewhere,
+    /// whose numbers are newer than their times.
+    pub fn channel_posts_by_time(&self, channel: &str, thread: Option<&str>, before: Option<(i64, i64)>, limit: usize) -> Result<Vec<Post>> {
+        const IN_THREAD: &str = "(SELECT thread FROM post_state WHERE post_state.post = posts.id)";
+        let in_thread = match thread {
+            Some(_) => format!("{IN_THREAD} = ?5"),
+            None => format!("{IN_THREAD} IS NULL AND ?5 IS NULL"),
+        };
+        let (at, seq) = before.unwrap_or((i64::MAX, i64::MAX));
+        let posts = self.db.lock().query(
+            &format!(
+                "SELECT {POST_COLUMNS} FROM posts WHERE channel = ?1 AND (posted_at < ?2 OR (posted_at = ?2 AND seq < ?3)) AND {in_thread} \
+                 ORDER BY posted_at DESC, seq DESC LIMIT ?4"
+            ),
+            params![channel, at, seq, limit as i64, thread],
+            post_from,
+        )?;
+        self.all_filled(posts)
+    }
+
+    /// The posts brought in from elsewhere, by channel: each run's first and last `seq`.
+    pub fn imported_ranges(&self) -> Result<std::collections::HashMap<String, Vec<(i64, i64)>>> {
+        let rows: Vec<(String, i64, i64)> =
+            self.db.lock().query("SELECT channel, from_seq, to_seq FROM imported_ranges ORDER BY channel, from_seq", params![], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        let mut ranges: std::collections::HashMap<String, Vec<(i64, i64)>> = std::collections::HashMap::new();
+        for (channel, from, to) in rows {
+            ranges.entry(channel).or_default().push((from, to));
+        }
+        Ok(ranges)
     }
 
     /// A page of the thread `thread` of `channel`, oldest first: `limit` posts
@@ -3557,12 +3617,12 @@ impl Store {
             None => format!("{IN_THREAD} IS NULL AND ?4 IS NULL"),
         };
         let mut before = self.db.lock().query(
-            &format!("SELECT {POST_COLUMNS} FROM posts WHERE channel = ?1 AND posted_at < ?2 AND {in_thread} ORDER BY seq DESC LIMIT ?3"),
+            &format!("SELECT {POST_COLUMNS} FROM posts WHERE channel = ?1 AND posted_at < ?2 AND {in_thread} ORDER BY posted_at DESC, seq DESC LIMIT ?3"),
             params![channel, at, half as i64 + 1, thread],
             post_from,
         )?;
         let mut after = self.db.lock().query(
-            &format!("SELECT {POST_COLUMNS} FROM posts WHERE channel = ?1 AND posted_at >= ?2 AND {in_thread} ORDER BY seq LIMIT ?3"),
+            &format!("SELECT {POST_COLUMNS} FROM posts WHERE channel = ?1 AND posted_at >= ?2 AND {in_thread} ORDER BY posted_at, seq LIMIT ?3"),
             params![channel, at, half as i64 + 1, thread],
             post_from,
         )?;

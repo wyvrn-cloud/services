@@ -32,6 +32,20 @@ wyvrn-community-host [--config <path>] import-expressions <name> <folder> [--pre
                                                                   scripts/discord_expressions.py, as the
                                                                   community's packs; its pack limits raised
                                                                   to fit. --dry-run says what it would do.
+wyvrn-community-host [--config <path>] discord-survey <folder> [<channel>...] [--out <file>]
+                                                                  what a DiscordChatExporter backup (JSON,
+                                                                  --media) holds and what importing it would
+                                                                  take: messages, attachments, GIF links,
+                                                                  disk space. Counts only, as Markdown.
+wyvrn-community-host [--config <path>] import-discord <name> <folder> <channel>... [--map <discord-id>=<channel>]
+                     [--text-only] [--expressions <folder>] [--dry-run]
+                                                                  a Discord channel's history (by its id, or
+                                                                  part of its file's name) into the channel
+                                                                  here of the same category and name (or as
+                                                                  --map says), read among its posts by time.
+                                                                  Files sealed; nobody notified; again, only
+                                                                  what isn't there yet. --dry-run says what
+                                                                  it would do.
 wyvrn-community-host [--config <path>] backup <name>              back one up now (backups.key set)
 wyvrn-community-host [--config <path>] open-backup <file> <out.tar.gz>
                                                                   open a backup with the backup key: the
@@ -108,6 +122,59 @@ async fn main() -> anyhow::Result<()> {
             registry.set_limits(name, Some(&limits))?;
             println!("{name} may hold {members} members and {channels} channels");
             Ok(())
+        }
+        ["discord-survey", folder, rest @ ..] => {
+            let mut only = Vec::new();
+            let mut out = None;
+            let mut args = rest.iter();
+            while let Some(arg) = args.next() {
+                match *arg {
+                    "--out" => out = Some(args.next().context("--out needs a file")?.to_string()),
+                    flag if flag.starts_with("--") => anyhow::bail!("{flag}: unrecognized\n\n{USAGE}"),
+                    channel => only.push(channel.to_string()),
+                }
+            }
+            let survey = wyvrn_community::discord_history::survey(std::path::Path::new(folder), &only, |file| eprintln!("reading {file}"))?;
+            let text = survey.markdown();
+            match out {
+                Some(out) => {
+                    std::fs::write(&out, &text)?;
+                    println!("written: {out}");
+                }
+                None => println!("{text}"),
+            }
+            Ok(())
+        }
+        ["import-discord", name, folder, rest @ ..] => {
+            let mut asked = wyvrn_community_host::history::Asked {
+                folder: std::path::PathBuf::from(folder),
+                channels: Vec::new(),
+                map: Default::default(),
+                media: true,
+                expressions: None,
+                dry_run: false,
+            };
+            let mut args = rest.iter();
+            while let Some(arg) = args.next() {
+                match *arg {
+                    "--dry-run" => asked.dry_run = true,
+                    "--text-only" => asked.media = false,
+                    "--expressions" => asked.expressions = Some(args.next().context("--expressions needs a folder")?.into()),
+                    "--map" => {
+                        let given = args.next().context("--map needs <discord-id>=<channel>")?;
+                        let (from, to) = given.split_once('=').context("--map needs <discord-id>=<channel>")?;
+                        asked.map.insert(from.to_string(), to.to_string());
+                        if !asked.channels.iter().any(|c| c == from) {
+                            asked.channels.push(from.to_string());
+                        }
+                    }
+                    flag if flag.starts_with("--") => anyhow::bail!("{flag}: unrecognized\n\n{USAGE}"),
+                    channel => asked.channels.push(channel.to_string()),
+                }
+            }
+            anyhow::ensure!(!asked.channels.is_empty(), "name the channels to import\n\n{USAGE}");
+            let host = Host::new(config.clone(), registry(&config)?);
+            tokio::task::block_in_place(|| wyvrn_community_host::history::run(&host, name, &asked, now()))
         }
         ["import-expressions", name, folder, rest @ ..] => {
             let dry_run = rest.contains(&"--dry-run");

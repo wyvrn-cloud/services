@@ -646,6 +646,7 @@ impl Community {
         };
         let mut seen = std::collections::HashSet::new();
         let follows = self.store.follows()?;
+        let imported = self.store.imported_ranges()?;
         for channel in self.store.channels()? {
             // A channel they may not see isn't there for them.
             if !self.sees(&member.did, &powers, &channel)? {
@@ -653,6 +654,11 @@ impl Community {
             }
             seen.insert(channel.id.clone());
             let mut body = Self::channel_body(&channel, &member.did);
+            // Posts brought in from elsewhere: numbers that are history, read by
+            // time, not news nor a hole to fill.
+            if let Some(ranges) = imported.get(&channel.id) {
+                body["imported_seqs"] = json!(ranges.iter().map(|(from, to)| json!([from, to])).collect::<Vec<_>>());
+            }
             body["permissions"] = json!(self.channel_permissions(&member.did, &powers, &channel)?);
             // On the web: its page's address, and from when it is public.
             if let (Some(url), None) = (&self.web_url, &channel.voice) {
@@ -2052,7 +2058,17 @@ impl Community {
                         json!({ "channel": channel.id, "thread": thread, "messages": messages, "more": more, "offset": offset, "total": total }),
                     )));
                 }
-                let mut posts = self.store.channel_posts_before(&channel.id, thread, body["before"].as_i64(), limit + 1)?;
+                // By time, newest first, from `before_at` (and `before_seq` among posts
+                // of that second) or from the newest: where posts were brought in from
+                // elsewhere, their numbers are newer than their times. By number with
+                // `before`, as an app filling a hole asks.
+                let mut posts = match body["before"].as_i64() {
+                    Some(before) if body.get("before_at").is_none() => self.store.channel_posts_before(&channel.id, thread, Some(before), limit + 1)?,
+                    _ => {
+                        let before = body["before_at"].as_i64().map(|at| (at, body["before_seq"].as_i64().unwrap_or(i64::MAX)));
+                        self.store.channel_posts_by_time(&channel.id, thread, before, limit + 1)?
+                    }
+                };
                 let more = posts.len() > limit;
                 posts.truncate(limit);
                 // Oldest first, as they are read.

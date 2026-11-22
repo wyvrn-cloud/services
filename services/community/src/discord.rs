@@ -252,7 +252,7 @@ fn capitalised(word: &str) -> String {
 
 /// A Discord name, as a text channel here may be called: in lowercase, spaces as
 /// `-`, without what a name here can't hold.
-fn text_name(name: &str) -> String {
+pub(crate) fn text_name(name: &str) -> String {
     static NOT: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(&format!("[^{}]", crate::community::NAME_CHARACTERS)).expect("a valid pattern"));
     let spaced: String = name.to_lowercase().split_whitespace().collect::<Vec<_>>().join("-");

@@ -19,6 +19,7 @@ pub mod assistant;
 pub mod automod;
 pub mod board;
 pub mod discord;
+pub mod discord_history;
 pub mod events;
 pub mod filters;
 pub mod forms;

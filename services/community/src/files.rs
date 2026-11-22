@@ -127,6 +127,12 @@ impl Files {
         if bytes.len() as u64 > self.config.max_file_bytes {
             anyhow::bail!("a file here is at most {} bytes", self.config.max_file_bytes);
         }
+        self.keep_any(owner, name, media_type, bytes, now)
+    }
+
+    /// As [`Files::keep_bytes`], whatever its size: what an owner brings in from
+    /// elsewhere (a Discord server's history), the host's limits raised for it.
+    pub fn keep_any(&self, owner: &str, name: &str, media_type: &str, bytes: &[u8], now: i64) -> anyhow::Result<(String, String, String)> {
         let hash = wyvrn_files::hash::of_bytes(bytes);
         let store = &self.host.store;
         let record = store.create(wyvrn_files::store::NewFile { owner, name, media_type, byte_count: bytes.len() as u64, hash: &hash, created: now, upload_expires: now + 3600, expires: now + KEEP })?;

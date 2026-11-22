@@ -13,6 +13,7 @@
 //! - [`export`]: a community's owner moving it to a server of their own.
 //! - [`import`]: the reverse, a community run on its own brought onto the host.
 //! - [`expressions`]: a Discord server's own emoji and stickers made a community's packs.
+//! - [`history`]: a Discord server's history (DiscordChatExporter's JSON) brought into a community.
 //!
 //! A community that outgrows its host moves to a server of its own, the single
 //! `wyvrn-community`, keeping its keys and public address.
@@ -23,6 +24,7 @@ pub mod config;
 pub mod creating;
 pub mod export;
 pub mod expressions;
+pub mod history;
 pub mod import;
 pub mod registry;
 pub mod server;
