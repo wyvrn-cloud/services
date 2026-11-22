@@ -26,6 +26,12 @@ wyvrn-community-host [--config <path>] import <name> <owner-did> --community <da
                                                                   address and everything it keeps. A
                                                                   database is a mysql:// URL or a SQLite file.
                                                                   Stop its own server first.
+wyvrn-community-host [--config <path>] import-expressions <name> <folder> [--prefix <name>] [--dry-run]
+                                                                  a Discord server's own emoji and stickers,
+                                                                  fetched into <folder> by
+                                                                  scripts/discord_expressions.py, as the
+                                                                  community's packs; its pack limits raised
+                                                                  to fit. --dry-run says what it would do.
 wyvrn-community-host [--config <path>] backup <name>              back one up now (backups.key set)
 wyvrn-community-host [--config <path>] open-backup <file> <out.tar.gz>
                                                                   open a backup with the backup key: the
@@ -101,6 +107,51 @@ async fn main() -> anyhow::Result<()> {
             let limits = Limits { members: members.parse()?, channels: channels.parse()?, ..record.limits.unwrap_or_else(|| config.limits.clone()) };
             registry.set_limits(name, Some(&limits))?;
             println!("{name} may hold {members} members and {channels} channels");
+            Ok(())
+        }
+        ["import-expressions", name, folder, rest @ ..] => {
+            let dry_run = rest.contains(&"--dry-run");
+            let prefix = match rest.iter().position(|arg| *arg == "--prefix") {
+                Some(at) => Some(rest.get(at + 1).context("--prefix needs a value")?.to_string()),
+                None => None,
+            };
+            for (at, arg) in rest.iter().enumerate() {
+                let value_of_flag = at > 0 && rest[at - 1] == "--prefix";
+                anyhow::ensure!(value_of_flag || ["--prefix", "--dry-run"].contains(arg), "{arg}: unrecognized\n\n{USAGE}");
+            }
+            let folder = std::path::Path::new(folder);
+            let manifest = wyvrn_community_host::expressions::manifest(folder)?;
+            let host = Host::new(config.clone(), registry(&config)?);
+            let record = registry(&config)?.get(name)?.with_context(|| format!("there is no community called {name}"))?;
+            let stores = host.stores(&record, record.storage)?;
+            let settings = host.settings(&record);
+            // Its packs are its own DID's, as those made through its workflows are.
+            let identity = wyvrn_service::identity::load(&stores.community, &settings.identity.path, "community")?
+                .with_context(|| format!("{name} has no keys yet: open it once (speak to it) first"))?;
+            let (agent, _) = wyvrn_community::server::build_agent_for(&settings, identity, None)?;
+            let owner = agent.did();
+            let location = stores.stickers.as_ref().context("this community keeps no stickers")?;
+            let store = wyvrn_stickers::store::Store::open(location)?;
+            let limits = record.limits.clone().unwrap_or_else(|| config.limits.clone());
+            let plan = wyvrn_community_host::expressions::plan(&manifest, folder, &store, &owner, &limits, prefix.as_deref())?;
+            println!("{} ({}) into {name}:", manifest.guild.name, manifest.guild.id);
+            println!("{}", wyvrn_community_host::expressions::describe(&plan));
+            if dry_run {
+                return Ok(());
+            }
+            if let Some(raised) = &plan.limits {
+                host.change_limits(name, record.limits.as_ref(), raised)?;
+            }
+            let became = wyvrn_community_host::expressions::write(&plan, &store, &owner, now())?;
+            let out = folder.join("imported.json");
+            // Added to what an earlier run wrote, so it covers every run.
+            let mut all = std::fs::read_to_string(&out).ok().and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok()).unwrap_or_else(|| serde_json::json!({}));
+            if let (Some(all), Some(new)) = (all.as_object_mut(), became.as_object()) {
+                all.extend(new.clone());
+            }
+            std::fs::write(&out, serde_json::to_string_pretty(&all)?)?;
+            println!("done; what each Discord id became: {}", out.display());
+            println!("members see the new packs the next time their app asks the community for its details");
             Ok(())
         }
         ["import", name, owner, rest @ ..] => {
