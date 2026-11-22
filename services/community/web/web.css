@@ -213,3 +213,8 @@ form.reactions button { display: inline-flex; gap: .25rem; align-items: center; 
 .event p { margin: .25rem 0; }
 .event.cancelled h2 { text-decoration: line-through; opacity: .7; }
 .event.happening article { outline: 2px solid var(--accent, currentColor); }
+
+/* The search box in the top bar (pages.rs's search). */
+.top .search { flex: 1; display: flex; justify-content: flex-end; margin: 0 12px; }
+.top .search input { width: min(16rem, 100%); padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border); background: transparent; color: inherit; font: inherit; }
+@media (max-width: 600px) { .top .search { display: none; } }
