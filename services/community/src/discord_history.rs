@@ -261,17 +261,31 @@ pub fn files_in(folder: &Path) -> anyhow::Result<Vec<PathBuf>> {
 
 /// A file the export kept beside it, by the path it wrote (as it is, or
 /// percent-encoded); `None` for a link, or one that isn't there.
+///
+/// Only ever a file inside `folder`: an export names its files relative to itself,
+/// and one naming an absolute path, `..`, or a link out of the folder (another
+/// community's keys, `/proc`) is given nothing (security review WYV-19).
 pub fn local(folder: &Path, url: &str) -> Option<PathBuf> {
     if url.is_empty() || url.starts_with("http://") || url.starts_with("https://") {
         return None;
     }
-    let plain = folder.join(url);
-    if plain.is_file() {
-        return Some(plain);
+    inside(folder, url).or_else(|| inside(folder, &percent_decode(url)))
+}
+
+/// `relative` under `folder`, if it is a plain relative path to a file there:
+/// no root, prefix or `..`, and, links resolved, still inside the folder.
+fn inside(folder: &Path, relative: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let path = Path::new(relative);
+    if !path.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir)) {
+        return None;
     }
-    let decoded = percent_decode(url);
-    let decoded = folder.join(decoded);
-    decoded.is_file().then_some(decoded)
+    let joined = folder.join(path);
+    if std::fs::symlink_metadata(&joined).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    let (real, base) = (joined.canonicalize().ok()?, folder.canonicalize().ok()?);
+    (real.starts_with(&base) && real.is_file()).then_some(joined)
 }
 
 fn percent_decode(text: &str) -> String {
@@ -1306,5 +1320,31 @@ mod tests {
         assert_eq!((guild.name.as_str(), channel.name.as_str(), channel.category.as_deref()), ("G", "fanart", Some("Art")));
         assert_eq!(read(&path).unwrap().messages.len(), 1);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod confined {
+    use super::local;
+
+    #[test]
+    fn an_exports_files_are_only_ever_inside_its_folder() {
+        let root = std::env::temp_dir().join(format!("discord-confined-{}", std::process::id()));
+        let folder = root.join("export");
+        std::fs::create_dir_all(folder.join("ch.json_Files")).unwrap();
+        std::fs::write(folder.join("ch.json_Files/a b.png"), b"x").unwrap();
+        std::fs::write(root.join("identity.json"), b"keys").unwrap();
+        assert!(local(&folder, "ch.json_Files/a b.png").is_some());
+        assert!(local(&folder, "ch.json_Files/a%20b.png").is_some());
+        assert!(local(&folder, "../identity.json").is_none());
+        assert!(local(&folder, "ch.json_Files/../../identity.json").is_none());
+        assert!(local(&folder, root.join("identity.json").to_str().unwrap()).is_none());
+        assert!(local(&folder, "%2E%2E/identity.json").is_none());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("identity.json"), folder.join("ch.json_Files/link.png")).unwrap();
+            assert!(local(&folder, "ch.json_Files/link.png").is_none());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
