@@ -25,6 +25,9 @@ sha2 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Keys at rest, sealed with a key the environment gives (identity.rs).
+aes-gcm = "0.10"
+hkdf = "0.12"
 
 [dev-dependencies]
 async-trait = { workspace = true }

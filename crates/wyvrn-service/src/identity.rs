@@ -2,9 +2,14 @@
 //! a SQLite store, or in the database for one that has a database ([`crate::db`]).
 //!
 //! With a database nothing is left on the machine itself, so a service can be
-//! moved or its container remade with nothing carried over but its settings. The
-//! keys are stored as the file holds them: unencrypted. Whoever can read the
-//! database can be the service, as whoever could read the file could.
+//! moved or its container remade with nothing carried over but its settings.
+//!
+//! **Sealed at rest**, where the process is given a key ([`seal_with`]; the
+//! community host's `COMMUNITY_HOST_SEAL_KEY`): kept as AES-256-GCM of the keys,
+//! under a key derived from it (HKDF-SHA256) and bound to where they are kept, so
+//! a stolen database, file or backup alone doesn't make anyone the service. Keys
+//! found unsealed are sealed the first time they are read. Without one, they are
+//! kept as the file holds them: whoever can read the database can be the service.
 
 use std::path::Path;
 
@@ -13,6 +18,93 @@ use didcomm_agent::Identity;
 
 use crate::db::{Db, Location, Schema, MYSQL_TABLE};
 use crate::params;
+
+/// The key keys are sealed with at rest, once the process is given one.
+static SEAL: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+
+/// Seals every identity this process keeps, from now on, with `key` (32 bytes, or
+/// base64 of them). Once: a second key is refused.
+pub fn seal_with(key: &str) -> anyhow::Result<()> {
+    use base64::Engine;
+    let text = key.trim();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(text.trim_end_matches('=')))
+        .context("the seal key is base64 of 32 bytes")?;
+    let key: [u8; 32] = bytes.try_into().map_err(|_| anyhow::anyhow!("the seal key is base64 of 32 bytes"))?;
+    anyhow::ensure!(SEAL.get().is_none_or(|held| *held == key), "a different seal key is set already");
+    let _ = SEAL.set(key);
+    Ok(())
+}
+
+const SEALED: &str = "wyvrn-sealed-identity/1";
+
+/// `identity` as it is kept: sealed, where there is a key, else as it is.
+fn kept_form(identity: &Identity, at: &str) -> anyhow::Result<String> {
+    let plain = identity.to_json()?;
+    let Some(key) = SEAL.get() else { return Ok(plain) };
+    use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
+    use base64::Engine;
+    let cipher = aes_gcm::Aes256Gcm::new_from_slice(&derived(key, at)).expect("a 32-byte key");
+    let nonce = aes_gcm::Aes256Gcm::generate_nonce(OsRng);
+    let sealed = cipher.encrypt(&nonce, Payload { msg: plain.as_bytes(), aad: at.as_bytes() }).map_err(|_| anyhow::anyhow!("the keys couldn't be sealed"))?;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    Ok(serde_json::json!({ "sealed": SEALED, "nonce": b64.encode(nonce), "keys": b64.encode(sealed) }).to_string())
+}
+
+/// Keys as kept (sealed or not) read back; and whether they were unsealed, to be
+/// sealed now.
+fn read_kept(text: &str, at: &str) -> anyhow::Result<(Identity, bool)> {
+    let value: serde_json::Value = serde_json::from_str(text).context("the keys aren't JSON")?;
+    if value["sealed"] != SEALED {
+        return Ok((Identity::from_json(text)?, SEAL.get().is_some()));
+    }
+    let key = SEAL.get().context("these keys are sealed: the key they were sealed with is needed (COMMUNITY_HOST_SEAL_KEY)")?;
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let nonce = b64.decode(value["nonce"].as_str().unwrap_or_default()).context("sealed keys' nonce")?;
+    let sealed = b64.decode(value["keys"].as_str().unwrap_or_default()).context("sealed keys")?;
+    anyhow::ensure!(nonce.len() == 12, "sealed keys' nonce");
+    let cipher = aes_gcm::Aes256Gcm::new_from_slice(&derived(key, at)).expect("a 32-byte key");
+    let plain = cipher
+        .decrypt(aes_gcm::Nonce::from_slice(&nonce), Payload { msg: &sealed, aad: at.as_bytes() })
+        .map_err(|_| anyhow::anyhow!("these keys don't open with this seal key (or were moved from where they were sealed)"))?;
+    Ok((Identity::from_json(std::str::from_utf8(&plain)?)?, false))
+}
+
+fn derived(key: &[u8; 32], at: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    hkdf::Hkdf::<sha2::Sha256>::new(Some(b"wyvrn identity at rest"), key).expand(at.as_bytes(), &mut out).expect("32 bytes is a length HKDF gives");
+    out
+}
+
+/// Where keys are kept, as they are bound to it: the file's name for a file (its
+/// folder is the community's own), the service for a database.
+fn place_of_file(path: &Path) -> String {
+    format!("file:{}", path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or_default())
+}
+
+fn file_load(path: &Path) -> anyhow::Result<Identity> {
+    let text = std::fs::read_to_string(path)?;
+    let at = place_of_file(path);
+    let (identity, reseal) = read_kept(&text, &at)?;
+    if reseal {
+        write_file(path, &kept_form(&identity, &at)?)?;
+        tracing::info!(path = %path.display(), "keys sealed at rest");
+    }
+    Ok(identity)
+}
+
+fn write_file(path: &Path, text: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let partial = path.with_extension("json.partial");
+    std::fs::write(&partial, text)?;
+    std::fs::rename(&partial, path)?;
+    Ok(())
+}
 
 fn schema() -> Schema {
     static MYSQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -29,10 +121,17 @@ fn schema() -> Schema {
 /// and not read again).
 pub fn load_or_generate(location: &Location, path: &Path, service: &str) -> anyhow::Result<Identity> {
     match location {
-        Location::Sqlite(_) => Identity::load_or_generate(path).with_context(|| format!("identity file {}", path.display())),
+        Location::Sqlite(_) => {
+            if path.exists() {
+                return file_load(path).with_context(|| format!("identity file {}", path.display()));
+            }
+            let identity = Identity::generate()?;
+            write_file(path, &kept_form(&identity, &place_of_file(path))?).with_context(|| format!("identity file {}", path.display()))?;
+            Ok(identity)
+        }
         Location::MySql(_) | Location::Shared { .. } => {
             let db = Db::open(location, &schema(), service).with_context(|| format!("the identity in {location}"))?;
-            in_database(&db, path)
+            in_database(&db, path, service)
         }
     }
 }
@@ -41,11 +140,17 @@ pub fn load_or_generate(location: &Location, path: &Path, service: &str) -> anyh
 /// one is: nothing is made.
 pub fn load(location: &Location, path: &Path, service: &str) -> anyhow::Result<Option<Identity>> {
     match location {
-        Location::Sqlite(_) => Ok(path.exists().then(|| Identity::load(path)).transpose().with_context(|| format!("identity file {}", path.display()))?),
+        Location::Sqlite(_) => Ok(path.exists().then(|| file_load(path)).transpose().with_context(|| format!("identity file {}", path.display()))?),
         Location::MySql(_) | Location::Shared { .. } => {
             let db = Db::open(location, &schema(), service).with_context(|| format!("the identity in {location}"))?;
             let held = db.lock().query_row("SELECT identity FROM wyvrn_identity WHERE id = 1", params![], |row| row.get::<String>(0))?;
-            Ok(held.map(|held| Identity::from_json(&held)).transpose()?)
+            let Some(held) = held else { return Ok(None) };
+            let at = format!("db:{service}");
+            let (identity, reseal) = read_kept(&held, &at)?;
+            if reseal {
+                db.lock().execute("UPDATE wyvrn_identity SET identity = ?1 WHERE id = 1", params![kept_form(&identity, &at)?])?;
+            }
+            Ok(Some(identity))
         }
     }
 }
@@ -59,32 +164,38 @@ pub fn keep(location: &Location, path: &Path, service: &str, identity: &Identity
         return Ok(());
     }
     match location {
-        Location::Sqlite(_) => identity.save(path).with_context(|| format!("identity file {}", path.display()))?,
+        Location::Sqlite(_) => write_file(path, &kept_form(identity, &place_of_file(path))?).with_context(|| format!("identity file {}", path.display()))?,
         Location::MySql(_) | Location::Shared { .. } => {
             let db = Db::open(location, &schema(), service)?;
-            db.lock().execute("INSERT INTO wyvrn_identity (id, identity) VALUES (1, ?1)", params![identity.to_json()?])?;
+            db.lock().execute("INSERT INTO wyvrn_identity (id, identity) VALUES (1, ?1)", params![kept_form(identity, &format!("db:{service}"))?])?;
         }
     }
     Ok(())
 }
 
-fn in_database(db: &Db, path: &Path) -> anyhow::Result<Identity> {
+fn in_database(db: &Db, path: &Path, service: &str) -> anyhow::Result<Identity> {
     const HELD: &str = "SELECT identity FROM wyvrn_identity WHERE id = 1";
+    let at = format!("db:{service}");
     let mut session = db.lock();
     if let Some(held) = session.query_row(HELD, params![], |row| row.get::<String>(0))? {
-        return Ok(Identity::from_json(&held)?);
+        let (identity, reseal) = read_kept(&held, &at)?;
+        if reseal {
+            session.execute("UPDATE wyvrn_identity SET identity = ?1 WHERE id = 1", params![kept_form(&identity, &at)?])?;
+            tracing::info!("this service's keys are sealed at rest");
+        }
+        return Ok(identity);
     }
     let (identity, from) = if path.exists() {
-        (Identity::load(path).with_context(|| format!("identity file {}", path.display()))?, "copied from its file")
+        (file_load(path).with_context(|| format!("identity file {}", path.display()))?, "copied from its file")
     } else {
         (Identity::generate()?, "made")
     };
     // Another start of the same service may have got there first: what is held
     // is what both use.
-    session.execute("INSERT OR IGNORE INTO wyvrn_identity (id, identity) VALUES (1, ?1)", params![identity.to_json()?])?;
+    session.execute("INSERT OR IGNORE INTO wyvrn_identity (id, identity) VALUES (1, ?1)", params![kept_form(&identity, &at)?])?;
     let held: String = session.query_value(HELD, params![])?;
     tracing::info!("this service's keys are kept in its database ({from})");
-    Ok(Identity::from_json(&held)?)
+    Ok(read_kept(&held, &at)?.0)
 }
 
 #[cfg(test)]
@@ -99,17 +210,17 @@ mod tests {
     fn keys_in_a_database_are_made_once_and_a_file_that_was_there_is_taken_in() {
         let nowhere = Path::new("/nonexistent/identity.json");
         let db = Db::scratch(&schema()).unwrap();
-        let first = in_database(&db, nowhere).unwrap();
-        assert_eq!(keys(&in_database(&db, nowhere).unwrap()), keys(&first));
+        let first = in_database(&db, nowhere, "test").unwrap();
+        assert_eq!(keys(&in_database(&db, nowhere, "test").unwrap()), keys(&first));
 
         let file = std::env::temp_dir().join(format!("wyvrn-identity-test-{}-{:?}.json", std::process::id(), std::thread::current().id()));
         let before = Identity::generate().unwrap();
         before.save(&file).unwrap();
         let moved = Db::scratch(&schema()).unwrap();
-        assert_eq!(keys(&in_database(&moved, &file).unwrap()), keys(&before));
+        assert_eq!(keys(&in_database(&moved, &file, "test").unwrap()), keys(&before));
         // Held from then on, whatever becomes of the file.
         std::fs::remove_file(&file).unwrap();
-        assert_eq!(keys(&in_database(&moved, &file).unwrap()), keys(&before));
+        assert_eq!(keys(&in_database(&moved, &file, "test").unwrap()), keys(&before));
         assert_ne!(keys(&before), keys(&first));
     }
 }

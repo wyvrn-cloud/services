@@ -52,6 +52,8 @@ wyvrn-community-host [--config <path>] open-backup <file> <out.tar.gz>
                                                                   .tar.gz is what an export is
 
 The config path is --config, else $COMMUNITY_HOST_CONFIG, else config/default.toml.
+COMMUNITY_HOST_SEAL_KEY (base64 of 32 bytes; or COMMUNITY_HOST_SEAL_KEY_FILE) seals every
+community's keys at rest; keys found unsealed are sealed as they are next read.
 A change made here while the host runs is taken up when the community is next opened.";
 
 fn registry(config: &Config) -> anyhow::Result<Registry> {
@@ -74,6 +76,16 @@ async fn main() -> anyhow::Result<()> {
         None => std::env::var("COMMUNITY_HOST_CONFIG").unwrap_or_else(|_| "config/default.toml".to_string()),
     };
     let config = Config::load(&config_path)?;
+    // Every community's keys sealed at rest with the host's key, where it is given
+    // one (wyvrn_service::identity): a stolen database, folder or backup alone then
+    // makes nobody any community. Kept in the environment or a secrets file, never
+    // in the store.
+    if let Some(key) = std::env::var("COMMUNITY_HOST_SEAL_KEY").ok().filter(|k| !k.trim().is_empty()) {
+        wyvrn_service::identity::seal_with(&key).context("COMMUNITY_HOST_SEAL_KEY")?;
+    } else if let Some(path) = std::env::var("COMMUNITY_HOST_SEAL_KEY_FILE").ok().filter(|p| !p.trim().is_empty()) {
+        let key = std::fs::read_to_string(&path).with_context(|| format!("COMMUNITY_HOST_SEAL_KEY_FILE {path}"))?;
+        wyvrn_service::identity::seal_with(&key).context("COMMUNITY_HOST_SEAL_KEY_FILE")?;
+    }
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let state_of = |name: &str, state: State, sealed: Option<i64>| -> anyhow::Result<()> {
         let registry = registry(&config)?;

@@ -5514,6 +5514,7 @@ dependencies = [
 name = "wyvrn-service"
 version = "0.0.1"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "async-trait",
  "axum",
@@ -5522,6 +5523,7 @@ dependencies = [
  "didcomm-agent",
  "didcomm-core",
  "didcomm-crypto-askar",
+ "hkdf 0.12.4",
  "mysql",
  "reqwest",
  "rusqlite",
