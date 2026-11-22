@@ -244,6 +244,12 @@ fn keep_files(community: &Community, hook: &Webhook, sent: &Sent, now: i64) -> R
     let Some(files) = &community.files else {
         return Err(problem(StatusCode::BAD_REQUEST, 50035, "This community keeps no files."));
     };
+    // Nothing more where the community has used all its host gives it (WYV-20).
+    let room = community.config.max_store_bytes;
+    let adding: u64 = sent.files.iter().map(|(_, _, _, bytes)| bytes.len() as u64).sum();
+    if room > 0 && community.used_bytes.load(std::sync::atomic::Ordering::Relaxed) + adding > room {
+        return Err(problem(StatusCode::PAYLOAD_TOO_LARGE, 40005, "This community has used all the room its host gives it."));
+    }
     // What each was said to be: `attachments: [{ id, description }]`, `id` the n of `files[n]`.
     let described: Vec<&Value> = sent.payload["attachments"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
     for (field, name, media_type, bytes) in &sent.files {
@@ -385,6 +391,11 @@ fn post_sent(state: &Arc<AppState>, hook: &Webhook, sent: Sent, query: &ExecuteQ
     // A channel of a kind its host turned off takes nothing new.
     if community.channel_off(&channel) {
         return problem(StatusCode::FORBIDDEN, 50013, "Missing Permissions");
+    }
+    // Out of the room its host gives it: nothing new, from a webhook either (WYV-20).
+    let room = community.config.max_store_bytes;
+    if room > 0 && community.used_bytes.load(std::sync::atomic::Ordering::Relaxed) >= room {
+        return problem(StatusCode::FORBIDDEN, 50001, "This community has used all the room its host gives it.");
     }
     if community.moving().unwrap_or(false) {
         return problem(StatusCode::FORBIDDEN, 50001, "This community is moving, and takes no posts until it has.");

@@ -3181,6 +3181,25 @@ async fn roles_are_dragged_into_order_where_the_app_draws_a_sortable_list() {
     assert_eq!(advance(&moderator, "r2", "reorder", json!({ "order": [moderator_role, admin, artist] })).await["body"]["code"], "not_authorized");
 }
 
+#[tokio::test]
+async fn a_webhook_is_held_to_the_room_its_community_has_and_to_a_members_file_quota() {
+    let server = start_server_with("max_store_bytes = 1000000", true).await;
+    let owner = Peer::start(&server).await;
+    server.admit(&[&owner]);
+    let general = open_channel(&owner, "general").await;
+    owner.community("join", json!({})).await;
+    let url = make_webhook(&owner, "w1", "CI", &general).await;
+    let http = reqwest::Client::new();
+    assert!(http.post(&url).json(&json!({ "content": "fine" })).send().await.unwrap().status().is_success());
+    // Its room used up: nothing more, text or files (WYV-20).
+    server.state.community.used_bytes.store(2_000_000, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(http.post(&url).json(&json!({ "content": "more" })).send().await.unwrap().status(), 403);
+    let form = reqwest::multipart::Form::new()
+        .text("payload_json", json!({ "content": "x" }).to_string())
+        .part("files[0]", reqwest::multipart::Part::bytes(vec![0u8; 10]).file_name("a.png").mime_str("image/png").unwrap());
+    assert!(!http.post(&url).multipart(form).send().await.unwrap().status().is_success());
+}
+
 /// A webhook's URL, made through the `webhooks` workflow by `owner` for `channel`.
 async fn make_webhook(owner: &Peer, instance: &str, name: &str, channel: &str) -> String {
     owner.workflow("start", json!({ "template_id": "webhooks", "instance_id": instance })).await;

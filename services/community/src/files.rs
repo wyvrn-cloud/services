@@ -127,6 +127,15 @@ impl Files {
         if bytes.len() as u64 > self.config.max_file_bytes {
             anyhow::bail!("a file here is at most {} bytes", self.config.max_file_bytes);
         }
+        // Held to what a member may keep, and to the community's total, as a
+        // member's upload is (security review WYV-20).
+        let store = &self.host.store;
+        if self.config.quota_bytes > 0 && store.used_by(owner)? + bytes.len() as u64 > self.config.quota_bytes {
+            anyhow::bail!("{owner} keeps as much here as it may");
+        }
+        if self.config.total_bytes > 0 && store.used_total()? + bytes.len() as u64 > self.config.total_bytes {
+            anyhow::bail!("this community keeps as much here as it may");
+        }
         self.keep_any(owner, name, media_type, bytes, now)
     }
 
