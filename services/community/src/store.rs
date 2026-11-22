@@ -1243,6 +1243,12 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         at INTEGER NOT NULL,
         PRIMARY KEY (service, account)
     );
+    -- Members that are bots, and their commands (bots.rs).
+    CREATE TABLE IF NOT EXISTS member_bots (
+        did TEXT PRIMARY KEY,
+        commands TEXT NOT NULL,
+        at INTEGER NOT NULL
+    );
     -- Imported posts claimed by whoever wrote them (claims.rs).
     CREATE TABLE IF NOT EXISTS discord_claims (
         discord_id TEXT PRIMARY KEY,
@@ -1873,6 +1879,12 @@ fn schema() -> Schema {
                 until BIGINT,
                 at BIGINT NOT NULL,
                 PRIMARY KEY (service(150), account(150))
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS member_bots (
+                did {MYSQL_DID} NOT NULL,
+                commands MEDIUMTEXT NOT NULL,
+                at BIGINT NOT NULL,
+                PRIMARY KEY (did(255))
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS private_threads (
                 thread VARCHAR(255) NOT NULL PRIMARY KEY

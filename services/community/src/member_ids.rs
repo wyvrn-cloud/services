@@ -27,7 +27,7 @@ pub const MODERATING: &[&str] = &["administrator", "kick_members", "ban_members"
 /// Keys whose value, a string or an array of strings, names a person where it is a DID.
 const PERSON_KEYS: &[&str] = &[
     "did", "by", "author", "answered_by", "removed_by", "created_by", "last_by", "resolved_by", "who", "voters", "owner", "owners", "you", "actor", "target", "member", "participants", "speakers", "to",
-    "invited_by", "holder", "from",
+    "invited_by", "holder", "from", "invoker", "presser",
 ];
 
 /// Messages whose people a member told DIDs is given the DID of too, beside the
@@ -333,6 +333,10 @@ impl Community {
                 said.insert("publicAddress".into(), json!(address));
             }
         }
+        if let Some(commands) = self.store.bot(&did)? {
+            said.insert("bot".into(), json!(true));
+            said.insert("commands".into(), commands);
+        }
         let profile_value = (!said.is_empty()).then(|| {
             said.insert("at".into(), json!(at));
             Value::Object(said)
@@ -515,8 +519,10 @@ impl Community {
             kept.public_address = address.as_str().filter(|address| address.starts_with("did:webvh:") && address.len() <= 1024).map(str::to_string);
         }
         let after = (kept.description.clone(), kept.banner.clone(), kept.linked.clone(), kept.public_address.clone());
+        // Being a bot, and its commands (bots.rs).
+        let bot_changed = self.take_bot(sender, profile, now)?;
         if before == after {
-            return Ok(false);
+            return Ok(bot_changed);
         }
         kept.at = now;
         self.store.set_member_profile(sender, &kept)?;

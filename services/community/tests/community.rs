@@ -4497,3 +4497,52 @@ async fn new_accounts_are_held_back_where_the_gates_say_and_a_ban_follows_its_li
     assert!(state.community.store.member(&again.did()).unwrap().is_none());
     assert!(state.community.store.banned(&again.did(), wyvrn_service::now()).unwrap().is_some());
 }
+
+#[tokio::test]
+async fn a_bot_says_its_commands_takes_them_through_the_community_and_answers_with_buttons() {
+    let server = start_server("").await;
+    let (admin, member, bot) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member, &bot]);
+    member.community("join", json!({})).await;
+    bot.community("join", json!({})).await;
+    let channel = open_channel(&admin, "general").await;
+    let commands = json!([{ "name": "roll", "description": "Roll a die", "options": [{ "name": "sides", "type": "number", "required": true }] }]);
+    bot.agent
+        .send(&bot.server, &json!({ "type": "https://didcomm.org/user-profile/1.0/profile", "body": { "profile": { "displayName": "Dicebot", "bot": true, "commands": commands } } }))
+        .await
+        .unwrap();
+    let bot_id = server.id(&bot);
+    let mut listed = Value::Null;
+    for _ in 0..50 {
+        let members = member.community("members-request", json!({})).await;
+        listed = members["body"]["members"].as_array().unwrap().iter().find(|m| m["member"] == bot_id.as_str()).cloned().unwrap_or_default();
+        if listed["profile"]["bot"] == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(listed["profile"]["commands"][0]["name"], "roll", "{listed}");
+
+    // A command the bot has, where the member may post: passed on, with who and where.
+    assert_eq!(member.community("bot-invoke", json!({ "member": bot_id, "channel": channel, "command": "fly" })).await["body"]["code"], "e.p.msg.unknown-command");
+    assert_eq!(member.community("bot-invoke", json!({ "member": bot_id, "channel": channel, "command": "roll" })).await["body"]["code"], "e.p.msg.invalid-command");
+    let sent = member.community("bot-invoke", json!({ "member": bot_id, "channel": channel, "command": "roll", "options": { "sides": 20, "extra": "dropped" } })).await;
+    assert_eq!(kind(&sent), "bot-sent", "{sent}");
+    let invoked = bot.next_of("https://wyvrn.app/bot-commands/1.0/invoke").await;
+    assert_eq!(invoked["body"]["options"], json!({ "sides": 20 }));
+    assert_eq!(invoked["body"]["invoker"], server.id(&member), "named by member id, never by DID");
+    assert!(!invoked.to_string().contains(&member.did()));
+
+    // It answers by posting, with buttons; a member's post can't have them.
+    let posted = bot.community("post", json!({ "channel": channel, "id": "r1", "content": "You rolled 17", "buttons": [{ "id": "again", "label": "Roll again" }] })).await;
+    assert_eq!(kind(&posted), "posted");
+    member.community("post", json!({ "channel": channel, "id": "m1", "content": "nice", "buttons": [{ "id": "x", "label": "Press me" }] })).await;
+    let history = member.community("history-request", json!({ "channel": channel })).await;
+    let by_id = |id: &str| history["body"]["messages"].as_array().unwrap().iter().find(|m| m["id"] == id).cloned().unwrap();
+    assert_eq!(by_id("r1")["buttons"][0]["label"], "Roll again");
+    assert!(by_id("m1").get("buttons").is_none());
+    assert_eq!(member.community("bot-press", json!({ "to": { "id": "r1" }, "button": "nope" })).await["body"]["code"], "e.p.msg.unknown-button");
+    assert_eq!(kind(&member.community("bot-press", json!({ "to": { "id": "r1" }, "button": "again" })).await), "bot-sent");
+    let pressed = bot.next_of("https://wyvrn.app/bot-commands/1.0/press").await;
+    assert_eq!((pressed["body"]["post"].as_str(), pressed["body"]["button"].as_str()), (Some("r1"), Some("again")));
+}

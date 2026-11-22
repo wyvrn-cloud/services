@@ -1069,7 +1069,7 @@ impl Community {
     /// The post a message reference names (`{ id, author }`): the one with that id,
     /// if whoever is said to have written it did. A reference that names another
     /// author is to no post here.
-    fn referred(&self, reference: &Value) -> anyhow::Result<Option<Post>> {
+    pub(crate) fn referred(&self, reference: &Value) -> anyhow::Result<Option<Post>> {
         let id = reference["id"].as_str().or(reference.as_str()).filter(|id| !id.is_empty());
         let Some(post) = id.map(|id| self.store.post_by_id(id)).transpose()?.flatten() else { return Ok(None) };
         Ok(match reference["author"].as_str() {
@@ -1480,10 +1480,14 @@ impl Community {
             },
             _ => None,
         };
-        let extra = match crate::posting::read_extra(body, &channel, thread.is_some(), now) {
+        let mut extra = match crate::posting::read_extra(body, &channel, thread.is_some(), now) {
             Ok(extra) => extra,
             Err((code, why)) => return refuse(message, code, &why),
         };
+        // A bot's post may carry buttons (bot-commands/1.0); anyone else's doesn't.
+        if let Some(buttons) = crate::bots::buttons_from(&body["buttons"]).filter(|_| matches!(self.store.bot(sender), Ok(Some(_)))) {
+            extra.get_or_insert_with(|| json!({}))["buttons"] = buttons;
+        }
         if extra.as_ref().is_some_and(|extra| extra.get("media").is_some()) && !self.may_in(sender, &channel, "attach_files")? {
             return refuse(message, "e.p.trust.not-authorized", "You can't post files in this channel.");
         }
@@ -1656,6 +1660,9 @@ impl Community {
             return Ok(outcome);
         }
         if let Some(outcome) = self.handle_wiki_message(&member, message, now)? {
+            return Ok(outcome);
+        }
+        if let Some(outcome) = self.handle_bot_message(&member, message, now)? {
             return Ok(outcome);
         }
         if let Some(outcome) = self.handle_board_message(&member, message, now)? {
