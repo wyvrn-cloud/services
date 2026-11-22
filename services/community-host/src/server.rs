@@ -101,12 +101,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/voice/auth", post(voice_auth))
         // An owner's export, once (export.rs).
         .route("/export/{token}", get(crate::export::download))
+        // Caddy's on-demand TLS asking about a community's own domain (domains.rs).
+        .route("/domains/ask", get(crate::domains::ask))
         // Everything under /c/<name> is the community's, by the fallback rather
         // than a route: a route's `{name}` and `{*rest}` would stay with the
         // request, and every route of the community's own that reads its path
         // (a member's picture, a pack's file, a post's page) would be handed
         // those as well as its own, and fail.
         .fallback(community)
+        // A community's own domain is its, whatever the path (domains.rs).
+        .layer(axum::middleware::from_fn_with_state(state.clone(), crate::domains::by_host))
         .with_state(state)
 }
 

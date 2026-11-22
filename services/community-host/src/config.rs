@@ -45,6 +45,9 @@ pub struct Config {
     /// Each community backed up on a schedule, sealed with a key (backups.rs).
     #[serde(default)]
     pub backups: BackupsConfig,
+    /// Communities at domains of their own (domains.rs).
+    #[serde(default)]
+    pub domains: crate::domains::DomainsConfig,
 }
 
 /// Backups: where (`dir`, empty for `<storage.dir>/.backups`), how often, how many

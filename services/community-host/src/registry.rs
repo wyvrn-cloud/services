@@ -32,6 +32,12 @@ CREATE TABLE IF NOT EXISTS create_codes (
     note TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     created_by TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS community_domains (
+    name TEXT PRIMARY KEY,
+    domain TEXT NOT NULL UNIQUE,
+    token TEXT NOT NULL,
+    verified_at INTEGER
 );";
 
 fn schema() -> Schema {
@@ -61,7 +67,9 @@ fn schema() -> Schema {
                 note TEXT NOT NULL,
                 created_at BIGINT NOT NULL,
                 created_by {MYSQL_DID} NOT NULL
-            ) {MYSQL_TABLE}"
+            ) {MYSQL_TABLE};
+            {}",
+            crate::domains::mysql()
         )
     });
     Schema { sqlite: SQLITE, mysql }
@@ -194,7 +202,7 @@ fn record(row: &wyvrn_service::db::Row) -> wyvrn_service::db::Result<Record> {
 }
 
 pub struct Registry {
-    db: Db,
+    pub(crate) db: Db,
 }
 
 impl Registry {

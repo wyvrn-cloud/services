@@ -311,3 +311,46 @@ keep = 7
 Each community is then backed up once a day, sealed (AES-256-GCM), the last 7 kept; Admin, Communities shows when and has "Back up now". To open one: `docker compose run --rm community-host open-backup <file> /tmp/out.tar.gz`, which is what an export is (it runs as its own `wyvrn-community`, or can be brought back in with `import`).
 
 Also new on that page: a community's roles, posts a minute from everyone, its store's size, and its own packs: 1 sticker pack of 25 and 1 emoji pack of 75 unless set, under What it may hold.
+
+## Communities' keys sealed at rest, and communities at their own domains (2026-11-22)
+
+**Keys at rest.** Give the community host a key and every community's keys are sealed with it (AES-256-GCM), in their folders and databases alike; keys found unsealed are sealed as each community is next opened. Keep the key out of the store and its backups: in `.env` or a secrets file.
+
+```sh
+openssl rand -base64 32   # once; keep it safe: without it no community opens
+```
+
+```yaml
+  community-host:
+    environment:
+      COMMUNITY_HOST_SEAL_KEY: ${COMMUNITY_HOST_SEAL_KEY}   # or COMMUNITY_HOST_SEAL_KEY_FILE: /run/secrets/seal
+```
+
+A backup then holds sealed keys: opening one to run elsewhere needs this key too. An owner's move-out export carries its keys readable, for their own server.
+
+**Own domains.** Owners may put their community's web pages at a domain of their own (Admin, "Your own domain": a CNAME to the host and a TXT record `_wyvrn.<domain>` the page gives, checked over DNS-over-HTTPS). Off unless turned on:
+
+```toml
+[domains]
+enabled = true
+cname = "c.wyvrn.app"      # what owners point their CNAME at
+```
+
+and Caddy gets certificates for proved domains only, asking the host:
+
+```caddyfile
+{
+	on_demand_tls {
+		ask http://community-host:8080/domains/ask
+	}
+}
+
+https:// {
+	tls {
+		on_demand
+	}
+	reverse_proxy community-host:8080
+}
+```
+
+The community's DID stays as it is (members' apps know it by it); its web view and the links it gives use the domain.

@@ -22,6 +22,7 @@ pub mod admin;
 pub mod backups;
 pub mod config;
 pub mod creating;
+pub mod domains;
 pub mod export;
 pub mod expressions;
 pub mod history;

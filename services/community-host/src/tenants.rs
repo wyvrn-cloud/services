@@ -209,8 +209,12 @@ impl Host {
             stickers: Some(StickersConfig { path: folder.join("stickers.sqlite") }),
             files: Some(FilesConfig { dir: folder.join("files"), max_file_bytes: limits.file_bytes, quota_bytes: limits.files_quota, total_bytes: limits.files_total }),
             assistant: None,
-            // Each community's web view is at its own address, under the host's.
-            web: wyvrn_community::config::WebConfig { public_url: None, ..self.config.web.clone() },
+            // Each community's web view is at its own address, under the host's, or
+            // at its own domain once proved (domains.rs).
+            web: wyvrn_community::config::WebConfig {
+                public_url: self.registry.domain_of(&record.name).ok().flatten().filter(|d| d.verified_at.is_some()).map(|d| format!("https://{}/", d.domain)),
+                ..self.config.web.clone()
+            },
         };
         settings.community.owners_are_admins();
         settings
@@ -260,7 +264,10 @@ impl Host {
     async fn load(&self, record: &Record) -> anyhow::Result<Tenant> {
         let config = self.settings(record);
         let stores = self.stores(record, record.storage)?;
-        let owner_pages: Arc<dyn wyvrn_service::admin::Pages> = Arc::new(crate::export::MoveOut { host: self.me.clone(), community: record.name.clone() });
+        let owner_pages: Arc<dyn wyvrn_service::admin::Pages> = Arc::new(crate::domains::Both(
+            Arc::new(crate::export::MoveOut { host: self.me.clone(), community: record.name.clone() }),
+            Arc::new(crate::domains::OwnDomain { host: self.me.clone(), community: record.name.clone() }),
+        ));
         let opening = Opening { profile_env: None, address: self.address(&record.name)?, voice_tokens: format!("{}.", record.name), assistant: None, owner_pages: Some(owner_pages) };
         let Opened { state, holding } = serve::open(&config, &stores, opening).await?;
         // What the host says of it stands over what it says of itself.

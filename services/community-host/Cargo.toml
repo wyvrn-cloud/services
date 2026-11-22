@@ -8,6 +8,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# A community's own domain's TXT record, read over DNS-over-HTTPS (domains.rs).
+reqwest = { workspace = true, features = ["json", "query"] }
 # Each community is wyvrn-community's, opened from settings the host makes.
 wyvrn-community = { path = "../community" }
 # A community's packs and files' records, made where it is moved to (tenants.rs).

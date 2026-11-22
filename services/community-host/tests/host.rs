@@ -657,3 +657,54 @@ async fn a_community_is_backed_up_sealed_with_the_hosts_key_and_opens_whole() {
     assert!(out.join("kept/data/identity.json").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn a_community_at_its_own_domain_once_proved_by_its_txt_record() {
+    use wyvrn_community_host::domains;
+    // A stand-in DNS-over-HTTPS resolver: what `_wyvrn.club.example.org` says.
+    let dns = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dns_url = format!("http://{}/dns-query", dns.local_addr().unwrap());
+    let record = Arc::new(std::sync::Mutex::new(String::new()));
+    let said = record.clone();
+    let resolver = axum::Router::new().route(
+        "/dns-query",
+        axum::routing::get(move |axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| {
+            let said = said.lock().unwrap().clone();
+            async move {
+                let answers = if q.get("name").map(String::as_str) == Some("_wyvrn.club.example.org") && !said.is_empty() { json!([{ "type": 16, "data": format!("\"{said}\"") }]) } else { json!([]) };
+                axum::Json(json!({ "Status": 0, "Answer": answers }))
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(dns, resolver).await.unwrap() });
+    let running = start_host_with_extra(600, "", &format!("[domains]\nenabled = true\ncname = \"c.wyvrn.example\"\ndns_over_https = \"{dns_url}\"\n")).await;
+    let ann = Peer::start().await;
+    running.host.registry.create("club", "The Club", Storage::Sqlite, &ann.did(), "test", 1).unwrap();
+    running.host.registry.create("other", "Other", Storage::Sqlite, &ann.did(), "test", 1).unwrap();
+    let ask = |domain: &str| reqwest::get(format!("{}domains/ask?domain={domain}", running.url));
+
+    // Claimed, and not yet proved: no certificate, and not its.
+    assert!(running.host.registry.claim_domain("club", "club.example.org", "wyvrn-token1").unwrap());
+    assert!(!running.host.registry.claim_domain("other", "club.example.org", "wyvrn-token2").unwrap(), "another community's");
+    assert_eq!(ask("club.example.org").await.unwrap().status(), 404);
+    assert!(domains::txt_records(&dns_url, "_wyvrn.club.example.org").await.unwrap().is_empty());
+
+    // The TXT record set: proved.
+    *record.lock().unwrap() = "wyvrn-token1".to_string();
+    assert_eq!(domains::txt_records(&dns_url, "_wyvrn.club.example.org").await.unwrap(), ["wyvrn-token1"]);
+    running.host.registry.domain_proved("club", 2).unwrap();
+    assert_eq!(ask("club.example.org").await.unwrap().status(), 200);
+    assert_eq!(ask("someone-elses.example.org").await.unwrap().status(), 404);
+
+    // A request for the domain is the community's, at its root.
+    let client = reqwest::Client::new();
+    let own = client.get(format!("{}.well-known/did.json", running.url)).header("host", "club.example.org").send().await.unwrap();
+    let at_path = client.get(format!("{}c/club/.well-known/did.json", running.url)).send().await.unwrap();
+    assert_eq!(own.status(), at_path.status());
+    let (own, at_path) = (own.text().await.unwrap(), at_path.text().await.unwrap());
+    assert_eq!(own, at_path, "the community's own answer, not the host's");
+    // The host's own name is still the host's.
+    assert!(client.get(&running.url).send().await.unwrap().text().await.unwrap().contains("keeps Wyvrn communities"));
+    // And its web view's address is the domain.
+    assert_eq!(running.host.settings(&running.host.registry.get("club").unwrap().unwrap()).web.public_url.as_deref(), Some("https://club.example.org/"));
+}
