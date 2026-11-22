@@ -736,9 +736,7 @@ pub fn match_channels(store: &Store, files: &[PathBuf], all: &[PathBuf], told: &
     let mut targets = Vec::new();
     for file in files {
         let (_, source) = header(file)?;
-        let found = if source.kind.contains("Private") {
-            (Err("a private thread: it waits on private threads here (imported now, everyone in the channel would read it)".to_string()), "")
-        } else if source.is_thread() {
+        let found = if source.is_thread() {
             let parent = source.category_id.as_ref().and_then(|id| headers.get(id));
             match parent {
                 Some(parent) => {
@@ -1127,6 +1125,11 @@ pub fn write(store: &Store, export: &Export, channel: &Channel, ctx: &Context, p
                 }
                 written.posts += 1;
             }
+            // A private thread stays one: read by whoever manages threads here (who
+            // was in it isn't in the export), until people are added to it.
+            if let (Some(root), true) = (&root, export.channel.kind.contains("Private")) {
+                db.execute("INSERT OR IGNORE INTO private_threads (thread) VALUES (?1)", params![root])?;
+            }
             // The thread, once the post it grows from is here (not touched: it is history).
             if let Some(root) = &root {
                 db.execute(
@@ -1285,6 +1288,10 @@ mod tests {
         write(&store, &lost, &art, &ctx(&dir), |_, _| {}).unwrap();
         assert_eq!(store.post_by_id("discord-70").unwrap().unwrap().content, "🧵 lost start");
         assert_eq!(store.thread("discord-70").unwrap().unwrap().count, 1);
+        // A private one stays private.
+        let hidden = export("80", "GuildPrivateThread", "mods only", Some("900"), vec![message("81", "2023-02-01T00:00:00+00:00", "between us")]);
+        write(&store, &hidden, &art, &ctx(&dir), |_, _| {}).unwrap();
+        assert!(store.is_private_thread("discord-80").unwrap());
         // Nothing of it was counted as a change.
         assert_eq!(store.latest_rev().unwrap(), 0);
     }
