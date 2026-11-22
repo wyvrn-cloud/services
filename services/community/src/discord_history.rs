@@ -695,43 +695,73 @@ pub struct Target {
 }
 
 /// A channel's name and its category's, as compared.
+pub fn name_key(name: &str) -> String {
+    key(name)
+}
+
 fn key(name: &str) -> String {
     crate::discord::text_name(name)
 }
 
 /// Matches each export to a channel here: `told` first (Discord channel id ->
 /// channel id here), then by category and name, then by name where only one has it.
-pub fn match_channels(store: &Store, files: &[PathBuf], told: &HashMap<String, String>) -> anyhow::Result<Vec<Target>> {
+/// A thread goes where the channel it is in went (that channel's file among
+/// `all`), or, in a forum (which has no file of its own), to the forum here of its
+/// name. A voice channel's text chat goes to the voice channel here of its name.
+pub fn match_channels(store: &Store, files: &[PathBuf], all: &[PathBuf], told: &HashMap<String, String>) -> anyhow::Result<Vec<Target>> {
     let channels = store.channels()?;
     let categories: HashMap<String, String> = store.categories()?.into_iter().map(|c| (c.id, key(&c.name))).collect();
     let category_of = |c: &Channel| c.category.as_ref().and_then(|id| categories.get(id)).cloned().unwrap_or_default();
+    let headers: HashMap<String, ExportChannel> = all.iter().filter_map(|f| header(f).ok()).map(|(_, c)| (c.id.clone(), c)).collect();
+    let find = |source: &ExportChannel| -> (Result<Channel, String>, &'static str) {
+        if let Some(local) = told.get(&source.id) {
+            return match channels.iter().find(|c| c.id == *local || key(&c.name) == key(local)) {
+                Some(channel) => (Ok(channel.clone()), "as told"),
+                None => (Err(format!("there is no channel {local} here")), "as told"),
+            };
+        }
+        let name = key(&source.name);
+        let category = source.category.as_deref().map(key).unwrap_or_default();
+        let voice = source.is_voice();
+        let kind = |c: &&Channel| (c.voice.is_some() == voice) && !c.calendar;
+        let both: Vec<&Channel> = channels.iter().filter(kind).filter(|c| key(&c.name) == name && category_of(c) == category).collect();
+        let named: Vec<&Channel> = channels.iter().filter(kind).filter(|c| key(&c.name) == name).collect();
+        match (both.as_slice(), named.as_slice()) {
+            ([one], _) => (Ok((*one).clone()), "by category and name"),
+            ([], [one]) => (Ok((*one).clone()), "by name"),
+            ([], []) => (Err(format!("no {}channel here has its name", if voice { "voice " } else { "" })), ""),
+            _ => (Err("several channels here have its name: say which".to_string()), ""),
+        }
+    };
     let mut targets = Vec::new();
     for file in files {
         let (_, source) = header(file)?;
-        let found = if let Some(local) = told.get(&source.id) {
-            match channels.iter().find(|c| c.id == *local || key(&c.name) == key(local)) {
-                Some(channel) => (Ok(channel.clone()), "as told"),
-                None => (Err(format!("there is no channel {local} here")), "as told"),
-            }
+        let found = if source.kind.contains("Private") {
+            (Err("a private thread: it waits on private threads here (imported now, everyone in the channel would read it)".to_string()), "")
         } else if source.is_thread() {
-            (Err("a thread: threads aren't imported yet".to_string()), "")
-        } else if source.is_voice() {
-            (Err("a voice channel's text chat: voice channels here take no posts yet (map it to a text channel to import it)".to_string()), "")
-        } else {
-            let name = key(&source.name);
-            let category = source.category.as_deref().map(key).unwrap_or_default();
-            let text = |c: &&Channel| c.voice.is_none() && !c.calendar;
-            let both: Vec<&Channel> = channels.iter().filter(text).filter(|c| key(&c.name) == name && category_of(c) == category).collect();
-            let named: Vec<&Channel> = channels.iter().filter(text).filter(|c| key(&c.name) == name).collect();
-            match (both.as_slice(), named.as_slice()) {
-                ([one], _) => (Ok((*one).clone()), "by category and name"),
-                ([], [one]) => (Ok((*one).clone()), "by name"),
-                ([], []) => (Err("no channel here has its name".to_string()), ""),
-                _ => (Err("several channels here have its name: say which".to_string()), ""),
+            let parent = source.category_id.as_ref().and_then(|id| headers.get(id));
+            match parent {
+                Some(parent) => {
+                    let (channel, how) = find(parent);
+                    (channel.map_err(|why| format!("the channel it is in, #{}: {why}", parent.name)), how)
+                }
+                None => {
+                    let forum = key(source.category.as_deref().unwrap_or_default());
+                    let forums: Vec<&Channel> = channels.iter().filter(|c| c.forum.is_some() && key(&c.name) == forum).collect();
+                    match forums.as_slice() {
+                        [one] => (Ok((*one).clone()), "a post in the forum of its name"),
+                        [] => (Err(format!("no forum here is called {}", source.category.as_deref().unwrap_or_default())), ""),
+                        _ => (Err("several forums here have its name".to_string()), ""),
+                    }
+                }
             }
+        } else {
+            find(&source)
         };
         targets.push(Target { file: file.clone(), source, channel: found.0, how: found.1 });
     }
+    // A channel before its threads: a thread's first post may be the channel's.
+    targets.sort_by_key(|t| t.source.is_thread());
     Ok(targets)
 }
 
@@ -941,7 +971,24 @@ fn card(e: &Embed) -> Option<Value> {
 pub fn write(store: &Store, export: &Export, channel: &Channel, ctx: &Context, progress: impl Fn(usize, usize)) -> anyhow::Result<Written> {
     let mut written = Written::default();
     let have = imported_here(store, &channel.id)?;
-    let mut messages: Vec<&Message> = export.messages.iter().collect();
+    // A thread: its posts are in the thread that grew from the post of its id (in a
+    // forum, its own first post; else the channel's post it was started from). One
+    // with neither gets a post to grow from, saying what it was called.
+    let thread_id = export.channel.is_thread().then(|| export.channel.id.clone());
+    let root = thread_id.as_ref().map(|id| format!("{POST_PREFIX}{id}"));
+    let forum = channel.forum.is_some();
+    let stub = match (&thread_id, &root) {
+        (Some(id), Some(root)) if !export.messages.iter().any(|m| m.id == *id) && store.post_by_id(root)?.is_none() => export.messages.iter().find(|m| is_said(&m.kind)).map(|first| Message {
+            id: id.clone(),
+            kind: "Default".into(),
+            timestamp: first.timestamp.clone(),
+            content: format!("🧵 {}", export.channel.name),
+            author: first.author.clone(),
+            ..Default::default()
+        }),
+        _ => None,
+    };
+    let mut messages: Vec<&Message> = export.messages.iter().chain(stub.iter()).collect();
     messages.sort_by(|a, b| seconds(&a.timestamp).cmp(&seconds(&b.timestamp)).then(a.id.len().cmp(&b.id.len())).then(a.id.cmp(&b.id)));
     let todo: Vec<&Message> = messages
         .into_iter()
@@ -1016,6 +1063,9 @@ pub fn write(store: &Store, export: &Export, channel: &Channel, ctx: &Context, p
                 author["avatar"] = avatar;
             }
             extra.insert("imported".into(), json!({ "from": "discord", "id": m.id, "channel": export.channel.id, "author": author }));
+            if forum && thread_id.as_deref() == Some(m.id.as_str()) {
+                extra.insert("title".into(), json!(export.channel.name.chars().take(100).collect::<String>()));
+            }
             let (mut content, mentions) = rewrite(m, ctx);
             for sticker in &m.stickers {
                 let shown = match ctx.expressions.get(&sticker.id) {
@@ -1054,10 +1104,11 @@ pub fn write(store: &Store, export: &Export, channel: &Channel, ctx: &Context, p
                 };
                 let mentions = (!mentions.is_empty()).then(|| Value::from(mentions.clone()).to_string());
                 let edited = m.timestamp_edited.as_deref().and_then(seconds);
+                let in_thread = root.as_ref().filter(|root| **root != id).cloned();
                 // rev 0: written before changes were counted, so nobody is sent it as one.
                 db.execute(
-                    "INSERT INTO post_state (post, rev, reply_to, reply_author, reply_snippet, mentions, edited_at, pinned) VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![id, reply_to, reply_author, snippet, mentions, edited, m.is_pinned],
+                    "INSERT INTO post_state (post, rev, reply_to, reply_author, reply_snippet, thread, mentions, edited_at, pinned) VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![id, reply_to, reply_author, snippet, in_thread, mentions, edited, m.is_pinned],
                 )?;
                 db.execute("INSERT INTO post_extra (post, extra) VALUES (?1, ?2)", params![id, extra.to_string()])?;
                 for r in &m.reactions {
@@ -1075,6 +1126,13 @@ pub fn write(store: &Store, export: &Export, channel: &Channel, ctx: &Context, p
                     }
                 }
                 written.posts += 1;
+            }
+            // The thread, once the post it grows from is here (not touched: it is history).
+            if let Some(root) = &root {
+                db.execute(
+                    "INSERT OR IGNORE INTO threads (id, channel, name, created_by, created_at) SELECT id, channel, ?2, author_did, posted_at FROM posts WHERE id = ?1",
+                    params![root, export.channel.name.chars().take(100).collect::<String>()],
+                )?;
             }
             if seq >= first {
                 db.execute("INSERT INTO imported_ranges (channel, from_seq, to_seq, at) VALUES (?1, ?2, ?3, ?4)", params![channel.id, first, seq, ctx.now])?;
@@ -1190,6 +1248,45 @@ mod tests {
         // Again: nothing new.
         let again = write(&store, &export, &channel, &ctx(&dir), |_, _| {}).unwrap();
         assert_eq!((again.posts, again.already), (0, 3));
+    }
+
+    #[test]
+    fn threads_and_forum_posts_grow_from_their_first_posts() {
+        let store = Store::in_memory().unwrap();
+        store.add_channel("art", "fanart", "", "did:example:owner", 100).unwrap();
+        store.add_channel("games", "games-general", "", "did:example:owner", 100).unwrap();
+        store.set_forum("games", &json!([])).unwrap();
+        let dir = std::env::temp_dir();
+        let export = |id: &str, kind: &str, name: &str, parent: Option<&str>, messages: Vec<Message>| Export {
+            guild: Named { id: "1".into(), name: "G".into() },
+            channel: ExportChannel { id: id.into(), kind: kind.into(), name: name.into(), category_id: parent.map(Into::into), ..Default::default() },
+            messages,
+        };
+        let art = store.channel("art").unwrap().unwrap();
+        let games = store.channel("games").unwrap().unwrap();
+        // A thread started from a channel's post: that post first, then the thread.
+        let parent = export("900", "GuildTextChat", "fanart", None, vec![message("50", "2021-01-01T00:00:00+00:00", "a drawing")]);
+        write(&store, &parent, &art, &ctx(&dir), |_, _| {}).unwrap();
+        let thread = export("50", "GuildPublicThread", "drawing talk", Some("900"), vec![message("51", "2021-01-01T01:00:00+00:00", "nice lines")]);
+        write(&store, &thread, &art, &ctx(&dir), |_, _| {}).unwrap();
+        let started = store.thread("discord-50").unwrap().unwrap();
+        assert_eq!((started.channel.as_str(), started.name.as_deref(), started.count), ("art", Some("drawing talk"), 1));
+        assert_eq!(store.post_by_id("discord-51").unwrap().unwrap().thread.as_deref(), Some("discord-50"));
+        // The channel reads without the thread's posts.
+        assert_eq!(store.channel_posts_by_time("art", None, None, 10).unwrap().len(), 1);
+        // A forum post: its own first post, titled with the thread's name.
+        let post = export("60", "GuildPublicThread", "Forum Rules", Some("700"), vec![message("60", "2022-01-01T00:00:00+00:00", "be nice"), message("61", "2022-01-02T00:00:00+00:00", "ok")]);
+        write(&store, &post, &games, &ctx(&dir), |_, _| {}).unwrap();
+        let root = store.post_by_id("discord-60").unwrap().unwrap();
+        assert_eq!((root.thread.as_deref(), root.extra.as_ref().unwrap()["title"].as_str()), (None, Some("Forum Rules")));
+        assert_eq!(store.thread("discord-60").unwrap().unwrap().count, 1);
+        // A thread whose first post isn't anywhere: one to grow from, named for it.
+        let lost = export("70", "GuildPublicThread", "lost start", Some("900"), vec![message("71", "2023-01-01T00:00:00+00:00", "where did it go")]);
+        write(&store, &lost, &art, &ctx(&dir), |_, _| {}).unwrap();
+        assert_eq!(store.post_by_id("discord-70").unwrap().unwrap().content, "🧵 lost start");
+        assert_eq!(store.thread("discord-70").unwrap().unwrap().count, 1);
+        // Nothing of it was counted as a change.
+        assert_eq!(store.latest_rev().unwrap(), 0);
     }
 
     #[test]

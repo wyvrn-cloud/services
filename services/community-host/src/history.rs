@@ -22,29 +22,44 @@ pub struct Asked {
     /// own emoji and stickers became.
     pub expressions: Option<PathBuf>,
     pub dry_run: bool,
+    /// A channel's threads come with it.
+    pub threads: bool,
 }
 
-/// The export files `chosen` names, from `folder`.
-pub fn chosen(folder: &Path, chosen: &[String]) -> anyhow::Result<Vec<PathBuf>> {
-    let all = history::files_in(folder)?;
-    let mut files = Vec::new();
+/// The export files `chosen` names, from `folder`: each a Discord channel's id, or
+/// its name (a forum's too, which has no file of its own: its posts' files). A
+/// channel brings its threads, unless `threads` is false.
+pub fn chosen(folder: &Path, chosen: &[String], threads: bool) -> anyhow::Result<Vec<PathBuf>> {
+    let all: Vec<(PathBuf, history::ExportChannel)> = history::files_in(folder)?.into_iter().filter_map(|path| history::header(&path).ok().map(|(_, c)| (path, c))).collect();
+    let key = |name: &str| wyvrn_community::discord_history::name_key(name);
+    let mut files: Vec<PathBuf> = Vec::new();
     for want in chosen {
-        let found: Vec<&PathBuf> = all
+        let channels: Vec<&(PathBuf, history::ExportChannel)> = all
             .iter()
-            .filter(|path| {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-                name.contains(&format!("[{want}]")) || name.contains(want.as_str())
-            })
+            .filter(|(_, c)| !c.is_thread() && if want.chars().all(|ch| ch.is_ascii_digit()) { c.id == *want } else { key(&c.name) == key(want) })
             .collect();
-        anyhow::ensure!(!found.is_empty(), "{want}: no file in {} has that channel id or name", folder.display());
-        // A channel's id is in its own file's name; a name may also be in its threads'.
-        let exact: Vec<&&PathBuf> = found.iter().filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains(&format!("[{want}]")))).collect();
-        let found: Vec<&PathBuf> = if exact.is_empty() { found } else { exact.into_iter().copied().collect() };
-        let without_threads: Vec<&PathBuf> = found.iter().copied().filter(|p| history::header(p).map(|(_, c)| !c.is_thread()).unwrap_or(true)).collect();
-        let found = if found.len() > 1 && without_threads.len() == 1 { without_threads } else { found };
-        anyhow::ensure!(found.len() == 1, "{want}: {} files match; give its channel id (the number in [...] in its name)", found.len());
-        if !files.contains(found[0]) {
-            files.push(found[0].clone());
+        anyhow::ensure!(channels.len() <= 1, "{want}: {} channels have that name; give its id (the number in [...] in its file's name)", channels.len());
+        let parent_id = channels.first().map(|(_, c)| c.id.clone());
+        let picked: Vec<&PathBuf> = all
+            .iter()
+            .filter(|(_, c)| {
+                let is_it = parent_id.as_deref() == Some(c.id.as_str()) || (c.is_thread() && c.id == *want);
+                let its_thread = threads
+                    && c.is_thread()
+                    && match &parent_id {
+                        Some(parent) => c.category_id.as_deref() == Some(parent.as_str()),
+                        // A forum, by name: its posts are threads of a channel with no file.
+                        None => !want.chars().all(|ch| ch.is_ascii_digit()) && c.category.as_deref().is_some_and(|n| key(n) == key(want)),
+                    };
+                is_it || its_thread
+            })
+            .map(|(path, _)| path)
+            .collect();
+        anyhow::ensure!(!picked.is_empty(), "{want}: no file in {} is that channel, thread or forum", folder.display());
+        for path in picked {
+            if !files.contains(path) {
+                files.push(path.clone());
+            }
         }
     }
     Ok(files)
@@ -67,8 +82,8 @@ pub fn run(host: &Host, name: &str, asked: &Asked, now: i64) -> anyhow::Result<(
     let stores = host.stores(&record, record.storage)?;
     let settings = host.settings(&record);
     let store = wyvrn_community::store::Store::open(&stores.community)?;
-    let files = chosen(&asked.folder, &asked.channels)?;
-    let targets = history::match_channels(&store, &files, &asked.map)?;
+    let files = chosen(&asked.folder, &asked.channels, asked.threads)?;
+    let targets = history::match_channels(&store, &files, &history::files_in(&asked.folder)?, &asked.map)?;
 
     let public_url = &settings.server.public_url;
     let expressions = match &asked.expressions {

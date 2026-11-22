@@ -38,9 +38,9 @@ wyvrn-community-host [--config <path>] discord-survey <folder> [<channel>...] [-
                                                                   take: messages, attachments, GIF links,
                                                                   disk space. Counts only, as Markdown.
 wyvrn-community-host [--config <path>] import-discord <name> <folder> <channel>... [--map <discord-id>=<channel>]
-                     [--text-only] [--expressions <folder>] [--dry-run]
-                                                                  a Discord channel's history (by its id, or
-                                                                  part of its file's name) into the channel
+                     [--text-only] [--no-threads] [--expressions <folder>] [--dry-run]
+                                                                  a Discord channel's history and its threads
+                                                                  (by its id or name; a forum's by name) into the channel
                                                                   here of the same category and name (or as
                                                                   --map says), read among its posts by time.
                                                                   Files sealed; nobody notified; again, only
@@ -153,12 +153,14 @@ async fn main() -> anyhow::Result<()> {
                 media: true,
                 expressions: None,
                 dry_run: false,
+                threads: true,
             };
             let mut args = rest.iter();
             while let Some(arg) = args.next() {
                 match *arg {
                     "--dry-run" => asked.dry_run = true,
                     "--text-only" => asked.media = false,
+                    "--no-threads" => asked.threads = false,
                     "--expressions" => asked.expressions = Some(args.next().context("--expressions needs a folder")?.into()),
                     "--map" => {
                         let given = args.next().context("--map needs <discord-id>=<channel>")?;
