@@ -399,8 +399,13 @@ impl CommunityService {
         // A ping's answer, to one the web view sent someone signing in.
         if received.message["type"] == crate::web::sign_in::PING_RESPONSE {
             if let (Some(web), Some(thid)) = (&state.web, received.message["thid"].as_str()) {
-                if web.sign_in.answered(thid) {
-                    return Ok(None);
+                // Only from the DID pinged, or a key of its own document: an answer
+                // from anyone else who knew the ping's id is no answer.
+                if let Some(pinged) = web.sign_in.pinged(thid) {
+                    let from_it = sender == pinged || wyvrn_service::named::holder_among(state.resolver.as_ref(), std::slice::from_ref(&pinged), &sender, incoming.sender_kid.as_deref()).await.is_some();
+                    if from_it && web.sign_in.answered(thid) {
+                        return Ok(None);
+                    }
                 }
             }
         }

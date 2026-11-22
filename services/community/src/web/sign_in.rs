@@ -55,9 +55,8 @@ struct Asked {
 #[derive(Default)]
 pub struct Signing {
     requests: Mutex<HashMap<String, Asked>>,
-    pings: Mutex<HashMap<String, oneshot::Sender<()>>>,
-    /// Public addresses already matched to members: address → member DID.
-    matched: Mutex<HashMap<String, String>>,
+    /// Pings under way: their id → the DID pinged, and whoever waits on its answer.
+    pings: Mutex<HashMap<String, (String, oneshot::Sender<()>)>>,
 }
 
 impl Signing {
@@ -73,9 +72,15 @@ impl Signing {
         self.requests.lock().unwrap_or_else(|p| p.into_inner()).remove(id).filter(|a| a.at > now - REQUEST_FOR)
     }
 
-    /// A ping's answer came (`thid`): whoever waits on it is told. Whether anyone was.
+    /// The DID a ping under way (`thid`) was sent to, for its answer to be held to.
+    pub fn pinged(&self, thid: &str) -> Option<String> {
+        self.pings.lock().unwrap_or_else(|p| p.into_inner()).get(thid).map(|(did, _)| did.clone())
+    }
+
+    /// A ping's answer came (`thid`), from the DID pinged (the caller has checked
+    /// that: `pinged`): whoever waits on it is told. Whether anyone was.
     pub fn answered(&self, thid: &str) -> bool {
-        self.pings.lock().unwrap_or_else(|p| p.into_inner()).remove(thid).is_some_and(|waiting| waiting.send(()).is_ok())
+        self.pings.lock().unwrap_or_else(|p| p.into_inner()).remove(thid).is_some_and(|(_, waiting)| waiting.send(()).is_ok())
     }
 }
 
@@ -235,7 +240,7 @@ async fn response(State(state): State<Arc<AppState>>, Json(answer): Json<Answer>
     if let Err(why) = ping(&state, web, &signed_in.did).await {
         return refusal(StatusCode::BAD_REQUEST, why);
     }
-    let Some(member) = member_for(&state, web, &signed_in.did, &signed_in.document).await else {
+    let Some(member) = member_for(&state, &signed_in.did).await else {
         return refusal(StatusCode::FORBIDDEN, "You signed in, but you aren't a member of this community. Join it in Wyvrn first.");
     };
     if state.community.store.banned(&member.did, at).ok().flatten().is_some() {
@@ -280,7 +285,7 @@ async fn trusted_issuers(web: &Web, presentation: &str, lookups: &Resolver) -> V
 async fn ping(state: &AppState, web: &Web, did: &str) -> Result<(), String> {
     let id = uuid::Uuid::new_v4().to_string();
     let (told, waiting) = oneshot::channel();
-    web.sign_in.pings.lock().unwrap_or_else(|p| p.into_inner()).insert(id.clone(), told);
+    web.sign_in.pings.lock().unwrap_or_else(|p| p.into_inner()).insert(id.clone(), (did.to_string(), told));
     let message = json!({ "id": id, "type": PING, "body": { "response_requested": true } });
     if let Err(error) = state.voice.send(&state.agent, did, &message).await {
         web.sign_in.pings.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
@@ -296,28 +301,16 @@ async fn ping(state: &AppState, web: &Web, did: &str) -> Result<(), String> {
 }
 
 /// The member `did` (a public address, usually) is: themselves, or the member
-/// whose document shares a key-agreement key with it.
-async fn member_for(state: &AppState, web: &Web, did: &str, document: &Value) -> Option<Member> {
+/// whose profile names it as their public address, which is kept only once shown
+/// over DIDComm to be theirs. Never by keys a document lists: anyone can publish
+/// someone else's public keys in their own document (security review WYV-01).
+async fn member_for(state: &AppState, did: &str) -> Option<Member> {
     let store = &state.community.store;
     if let Some(member) = store.member(did).ok().flatten() {
         return Some(member);
     }
-    let remembered = web.sign_in.matched.lock().unwrap_or_else(|p| p.into_inner()).get(did).cloned();
-    if let Some(member) = remembered.and_then(|m| store.member(&m).ok().flatten()) {
-        return Some(member);
-    }
-    let keys = wyvrn_hosted_did::keys::keys_for(document, "keyAgreement");
-    if keys.is_empty() {
-        return None;
-    }
-    for member in store.members().ok()? {
-        let Ok(theirs) = state.resolver.resolve(&member.did).await else { continue };
-        if wyvrn_hosted_did::keys::keys_for(&theirs, "keyAgreement").iter().any(|k| keys.contains(k)) {
-            web.sign_in.matched.lock().unwrap_or_else(|p| p.into_inner()).insert(did.to_string(), member.did.clone());
-            return Some(member);
-        }
-    }
-    None
+    let holder = store.member_with_address(did).ok().flatten()?;
+    store.member(&holder).ok().flatten()
 }
 
 #[derive(Deserialize)]

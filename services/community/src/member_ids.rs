@@ -145,6 +145,17 @@ impl Store {
         }
     }
 
+    /// The member whose profile names `address` as their public address: kept only
+    /// once shown to be theirs (server.rs, `holder_among`), so a link proven over
+    /// DIDComm. The most recent, should two have claimed it in turn.
+    pub fn member_with_address(&self, address: &str) -> Result<Option<String>> {
+        self.db.lock().query_row(
+            "SELECT member_profiles.did FROM member_profiles JOIN members ON members.did = member_profiles.did WHERE member_profiles.public_address = ?1 ORDER BY member_profiles.at DESC LIMIT 1",
+            params![address],
+            |row| row.get::<String>(0),
+        )
+    }
+
     pub fn member_profile(&self, did: &str) -> Result<Option<MemberProfile>> {
         self.db.lock().query_row(
             "SELECT description, banner_type, banner_data, linked, public_address, at FROM member_profiles WHERE did = ?1",
@@ -654,5 +665,24 @@ mod small_picture_tests {
 
         // Not a picture at all.
         assert!(small_picture("image/png", "bm90IGEgcGljdHVyZQ").is_none());
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+    use crate::store::{Role, Store};
+
+    #[test]
+    fn an_address_is_a_member_only_where_their_profile_proved_it() {
+        let store = Store::in_memory().unwrap();
+        store.set_member("did:peer:alice", Role::Member, 1).unwrap();
+        let profile = |address: Option<&str>, at| MemberProfile { description: None, banner: None, linked: None, public_address: address.map(str::to_string), at };
+        assert_eq!(store.member_with_address("did:web:id.example:alice").unwrap(), None);
+        store.set_member_profile("did:peer:alice", &profile(Some("did:web:id.example:alice"), 5)).unwrap();
+        assert_eq!(store.member_with_address("did:web:id.example:alice").unwrap().as_deref(), Some("did:peer:alice"));
+        // Gone from the community: their address is nobody here.
+        store.remove_member("did:peer:alice").unwrap();
+        assert_eq!(store.member_with_address("did:web:id.example:alice").unwrap(), None);
     }
 }
