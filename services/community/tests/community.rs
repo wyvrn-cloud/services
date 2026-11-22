@@ -4023,6 +4023,40 @@ async fn a_form_channel_is_filled_in_with_survey_1_0_reviewed_and_an_accepted_ap
     assert_eq!(other.community("review-answer", json!({ "answer": ticket, "status": "accepted" })).await["body"]["code"], "e.p.trust.not-authorized");
 }
 
+#[tokio::test]
+async fn a_form_gives_only_a_role_its_editor_and_reviewer_outrank_and_nobody_accepts_their_own() {
+    let server = start_server("").await;
+    let (owner, mod_a, mod_b) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &mod_a, &mod_b]);
+    for peer in [&owner, &mod_a, &mod_b] {
+        peer.community("join", json!({})).await;
+    }
+    for peer in [&mod_a, &mod_b] {
+        owner.community("set-member", json!({ "did": peer.did(), "role": "moderator" })).await;
+    }
+    // Moderators here may manage channels: still not make a form that gives Admin.
+    let store = &server.state.community.store;
+    let mut moderator = store.role("moderator").unwrap().unwrap();
+    moderator.permissions.push("manage_channels".into());
+    store.save_role(&moderator).unwrap();
+    let to_admin = json!({ "type": "application", "title": "Be an admin", "role": "admin", "fields": [{ "label": "Why?", "kind": "text" }] });
+    let refused = mod_a.community("create-channel", json!({ "name": "apply", "kind": "form", "form": to_admin })).await;
+    assert_eq!(refused["body"]["code"], "e.p.msg.invalid-form", "{refused}");
+    // The owner makes it; a moderator applies, and can't accept their own...
+    let apply = owner.community("create-channel", json!({ "name": "apply", "kind": "form", "form": to_admin })).await["body"]["created"].as_str().unwrap().to_string();
+    let changed = mod_a.community("update-channel", json!({ "channel": apply, "form": to_admin })).await;
+    assert_eq!(changed["body"]["code"], "e.p.msg.invalid-form", "{changed}");
+    let answer = fill(&mod_a, &apply, json!({ "q1": "please" })).await["body"]["answer"]["id"].as_str().unwrap().to_string();
+    let own = mod_a.community("review-answer", json!({ "answer": answer, "status": "accepted" })).await;
+    assert_eq!(own["body"]["code"], "e.p.trust.not-authorized", "{own}");
+    // ...nor another moderator, who doesn't outrank Admin; the owner can.
+    let other = mod_b.community("review-answer", json!({ "answer": answer, "status": "accepted" })).await;
+    assert_eq!(other["body"]["code"], "e.p.trust.not-authorized", "{other}");
+    assert!(!store.member_roles(&mod_a.did()).unwrap().contains(&"admin".to_string()));
+    assert_eq!(owner.community("review-answer", json!({ "answer": answer, "status": "accepted" })).await["body"]["answer"]["status"], "accepted");
+    assert!(store.member_roles(&mod_a.did()).unwrap().contains(&"admin".to_string()));
+}
+
 /// Fills in the form of `channel` as `peer`, with survey/1.0: what the server answers.
 async fn fill(peer: &Peer, channel: &str, data: Value) -> Value {
     let request = peer.community("form-request", json!({ "channel": channel })).await;

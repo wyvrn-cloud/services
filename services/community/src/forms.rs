@@ -189,10 +189,18 @@ pub fn summary(form: &Value, answers: &[FormAnswer]) -> Value {
 
 impl Community {
     /// A form as an admin gives it, checked against this community's channels and roles.
-    pub(crate) fn checked_form(&self, given: &Value) -> Result<Value, String> {
+    /// `editor` may only make a form grant a role ranked below their own, as they
+    /// could give it by hand (security review WYV-04).
+    pub(crate) fn checked_form(&self, given: &Value, editor: &str) -> Result<Value, String> {
         let channels = self.store.channels().map_err(|e| e.to_string())?;
         let roles = self.store.roles().map_err(|e| e.to_string())?;
-        read_form(given, &|id| channels.iter().any(|c| c.id == id && c.voice.is_none() && c.form.is_none() && !c.calendar), &|id| roles.iter().any(|r| r.id == id && r.id != "everyone"))
+        let form = read_form(given, &|id| channels.iter().any(|c| c.id == id && c.voice.is_none() && c.form.is_none() && !c.calendar), &|id| roles.iter().any(|r| r.id == id && r.id != "everyone"))?;
+        if let Some(role) = form["role"].as_str().and_then(|id| roles.iter().find(|r| r.id == id)) {
+            if !self.powers(editor).map_err(|e| e.to_string())?.above(role.position) {
+                return Err("A form can only give a role ranked below yours.".into());
+            }
+        }
+        Ok(form)
     }
 
     /// An answer as `to` is shown it: who answered left out of an anonymous survey's, for its reviewers.
@@ -364,6 +372,14 @@ impl Community {
                     }
                     if status == "accepted" && answer.status != "accepted" {
                         if let Some(role) = form["role"].as_str() {
+                            // As giving the role by hand: to someone else, ranked below the reviewer.
+                            if answer.did == did {
+                                return refuse(message, "e.p.trust.not-authorized", "Someone else accepts your own application.").map(Some);
+                            }
+                            let position = self.store.role(role)?.map(|r| r.position).unwrap_or(i64::MAX);
+                            if !self.powers(did)?.above(position) {
+                                return refuse(message, "e.p.trust.not-authorized", "Accepting this gives a role ranked at or above yours.").map(Some);
+                            }
                             if self.store.member(&answer.did)?.is_some() {
                                 self.store.give_role(&answer.did, role)?;
                             }

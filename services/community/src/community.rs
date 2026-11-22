@@ -1759,7 +1759,7 @@ impl Community {
                 }
                 // A form channel's form, checked before anything is made.
                 let form = match body["kind"].as_str() {
-                    Some("form") => match self.checked_form(&body["form"]) {
+                    Some("form") => match self.checked_form(&body["form"], sender) {
                         Ok(form) => Some(form),
                         Err(why) => return refuse(message, "e.p.msg.invalid-form", &why),
                     },
@@ -1917,7 +1917,7 @@ impl Community {
                     if !self.powers(sender)?.has("manage_channels") {
                         return refuse(message, "e.p.trust.not-authorized", "Changing a form takes Manage channels.");
                     }
-                    match self.checked_form(given) {
+                    match self.checked_form(given, sender) {
                         Ok(form) => self.store.set_form(&channel.id, &form)?,
                         Err(why) => return refuse(message, "e.p.msg.invalid-form", &why),
                     }
