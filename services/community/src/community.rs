@@ -24,6 +24,10 @@ pub const MESSAGE: &str = "https://wyvrn.app/community/1.0/message";
 pub const HISTORY_REQUEST: &str = "https://wyvrn.app/community/1.0/history-request";
 pub const HISTORY: &str = "https://wyvrn.app/community/1.0/history";
 pub const MEMBERS_REQUEST: &str = "https://wyvrn.app/community/1.0/members-request";
+/// Posts imported under a member's Discord account asked to be made theirs (claims.rs).
+pub const CLAIM_IMPORTED: &str = "https://wyvrn.app/community/1.0/claim-imported";
+/// A moderator's answer to one: `{ member, approve }`.
+pub const DECIDE_CLAIM: &str = "https://wyvrn.app/community/1.0/decide-claim";
 pub const MEMBERS: &str = "https://wyvrn.app/community/1.0/members";
 pub const MEMBER_CHANGED: &str = "https://wyvrn.app/community/1.0/member-changed";
 pub const SET_MEMBER_PROFILE: &str = "https://wyvrn.app/community/1.0/set-member-profile";
@@ -738,6 +742,22 @@ impl Community {
             }
             if powers.has("admit_members") {
                 body["waiting"] = json!(self.store.waiting_count()?);
+                // Imported posts members asked to have made theirs.
+                let asked = self.store.claims_asked()?;
+                if !asked.is_empty() {
+                    body["claims"] = json!(asked
+                        .iter()
+                        .map(|claim| Ok(json!({ "member": claim.did, "discord_id": claim.discord_id, "posts": self.imported_count(&claim.discord_id)?, "at": claim.at })))
+                        .collect::<anyhow::Result<Vec<_>>>()?);
+                }
+            }
+            // Posts imported under this member's verified Discord account, and where
+            // their claim on them stands.
+            if let Some(claim) = self.store.claim_of(&member.did)? {
+                let posts = if claim.state == "claimed" { 0 } else { self.imported_count(&claim.discord_id)? };
+                if claim.state == "claimed" || posts > 0 {
+                    body["imported_claim"] = json!({ "from": "discord", "state": claim.state, "posts": posts });
+                }
             }
             if self.moving()? {
                 body["moving"] = json!(true);
@@ -1183,6 +1203,12 @@ impl Community {
         Ok(listed)
     }
 
+    /// How many posts were imported under the Discord account `discord_id` and are
+    /// still its.
+    pub(crate) fn imported_count(&self, discord_id: &str) -> anyhow::Result<i64> {
+        Ok(self.store.db.lock().query_value("SELECT COUNT(*) FROM posts WHERE author_did = ?1", wyvrn_service::params![format!("{}{discord_id}", crate::discord_history::AUTHOR_PREFIX)])?)
+    }
+
     /// `community` for every joined member holding `admit_members`, the waiting
     /// list having changed: its `waiting` says how many wait now.
     pub(crate) fn admins_told(&self) -> anyhow::Result<Vec<(String, Value)>> {
@@ -1322,9 +1348,8 @@ impl Community {
         if channel.closed {
             return refuse(message, "e.p.msg.closed", "That channel is closed.");
         }
-        if channel.voice.is_some() {
-            return refuse(message, "e.p.msg.voice-channel", "A voice channel takes no posts.");
-        }
+        // A voice channel (and a stage) has a text chat of its own, as Discord's do:
+        // posted in as any channel, by the same permissions.
         if channel.calendar {
             return refuse(message, "e.p.msg.calendar-channel", "A calendar channel takes no posts: it shows the community's events.");
         }
@@ -2079,6 +2104,53 @@ impl Community {
                     history["thread"] = json!(thread);
                 }
                 Ok(Outcome::reply(reply_to(message, HISTORY, history)))
+            }
+
+            CLAIM_IMPORTED => {
+                let Some(mut claim) = self.store.claim_of(sender)?.filter(|c| c.state == "verified" || c.state == "refused") else {
+                    return refuse(
+                        message,
+                        "e.p.msg.no-claim",
+                        "No Discord account of yours with posts here has been checked: show your verified Discord account in your profile first.",
+                    );
+                };
+                if self.imported_count(&claim.discord_id)? == 0 {
+                    return refuse(message, "e.p.msg.no-claim", "Nothing was brought in from your Discord account.");
+                }
+                claim.state = "asked".into();
+                claim.at = now;
+                claim.decided_by = None;
+                self.store.set_claim(&claim)?;
+                self.audit(now, sender, "claim.ask", None, Some(json!({ "discord_id": claim.discord_id })));
+                let mut outcome = Outcome::reply(reply_to(message, COMMUNITY, self.community(&member)?));
+                outcome.notices = self.admins_told()?;
+                Ok(outcome)
+            }
+
+            DECIDE_CLAIM => {
+                if !self.powers(sender)?.has("admit_members") {
+                    return refuse(message, "e.p.trust.not-authorized", "Deciding a claim on imported posts takes Let members in.");
+                }
+                let who = body["member"].as_str().unwrap_or_default();
+                let Some(mut claim) = self.store.claim_of(who)?.filter(|c| c.state == "asked") else {
+                    return refuse(message, "e.p.msg.no-claim", "That member hasn't asked for any imported posts.");
+                };
+                let approve = body["approve"].as_bool() == Some(true);
+                let mut outcome = Outcome::default();
+                if approve {
+                    outcome.changed = self.store.claim_imported_posts(&claim.discord_id, who, now)?;
+                }
+                claim.state = if approve { "claimed" } else { "refused" }.into();
+                claim.at = now;
+                claim.decided_by = Some(sender.to_string());
+                self.store.set_claim(&claim)?;
+                self.audit(now, sender, if approve { "claim.approve" } else { "claim.refuse" }, None, Some(json!({ "member": who, "discord_id": claim.discord_id })));
+                outcome.reply = Some(reply_to(message, COMMUNITY, self.community(&member)?));
+                if let Some(claimant) = self.store.member(who)? {
+                    outcome.notices.push((claimant.did.clone(), json!({ "type": COMMUNITY, "body": self.community(&claimant)? })));
+                }
+                outcome.notices.extend(self.admins_told()?.into_iter().filter(|(did, _)| did != sender));
+                Ok(outcome)
             }
 
             MEMBERS_REQUEST => {

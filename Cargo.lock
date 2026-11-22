@@ -5337,6 +5337,7 @@ name = "wyvrn-community"
 version = "0.0.1"
 dependencies = [
  "aes-gcm",
+ "affinidi-data-integrity 0.7.14",
  "anyhow",
  "askama",
  "async-trait",

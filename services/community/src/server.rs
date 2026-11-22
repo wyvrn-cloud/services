@@ -527,12 +527,82 @@ impl CommunityService {
         } else {
             &received.message
         };
+        // A profile whose address is theirs, with linked accounts: one of them may be
+        // a Discord account posts were imported under (claims.rs). Checked apart.
+        let first_profile = message["type"] == community::PROFILE && matches!(state.community.store.member_profile(&sender), Ok(None));
+        let linked_with = (message["type"] == community::PROFILE)
+            .then(|| (message["body"]["profile"]["publicAddress"].as_str().map(str::to_string), message["body"]["profile"]["linkedAccounts"].as_array().cloned()))
+            .and_then(|(address, linked)| Some((address?, linked?)));
         let outcome = state.community.handle(&sender, message, now())?;
+        if let Some((address, linked)) = linked_with {
+            tokio::spawn(consider_claim(Arc::clone(state), sender.clone(), address, linked, first_profile));
+        }
         if message["type"] != community::PROFILE {
             ask_for_profile(state, &sender);
         }
         Ok(carry_out(state, &sender, outcome))
     }
+}
+
+/// Notes the Discord account a member's profile proves (`linked`, about `address`),
+/// where posts were imported under it; and, within a day of joining (or on the
+/// first profile they send), makes those posts theirs at once (claims.rs). Fetches
+/// only from the trusted issuers' own addresses, with a time and size limit.
+async fn consider_claim(state: Arc<AppState>, did: String, address: String, linked: Vec<Value>, first_profile: bool) {
+    let community = &state.community;
+    let issuers = community.config.linked_account_issuers.clone();
+    let now_text = chrono::DateTime::from_timestamp(now(), 0).map(|t| t.to_rfc3339()).unwrap_or_default();
+    let Some(discord_id) = crate::claims::verified_discord(&linked, &address, &issuers, &now_text, fetch_small_json).await else { return };
+    let store = &community.store;
+    let result = (|| -> anyhow::Result<()> {
+        if !store.has_imported_from(&discord_id)? {
+            return Ok(());
+        }
+        let Some(member) = store.member(&did)? else { return Ok(()) };
+        let held = store.claim(&discord_id)?;
+        if held.as_ref().is_some_and(|c| c.state == "claimed" || (c.did == did && c.state == "asked")) {
+            return Ok(());
+        }
+        let now = now();
+        let joining = first_profile || now - member.since <= crate::claims::AT_JOINING;
+        let mut claim = crate::claims::Claim { discord_id: discord_id.clone(), did: did.clone(), state: "verified".into(), at: now, decided_by: None };
+        if joining {
+            let changed = store.claim_imported_posts(&discord_id, &did, now)?;
+            claim.state = "claimed".into();
+            store.set_claim(&claim)?;
+            community.audit(now, &did, "claim.at-joining", None, Some(json!({ "discord_id": discord_id, "posts": changed.len() })));
+            carry_out(&state, &did, community::Outcome { changed, ..Default::default() });
+        } else {
+            store.set_claim(&claim)?;
+        }
+        // Told where they stand with them.
+        let body = community.community(&member)?;
+        carry_out(&state, &did, community::Outcome { notices: vec![(did.clone(), json!({ "type": community::COMMUNITY, "body": body }))], ..Default::default() });
+        Ok(())
+    })();
+    if let Err(error) = result {
+        tracing::warn!(%error, "a claim on imported posts couldn't be considered");
+    }
+}
+
+/// A small JSON document at an HTTPS address (a DID document, a status list): at
+/// most 256 KB, within ten seconds, without following redirects.
+async fn fetch_small_json(url: String) -> Option<Value> {
+    static HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+        reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).redirect(reqwest::redirect::Policy::none()).build().expect("a client with a timeout builds")
+    });
+    if !url.starts_with("https://") {
+        return None;
+    }
+    let mut response = HTTP.get(&url).send().await.ok()?.error_for_status().ok()?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > 256 * 1024 {
+            return None;
+        }
+    }
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Does what handling a member's message came to (`Community::handle`), however

@@ -66,6 +66,8 @@ chrono = { workspace = true }
 aes-gcm = "0.10"
 
 [dev-dependencies]
+# Linked-account credentials signed in claims.rs' tests.
+affinidi-data-integrity = { workspace = true }
 mysql = { workspace = true }
 reqwest-websocket = "0.6"
 # The tests talk to the server as members' apps would, and as browsers and

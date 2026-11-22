@@ -184,6 +184,10 @@ pub struct CommunityConfig {
     /// Where Discord's API is, for reading a server template to import
     /// (discord.rs). A test points it elsewhere.
     pub discord_api: String,
+    /// Whose linked-account credentials (linked-accounts/1.0) it trusts, for a
+    /// member to claim posts imported under their Discord account (claims.rs).
+    /// wyvrn-verify's unless set (`COMMUNITY_LINKED_ACCOUNT_ISSUERS`, comma-separated).
+    pub linked_account_issuers: Vec<String>,
     /// As many roles as there may be (at most [`crate::admin_flows::MAX_ROLES`]).
     pub max_roles: usize,
     /// As many posts as the whole community takes in a minute, from everyone; 0
@@ -241,6 +245,7 @@ impl Default for CommunityConfig {
             max_members: 0,
             deleted_text_days: 30,
             discord_api: "https://discord.com/api/v10".to_string(),
+            linked_account_issuers: vec![crate::claims::DEFAULT_ISSUER.to_string()],
             outgoing_private: false,
             max_roles: 250,
             max_community_posts_per_minute: 0,
@@ -291,6 +296,9 @@ impl Config {
             config.community.owners = dids(&owners);
         }
         config.community.owners_are_admins();
+        if let Some(issuers) = env("COMMUNITY_LINKED_ACCOUNT_ISSUERS") {
+            config.community.linked_account_issuers = dids(&issuers);
+        }
         if let Some(days) = env("COMMUNITY_DELETED_TEXT_DAYS") {
             config.community.deleted_text_days = days.trim().parse().map_err(|_| anyhow::anyhow!("COMMUNITY_DELETED_TEXT_DAYS: a whole number of days"))?;
         }

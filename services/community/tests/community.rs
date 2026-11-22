@@ -1015,7 +1015,7 @@ async fn kinds_of_channel_the_host_turned_off_are_not_opened_and_those_there_are
 }
 
 #[tokio::test]
-async fn an_admin_opens_voice_channels_which_take_no_posts() {
+async fn an_admin_opens_voice_channels_with_a_text_chat_of_their_own() {
     let server = start_server("[voice]\nrelay_url = \"https://voice.example/\"").await;
     let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);
     server.admit(&[&admin, &member]);
@@ -1034,8 +1034,11 @@ async fn an_admin_opens_voice_channels_which_take_no_posts() {
     assert_eq!(made["body"]["voice"]["transport"], "moq");
     member.next_of(&format!("{C}community")).await;
 
-    // It takes no posts.
-    assert_eq!(member.community("post", json!({ "channel": id, "content": "hi" })).await["body"]["code"], "e.p.msg.voice-channel");
+    // It has a text chat of its own, as Discord's voice channels do.
+    let posted = member.community("post", json!({ "channel": id, "content": "hi" })).await;
+    assert_eq!(kind(&posted), "posted", "{posted}");
+    let history = member.community("history-request", json!({ "channel": id })).await;
+    assert_eq!(history["body"]["messages"][0]["content"], "hi");
 
     // Its settings change a field at a time; the community's defaults by set-voice.
     let changed = admin.community("update-channel", json!({ "channel": id, "voice": { "transport": "webrtc", "limit": null } })).await;
@@ -4301,4 +4304,58 @@ async fn wiki_changes_sent_at_once_are_each_kept() {
     for n in 1..=20 {
         assert!(text.lines().any(|l| l == format!("line {n}")), "line {n} lost: {text}");
     }
+}
+
+#[tokio::test]
+async fn a_member_asks_for_the_posts_imported_under_their_discord_account_and_a_moderator_decides() {
+    use wyvrn_community::discord_history as history;
+    let server = start_server("").await;
+    let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member]);
+    member.community("join", json!({})).await;
+    let channel = open_channel(&admin, "fanart").await;
+    let store = &server.state.community.store;
+    let export = history::Export {
+        guild: history::Named { id: "1".into(), name: "G".into() },
+        channel: history::ExportChannel { id: "900".into(), kind: "GuildTextChat".into(), name: "fanart".into(), ..Default::default() },
+        messages: vec![history::Message {
+            id: "10".into(),
+            kind: "Default".into(),
+            timestamp: "2020-01-01T00:00:00+00:00".into(),
+            content: "old art".into(),
+            author: history::User { id: "111".into(), name: "ann".into(), ..Default::default() },
+            ..Default::default()
+        }],
+    };
+    let folder = std::env::temp_dir();
+    let setting = history::Context { folder: &folder, files: None, channel_names: Default::default(), roles: Default::default(), expressions: Default::default(), now: 1 };
+    history::write(store, &export, &store.channel(&channel).unwrap().unwrap(), &setting, |_, _| {}).unwrap();
+
+    // Not checked yet: nothing to claim.
+    let refused = member.community("claim-imported", json!({})).await;
+    assert_eq!(refused["body"]["code"], "e.p.msg.no-claim", "{refused}");
+    // Their profile proved the Discord account (as consider_claim records it, past their first day).
+    store.set_claim(&wyvrn_community::claims::Claim { discord_id: "111".into(), did: member.did(), state: "verified".into(), at: 1, decided_by: None }).unwrap();
+    let standing = member.community("join", json!({})).await;
+    assert_eq!(standing["body"]["imported_claim"], json!({ "from": "discord", "state": "verified", "posts": 1 }), "{standing}");
+
+    let asked = member.community("claim-imported", json!({})).await;
+    assert_eq!(asked["body"]["imported_claim"]["state"], "asked", "{asked}");
+    let seen = admin.community("join", json!({})).await;
+    let listed = seen["body"]["claims"][0].clone();
+    assert_eq!((listed["discord_id"].as_str(), listed["posts"].as_i64()), (Some("111"), Some(1)), "{seen}");
+    let who = listed["member"].as_str().unwrap().to_string();
+    assert!(!who.starts_with("did:"), "named by member id: {who}");
+
+    // Only someone who lets members in decides.
+    let not_theirs = member.community("decide-claim", json!({ "member": who, "approve": true })).await;
+    assert_eq!(not_theirs["body"]["code"], "e.p.trust.not-authorized");
+    let decided = admin.community("decide-claim", json!({ "member": who, "approve": true })).await;
+    assert_eq!(kind(&decided), "community", "{decided}");
+    assert!(decided["body"].get("claims").is_none());
+    let post = store.post_by_id("discord-10").unwrap().unwrap();
+    assert_eq!(post.author_did, member.did());
+    assert_eq!(post.extra.unwrap()["imported"]["claimed"], true);
+    let after = member.community("join", json!({})).await;
+    assert_eq!(after["body"]["imported_claim"]["state"], "claimed");
 }

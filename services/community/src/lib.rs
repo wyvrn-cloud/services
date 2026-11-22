@@ -18,6 +18,7 @@ pub mod announcements;
 pub mod assistant;
 pub mod automod;
 pub mod board;
+pub mod claims;
 pub mod discord;
 pub mod discord_history;
 pub mod events;

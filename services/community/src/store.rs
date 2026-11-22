@@ -1212,6 +1212,14 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         at INTEGER NOT NULL,
         PRIMARY KEY (channel, from_seq)
     );
+    -- Imported posts claimed by whoever wrote them (claims.rs).
+    CREATE TABLE IF NOT EXISTS discord_claims (
+        discord_id TEXT PRIMARY KEY,
+        did TEXT NOT NULL,
+        state TEXT NOT NULL,
+        at INTEGER NOT NULL,
+        decided_by TEXT
+    );
     -- Each member's vote on a poll, and the polls whose end everyone has been told of.
     CREATE TABLE IF NOT EXISTS votes (
         post TEXT NOT NULL,
@@ -1819,6 +1827,13 @@ fn schema() -> Schema {
                 to_seq BIGINT NOT NULL,
                 at BIGINT NOT NULL,
                 PRIMARY KEY (channel, from_seq)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS discord_claims (
+                discord_id VARCHAR(64) NOT NULL PRIMARY KEY,
+                did {MYSQL_DID} NOT NULL,
+                state VARCHAR(16) NOT NULL,
+                at BIGINT NOT NULL,
+                decided_by {MYSQL_DID}
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS webhooks (
                 id VARCHAR(64) NOT NULL PRIMARY KEY,
