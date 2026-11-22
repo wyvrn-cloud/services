@@ -332,6 +332,8 @@ pub struct Thread {
     pub locked: bool,
     /// The forum section it is in.
     pub section: Option<String>,
+    /// Read only by those in it, and whoever manages threads (`private_threads`).
+    pub private: bool,
 }
 
 /// A role (community/1.0's roles): a name, permissions and a rank, `position`,
@@ -1212,6 +1214,18 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         at INTEGER NOT NULL,
         PRIMARY KEY (channel, from_seq)
     );
+    -- Private threads (community/1.0's `private`), and who is in each: only they,
+    -- and whoever may manage threads in its channel, read it.
+    CREATE TABLE IF NOT EXISTS private_threads (
+        thread TEXT PRIMARY KEY
+    );
+    CREATE TABLE IF NOT EXISTS thread_members (
+        thread TEXT NOT NULL,
+        did TEXT NOT NULL,
+        added_by TEXT NOT NULL,
+        at INTEGER NOT NULL,
+        PRIMARY KEY (thread, did)
+    );
     -- Imported posts claimed by whoever wrote them (claims.rs).
     CREATE TABLE IF NOT EXISTS discord_claims (
         discord_id TEXT PRIMARY KEY,
@@ -1827,6 +1841,16 @@ fn schema() -> Schema {
                 to_seq BIGINT NOT NULL,
                 at BIGINT NOT NULL,
                 PRIMARY KEY (channel, from_seq)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS private_threads (
+                thread VARCHAR(255) NOT NULL PRIMARY KEY
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS thread_members (
+                thread VARCHAR(255) NOT NULL,
+                did {MYSQL_DID} NOT NULL,
+                added_by {MYSQL_DID} NOT NULL,
+                at BIGINT NOT NULL,
+                PRIMARY KEY (thread, did(255))
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS discord_claims (
                 discord_id VARCHAR(64) NOT NULL PRIMARY KEY,
@@ -3049,7 +3073,7 @@ impl Store {
         let threads = db.query(
             &format!(
                 "SELECT id, channel, name, created_by, created_at, (SELECT sticky FROM thread_flags WHERE thread_flags.thread = threads.id), (SELECT locked FROM thread_flags WHERE thread_flags.thread = threads.id), \
-                 (SELECT section FROM thread_flags WHERE thread_flags.thread = threads.id) FROM threads WHERE id IN ({})",
+                 (SELECT section FROM thread_flags WHERE thread_flags.thread = threads.id), (SELECT 1 FROM private_threads WHERE private_threads.thread = threads.id) FROM threads WHERE id IN ({})",
                 marks(ids.len())
             ),
             &ids,
@@ -3066,6 +3090,7 @@ impl Store {
                     sticky: row.get::<Option<i64>>(5)?.unwrap_or(0) != 0,
                     locked: row.get::<Option<i64>>(6)?.unwrap_or(0) != 0,
                     section: row.get(7)?,
+                    private: row.get::<Option<i64>>(8)?.is_some(),
                 })
             },
         )?;
@@ -3217,7 +3242,7 @@ impl Store {
         let mut db = self.db.lock();
         let found = db.query_row(
             "SELECT id, channel, name, created_by, created_at, (SELECT sticky FROM thread_flags WHERE thread_flags.thread = threads.id), (SELECT locked FROM thread_flags WHERE thread_flags.thread = threads.id), \
-             (SELECT section FROM thread_flags WHERE thread_flags.thread = threads.id) FROM threads WHERE id = ?1",
+             (SELECT section FROM thread_flags WHERE thread_flags.thread = threads.id), (SELECT 1 FROM private_threads WHERE private_threads.thread = threads.id) FROM threads WHERE id = ?1",
             params![id],
             |row| {
                 Ok(Thread {
@@ -3232,6 +3257,7 @@ impl Store {
                     sticky: row.get::<Option<i64>>(5)?.unwrap_or(0) != 0,
                     locked: row.get::<Option<i64>>(6)?.unwrap_or(0) != 0,
                     section: row.get(7)?,
+                    private: row.get::<Option<i64>>(8)?.is_some(),
                 })
             },
         )?;
@@ -3455,6 +3481,45 @@ impl Store {
             Self::forget_sections(&mut db, channel)?;
         }
         Ok(made)
+    }
+
+    pub fn rename_thread(&self, id: &str, name: Option<&str>) -> Result<()> {
+        self.db.lock().execute("UPDATE threads SET name = ?2 WHERE id = ?1", params![id, name])?;
+        Ok(())
+    }
+
+    /// Whether the thread `id` is private.
+    pub fn is_private_thread(&self, id: &str) -> Result<bool> {
+        Ok(self.db.lock().query_row("SELECT 1 FROM private_threads WHERE thread = ?1", params![id], |_| Ok(()))?.is_some())
+    }
+
+    /// Makes the thread `id` private, with `by` in it.
+    pub fn make_thread_private(&self, id: &str, by: &str, now: i64) -> Result<()> {
+        let mut db = self.db.lock();
+        db.execute("INSERT OR IGNORE INTO private_threads (thread) VALUES (?1)", params![id])?;
+        db.execute("INSERT OR IGNORE INTO thread_members (thread, did, added_by, at) VALUES (?1, ?2, ?2, ?3)", params![id, by, now])?;
+        Ok(())
+    }
+
+    /// Whether `did` is in the private thread `id`.
+    pub fn in_thread(&self, id: &str, did: &str) -> Result<bool> {
+        Ok(self.db.lock().query_row("SELECT 1 FROM thread_members WHERE thread = ?1 AND did = ?2", params![id, did], |_| Ok(()))?.is_some())
+    }
+
+    /// Who is in the private thread `id`.
+    pub fn thread_members(&self, id: &str) -> Result<Vec<String>> {
+        self.db.lock().query("SELECT did FROM thread_members WHERE thread = ?1 ORDER BY at", params![id], |row| row.get(0))
+    }
+
+    /// Puts `did` in the private thread `id`, or takes them out.
+    pub fn set_in_thread(&self, id: &str, did: &str, by: &str, inside: bool, now: i64) -> Result<()> {
+        let mut db = self.db.lock();
+        if inside {
+            db.execute("INSERT OR IGNORE INTO thread_members (thread, did, added_by, at) VALUES (?1, ?2, ?3, ?4)", params![id, did, by, now])?;
+        } else {
+            db.execute("DELETE FROM thread_members WHERE thread = ?1 AND did = ?2", params![id, did])?;
+        }
+        Ok(())
     }
 
     /// Notes that the thread `id` has changed (a post was added to it), so that the

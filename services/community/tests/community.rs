@@ -286,7 +286,7 @@ async fn an_admin_opens_channels_and_everyone_who_joined_is_told() {
     let changed = admin.community("update-channel", json!({ "channel": channel, "name": "design", "topic": "What we are building", "closed": true })).await;
     let mut held = changed["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == channel.as_str()).unwrap().clone();
     // An admin may do everything a channel gives.
-    assert_eq!(held["permissions"].as_array().unwrap().len(), 13);
+    assert_eq!(held["permissions"].as_array().unwrap().len(), 17);
     held.as_object_mut().unwrap().remove("permissions");
     assert_eq!(held, json!({ "id": channel, "name": "design", "topic": "What we are building", "closed": true, "latest_seq": 0, "yours": true }));
     let late = admin.community("post", json!({ "channel": channel, "content": "too late" })).await;
@@ -998,7 +998,7 @@ async fn kinds_of_channel_the_host_turned_off_are_not_opened_and_those_there_are
     // The owner still keeps order there.
     let owners = owner.community("join", json!({})).await;
     let listed = owners["body"]["channels"].as_array().unwrap().iter().find(|c| c["id"] == "old-news").unwrap().clone();
-    assert_eq!(listed["permissions"], json!(["manage_messages", "moderate_voice", "view_channel"]), "{listed}");
+    assert_eq!(listed["permissions"], json!(["manage_messages", "manage_threads", "moderate_voice", "view_channel"]), "{listed}");
     // And a text channel takes posts as ever.
     assert_eq!(kind(&member.community("post", json!({ "channel": general, "content": "hi" })).await), "posted");
 
@@ -4358,4 +4358,78 @@ async fn a_member_asks_for_the_posts_imported_under_their_discord_account_and_a_
     assert_eq!(post.extra.unwrap()["imported"]["claimed"], true);
     let after = member.community("join", json!({})).await;
     assert_eq!(after["body"]["imported_claim"]["state"], "claimed");
+}
+
+#[tokio::test]
+async fn a_private_thread_is_read_only_by_those_in_it_and_whoever_manages_threads() {
+    let server = start_server("").await;
+    let (admin, ann, bob, cat) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &ann, &bob, &cat]);
+    for peer in [&ann, &bob, &cat] {
+        peer.community("join", json!({})).await;
+    }
+    let channel = open_channel(&admin, "general").await;
+    ann.community("post", json!({ "channel": channel, "id": "root", "content": "Planning a surprise" })).await;
+    let grown = ann.community("create-thread", json!({ "to": { "id": "root" }, "name": "Bob's birthday", "private": true })).await;
+    assert_eq!(kind(&grown), "changed", "{grown}");
+    // Said of it in the channel: that there is one, not what it is called nor how much is in it.
+    assert_eq!(grown["body"]["grew"]["private"], true);
+    assert!(grown["body"]["grew"].get("name").is_none() && grown["body"]["grew"].get("count").is_none(), "{grown}");
+    assert_eq!(kind(&ann.community("post", json!({ "channel": channel, "id": "p1", "content": "cake secret", "thread": "root" })).await), "posted");
+
+    // Bob isn't in it: it isn't there for him, however he asks.
+    let unknown = |answer: Value| answer["body"]["code"] == "e.p.msg.unknown-thread";
+    assert!(unknown(bob.community("history-request", json!({ "channel": channel, "thread": "root" })).await));
+    assert!(unknown(bob.community("history-request", json!({ "channel": channel, "thread": "root", "at": 1 })).await));
+    assert!(unknown(bob.community("post", json!({ "channel": channel, "content": "hi", "thread": "root" })).await));
+    assert!(unknown(bob.community("thread-members-request", json!({ "thread": "root" })).await));
+    let found = bob.community("search-request", json!({ "query": "cake secret" })).await;
+    assert_eq!(found["body"]["messages"], json!([]), "{found}");
+    let changes = bob.community("changes-request", json!({ "after_rev": 0 })).await;
+    assert!(!changes.to_string().contains("cake secret"), "{changes}");
+    assert_eq!(bob.ask("https://wyvrn.app/message-reactions/1.0/reactions", json!({ "to": { "id": "p1" }, "emoji": ["👍"] })).await["body"]["code"], "e.p.msg.unknown-post");
+
+    // The admin manages threads: reads it.
+    let read = admin.community("history-request", json!({ "channel": channel, "thread": "root" })).await;
+    assert_eq!(read["body"]["messages"][0]["content"], "cake secret", "{read}");
+
+    // Ann adds Cat; Cat reads it, and may add others but not take them out.
+    let cat_id = server.id(&cat);
+    let members = ann.community("thread-members-request", json!({ "thread": "root", "add": [{ "member": cat_id }] })).await;
+    assert_eq!(members["body"]["name"], "Bob's birthday", "{members}");
+    assert_eq!(members["body"]["members"].as_array().unwrap().len(), 2);
+    let read = cat.community("history-request", json!({ "channel": channel, "thread": "root" })).await;
+    assert_eq!(read["body"]["messages"][0]["content"], "cake secret", "{read}");
+    let ann_id = server.id(&ann);
+    assert_eq!(cat.community("thread-members-request", json!({ "thread": "root", "remove": [{ "member": ann_id }] })).await["body"]["code"], "e.p.trust.not-authorized");
+    // Cat leaves.
+    cat.community("thread-members-request", json!({ "thread": "root", "remove": [{ "member": cat_id }] })).await;
+    assert!(unknown(cat.community("history-request", json!({ "channel": channel, "thread": "root" })).await));
+}
+
+#[tokio::test]
+async fn posting_in_threads_and_making_polls_are_permissions_of_their_own() {
+    let server = start_server("").await;
+    let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member]);
+    member.community("join", json!({})).await;
+    let channel = open_channel(&admin, "general").await;
+    member.community("post", json!({ "channel": channel, "id": "root", "content": "Start" })).await;
+    member.community("create-thread", json!({ "to": { "id": "root" } })).await;
+    // Everyone may by default, as before.
+    assert_eq!(kind(&member.community("post", json!({ "channel": channel, "content": "in it", "thread": "root" })).await), "posted");
+    let poll = json!({ "question": "Pizza?", "answers": [{ "id": "a", "text": "Yes" }, { "id": "b", "text": "No" }], "ends_at": wyvrn_service::now() + 3600 });
+    let polled = member.community("post", json!({ "channel": channel, "content": "", "poll": poll.clone() })).await;
+    assert_eq!(kind(&polled), "posted", "{polled}");
+
+    // Each taken away on its own: posting in the channel goes on.
+    let store = &server.state.community.store;
+    store.set_override(&channel, wyvrn_community::roles::EVERYONE_ROLE, &[], &["send_in_threads".to_string(), "create_polls".to_string()]).unwrap();
+    assert_eq!(member.community("post", json!({ "channel": channel, "content": "in it", "thread": "root" })).await["body"]["code"], "e.p.trust.not-authorized");
+    assert_eq!(member.community("post", json!({ "channel": channel, "content": "", "poll": poll })).await["body"]["code"], "e.p.trust.not-authorized");
+    assert_eq!(kind(&member.community("post", json!({ "channel": channel, "content": "still here" })).await), "posted");
+    // And the other way: a read-only channel's threads may still be posted in, where allowed.
+    store.set_override(&channel, wyvrn_community::roles::EVERYONE_ROLE, &["send_in_threads".to_string()], &["post".to_string()]).unwrap();
+    assert_eq!(member.community("post", json!({ "channel": channel, "content": "no" })).await["body"]["code"], "e.p.trust.not-authorized");
+    assert_eq!(kind(&member.community("post", json!({ "channel": channel, "content": "in it", "thread": "root" })).await), "posted");
 }

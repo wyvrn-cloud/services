@@ -115,6 +115,9 @@ impl Community {
 
     /// A post that changed, as an event (`post.changed`).
     pub fn post_changed_event(&self, post: &Post, now: i64) {
+        if post.thread.as_deref().is_some_and(|t| self.store.is_private_thread(t).unwrap_or(true)) {
+            return;
+        }
         if let Ok(Some(channel)) = self.store.channel(&post.channel) {
             self.emit_event("post.changed", Some(&channel), self.post_in_event(post, &channel, now), now);
         }
@@ -138,7 +141,8 @@ impl Community {
         let mut last = from;
         for post in self.store.posts_after(from, 200)? {
             last = last.max(post.serial);
-            if post.deleted {
+            // (Nor a private thread's: an event's receiver is in no thread.)
+            if post.deleted || post.thread.as_deref().is_some_and(|t| self.store.is_private_thread(t).unwrap_or(true)) {
                 continue;
             }
             if let Some(channel) = self.store.channel(&post.channel)? {

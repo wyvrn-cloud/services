@@ -264,7 +264,13 @@ impl Community {
                 let more = found.len() > limit;
                 found.truncate(limit);
                 let next = found.last().map(|post| post.serial);
-                let messages: Vec<Value> = found.iter().map(|post| self.post_body(post, now)).collect();
+                let mut messages = Vec::new();
+                for post in &found {
+                    // (Not one in a private thread they aren't in.)
+                    if post.thread.is_none() || self.reads_post_id(sender, post)? {
+                        messages.push(self.post_body(post, now));
+                    }
+                }
                 let mut results = json!({ "messages": messages, "more": more });
                 if let Some(next) = next.filter(|_| more) {
                     results["next"] = json!(next);
@@ -312,6 +318,11 @@ impl Community {
                 };
                 let limit = body["limit"].as_u64().map_or(crate::community::DEFAULT_HISTORY_LIMIT, |l| (l as usize).clamp(2, crate::community::MAX_HISTORY_LIMIT));
                 let thread = body["thread"].as_str();
+                if let Some(thread) = thread {
+                    if !self.reads_thread(sender, &self.powers(sender)?, &channel, thread)? {
+                        return refuse(message, "e.p.msg.unknown-thread", "There is no such thread in this channel.").map(Some);
+                    }
+                }
                 let (posts, more, newer) = self.store.channel_posts_around(&channel.id, thread, body["at"].as_i64().unwrap_or(now), limit / 2)?;
                 let messages: Vec<Value> = posts.iter().map(|post| self.post_body(post, now)).collect();
                 Outcome::reply(reply_to(message, HISTORY, json!({ "channel": channel.id, "messages": messages, "more": more, "newer": newer })))

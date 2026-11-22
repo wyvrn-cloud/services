@@ -51,6 +51,10 @@ pub const CHANNEL_PERMISSIONS: &[(&str, &str)] = &[
     ("post", "Post"),
     ("react", "React"),
     ("create_threads", "Start threads"),
+    ("create_private_threads", "Start private threads"),
+    ("send_in_threads", "Post in threads"),
+    ("manage_threads", "Manage threads: lock, rename, and see and manage private ones"),
+    ("create_polls", "Make polls"),
     ("attach_files", "Post files"),
     ("mention_everyone", "Mention everyone, and any role"),
     ("manage_messages", "Remove and pin anyone's posts"),
@@ -65,9 +69,10 @@ pub const CHANNEL_PERMISSIONS: &[(&str, &str)] = &[
 /// Holding any of these makes someone a `moderator` in older terms.
 const MODERATING: &[&str] = &["manage_messages", "admit_members", "kick_members", "ban_members", "timeout_members", "manage_reports"];
 
-const EVERYONE_DEFAULT: &[&str] = &["view_channel", "post", "react", "create_threads", "attach_files", "connect", "speak", "video"];
+const EVERYONE_DEFAULT: &[&str] =
+    &["view_channel", "post", "react", "create_threads", "create_private_threads", "send_in_threads", "create_polls", "attach_files", "connect", "speak", "video"];
 const MODERATOR_DEFAULT: &[&str] =
-    &["admit_members", "kick_members", "timeout_members", "manage_reports", "view_audit_log", "manage_messages", "bypass_slow_mode", "moderate_voice", "create_events", "manage_events"];
+    &["admit_members", "kick_members", "timeout_members", "manage_reports", "view_audit_log", "manage_messages", "manage_threads", "bypass_slow_mode", "moderate_voice", "create_events", "manage_events"];
 
 pub fn is_permission(name: &str) -> bool {
     COMMUNITY_PERMISSIONS.iter().chain(CHANNEL_PERMISSIONS).any(|(known, _)| *known == name)
@@ -204,10 +209,36 @@ impl Community {
                 }
                 self.store.set_setting("events_given", "true")?;
             }
+            // A store from before thread permissions and polls' own: everyone starts
+            // private threads, posts in threads and makes polls, as they could; where a
+            // role may not post, it may not post in threads either; Moderator manages
+            // threads.
+            if self.store.setting("threads_given")?.is_none() {
+                for permission in ["create_private_threads", "send_in_threads", "create_polls"] {
+                    self.set_everyone(permission, true)?;
+                }
+                let keys: Vec<String> = self.store.channels()?.into_iter().map(|c| c.id).chain(self.store.categories()?.iter().map(|c| category_key(&c.id))).collect();
+                for key in keys {
+                    for mut o in self.store.overrides(&key)? {
+                        if o.deny.iter().any(|p| p == "post") && !o.deny.iter().any(|p| p == "send_in_threads") {
+                            o.deny.push("send_in_threads".into());
+                            self.store.set_override(&key, &o.role, &o.allow, &o.deny)?;
+                        }
+                    }
+                }
+                if let Some(mut moderator) = self.store.role("moderator")? {
+                    if !moderator.permissions.iter().any(|p| p == "manage_threads") {
+                        moderator.permissions.push("manage_threads".into());
+                    }
+                    self.store.save_role(&moderator)?;
+                }
+                self.store.set_setting("threads_given", "true")?;
+            }
             return Ok(());
         }
         self.store.set_setting("view_channel_given", "true")?;
         self.store.set_setting("events_given", "true")?;
+        self.store.set_setting("threads_given", "true")?;
         let mut everyone = strings(EVERYONE_DEFAULT);
         if self.config.members_may_create_channels {
             everyone.push("create_channels".into());
@@ -399,6 +430,31 @@ impl Community {
         Ok(powers.all() || channel.created_by == did || self.channel_permissions(did, powers, channel)?.contains("view_channel"))
     }
 
+    /// Whether `did` reads the thread `thread` of `channel`: any thread but a private
+    /// one; a private one, whoever is in it and whoever may manage threads there.
+    pub fn reads_thread(&self, did: &str, powers: &Powers, channel: &Channel, thread: &str) -> anyhow::Result<bool> {
+        if !self.store.is_private_thread(thread)? {
+            return Ok(true);
+        }
+        Ok(powers.all() || self.store.in_thread(thread, did)? || self.channel_permissions(did, powers, channel)?.contains("manage_threads"))
+    }
+
+    /// Whether `did`, who sees `channel`, reads `post` of it: not one in a private
+    /// thread they aren't in.
+    pub fn reads_post(&self, did: &str, powers: &Powers, channel: &Channel, post: &crate::store::Post) -> anyhow::Result<bool> {
+        match &post.thread {
+            Some(thread) => self.reads_thread(did, powers, channel, thread),
+            None => Ok(true),
+        }
+    }
+
+    /// Whether `did` sees and reads `post` (its channel, and its thread).
+    pub fn reads_post_id(&self, did: &str, post: &crate::store::Post) -> anyhow::Result<bool> {
+        let Some(channel) = self.store.channel(&post.channel)? else { return Ok(false) };
+        let powers = self.powers(did)?;
+        Ok(self.sees(did, &powers, &channel)? && self.reads_post(did, &powers, &channel, post)?)
+    }
+
     /// Whether `did` may see the channel `id` (an unknown one, no).
     pub fn sees_id(&self, did: &str, id: &str) -> anyhow::Result<bool> {
         let Some(channel) = self.store.channel(id)? else { return Ok(false) };
@@ -541,5 +597,20 @@ mod view_channel_tests {
         // A new store's `everyone` has it from the start.
         let fresh = Community::new(Store::in_memory().unwrap(), CommunityConfig::default(), None).unwrap();
         assert!(fresh.everyone_has("view_channel").unwrap());
+    }
+
+    #[test]
+    fn a_store_from_before_thread_permissions_keeps_what_everyone_could_do_and_read_only_stays_so() {
+        let store = Store::in_memory().unwrap();
+        let everyone = RoleDef { id: EVERYONE_ROLE.into(), name: "everyone".into(), color: None, icon: None, position: 0, permissions: strings(&["view_channel", "post", "create_threads"]), mentionable: false, hoist: false, self_assignable: false };
+        store.save_role(&everyone).unwrap();
+        store.add_channel("news", "news", "", "did:example:owner", 1).unwrap();
+        store.set_override("news", EVERYONE_ROLE, &[], &strings(&["post"])).unwrap();
+        let community = Community::new(store, CommunityConfig::default(), None).unwrap();
+        for permission in ["send_in_threads", "create_private_threads", "create_polls"] {
+            assert!(community.everyone_has(permission).unwrap(), "{permission}");
+        }
+        let news = community.store.overrides("news").unwrap();
+        assert!(news[0].deny.contains(&"send_in_threads".to_string()), "a channel nobody posted in takes no thread posts either");
     }
 }

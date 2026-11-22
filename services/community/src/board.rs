@@ -9,6 +9,10 @@ use crate::community::{line, refuse, reply_to, Community, Outcome};
 use crate::store::Member;
 
 pub const SET_THREAD: &str = "https://wyvrn.app/community/1.0/set-thread";
+/// Who is in a private thread, asked, or changed: `{ thread, add?, remove? }`, each
+/// a list of `{ member }`.
+pub const THREAD_MEMBERS_REQUEST: &str = "https://wyvrn.app/community/1.0/thread-members-request";
+pub const THREAD_MEMBERS: &str = "https://wyvrn.app/community/1.0/thread-members";
 pub const FORUM_STATS_REQUEST: &str = "https://wyvrn.app/community/1.0/forum-stats-request";
 pub const FORUM_STATS: &str = "https://wyvrn.app/community/1.0/forum-stats";
 pub const REBUILD_COUNTS: &str = "https://wyvrn.app/community/1.0/rebuild-counts";
@@ -105,18 +109,82 @@ impl Community {
         let body = &message["body"];
         let did = member.did.as_str();
         match message["type"].as_str().unwrap_or_default() {
+            THREAD_MEMBERS_REQUEST => {
+                let unknown = || refuse(message, "e.p.msg.unknown-thread", "There is no such thread.").map(Some);
+                let Some(thread) = body["thread"].as_str().map(|id| self.store.thread(id)).transpose()?.flatten() else { return unknown() };
+                let Some(channel) = self.store.channel(&thread.channel)? else { return unknown() };
+                let powers = self.powers(did)?;
+                if !thread.private || !self.sees(did, &powers, &channel)? || !self.reads_thread(did, &powers, &channel, &thread.id)? {
+                    return unknown();
+                }
+                let now = crate::gates::now();
+                let manages = self.channel_permissions(did, &powers, &channel)?.contains("manage_threads");
+                // Each `{ member }`, a member id (read as whom it names).
+                let named = |key: &str| -> Vec<String> { body[key].as_array().into_iter().flatten().filter_map(|m| m["member"].as_str().map(str::to_string)).take(50).collect() };
+                let (add, remove) = (named("add"), named("remove"));
+                // Whoever is in it adds others who see the channel (as Discord's: anyone
+                // in a private thread may add); taking out is its starter's, or a
+                // thread manager's, and anyone may leave.
+                for who in &add {
+                    let Some(member) = self.store.member(who)?.filter(|m| m.joined) else { continue };
+                    if self.sees(&member.did, &self.powers(&member.did)?, &channel)? {
+                        self.store.set_in_thread(&thread.id, &member.did, did, true, now)?;
+                        self.store.follow_thread(&member.did, &thread.id, true)?;
+                    }
+                }
+                for who in &remove {
+                    if who != did && !(manages || thread.created_by == did) {
+                        return refuse(message, "e.p.trust.not-authorized", "Only whoever started a private thread, or manages threads, takes others out.").map(Some);
+                    }
+                    self.store.set_in_thread(&thread.id, who, did, false, now)?;
+                    self.store.follow_thread(who, &thread.id, false)?;
+                }
+                if !add.is_empty() || !remove.is_empty() {
+                    self.audit(now, did, "thread.members", Some(&thread.id), Some(json!({ "added": add.len(), "removed": remove.len() })));
+                }
+                let members = self.store.thread_members(&thread.id)?;
+                let mut answer = json!({ "thread": thread.id, "channel": channel.id, "members": members.iter().map(|m| json!({ "member": m })).collect::<Vec<_>>() });
+                if let Some(name) = &thread.name {
+                    answer["name"] = json!(name);
+                }
+                let mut outcome = Outcome::reply(reply_to(message, THREAD_MEMBERS, answer.clone()));
+                // Those added are told, so their app knows the thread.
+                for who in add.iter().filter(|who| members.contains(who)) {
+                    outcome.notices.push((who.clone(), json!({ "type": THREAD_MEMBERS, "body": answer.clone() })));
+                }
+                Ok(Some(outcome))
+            }
+
             SET_THREAD => {
                 let Some(thread) = body["thread"].as_str().map(|id| self.store.thread(id)).transpose()?.flatten() else {
                     return refuse(message, "e.p.msg.unknown-thread", "There is no such thread.").map(Some);
                 };
-                let Some(channel) = self.store.channel(&thread.channel)?.filter(|c| c.forum.is_some()) else {
+                let Some(channel) = self.store.channel(&thread.channel)? else {
                     return refuse(message, "e.p.msg.unknown-thread", "There is no such thread.").map(Some);
                 };
-                if !self.sees_id(did, &channel.id)? {
+                let powers = self.powers(did)?;
+                if !self.sees(did, &powers, &channel)? || !self.reads_thread(did, &powers, &channel, &thread.id)? {
                     return refuse(message, "e.p.msg.unknown-thread", "There is no such thread.").map(Some);
                 }
-                if !self.may_in(did, &channel, "manage_messages")? {
-                    return refuse(message, "e.p.trust.not-authorized", "A thread's standing is set by whoever manages posts in the forum.").map(Some);
+                let manages = self.may_in(did, &channel, "manage_messages")? || self.may_in(did, &channel, "manage_threads")?;
+                // Its name: whoever started it, or manages threads.
+                if let Some(name) = body.get("name") {
+                    if !(manages || thread.created_by == did) {
+                        return refuse(message, "e.p.trust.not-authorized", "A thread is renamed by whoever started it, or manages threads.").map(Some);
+                    }
+                    let name = line(name, crate::community::MAX_THREAD_NAME);
+                    self.store.rename_thread(&thread.id, name.as_deref())?;
+                    if ["sticky", "locked", "section"].iter().all(|k| body.get(*k).is_none()) {
+                        self.store.touch_thread(&thread.id)?;
+                        self.audit(crate::gates::now(), did, "thread.rename", Some(&thread.id), None);
+                        return self.changed_answer(message, &thread.id).map(Some);
+                    }
+                }
+                if !manages {
+                    return refuse(message, "e.p.trust.not-authorized", "A thread's standing is set by whoever manages posts or threads.").map(Some);
+                }
+                if channel.forum.is_none() && (body.get("sticky").is_some() || body.get("section").is_some()) {
+                    return refuse(message, "e.p.msg.invalid-thread", "Only a forum's threads are pinned or put in sections.").map(Some);
                 }
                 let sticky = body["sticky"].as_bool().unwrap_or(thread.sticky);
                 let locked = body["locked"].as_bool().unwrap_or(thread.locked);

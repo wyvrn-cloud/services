@@ -79,7 +79,7 @@ pub const MAX_MENTIONS: usize = 50;
 const MAX_MENTION_NAME: usize = 40;
 /// As many different emoji as one post takes, and as one member puts on it.
 const MAX_REACTIONS: usize = 20;
-const MAX_THREAD_NAME: usize = 80;
+pub const MAX_THREAD_NAME: usize = 80;
 /// As many changed posts as one `changes` carries.
 const CHANGES_BATCH: usize = 100;
 
@@ -146,7 +146,7 @@ pub fn channel_kind(channel: &crate::store::Channel) -> &'static str {
 /// The permissions in a channel that add to it, or join it: what a channel of a
 /// kind its host turned off is without, whoever holds them. Seeing it, and
 /// keeping order in it (`manage_messages`, `moderate_voice`), stay.
-pub const ADDING: &[&str] = &["post", "react", "create_threads", "attach_files", "mention_everyone", "bypass_slow_mode", "connect", "speak", "video", "manage_webhooks"];
+pub const ADDING: &[&str] = &["post", "react", "create_threads", "create_private_threads", "send_in_threads", "create_polls", "attach_files", "mention_everyone", "bypass_slow_mode", "connect", "speak", "video", "manage_webhooks"];
 
 /// A voice channel's settings as an admin gives them (community-voice/1.0, "A voice
 /// channel"), laid over what it had: checked, and with nothing in them the protocol
@@ -972,14 +972,22 @@ impl Community {
         }
         if let Some(thread) = &post.grew {
             let mut grew = json!({ "created_by": thread.created_by, "created_at": thread.created_at, "count": thread.count });
-            if let Some(last_at) = thread.last_at {
-                grew["last_at"] = json!(last_at);
-            }
-            if let Some(name) = &thread.name {
-                grew["name"] = json!(name);
-            }
-            if let Some(last_by) = &thread.last_by {
-                grew["last_by"] = json!(last_by);
+            // A private thread: that there is one, and who started it; what it is
+            // called and who wrote in it last are for those who read it
+            // (`thread-members` and its history say them).
+            if thread.private {
+                grew["private"] = json!(true);
+                grew.as_object_mut().map(|g| g.remove("count"));
+            } else {
+                if let Some(last_at) = thread.last_at {
+                    grew["last_at"] = json!(last_at);
+                }
+                if let Some(name) = &thread.name {
+                    grew["name"] = json!(name);
+                }
+                if let Some(last_by) = &thread.last_by {
+                    grew["last_by"] = json!(last_by);
+                }
             }
             if thread.sticky {
                 grew["sticky"] = json!(true);
@@ -1050,7 +1058,7 @@ impl Community {
     /// may not is no post, as unknown as one that isn't.
     fn named_post(&self, body: &Value, viewer: &str) -> anyhow::Result<Option<Post>> {
         Ok(match self.referred(&body["to"])? {
-            Some(post) if self.sees_id(viewer, &post.channel)? => Some(post),
+            Some(post) if self.reads_post_id(viewer, &post)? => Some(post),
             _ => None,
         })
     }
@@ -1359,8 +1367,14 @@ impl Community {
         if channel.wiki {
             return refuse(message, "e.p.msg.wiki-channel", "A wiki takes no posts: its pages are edited.");
         }
-        if !self.may_in(sender, &channel, "post")? {
+        // Into a thread takes `send_in_threads`, said once the thread is known;
+        // anything else `post`.
+        let towards_thread = body["thread"].as_str().is_some_and(|t| !t.is_empty()) || body.get("reply_to").is_some_and(|r| !r.is_null());
+        if !towards_thread && !self.may_in(sender, &channel, "post")? {
             return refuse(message, "e.p.trust.not-authorized", "You can't post in this channel.");
+        }
+        if body.get("poll").is_some_and(|p| !p.is_null()) && !self.may_in(sender, &channel, "create_polls")? {
+            return refuse(message, "e.p.trust.not-authorized", "You can't make polls in this channel.");
         }
         // A post sent again after a lost answer isn't held to slow mode.
         let again = body["id"].as_str().map(|id| self.store.post_by_id(id)).transpose()?.flatten().is_some_and(|post| post.author_did == sender);
@@ -1412,9 +1426,23 @@ impl Community {
             // answer to a thread's first post is in its thread too.
             None => answered.as_ref().and_then(|post| post.thread.clone().or_else(|| (channel.forum.is_some() && post.grew.is_some()).then(|| post.id.clone()))),
         };
+        match thread.as_deref() {
+            Some(id) => {
+                let powers = self.powers(sender)?;
+                // A private thread they aren't in is as unknown as one that isn't there.
+                if !self.reads_thread(sender, &powers, &channel, id)? {
+                    return refuse(message, "e.p.msg.unknown-thread", "There is no such thread in this channel.");
+                }
+                if !self.may_in(sender, &channel, "send_in_threads")? {
+                    return refuse(message, "e.p.trust.not-authorized", "You can't post in threads in this channel.");
+                }
+            }
+            None if !self.may_in(sender, &channel, "post")? => return refuse(message, "e.p.trust.not-authorized", "You can't post in this channel."),
+            None => {}
+        }
         // A locked thread takes posts only from whoever manages them.
         let locked = thread.as_deref().map(|id| self.store.thread(id)).transpose()?.flatten().is_some_and(|t| t.locked);
-        if locked && !self.may_in(sender, &channel, "manage_messages")? {
+        if locked && !(self.may_in(sender, &channel, "manage_messages")? || self.may_in(sender, &channel, "manage_threads")?) {
             return refuse(message, "e.p.msg.locked", "This thread is locked.");
         }
         // A forum thread begun in one of its sections.
@@ -2021,8 +2049,17 @@ impl Community {
                 if self.timed_out(sender, now)? {
                     return refuse(message, "e.p.msg.timed-out", "You are timed out here for now.");
                 }
-                if !self.store.channel(&post.channel)?.map(|channel| self.may_in(sender, &channel, "create_threads")).transpose()?.unwrap_or(false) {
-                    return refuse(message, "e.p.trust.not-authorized", "You can't start threads in this channel.");
+                // A private thread (Discord's): read by those in it, and whoever may
+                // manage threads; not in a forum, whose posts are threads for all.
+                let private = body["private"].as_bool() == Some(true);
+                let Some(channel) = self.store.channel(&post.channel)? else {
+                    return refuse(message, "e.p.msg.unknown-post", "There is no such post.");
+                };
+                if private && channel.forum.is_some() {
+                    return refuse(message, "e.p.msg.invalid-thread", "A forum's threads are for everyone who sees it.");
+                }
+                if !self.may_in(sender, &channel, if private { "create_private_threads" } else { "create_threads" })? {
+                    return refuse(message, "e.p.trust.not-authorized", if private { "You can't start private threads in this channel." } else { "You can't start threads in this channel." });
                 }
                 // Only someone in the conversation it grows from: whoever wrote the
                 // post, what it answers, or an answer to it.
@@ -2032,10 +2069,17 @@ impl Community {
                     return refuse(message, "e.p.trust.not-authorized", "A thread is started by someone who wrote in the replies it grows from.");
                 }
                 let name = line(&body["name"], MAX_THREAD_NAME);
+                if private {
+                    // Private before it is there, so nothing of it is ever told to anyone else.
+                    self.store.make_thread_private(&post.id, sender, now)?;
+                }
                 self.store.add_thread(&post.id, &post.channel, name.as_deref(), sender, now)?;
-                // Whoever grew it follows it, and so does whoever wrote the post.
+                // Whoever grew it follows it, and so does whoever wrote the post (a
+                // private one, only who started it: the rest are added to it).
                 self.store.follow_thread(sender, &post.id, true)?;
-                self.store.follow_thread(&post.author_did, &post.id, true)?;
+                if !private {
+                    self.store.follow_thread(&post.author_did, &post.id, true)?;
+                }
                 self.changed_answer(message, &post.id)
             }
 
@@ -2047,7 +2091,13 @@ impl Community {
                 let upto = posts.last().map_or(after, |post| post.rev);
                 // (What they may not see is passed over, `rev` past it all the same.)
                 let seen = self.seen_by(sender)?;
-                let messages: Vec<Value> = posts.iter().filter(|post| seen.contains(&post.channel)).map(Self::message_body).collect();
+                let mut messages = Vec::new();
+                for post in posts.iter().filter(|post| seen.contains(&post.channel)) {
+                    // (Nor posts of a private thread they aren't in.)
+                    if post.thread.is_none() || self.reads_post_id(sender, post)? {
+                        messages.push(Self::message_body(post));
+                    }
+                }
                 Ok(Outcome::reply(reply_to(message, CHANGES, json!({ "messages": messages, "rev": upto, "more": more }))))
             }
 
@@ -2057,6 +2107,12 @@ impl Community {
                 };
                 let limit = body["limit"].as_u64().map_or(DEFAULT_HISTORY_LIMIT, |limit| (limit as usize).clamp(1, MAX_HISTORY_LIMIT));
                 let thread = body["thread"].as_str().filter(|id| !id.is_empty());
+                // A private thread they aren't in is no thread.
+                if let Some(thread) = thread {
+                    if !self.reads_thread(sender, &self.powers(sender)?, &channel, thread)? {
+                        return refuse(message, "e.p.msg.unknown-thread", "There is no such thread in this channel.");
+                    }
+                }
                 // A thread read a page at a time, as a forum's is: from a place in
                 // it, or the page holding the first post after one already read (by
                 // its seq, or by its id: what a read mark synced between a member's

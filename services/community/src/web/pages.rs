@@ -509,7 +509,8 @@ fn post_view(state: &AppState, post: &Post, channel: &Channel, root: &str, focus
             })
         })
         .collect();
-    let thread = post.grew.as_ref();
+    // (A private thread isn't linked, nor named, on the web.)
+    let thread = post.grew.as_ref().filter(|t| !t.private);
     PostView {
         id: post.id.clone(),
         seq: post.seq,
@@ -690,7 +691,7 @@ fn discussion(post: &Post, web: &Web, channel: &Channel, name: &str) -> Value {
         "author": { "@type": "Person", "name": name },
         "datePublished": render::iso(post.posted_at),
         "text": render::excerpt(&post.content, 500),
-        "commentCount": post.grew.as_ref().map_or(0, |t| t.count),
+        "commentCount": post.grew.as_ref().filter(|t| !t.private).map_or(0, |t| t.count),
     })
 }
 
@@ -1132,6 +1133,10 @@ async fn thread_page(State(state): State<Arc<AppState>>, Path((id, thread)): Pat
     let Some((channel, since)) = visible_channel(&state, &viewer, &id) else { return nothing() };
     let store = &state.community.store;
     let Some(root_post) = store.post_by_id(&thread).ok().flatten().filter(|p| p.channel == channel.id && shows(p, since)) else { return nothing() };
+    // A private thread is never on the web, signed in or not.
+    if store.is_private_thread(&thread).unwrap_or(true) {
+        return nothing();
+    }
     let root = "../../../";
     let mut posts = match store.channel_posts_before(&channel.id, Some(&thread), None, 200) {
         Ok(posts) => posts,

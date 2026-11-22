@@ -240,9 +240,17 @@ async fn rotation(state: &AppState, received: &Received, sender: &str) -> Option
 fn send_changed(state: &Arc<AppState>, notice: &Value) -> anyhow::Result<()> {
     let channel = notice["body"]["channel"].as_str().unwrap_or_default();
     for member in state.community.store.joined()? {
-        // Not to anyone who may not see the channel.
+        // Not to anyone who may not see the channel, nor a private thread's post to
+        // anyone not in it.
         if !state.community.sees_id(&member.did, channel)? {
             continue;
+        }
+        if let Some(thread) = notice["body"]["thread"].as_str() {
+            if let Some(found) = state.community.store.channel(channel)? {
+                if !state.community.reads_thread(&member.did, &state.community.powers(&member.did)?, &found, thread)? {
+                    continue;
+                }
+            }
         }
         if !state.to_watching(&member.did, notice) && state.community.changes_reach(&member)? {
             send_later(state, member.did, notice.clone());
@@ -1020,7 +1028,8 @@ async fn deliver_to(state: &Arc<AppState>, member: crate::store::Member) {
     for post in posts {
         // A post in a channel they may not see is passed over, for good: seeing it
         // later, they read back in it.
-        if !seen.contains(&post.channel) {
+        let unread_thread = post.thread.is_some() && !matches!(state.community.reads_post_id(&member.did, &post), Ok(true));
+        if !seen.contains(&post.channel) || unread_thread {
             if let Err(error) = state.community.store.set_delivered(&member.did, post.serial) {
                 return tracing::error!(%error, "couldn't record a delivery");
             }
