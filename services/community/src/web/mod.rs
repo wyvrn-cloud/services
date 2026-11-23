@@ -225,6 +225,16 @@ pub fn secret(store: &Store, did: &str) -> anyhow::Result<String> {
     Ok(wyvrn_service::identity::open_text(&kept, &at)?.0)
 }
 
+/// The web secret, where one is kept, opened and sealed again where it should be:
+/// at start-up, beside the identity, so the start that adopts unsealed keys
+/// adopts it too, and one that doesn't open stops the server (WYV-111).
+pub fn settle_secret(store: &Store, did: &str) -> anyhow::Result<()> {
+    if store.setting(SECRET)?.is_some() {
+        secret(store, did).map_err(|e| e.context("the community's web secret"))?;
+    }
+    Ok(())
+}
+
 /// `community`'s `web`, for a server with a web view.
 pub fn community_body(web_url: &str, store: &Store) -> serde_json::Value {
     let mut body = serde_json::json!({ "url": web_url, "page": page_on(store), "voice": voice_choice(store), "public_channels": public_choice(store) });

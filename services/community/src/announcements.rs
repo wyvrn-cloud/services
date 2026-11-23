@@ -623,7 +623,10 @@ impl Community {
                 if self.store.followers_of(&channel.id).map_err(failed)?.iter().any(|f| f.target == url) {
                     return Err(Refusal::new("guard_failed", "The channel's posts go there already."));
                 }
-                let follower = Follower { id: new_id(), channel: channel.id.clone(), kind: kind.into(), target: url.clone(), name, secret: secret.clone(), created_by: flow.owner.clone(), created_at: now, failures: 0, off_at: None };
+                let id = new_id();
+                // Kept sealed where the service has a seal key (WYV-32); shown plain, this once.
+                let kept = secret.as_deref().map(|secret| self.seal_follower_secret(&id, secret)).transpose().map_err(failed)?;
+                let follower = Follower { id, channel: channel.id.clone(), kind: kind.into(), target: url.clone(), name, secret: kept, created_by: flow.owner.clone(), created_at: now, failures: 0, off_at: None };
                 self.store.save_follower(&follower).map_err(failed)?;
                 self.audit(now, &flow.owner, "announcement.webhook", Some(&channel.id), Some(json!({ "kind": kind })));
                 flow.data["note"] = json!(match secret {
@@ -922,7 +925,11 @@ async fn to_service(community: &Community, follower: &Follower, channel: &Channe
     let body = json!({ "type": kind, "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true), "data": data }).to_string();
     let id = format!("msg_{}", uuid::Uuid::new_v4().simple());
     let timestamp = chrono::Utc::now().timestamp();
-    let signature = standard_signatures(follower.secret.as_deref(), community.signing_seed.as_ref(), &id, timestamp, &body);
+    let secret = community.follower_secret(follower).map_err(|error| {
+        tracing::warn!(follower = %follower.id, %error, "an announcement follower's signing secret doesn't open");
+        "its signing secret doesn't open".to_string()
+    })?;
+    let signature = standard_signatures(secret.as_deref(), community.signing_seed.as_ref(), &id, timestamp, &body);
     let (client, url) = crate::outgoing::client_for(&follower.target, community.config.outgoing_private, "wyvrn-community (announcements)").await?;
     let answer = client
         .post(url)
@@ -977,5 +984,27 @@ mod tests {
         assert_eq!(discord_username("My Discord fans #news"), "My  fans #news");
         assert_eq!(discord_username("discord"), "Wyvrn");
         assert_eq!(discord_username(&"x".repeat(100)).chars().count(), 80);
+    }
+}
+
+impl Community {
+    /// A new follower's signing secret as it is kept: sealed with the service's
+    /// seal key where it has one (WYV-32).
+    pub fn seal_follower_secret(&self, follower_id: &str, plain: &str) -> anyhow::Result<String> {
+        wyvrn_service::identity::seal_text(plain, &self.secret_place(&format!("follower-{follower_id}")))
+    }
+
+    /// A follower's signing secret (a Discord webhook has none), opened; kept again
+    /// where it should be (found unsealed, or sealed with a previous key).
+    pub fn follower_secret(&self, follower: &Follower) -> anyhow::Result<Option<String>> {
+        let Some(kept) = &follower.secret else { return Ok(None) };
+        let place = self.secret_place(&format!("follower-{}", follower.id));
+        let (plain, again) = wyvrn_service::identity::open_text(kept, &place)?;
+        if again {
+            let mut resealed = follower.clone();
+            resealed.secret = Some(wyvrn_service::identity::seal_text(&plain, &place)?);
+            self.store.save_follower(&resealed)?;
+        }
+        Ok(Some(plain))
     }
 }

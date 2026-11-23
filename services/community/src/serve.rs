@@ -117,6 +117,12 @@ pub async fn open(config: &Config, stores: &Stores, opening: Opening) -> anyhow:
     state.web = web;
     // Read whether or not the web view is on (WYV-98).
     state.clients = crate::clients::Clients::new(&config.trusted_proxies())?;
+    // Every secret kept sealed, opened now beside the identity (WYV-111): one that
+    // doesn't open stops the start, and WYVRN_SEAL_ADOPT_PLAIN adopts them all.
+    let did = state.agent.did();
+    crate::web::settle_secret(&state.community.store, &did)?;
+    crate::web::oidc::settle_keys(&state.community.store, &did)?;
+    state.community.settle_secrets()?;
     let state = Arc::new(match opening.assistant {
         Some(assistant) => {
             tracing::info!(name = %assistant.config.name, model = %assistant.config.model, "an assistant answers in every channel");

@@ -49,6 +49,49 @@ const ANSWER_WITHIN: Duration = Duration::from_secs(10);
 const CURSOR: &str = "outgoing_serial";
 
 impl Community {
+    /// Where a signing secret of the community's is bound when it is kept sealed
+    /// (WYV-32): the community, by its DID, and which secret it is.
+    pub(crate) fn secret_place(&self, what: &str) -> String {
+        format!("{}#{what}", self.own.as_deref().unwrap_or_default())
+    }
+
+    /// A new event receiver's signing secret as it is kept: sealed with the
+    /// service's seal key where it has one (WYV-32).
+    pub fn seal_hook_secret(&self, hook_id: &str, plain: &str) -> anyhow::Result<String> {
+        wyvrn_service::identity::seal_text(plain, &self.secret_place(&format!("event-hook-{hook_id}")))
+    }
+
+    /// An event receiver's signing secret, opened; kept again where it should be
+    /// (found unsealed, or sealed with a previous key).
+    pub fn hook_secret(&self, hook: &EventHook) -> anyhow::Result<String> {
+        let place = self.secret_place(&format!("event-hook-{}", hook.id));
+        let (plain, again) = wyvrn_service::identity::open_text(&hook.secret, &place)?;
+        if again {
+            let mut kept = hook.clone();
+            kept.secret = wyvrn_service::identity::seal_text(&plain, &place)?;
+            self.store.save_event_hook(&kept)?;
+        }
+        Ok(plain)
+    }
+
+    /// Every signing secret the community keeps for sending out (event receivers,
+    /// announcement followers), opened and sealed again where it should be: at
+    /// start-up, so that the start that adopts unsealed ones adopts them all
+    /// (WYV-32, WYV-111). One that doesn't open is said, and its sends fail.
+    pub fn settle_secrets(&self) -> anyhow::Result<()> {
+        for hook in self.store.event_hooks()? {
+            if let Err(error) = self.hook_secret(&hook) {
+                tracing::warn!(hook = %hook.id, error = %format!("{error:#}"), "an event receiver's signing secret doesn't open: nothing is sent to it until it is given a new one");
+            }
+        }
+        for follower in self.store.followers()? {
+            if let Err(error) = self.follower_secret(&follower) {
+                tracing::warn!(follower = %follower.id, error = %format!("{error:#}"), "an announcement follower's signing secret doesn't open: nothing is sent to it until it is made again");
+            }
+        }
+        Ok(())
+    }
+
     /// Whether `did`, who made a webhook or an event receiver, is still in the
     /// community and not banned from it: what either goes on working for, as they
     /// allowed it and may no longer once they are gone (WYV-20, WYV-99).
@@ -215,7 +258,7 @@ pub(crate) async fn client_for(url: &str, private: bool, user_agent: &str) -> Re
 }
 
 /// Sends one event. `Ok` when the receiver took it.
-async fn send(hook: &EventHook, body: &str, kind: &str, id: &str, private: bool) -> Result<(), String> {
+async fn send(hook: &EventHook, secret: &str, body: &str, kind: &str, id: &str, private: bool) -> Result<(), String> {
     let (client, url) = client_for(&hook.url, private, "wyvrn-community (events)").await?;
     let at = chrono::Utc::now().timestamp();
     let answer = client
@@ -223,7 +266,7 @@ async fn send(hook: &EventHook, body: &str, kind: &str, id: &str, private: bool)
         .header("content-type", "application/json")
         .header("wyvrn-event", kind)
         .header("wyvrn-delivery", id)
-        .header("wyvrn-signature", signature(&hook.secret, at, body))
+        .header("wyvrn-signature", signature(secret, at, body))
         .body(body.to_string())
         .send()
         .await
@@ -266,7 +309,14 @@ async fn send_due(state: &Arc<AppState>, now: i64) -> anyhow::Result<()> {
             continue;
         };
         let kind = serde_json::from_str::<Value>(&body).ok().and_then(|b| b["type"].as_str().map(str::to_string)).unwrap_or_default();
-        match send(&hook, &body, &kind, &id, private).await {
+        let sent = match community.hook_secret(&hook) {
+            Ok(secret) => send(&hook, &secret, &body, &kind, &id, private).await,
+            Err(error) => {
+                tracing::warn!(hook = %hook.id, %error, "an event receiver's signing secret doesn't open");
+                Err("its signing secret doesn't open".to_string())
+            }
+        };
+        match sent {
             Ok(()) => {
                 community.store.event_done(&id)?;
                 if hook.failures != 0 {

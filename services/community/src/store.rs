@@ -1844,7 +1844,7 @@ fn schema() -> Schema {
                 kind VARCHAR(16) NOT NULL,
                 target TEXT NOT NULL,
                 name VARCHAR(255) NOT NULL,
-                secret VARCHAR(128),
+                secret TEXT,
                 created_by VARCHAR(3000) NOT NULL,
                 created_at BIGINT NOT NULL,
                 failures BIGINT NOT NULL DEFAULT 0,
@@ -1967,7 +1967,7 @@ fn schema() -> Schema {
             CREATE TABLE IF NOT EXISTS event_hooks (
                 id VARCHAR(64) NOT NULL PRIMARY KEY,
                 url TEXT NOT NULL,
-                secret VARCHAR(128) NOT NULL,
+                secret TEXT NOT NULL,
                 events TEXT NOT NULL,
                 channel VARCHAR(255),
                 created_by VARCHAR(3000) NOT NULL,
@@ -2177,7 +2177,11 @@ fn schema() -> Schema {
             CREATE INDEX IF NOT EXISTS wiki_comments_by_page ON wiki_comments (page, at);
             CREATE INDEX IF NOT EXISTS announce_followers_by_channel ON announce_followers (channel);
             CREATE INDEX IF NOT EXISTS announce_queue_by_due ON announce_queue (next_at);
-            CREATE INDEX IF NOT EXISTS event_queue_by_due ON event_queue (next_at)"
+            CREATE INDEX IF NOT EXISTS event_queue_by_due ON event_queue (next_at);
+            -- Signing secrets are kept sealed (WYV-32), longer than the 128 these
+            -- once had: widened on a store from before, and nothing done after.
+            ALTER TABLE event_hooks MODIFY secret TEXT NOT NULL;
+            ALTER TABLE announce_followers MODIFY secret TEXT"
         )
     });
     Schema { sqlite: SQLITE, mysql }

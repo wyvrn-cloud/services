@@ -936,7 +936,10 @@ impl Community {
             ("list", "create_out") => {
                 let (url, events, channel) = self.read_receiver(flow, input, &channels)?;
                 let secret = format!("whsec_{}", new_token());
-                let hook = crate::store::EventHook { id: uuid::Uuid::new_v4().simple().to_string()[..16].to_string(), url: url.clone(), secret: secret.clone(), events, channel, created_by: flow.owner.clone(), created_at: now, failures: 0, off_at: None };
+                let id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
+                // Kept sealed where the service has a seal key (WYV-32); shown plain, this once.
+                let kept = self.seal_hook_secret(&id, &secret).map_err(failed)?;
+                let hook = crate::store::EventHook { id, url: url.clone(), secret: kept, events, channel, created_by: flow.owner.clone(), created_at: now, failures: 0, off_at: None };
                 self.store.save_event_hook(&hook).map_err(failed)?;
                 self.audit(now, &flow.owner, "event_hook.create", hook.channel.as_deref(), Some(json!({ "url": url })));
                 flow.data["event_hook"] = json!(hook.id);
@@ -975,10 +978,11 @@ impl Community {
             }
             ("edit_out", "secret_out") => {
                 let mut hook = self.editable_receiver(flow.data["event_hook"].as_str().unwrap_or_default(), &channels)?;
-                hook.secret = format!("whsec_{}", new_token());
+                let secret = format!("whsec_{}", new_token());
+                hook.secret = self.seal_hook_secret(&hook.id, &secret).map_err(failed)?;
                 self.store.save_event_hook(&hook).map_err(failed)?;
                 self.audit(now, &flow.owner, "event_hook.update", hook.channel.as_deref(), Some(json!({ "url": hook.url, "new_secret": true })));
-                flow.data["note"] = json!(format!("A new signing secret, shown this once: {}", hook.secret));
+                flow.data["note"] = json!(format!("A new signing secret, shown this once: {secret}"));
                 Ok(false)
             }
             ("edit_out", "delete_out") => {

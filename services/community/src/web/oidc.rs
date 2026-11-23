@@ -5,6 +5,7 @@
 //! (RFC 7591) or known by their address (IndieAuth), the last two off until an
 //! admin turns them on, and shown as unverified.
 
+use anyhow::Context;
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -117,21 +118,32 @@ async fn discovery(State(state): State<Arc<AppState>>) -> Response {
 /// come due.
 /// Where an ID-token signing key is bound when it is kept sealed (WYV-32): the
 /// community, by its DID, and the key's id.
-fn key_place(state: &AppState, kid: &str) -> String {
-    format!("{}#oidc-{kid}", state.agent.did())
+fn key_place(did: &str, kid: &str) -> String {
+    format!("{did}#oidc-{kid}")
 }
 
 /// A signing key as kept (sealed with the service's seal key where it has one),
 /// read back as its JWK: one found unsealed, or sealed with a previous key, is
 /// kept again as it should be (security review WYV-32).
-fn opened_jwk(state: &AppState, kid: &str, kept: &str, made: i64) -> anyhow::Result<String> {
-    let place = key_place(state, kid);
+fn opened_jwk(store: &crate::store::Store, did: &str, kid: &str, kept: &str, made: i64) -> anyhow::Result<String> {
+    let place = key_place(did, kid);
     let (jwk, again) = wyvrn_service::identity::open_text(kept, &place)?;
     if again {
-        state.community.store.remove_oidc_key(kid)?;
-        state.community.store.add_oidc_key(kid, &wyvrn_service::identity::seal_text(&jwk, &place)?, made)?;
+        store.remove_oidc_key(kid)?;
+        store.add_oidc_key(kid, &wyvrn_service::identity::seal_text(&jwk, &place)?, made)?;
     }
     Ok(jwk)
+}
+
+/// Every signing key kept, opened, and sealed again where it should be: at
+/// start-up, beside the identity, so that a start with WYVRN_SEAL_ADOPT_PLAIN
+/// adopts them all and one that doesn't open stops the server, rather than token
+/// issuance failing later (WYV-111).
+pub fn settle_keys(store: &crate::store::Store, did: &str) -> anyhow::Result<()> {
+    for (kid, kept, made) in store.oidc_keys()? {
+        opened_jwk(store, did, &kid, &kept, made).with_context(|| format!("the community's ID-token signing key {kid}"))?;
+    }
+    Ok(())
 }
 
 fn signing_key(state: &AppState) -> anyhow::Result<(String, SecretKey)> {
@@ -141,14 +153,14 @@ fn signing_key(state: &AppState) -> anyhow::Result<(String, SecretKey)> {
     let current = keys.first().filter(|(_, _, made)| *made > at - KEY_FOR).cloned();
     let (kid, jwk) = match current {
         Some((kid, kept, made)) => {
-            let jwk = opened_jwk(state, &kid, &kept, made)?;
+            let jwk = opened_jwk(store, &state.agent.did(), &kid, &kept, made)?;
             (kid, jwk)
         }
         None => {
             let key = SecretKey::generate_p256();
             let kid = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
             let jwk = key.to_jwk().to_string();
-            store.add_oidc_key(&kid, &wyvrn_service::identity::seal_text(&jwk, &key_place(state, &kid))?, at)?;
+            store.add_oidc_key(&kid, &wyvrn_service::identity::seal_text(&jwk, &key_place(&state.agent.did(), &kid))?, at)?;
             (kid, jwk)
         }
     };
@@ -175,7 +187,7 @@ async fn jwks(State(state): State<Arc<AppState>>) -> Response {
         .unwrap_or_default()
         .into_iter()
         .filter_map(|(kid, kept, made)| {
-            let jwk = opened_jwk(&state, &kid, &kept, made).ok()?;
+            let jwk = opened_jwk(&state.community.store, &state.agent.did(), &kid, &kept, made).ok()?;
             let key = SecretKey::from_jwk(&serde_json::from_str(&jwk).ok()?).ok()?;
             let mut public = key.public().to_jwk();
             public["kid"] = json!(kid);
@@ -563,11 +575,20 @@ async fn token(State(state): State<Arc<AppState>>, headers: HeaderMap, Form(form
     let Some(member) = store.member_by_key(&code.mkey).ok().flatten().filter(|m| store.banned(&m.did, at).ok().flatten().is_none()) else {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", "They aren't a member any more.");
     };
+    // Without the secret it is made with, there is no sub to give: nothing is
+    // issued (WYV-111), rather than an id every website sees as someone new.
+    let sub = match sub(&state, &client, &code.mkey) {
+        Ok(sub) => sub,
+        Err(error) => {
+            tracing::error!(%error, "couldn't make a member's sub");
+            return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "Something went wrong.");
+        }
+    };
     let access = super::store::secret();
     if let Err(error) = store.add_token(&access, &Token { mkey: code.mkey.clone(), client: client.id.clone(), scopes: code.scopes.clone() }, &form.code, at + TOKEN_FOR) {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", &error.to_string());
     }
-    let mut payload = json!({ "iss": web.issuer(), "sub": sub(&state, &client, &code.mkey), "aud": client.id, "iat": at, "exp": at + ID_TOKEN_FOR });
+    let mut payload = json!({ "iss": web.issuer(), "sub": sub, "aud": client.id, "iat": at, "exp": at + ID_TOKEN_FOR });
     if let Some(nonce) = &code.nonce {
         payload["nonce"] = json!(nonce);
     }
@@ -587,9 +608,11 @@ async fn token(State(state): State<Arc<AppState>>, headers: HeaderMap, Form(form
 }
 
 /// A member's id at a website: different at each, the same through changes of DID.
-fn sub(state: &AppState, client: &Client, mkey: &str) -> String {
-    let secret = super::secret(&state.community.store, &state.agent.did()).unwrap_or_default();
-    keyed(&secret, &format!("sub\n{}\n{mkey}", sector(client)))[..40].to_string()
+/// Fails, rather than keying it on nothing, when the secret doesn't open (WYV-111).
+fn sub(state: &AppState, client: &Client, mkey: &str) -> anyhow::Result<String> {
+    let secret = super::secret(&state.community.store, &state.agent.did())?;
+    anyhow::ensure!(!secret.is_empty(), "the community's web secret is empty");
+    Ok(keyed(&secret, &format!("sub\n{}\n{mkey}", sector(client)))[..40].to_string())
 }
 
 /// The claims `scopes` give, beyond `sub`.
@@ -631,7 +654,13 @@ async fn userinfo(State(state): State<Arc<AppState>>, request: Request) -> Respo
     let Some(member) = store.member_by_key(&held.mkey).ok().flatten().filter(|m| store.banned(&m.did, at).ok().flatten().is_none()) else { return unauthorized() };
     let Some(client) = client_named(&state, &held.client).await else { return unauthorized() };
     let mut body = claims(&state, web, &client, &member, &held.mkey, &held.scopes);
-    body["sub"] = json!(sub(&state, &client, &held.mkey));
+    match sub(&state, &client, &held.mkey) {
+        Ok(sub) => body["sub"] = json!(sub),
+        Err(error) => {
+            tracing::error!(%error, "couldn't make a member's sub");
+            return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "Something went wrong.");
+        }
+    }
     open(Json(body).into_response())
 }
 
