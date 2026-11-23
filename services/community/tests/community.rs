@@ -4786,8 +4786,29 @@ async fn a_community_may_let_in_only_someone_with_a_verified_public_address() {
     // On: a did:peer that names no address isn't (WYV-62).
     let refused = newcomer.community("join", json!({})).await;
     assert_eq!(refused["body"]["code"], "e.p.msg.address-required", "{refused}");
+    // address_hosts (community/1.0): up to 20 host names, said while set, [] clears it.
+    let hosts = owner.community("set-admission", json!({ "address_hosts": ["ID.wyvrn.app", "example.com%3A8443"] })).await;
+    assert_eq!(hosts["body"]["address_hosts"], json!(["id.wyvrn.app", "example.com%3a8443"]), "{hosts}");
+    let too_many: Vec<String> = (0..21).map(|n| format!("h{n}.example.org")).collect();
+    assert_eq!(owner.community("set-admission", json!({ "address_hosts": too_many })).await["body"]["code"], "e.p.msg.invalid-admission");
+    assert_eq!(owner.community("set-admission", json!({ "address_hosts": ["not a host"] })).await["body"]["code"], "e.p.msg.invalid-admission");
+    let cleared = owner.community("set-admission", json!({ "address_hosts": [] })).await;
+    assert!(cleared["body"].get("address_hosts").is_none(), "{cleared}");
     owner.community("set-admission", json!({ "requires_address": false })).await;
     assert_eq!(kind(&newcomer.community("join", json!({})).await), "community");
+}
+
+#[test]
+fn an_address_counts_at_a_listed_host_only_as_a_did_webvh_there_exactly() {
+    use wyvrn_community::community::Community;
+    let hosts = vec!["id.wyvrn.app".to_string(), "example.com%3A8443".to_string()];
+    assert!(Community::address_at_listed_host("did:webvh:QmScid:id.wyvrn.app:frosty", &hosts));
+    assert!(Community::address_at_listed_host("did:webvh:QmScid:ID.WYVRN.APP", &hosts), "without case");
+    assert!(Community::address_at_listed_host("did:webvh:QmScid:example.com%3A8443:u:a", &hosts), "a port, as %3A");
+    assert!(!Community::address_at_listed_host("did:web:id.wyvrn.app:frosty", &hosts), "a did:web doesn't count");
+    assert!(!Community::address_at_listed_host("did:webvh:QmScid:evil.id.wyvrn.app", &hosts), "a subdomain isn't the host");
+    assert!(!Community::address_at_listed_host("did:webvh:QmScid:example.com", &hosts), "another port isn't");
+    assert!(Community::address_at_listed_host("did:web:anything.example", &[]), "none listed: any");
 }
 
 #[test]

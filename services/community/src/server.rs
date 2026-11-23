@@ -432,6 +432,10 @@ impl CommunityService {
                 Ok(document) => document["alsoKnownAs"].as_array().into_iter().flatten().filter_map(Value::as_str).take(5).map(str::to_string).collect(),
                 Err(_) => Vec::new(),
             };
+            // Where the community lists hosts, only a verified did:webvh at one of them
+            // counts (community/1.0's address_hosts): the resolver verified its log.
+            let hosts = state.community.address_hosts()?;
+            let named: Vec<String> = named.into_iter().filter(|address| crate::community::Community::address_at_listed_host(address, &hosts)).collect();
             let Some(address) = wyvrn_service::named::holder_among(state.resolver.as_ref(), &named, &sender, kid).await.map(str::to_string) else {
                 let refused = crate::community::refuse(&received.message, "e.p.msg.address-required", "This community lets in only someone with a verified public address: set one up in Settings, Public address, then ask again.")?;
                 return Ok(refused.reply);

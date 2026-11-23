@@ -740,6 +740,11 @@ impl Community {
             "latest_rev": self.store.latest_rev()?,
         }))
         .and_then(|mut body: Value| {
+            // Said while it is set (community/1.0's address_hosts).
+            let hosts = self.address_hosts()?;
+            if !hosts.is_empty() {
+                body["address_hosts"] = json!(hosts);
+            }
             if let Some(rules) = self.rules()? {
                 body["rules"] = json!(rules.text);
                 body["rules_version"] = json!(rules.version);
@@ -1136,6 +1141,27 @@ impl Community {
     /// `set-admission`'s `requires_address`.
     pub fn requires_address(&self) -> anyhow::Result<bool> {
         Ok(self.store.setting("admission_requires_address")?.as_deref() == Some("1"))
+    }
+
+    /// `set-admission`'s `address_hosts`: with `requires_address`, the hosts a
+    /// verified `did:webvh` must be at to count (empty: any `did:web`/`did:webvh`).
+    pub fn address_hosts(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self.store.setting("admission_address_hosts")?.and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default())
+    }
+
+    /// Whether `address` (a public address a joiner's DID names, its document
+    /// read and checked by the resolver) counts under `address_hosts`: a
+    /// `did:webvh` at one of them exactly, its host compared without case, a port
+    /// as `%3A` (community/1.0, "A public address first").
+    pub fn address_at_listed_host(address: &str, hosts: &[String]) -> bool {
+        if hosts.is_empty() {
+            return true;
+        }
+        let parts: Vec<&str> = address.split(':').collect();
+        match parts.as_slice() {
+            ["did", "webvh", _scid, host, ..] => hosts.iter().any(|listed| listed.eq_ignore_ascii_case(host)),
+            _ => false,
+        }
     }
 
     pub fn admission(&self) -> anyhow::Result<Admission> {
@@ -2369,10 +2395,27 @@ impl Community {
                     },
                     None => None,
                 };
+                let address_hosts = match body.get("address_hosts").filter(|v| !v.is_null()) {
+                    Some(value) => {
+                        let hosts: Option<Vec<String>> = value.as_array().filter(|list| list.len() <= 20).and_then(|list| {
+                            list.iter()
+                                .map(|host| host.as_str().map(str::to_ascii_lowercase).filter(|h| !h.is_empty() && h.len() <= 253 && h.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '%'))))
+                                .collect()
+                        });
+                        match hosts {
+                            Some(hosts) => Some(hosts),
+                            None => return refuse(message, "e.p.msg.invalid-admission", "address_hosts is a list of up to 20 host names."),
+                        }
+                    }
+                    None => None,
+                };
                 if let Some(requires) = requires_address {
                     self.store.set_setting("admission_requires_address", if requires { "1" } else { "0" })?;
                 }
-                if admission.is_none() && may_invite.is_none() && requires_address.is_none() {
+                if let Some(hosts) = &address_hosts {
+                    self.store.set_setting("admission_address_hosts", &serde_json::to_string(hosts)?)?;
+                }
+                if admission.is_none() && may_invite.is_none() && requires_address.is_none() && address_hosts.is_none() {
                     return refuse(message, "e.p.msg.invalid-admission", "That changes nothing.");
                 }
                 if let Some(admission) = admission {
