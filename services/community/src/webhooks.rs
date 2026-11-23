@@ -54,10 +54,29 @@ fn new_token() -> String {
     format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
 }
 
-/// A webhook's URL, as whoever manages it copies it.
-pub fn url_of(public_url: &str, hook: &Webhook) -> String {
-    format!("{}/api/webhooks/{}/{}", public_url.trim_end_matches('/'), hook.id, hook.token)
+/// How a webhook's token is kept: its SHA-256 (security review WYV-63), so a copy
+/// of the database posts nowhere. One kept from before this is the token itself.
+const HASHED: &str = "sha256:";
+
+pub fn kept_token(token: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(token.as_bytes());
+    format!("{HASHED}{}", digest.iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
+
+/// Whether `given` is the token kept as `kept`, compared in constant time.
+fn token_is(kept: &str, given: &str) -> bool {
+    let expected = if kept.starts_with(HASHED) { kept_token(given) } else { given.to_string() };
+    kept.len() == expected.len() && kept.bytes().zip(expected.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
+/// A webhook's URL, made from its token as it was made (the kept one is a hash).
+pub fn url_with(public_url: &str, id: &str, token: &str) -> String {
+    format!("{}/api/webhooks/{id}/{token}", public_url.trim_end_matches('/'))
+}
+
+/// The URL of a webhook just made or given a new one, for its page to show once.
+static SHOW_ONCE: LazyLock<std::sync::Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
 
 /// An `http(s)` address, as an embed or avatar may give one; `attachment://name`
 /// is one of the files sent with it, where `files` has it.
@@ -187,7 +206,7 @@ fn allowed_now(id: &str, now_ms: i64) -> Result<(), f64> {
 fn hook_for(community: &Community, id: &str, token: &str) -> Result<Webhook, Response> {
     let Some(hook) = community.store.webhook(id).ok().flatten() else { return Err(unknown()) };
     // (Compared in full whatever differs first: nothing is learned from how long it takes.)
-    let same = hook.token.len() == token.len() && hook.token.bytes().zip(token.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
+    let same = token_is(&hook.token, token);
     if !same {
         return Err(problem(StatusCode::UNAUTHORIZED, 50027, "Invalid Webhook Token"));
     }
@@ -415,7 +434,7 @@ fn post_sent(state: &Arc<AppState>, hook: &Webhook, sent: Sent, query: &ExecuteQ
     if content.is_empty() && embeds.is_empty() && attachments.is_empty() {
         return problem(StatusCode::BAD_REQUEST, 50006, "Cannot send an empty message");
     }
-    let (content, mentions) = mentions_in(community, &content, &sent.payload);
+    let (content, mentions) = mentions_in(community, &content, &sent.payload, &hook.created_by);
     let (content, alerted) = match automod(community, &channel, &hook, &content, mentions.len(), now) {
         Ok(checked) => checked,
         Err(response) => return response,
@@ -442,7 +461,10 @@ fn post_sent(state: &Arc<AppState>, hook: &Webhook, sent: Sent, query: &ExecuteQ
 /// community's everyone), as far as `allowed_mentions` lets it -- everything, where
 /// it says nothing, as on Discord. The text says each by name, whether or not it
 /// calls on them: one not let through is shown, and notifies nobody.
-pub fn mentions_in(community: &Community, content: &str, payload: &Value) -> (String, Vec<Mention>) {
+pub fn mentions_in(community: &Community, content: &str, payload: &Value, creator: &str) -> (String, Vec<Mention>) {
+    // Only what whoever made the webhook could call on themselves (WYV-63):
+    // everyone, and a role that isn't open to all, take Mention everyone.
+    let creator_may_everyone = community.powers(creator).map(|powers| powers.has("mention_everyone")).unwrap_or(false);
     static TOKEN: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"<@(!|&)?([A-Za-z0-9_-]{1,64})>|@(everyone|here)\b").unwrap());
     let allowed = &payload["allowed_mentions"];
     let said = allowed.is_object();
@@ -453,7 +475,7 @@ pub fn mentions_in(community: &Community, content: &str, payload: &Value) -> (St
     let text = TOKEN.replace_all(content, |found: &regex::Captures| {
         let whole = found[0].to_string();
         if found.get(3).is_some() {
-            if may("everyone", "", "") && !mentions.iter().any(|m| m.who == crate::community::EVERYONE) {
+            if creator_may_everyone && may("everyone", "", "") && !mentions.iter().any(|m| m.who == crate::community::EVERYONE) {
                 mentions.push(Mention { who: crate::community::EVERYONE.into(), name: crate::community::EVERYONE.into() });
             }
             return "@everyone".to_string();
@@ -462,7 +484,7 @@ pub fn mentions_in(community: &Community, content: &str, payload: &Value) -> (St
         if found.get(1).map(|m| m.as_str()) == Some("&") {
             let Some(role) = community.store.role(id).ok().flatten().filter(|role| role.id != crate::roles::EVERYONE_ROLE) else { return whole };
             let who = format!("role:{}", role.id);
-            if may("roles", "roles", id) && !mentions.iter().any(|m| m.who == who) {
+            if (role.mentionable || creator_may_everyone) && may("roles", "roles", id) && !mentions.iter().any(|m| m.who == who) {
                 mentions.push(Mention { who, name: role.name.clone() });
             }
             return format!("@{}", role.name);
@@ -564,7 +586,8 @@ fn its_post(community: &Community, hook: &Webhook, message: &str) -> Result<Post
 /// `GET /api/webhooks/{id}/{token}`: the webhook, as Discord says one.
 pub async fn describe(State(state): State<Arc<AppState>>, Path((id, token)): Path<(String, String)>) -> Response {
     match hook_for(&state.community, &id, &token) {
-        Ok(hook) => axum::Json(json!({ "id": hook.id, "type": 1, "channel_id": hook.channel, "name": hook.name, "avatar": Value::Null, "token": hook.token, "application_id": Value::Null })).into_response(),
+        // The token as it was given: the one kept is a hash.
+        Ok(hook) => axum::Json(json!({ "id": hook.id, "type": 1, "channel_id": hook.channel, "name": hook.name, "avatar": Value::Null, "token": token, "application_id": Value::Null })).into_response(),
         Err(response) => response,
     }
 }
@@ -609,7 +632,7 @@ pub async fn edit_message(State(state): State<Arc<AppState>>, Path((id, token, m
         return problem(StatusCode::BAD_REQUEST, 50035, "Must be 2000 or fewer in length.");
     }
     // What it calls on, and AutoMod, as for a new post (only when the text changes).
-    let (content, mentions) = if sent.payload.get("content").is_some() { mentions_in(community, &content, &sent.payload) } else { (content, Vec::new()) };
+    let (content, mentions) = if sent.payload.get("content").is_some() { mentions_in(community, &content, &sent.payload, &hook.created_by) } else { (content, Vec::new()) };
     let content = if sent.payload.get("content").is_some() {
         let Some(channel) = community.store.channel(&post.channel).ok().flatten() else { return problem(StatusCode::NOT_FOUND, 10003, "Unknown Channel") };
         match automod(community, &channel, &hook, &content, mentions.len(), now) {
@@ -771,9 +794,13 @@ impl Community {
             let Some(hook) = self.store.webhook(id)?.filter(|h| named(&h.channel).is_some()) else {
                 return Ok((json!([{ "type": "text", "text": "That webhook is gone." }, { "type": "submit-button", "label": "Back", "event": "back", "input": {} }]), vec!["back"]));
             };
-            items.push(json!({ "type": "text", "text": "Anything that posts to a Discord webhook posts here, given this URL instead. Keep it secret: whoever has it can post in the channel." }));
+            items.push(json!({ "type": "text", "text": "Anything that posts to a Discord webhook posts here, given its URL instead. Keep it secret: whoever has it can post in the channel." }));
+            // Shown once, as it is made: what is kept is only a hash of it (WYV-63).
+            match SHOW_ONCE.lock().unwrap_or_else(|p| p.into_inner()).remove(&hook.id) {
+                Some(url) => items.push(json!({ "type": "form", "children": [{ "type": "text-input", "form-id": "url", "label": "Its URL: copy it now, it isn't shown again", "value": url }] })),
+                None => items.push(json!({ "type": "text", "text": "Its URL was shown when it was made. Lost it? Make a new one: the old one stops working." })),
+            }
             items.push(json!({ "type": "form", "children": [
-                { "type": "text-input", "form-id": "url", "label": "Its URL (copy it)", "value": url_of(&self.public_url, &hook) },
                 { "type": "text-input", "form-id": "name", "label": "Name", "value": hook.name, "required": true },
                 { "type": "text-input", "form-id": "avatar", "label": "Picture (an https:// address, or empty)", "value": hook.avatar.clone().unwrap_or_default() },
                 { "type": "drop-down", "form-id": "channel", "label": "Posts in", "value": hook.channel, "options": options },
@@ -839,8 +866,10 @@ impl Community {
             ("list", "create") => {
                 let name = line(&input["name"], MAX_NAME).ok_or_else(|| Refusal::new("guard_failed", "A webhook needs a name."))?;
                 let channel = channel_of(&input["channel"])?;
-                let hook = Webhook { id: uuid::Uuid::new_v4().simple().to_string()[..16].to_string(), channel, name: name.clone(), avatar: None, token: new_token(), created_by: flow.owner.clone(), created_at: now };
+                let token = new_token();
+                let hook = Webhook { id: uuid::Uuid::new_v4().simple().to_string()[..16].to_string(), channel, name: name.clone(), avatar: None, token: kept_token(&token), created_by: flow.owner.clone(), created_at: now };
                 self.store.save_webhook(&hook).map_err(failed)?;
+                SHOW_ONCE.lock().unwrap_or_else(|p| p.into_inner()).insert(hook.id.clone(), url_with(&self.public_url, &hook.id, &token));
                 self.audit(now, &flow.owner, "webhook.create", Some(&hook.channel), Some(json!({ "name": name })));
                 flow.data["webhook"] = json!(hook.id);
                 flow.data["note"] = json!(format!("Made {name}. Copy its URL into the service that is to post."));
@@ -872,8 +901,10 @@ impl Community {
             }
             ("edit", "new_url") => {
                 let mut hook = editable(flow.data["webhook"].as_str().unwrap_or_default())?;
-                hook.token = new_token();
+                let token = new_token();
+                hook.token = kept_token(&token);
                 self.store.save_webhook(&hook).map_err(failed)?;
+                SHOW_ONCE.lock().unwrap_or_else(|p| p.into_inner()).insert(hook.id.clone(), url_with(&self.public_url, &hook.id, &token));
                 self.audit(now, &flow.owner, "webhook.update", Some(&hook.channel), Some(json!({ "name": hook.name, "new_url": true })));
                 flow.data["note"] = json!("A new URL: the old one no longer posts.");
                 Ok(false)
@@ -953,6 +984,16 @@ impl Community {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_token_is_kept_as_its_hash_and_one_kept_from_before_still_works() {
+        let kept = super::kept_token("the-token");
+        assert!(kept.starts_with("sha256:") && !kept.contains("the-token"));
+        assert!(super::token_is(&kept, "the-token"));
+        assert!(!super::token_is(&kept, "another"));
+        assert!(super::token_is("plain-old-token", "plain-old-token"), "kept before hashing");
+        assert!(!super::token_is("plain-old-token", "plain-old-tokeN"));
+    }
+
     use super::*;
 
     #[test]
