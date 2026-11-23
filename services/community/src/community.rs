@@ -721,6 +721,7 @@ impl Community {
             "permissions": powers.listed(),
             "members_may_create_channels": self.everyone_has("create_channels")?,
             "admission": self.admission()?.as_str(),
+            "requires_address": self.requires_address()?,
             "members_may_invite": self.members_may_invite()?,
             // The kinds of channel that may be opened here (its host's say).
             "channel_kinds": self.channel_kinds(),
@@ -1122,6 +1123,12 @@ impl Community {
     }
 
     /// Who a `join` lets in: as an admin last set it, or as configured.
+    /// Whether someone is let in only with a verified public address (WYV-62):
+    /// `set-admission`'s `requires_address`.
+    pub fn requires_address(&self) -> anyhow::Result<bool> {
+        Ok(self.store.setting("admission_requires_address")?.as_deref() == Some("1"))
+    }
+
     pub fn admission(&self) -> anyhow::Result<Admission> {
         let set = self.store.setting("admission")?;
         Ok(set.as_deref().or(Some(self.config.admission.as_str())).and_then(Admission::parse).unwrap_or(Admission::Admin))
@@ -2346,7 +2353,17 @@ impl Community {
                     },
                     None => None,
                 };
-                if admission.is_none() && may_invite.is_none() {
+                let requires_address = match body.get("requires_address").filter(|v| !v.is_null()) {
+                    Some(value) => match value.as_bool() {
+                        Some(requires) => Some(requires),
+                        None => return refuse(message, "e.p.msg.invalid-admission", "requires_address is true or false."),
+                    },
+                    None => None,
+                };
+                if let Some(requires) = requires_address {
+                    self.store.set_setting("admission_requires_address", if requires { "1" } else { "0" })?;
+                }
+                if admission.is_none() && may_invite.is_none() && requires_address.is_none() {
                     return refuse(message, "e.p.msg.invalid-admission", "That changes nothing.");
                 }
                 if let Some(admission) = admission {

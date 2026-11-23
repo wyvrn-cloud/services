@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    body::Bytes,
     extract::{
         ws::{rejection::WebSocketUpgradeRejection, Message, WebSocket, WebSocketUpgrade},
         State,
@@ -423,6 +422,26 @@ impl CommunityService {
         let store = &state.community.store;
         let config = &state.community.config;
         let kid = incoming.sender_kid.as_deref();
+        // A community that lets in only someone with a public address (WYV-62): a
+        // join from a DID that names none, or none that names it back, is refused
+        // before anything else is done with it. A ban then follows the address.
+        if received.message["type"] == crate::community::JOIN && store.member(&sender)?.is_none() && state.community.requires_address()? {
+            let named: Vec<String> = match state.resolver.resolve(&sender).await {
+                Ok(document) => document["alsoKnownAs"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect(),
+                Err(_) => Vec::new(),
+            };
+            let Some(address) = wyvrn_service::named::holder_among(state.resolver.as_ref(), &named, &sender, kid).await.map(str::to_string) else {
+                let refused = crate::community::refuse(&received.message, "e.p.msg.address-required", "This community lets in only someone with a verified public address: set one up in Settings, Public address, then ask again.")?;
+                return Ok(refused.reply);
+            };
+            // The same address as someone banned: banned, under whichever DID.
+            let at = now();
+            let banned_address = store.bans(at)?.iter().any(|ban| store.member_profile(&ban.did).ok().flatten().and_then(|p| p.public_address).as_deref() == Some(address.as_str()));
+            if banned_address {
+                let refused = crate::community::refuse(&received.message, "e.p.trust.not-authorized", "This community is by invitation: you are not on its list.")?;
+                return Ok(refused.reply);
+            }
+        }
         if !store.is_superseded(&sender)? {
             let role = store.member(&sender)?.map(|member| member.role);
             if role != Some(crate::store::Role::Admin) {
@@ -1221,9 +1240,42 @@ pub async fn run_pruning(state: Arc<AppState>) {
     }
 }
 
+/// DIDComm messages one address may send a minute (WYV-62): a flood of joins from
+/// fresh DIDs, or of anything, comes from somewhere. Behind the web view's trusted
+/// proxies, the address `X-Forwarded-For` gives; otherwise the connection's.
+const MESSAGES_PER_ADDRESS_A_MINUTE: u32 = 300;
+
+async fn take_message(State(state): State<Arc<AppState>>, request: axum::extract::Request) -> Response {
+    let address = match &state.web {
+        Some(web) => web.client(&request),
+        None => request.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|info| info.0.ip()),
+    };
+    if let Some(address) = address {
+        static SEEN: std::sync::LazyLock<std::sync::Mutex<HashMap<std::net::IpAddr, (i64, u32)>>> = std::sync::LazyLock::new(Default::default);
+        let minute = now() / 60;
+        let mut seen = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+        if seen.len() > 50_000 {
+            seen.retain(|_, (at, _)| *at == minute);
+        }
+        let entry = seen.entry(address).or_insert((minute, 0));
+        if entry.0 != minute {
+            *entry = (minute, 0);
+        }
+        entry.1 += 1;
+        if entry.1 > MESSAGES_PER_ADDRESS_A_MINUTE {
+            return (StatusCode::TOO_MANY_REQUESTS, "Too many messages from this address: wait a minute.").into_response();
+        }
+    }
+    let body = match axum::body::to_bytes(request.into_body(), 2 * 1024 * 1024).await {
+        Ok(body) => body,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    receive(Arc::new(CommunityService(state)), body).await.into_response()
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     let didcomm = Router::new()
-        .route("/", get(root).post(|State(state): State<Arc<AppState>>, body: Bytes| receive(Arc::new(CommunityService(state)), body)))
+        .route("/", get(root).post(take_message))
         .route("/voice/auth", post(voice_auth))
         // Files members attach (files.rs): a chunk is at most what the host takes in one.
         .route("/u/{id}", axum::routing::put(crate::files::put_chunk).head(crate::files::upload_standing).layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)))

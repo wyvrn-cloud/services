@@ -4760,3 +4760,19 @@ async fn a_ban_is_lifted_only_from_above_a_banned_did_isnt_let_back_in_sideways_
         assert_eq!(told["body"]["open"], n);
     }
 }
+
+#[tokio::test]
+async fn a_community_may_let_in_only_someone_with_a_verified_public_address() {
+    let server = start_server("admission = \"open\"").await;
+    let (owner, newcomer) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner]);
+    owner.community("join", json!({})).await;
+    // Off: anyone is let in, as admission says.
+    let set = owner.community("set-admission", json!({ "requires_address": true })).await;
+    assert_eq!(set["body"]["requires_address"], true, "{set}");
+    // On: a did:peer that names no address isn't (WYV-62).
+    let refused = newcomer.community("join", json!({})).await;
+    assert_eq!(refused["body"]["code"], "e.p.msg.address-required", "{refused}");
+    owner.community("set-admission", json!({ "requires_address": false })).await;
+    assert_eq!(kind(&newcomer.community("join", json!({})).await), "community");
+}
