@@ -188,7 +188,9 @@ pub async fn serve(config: Config, assistant: Option<Assistant>) -> anyhow::Resu
         let service = Arc::new(server::CommunityService(state.clone()));
         tokio::spawn(wyvrn_service::mediator::run_pickups(service, mediator.poll_every()));
     }
-    wyvrn_service::http::serve(&config.server.bind, server::router(state)).await
+    // The same proxies as every other limit by address here (WYV-73's DID fetches).
+    let proxies = wyvrn_service::client_address::Proxies::parse(&config.trusted_proxies())?;
+    wyvrn_service::http::serve_with(&config.server.bind, server::router(state), proxies).await
 }
 
 /// The seed of `identity`'s Ed25519 key, from its saved form.

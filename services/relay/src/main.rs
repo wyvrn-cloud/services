@@ -62,5 +62,6 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let relay = Relay::new(config.relay.clone(), open_store(&config)?)?;
     tracing::info!(did = %agent.did(), url = %config.server.public_url, carries = relay.config.carries.as_str(), open = relay.config.open, "relay ready");
     let state = Arc::new(server::AppState { agent, relay, did_document });
-    wyvrn_service::http::serve(&config.server.bind, server::router(state)).await
+    let proxies = state.relay.proxies.clone();
+    wyvrn_service::http::serve_with(&config.server.bind, server::router(state), proxies).await
 }

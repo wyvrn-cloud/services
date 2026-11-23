@@ -974,8 +974,10 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket, client: Option
         if holder.is_some() && frame_sender(&bytes) != holder_sender {
             continue;
         }
-        let Ok(mut received) = state.agent.receive(&bytes).await else { continue };
-        let Ok(unpacked) = state.agent.messaging().unpack_verified(&bytes).await else { continue };
+        // DID documents fetched to open it are charged to the socket's address
+        // (WYV-73); past its share the frame is dropped unopened.
+        let Ok(mut received) = wyvrn_service::fetch_budget::charged(client, state.agent.receive(&bytes)).await else { continue };
+        let Ok(unpacked) = wyvrn_service::fetch_budget::charged(client, state.agent.messaging().unpack_verified(&bytes)).await else { continue };
         let (Some(sender), Some(sender_kid)) = (received.sender.clone(), unpacked.sender_kid) else { continue };
         match &holder {
             None => {

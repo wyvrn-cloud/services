@@ -131,7 +131,7 @@ fn addressed(received: &Received) -> String {
 
 /// One client's socket, until it closes. Every connection opened through it
 /// closes with it.
-async fn connection(state: Arc<AppState>, socket: WebSocket) {
+async fn connection(state: Arc<AppState>, socket: WebSocket, client: Option<std::net::IpAddr>) {
     tracing::debug!("a client connected");
     let (mut sink, mut stream) = socket.split();
     let (out, mut outgoing) = mpsc::channel::<Vec<u8>>(256);
@@ -160,14 +160,16 @@ async fn connection(state: Arc<AppState>, socket: WebSocket) {
         if bytes.len() > largest {
             continue;
         }
-        let received = match state.agent.receive(&bytes).await {
+        // DID documents fetched to open it are charged to the socket's address
+        // (WYV-73); past its share the frame is dropped, as one that didn't open.
+        let received = match wyvrn_service::fetch_budget::charged(client, state.agent.receive(&bytes)).await {
             Ok(received) => received,
             Err(error) => {
                 tracing::debug!(%error, "a frame that didn't open");
                 continue;
             }
         };
-        let Ok(unpacked) = state.agent.messaging().unpack_verified(&bytes).await else { continue };
+        let Ok(unpacked) = wyvrn_service::fetch_budget::charged(client, state.agent.messaging().unpack_verified(&bytes)).await else { continue };
         let (Some(sender), Some(sender_kid)) = (received.sender.clone(), unpacked.sender_kid) else {
             tracing::debug!("a frame nobody authenticated");
             continue;
@@ -330,7 +332,7 @@ async fn root(
                     // Released when this is dropped: after the connection, or
                     // unrun if the upgrade fails (WYV-110).
                     let _held = held;
-                    connection(state.clone(), socket).await;
+                    connection(state.clone(), socket, client).await;
                 })
                 .into_response()
         }
