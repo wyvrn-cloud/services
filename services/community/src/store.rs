@@ -2301,6 +2301,16 @@ impl Store {
         if new == prior {
             return Ok(false);
         }
+        // A DID moves once (security review WYV-27): a second move from it, to
+        // somewhere its first didn't lead, is whoever else still holds its old keys,
+        // and is not taken.
+        let before: Option<String> = self.db.lock().query_row("SELECT became FROM superseded WHERE did = ?1", params![prior], |row| row.get(0))?;
+        if let Some(became) = before {
+            if &self.current_did(&became)? != new {
+                tracing::warn!(%prior, %new, "a second, different move from a DID that has moved already: not taken");
+                return Ok(false);
+            }
+        }
         self.db.lock().transaction(|tx| {
             let old = tx.query_row(&format!("SELECT {MEMBER_COLUMNS} FROM members WHERE did = ?1"), params![prior], member_from)?;
             if let Some(old) = &old {

@@ -4776,3 +4776,18 @@ async fn a_community_may_let_in_only_someone_with_a_verified_public_address() {
     owner.community("set-admission", json!({ "requires_address": false })).await;
     assert_eq!(kind(&newcomer.community("join", json!({})).await), "community");
 }
+
+#[test]
+fn a_did_moves_once_and_a_second_different_move_from_it_is_not_taken() {
+    let store = Store::in_memory().unwrap();
+    let (old, new, thief) = ("did:peer:2.old", "did:peer:2.new", "did:peer:2.thief");
+    store.set_member(old, wyvrn_community::store::Role::Member, 1).unwrap();
+    store.rotate(old, new, 2).unwrap();
+    // Whoever still holds the old keys says it moved elsewhere too (WYV-27).
+    store.rotate(old, thief, 3).unwrap();
+    assert_eq!(store.current_did(old).unwrap(), new);
+    assert!(store.member(thief).unwrap().is_none());
+    // The same move again changes nothing.
+    store.rotate(old, new, 4).unwrap();
+    assert_eq!(store.current_did(old).unwrap(), new);
+}
