@@ -176,14 +176,10 @@ impl Community {
                     return refuse(message, "e.p.msg.invalid-ban", "That isn't a DID.").map(Some);
                 };
                 if message_type == UNBAN {
-                    // Lifted by whoever banned, the owner, or someone who outranks
-                    // whoever banned (WYV-50): not by a junior moderator undoing a
-                    // senior one's.
-                    if let Some(ban) = self.store.banned(did, now)? {
-                        if ban.by != sender && !powers.owner && !self.outranks(&powers, &ban.by)? {
-                            return refuse(message, "e.p.trust.not-authorized", "Only someone ranked above whoever banned them can lift it.").map(Some);
-                        }
-                    }
+                    // Anyone who may ban may lift one, whoever banned: a ban is
+                    // often handed to another moderator to settle (the owner's
+                    // decision, 2026-11-23; WYV-50's rank rule taken out, as appeals
+                    // never had it).
                     if !self.lift_ban(did)? {
                         return refuse(message, "e.p.msg.unknown-ban", "They aren't banned.").map(Some);
                     }

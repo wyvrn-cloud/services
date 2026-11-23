@@ -4725,7 +4725,7 @@ async fn a_bot_says_its_commands_takes_them_through_the_community_and_answers_wi
 }
 
 #[tokio::test]
-async fn a_ban_is_lifted_only_from_above_a_banned_did_isnt_let_back_in_sideways_and_reports_are_kept_few() {
+async fn a_ban_is_lifted_by_any_who_may_ban_a_banned_did_isnt_let_back_in_sideways_and_reports_are_kept_few() {
     let server = start_server("").await;
     let (owner, admin, other_admin, member, bob) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
     server.admit(&[&owner, &admin, &other_admin, &member, &bob]);
@@ -4736,14 +4736,17 @@ async fn a_ban_is_lifted_only_from_above_a_banned_did_isnt_let_back_in_sideways_
     owner.community("set-member", json!({ "did": admin.did(), "role": "admin" })).await;
     owner.community("set-member", json!({ "did": other_admin.did(), "role": "admin" })).await;
 
-    // Banned by an admin: another of the same rank can't lift it (WYV-50).
+    // Banned by an admin: not let back in as a member sideways (WYV-50).
     assert_eq!(kind(&admin.community("ban", json!({ "did": member.did(), "reason": "spam" })).await), "bans");
-    assert_eq!(other_admin.community("unban", json!({ "did": member.did() })).await["body"]["code"], "e.p.trust.not-authorized");
-    // Nor let them back in as a member.
     assert_eq!(owner.community("set-member", json!({ "did": member.did(), "role": "member" })).await["body"]["code"], "e.p.msg.banned");
-    // Whoever banned can, and so can the owner.
-    assert_eq!(kind(&admin.community("unban", json!({ "did": member.did() })).await), "bans");
-    assert_eq!(kind(&other_admin.community("ban", json!({ "did": member.did() })).await), "bans");
+    // Lifted by anyone who may ban, whoever banned: a ban is often handed on to
+    // another moderator to settle (the owner's decision, 2026-11-23).
+    assert_eq!(kind(&other_admin.community("unban", json!({ "did": member.did() })).await), "bans");
+    assert_eq!(kind(&admin.community("ban", json!({ "did": member.did() })).await), "bans");
+    assert_eq!(kind(&owner.community("unban", json!({ "did": member.did() })).await), "bans");
+    // Not by a member who may not ban.
+    assert_eq!(kind(&admin.community("ban", json!({ "did": member.did() })).await), "bans");
+    assert_eq!(bob.community("unban", json!({ "did": member.did() })).await["body"]["code"], "e.p.trust.not-authorized");
     assert_eq!(kind(&owner.community("unban", json!({ "did": member.did() })).await), "bans");
 
     // Five reports in ten minutes, then a wait. Each moderator is sent the new one alone.
