@@ -940,8 +940,8 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket, client: Option
     // socket no one speaks on holds no place.
     let hello_by = tokio::time::Instant::now() + LIVE_HELLO_WITHIN;
     // Whom the holder's frames say they are from, as read without opening them
-    // (`frame_sender`), where it could be: anyone else's are dropped unopened.
-    let mut holder_skid: Option<String> = None;
+    // (`frame_sender`: `skid`, else `apu`): anyone else's are dropped unopened.
+    let mut holder_sender: Option<String> = None;
     let mut limited = false;
     loop {
         let wait = tokio::time::Instant::now() + LIVE_SILENT_FOR;
@@ -967,9 +967,10 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket, client: Option
                 break;
             }
         }
-        // One member's connection: anyone else's message on it is dropped before
-        // anything is resolved or opened (WYV-97).
-        if holder_skid.is_some() && frame_sender(&bytes) != holder_skid {
+        // One member's connection: anyone else's message on it, or one that names
+        // no sender at all, is dropped before anything is resolved or opened (WYV-97,
+        // WYV-120).
+        if holder.is_some() && frame_sender(&bytes) != holder_sender {
             continue;
         }
         let Ok(mut received) = state.agent.receive(&bytes).await else { continue };
@@ -979,7 +980,7 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket, client: Option
             None => {
                 let Some(held) = crate::web::posting::LiveHeld::take(&state.live_open, vec![(format!("ws:{sender}"), LIVE_PER_DID)]) else { break };
                 _theirs = Some(held);
-                holder_skid = frame_sender(&bytes);
+                holder_sender = frame_sender(&bytes);
                 holder = Some(sender.clone());
                 *holder_cell.lock().unwrap_or_else(|p| p.into_inner()) = Some(sender.clone());
                 state.live.lock().unwrap_or_else(|p| p.into_inner()).insert(id, (sender.clone(), out.clone()));
@@ -1053,15 +1054,19 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket, client: Option
     writing.abort();
 }
 
-/// The DID an authcrypted frame says it is from (its protected header's `skid`),
-/// read without resolving or opening anything; `None` for anything else.
+/// The DID an authcrypted frame says it is from, read without resolving or opening
+/// anything: its `skid`, else its `apu` (the sender kid, base64url), since DIDComm
+/// v2.1 lets an authcrypt leave `skid` out and requires receivers to take the sender
+/// from `apu` then (ECDH-1PU key wrapping; a COSE envelope from this library never
+/// carries one). Read as the library reads it, JWE or COSE alike (WYV-120). `None`
+/// for anything else.
 fn frame_sender(bytes: &[u8]) -> Option<String> {
-    use base64::Engine;
-    let message: Value = serde_json::from_slice(bytes).ok()?;
-    let protected = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(message.get("protected")?.as_str()?.trim_end_matches('=')).ok()?;
-    let header: Value = serde_json::from_slice(&protected).ok()?;
-    let skid = header.get("skid")?.as_str()?;
-    Some(skid.split('#').next().unwrap_or(skid).to_string())
+    let envelope = didcomm_core::envelope::EncryptedEnvelope::from_encoded(bytes).ok()?;
+    let kid = match envelope.skid() {
+        Some(skid) => skid,
+        None => String::from_utf8(envelope.apu_bytes().ok()?).ok()?,
+    };
+    Some(kid.split('#').next().unwrap_or(&kid).to_string())
 }
 
 /// The forwarding service's question, by moq-auth's auth contract: may the session
@@ -1521,5 +1526,37 @@ mod invite_landing_tests {
             Some("https://chat.wyvrn.app/dl/did:web:c.wyvrn.app:c:frosty?invite=https%3A%2F%2Fc.wyvrn.app%2Fc%2Ffrosty%2Finvite%2Fk3J9xQ2mAbCdEf")
         );
         assert!(super::invite_landing("https://chat.wyvrn.app/dl/", "did:peer:4zQm", "https://x/invite/a").is_none());
+    }
+}
+
+#[cfg(test)]
+mod frame_sender_tests {
+    use base64::Engine;
+    use didcomm_agent::{Agent, Identity};
+    use serde_json::{json, Value};
+
+    /// A JWE authcrypt is read by its `skid`, and with that left out (as v2.1 allows)
+    /// by its `apu`; anything else names nobody (WYV-120).
+    #[tokio::test]
+    async fn a_frame_is_from_its_skid_else_its_apu() {
+        let (alice, bob) = (Agent::new(Identity::generate().unwrap()).unwrap(), Agent::new(Identity::generate().unwrap()).unwrap());
+        let message = json!({ "type": "https://didcomm.org/trust-ping/2.0/ping", "body": {} });
+        let packed = alice.messaging().pack_as(&message, &bob.did(), Some(&alice.did()), didcomm_core::crypto::Encoding::Json).await.unwrap().message;
+        assert_eq!(super::frame_sender(&packed).as_deref(), Some(alice.did().as_str()));
+
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let mut jwe: Value = serde_json::from_slice(&packed).unwrap();
+        let mut protected: Value = serde_json::from_slice(&b64.decode(jwe["protected"].as_str().unwrap()).unwrap()).unwrap();
+        protected.as_object_mut().unwrap().remove("skid").expect("packed with a skid");
+        jwe["protected"] = b64.encode(serde_json::to_vec(&protected).unwrap()).into();
+        let apu_only = serde_json::to_vec(&jwe).unwrap();
+        assert_eq!(super::frame_sender(&apu_only).as_deref(), Some(alice.did().as_str()));
+
+        protected.as_object_mut().unwrap().remove("apu");
+        jwe["protected"] = b64.encode(serde_json::to_vec(&protected).unwrap()).into();
+        assert_eq!(super::frame_sender(&serde_json::to_vec(&jwe).unwrap()), None);
+        let anoncrypt = alice.messaging().pack(&message, &bob.did(), None).await.unwrap().message;
+        assert_eq!(super::frame_sender(&anoncrypt), None);
+        assert_eq!(super::frame_sender(b"{\"junk\":1}"), None);
     }
 }

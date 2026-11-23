@@ -1093,9 +1093,16 @@ impl Live {
     }
 
     async fn send_as(&mut self, peer: &Peer, message_type: &str, body: Value) {
+        let encoding = peer.agent.messaging().negotiate_encoding(&peer.server).await;
+        self.send_encoded(peer, message_type, body, encoding).await
+    }
+
+    /// [`send_as`](Self::send_as) in `encoding`: a COSE authcrypt carries its sender
+    /// only in `apu`, never a `skid`.
+    async fn send_encoded(&mut self, peer: &Peer, message_type: &str, body: Value, encoding: didcomm_core::crypto::Encoding) {
         use futures_util::SinkExt;
         let message = json!({ "id": uuid::Uuid::new_v4().to_string(), "type": message_type, "body": body, "return_route": "all" });
-        let packed = peer.agent.messaging().pack(&message, &peer.server, Some(&peer.did())).await.unwrap();
+        let packed = peer.agent.messaging().pack_as(&message, &peer.server, Some(&peer.did()), encoding).await.unwrap();
         let frame = match String::from_utf8(packed.message) {
             Ok(text) => reqwest_websocket::Message::Text(text),
             Err(bytes) => reqwest_websocket::Message::Binary(bytes.into_bytes().into()),
@@ -2271,6 +2278,43 @@ async fn a_member_not_watching_is_sent_through_the_mediator_only_what_they_chose
     member.community("set-notifications", json!({ "level": "all" })).await;
     admin.community("post", post("everything", json!({}))).await;
     assert_eq!(member.next_message().await["id"], "everything");
+}
+
+/// DIDComm v2.1: "authcrypt implementations MUST be able to resolve the sender kid
+/// from the apu header if skid is not set". A live connection takes its holder, and
+/// tells the holder's later frames from anyone else's, by `skid` or else `apu`
+/// (WYV-120): a COSE authcrypt carries only `apu`.
+#[tokio::test]
+async fn a_live_connection_knows_its_holder_by_apu_when_a_frame_has_no_skid() {
+    use didcomm_core::crypto::Encoding;
+    let server = start_server("").await;
+    let (admin, member, stranger) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member, &stranger]);
+    open_channel(&admin, "general").await;
+    member.community("join", json!({})).await;
+    stranger.community("join", json!({})).await;
+    let watch = format!("{C}watch");
+    let watching = format!("{C}community");
+
+    // An apu-only hello, and an apu-only frame after it, are the holder's.
+    let mut live = Live::open(&member, &server).await;
+    live.send_encoded(&member, &watch, json!({}), Encoding::Cbor).await;
+    live.next_typed(&member, &watching).await;
+    // Someone else's frame on it, named by skid or by apu alone, is dropped
+    // unanswered (an answer to them would fail to open as the member's, below).
+    live.send_encoded(&stranger, &watch, json!({}), Encoding::Cbor).await;
+    live.send_encoded(&stranger, &watch, json!({}), Encoding::Json).await;
+    live.send_encoded(&member, &watch, json!({}), Encoding::Cbor).await;
+    live.next_typed(&member, &watching).await;
+    drop(live);
+
+    // A connection that began with skid still takes the holder's apu-only frames.
+    let mut live = Live::open(&member, &server).await;
+    live.send_encoded(&member, &watch, json!({}), Encoding::Json).await;
+    live.next_typed(&member, &watching).await;
+    live.send_encoded(&stranger, &watch, json!({}), Encoding::Cbor).await;
+    live.send_encoded(&member, &watch, json!({}), Encoding::Cbor).await;
+    live.next_typed(&member, &watching).await;
 }
 
 #[tokio::test]
