@@ -189,8 +189,10 @@ async fn live(State(state): State<Arc<AppState>>, Path(id): Path<String>, reques
     }
     // So many open at once from one address, and from one member (WYV-51).
     let mut keys = Vec::new();
-    if let Some(client) = web.client(&request).filter(|client| wyvrn_service::guard::is_public(*client)) {
-        keys.push((format!("ip:{client}"), LIVE_PER_ADDRESS));
+    // Every client but this machine's own (WYV-74): the trusted proxies give the
+    // client, so a private address is a client on a private network, not a proxy.
+    if let Some(client) = web.client(&request).filter(|client| !client.is_loopback()) {
+        keys.push((format!("ip:{}", wyvrn_service::client_address::bucket(client)), LIVE_PER_ADDRESS));
     }
     if let Some((member, _)) = super::sign_in::session_of(&state, &headers) {
         keys.push((format!("member:{}", member.did), LIVE_PER_MEMBER));
