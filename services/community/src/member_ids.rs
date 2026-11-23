@@ -347,6 +347,9 @@ impl Community {
         if let Some(commands) = self.store.bot(&did)? {
             said.insert("bot".into(), json!(true));
             said.insert("commands".into(), commands);
+        } else if self.store.bot_asked(&did)?.is_some() {
+            // Says it is a bot, not yet approved (WYV-89): shown as asking, not as one.
+            said.insert("bot_pending".into(), json!(true));
         }
         let profile_value = (!said.is_empty()).then(|| {
             said.insert("at".into(), json!(at));

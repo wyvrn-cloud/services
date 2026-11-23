@@ -1249,6 +1249,13 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         commands TEXT NOT NULL,
         at INTEGER NOT NULL
     );
+    -- Bots let be bots, and by whom (bots.rs, WYV-89): a profile's bot: true takes
+    -- effect only once someone who may manage roles approves it.
+    CREATE TABLE IF NOT EXISTS bot_approvals (
+        did TEXT PRIMARY KEY,
+        by_did TEXT NOT NULL,
+        at INTEGER NOT NULL
+    );
     -- What a ban says to whoever it bans, beside the ban (appeals.rs): whether its
     -- reason is shown them, whether appeals are closed, and whether it was the
     -- server's own (an account match).
@@ -1904,6 +1911,12 @@ fn schema() -> Schema {
             CREATE TABLE IF NOT EXISTS member_bots (
                 did {MYSQL_DID} NOT NULL,
                 commands MEDIUMTEXT NOT NULL,
+                at BIGINT NOT NULL,
+                PRIMARY KEY (did(255))
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS bot_approvals (
+                did {MYSQL_DID} NOT NULL,
+                by_did {MYSQL_DID} NOT NULL,
                 at BIGINT NOT NULL,
                 PRIMARY KEY (did(255))
             ) {MYSQL_TABLE};

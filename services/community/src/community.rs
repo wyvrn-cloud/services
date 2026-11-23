@@ -578,6 +578,12 @@ impl Community {
         };
         let community = Self { store, config, used_bytes: Default::default(), host_full: Default::default(), changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, expressions: None, live: Default::default(), web_url: None, public_url: String::new(), speaks_as: None, importing: Default::default(), signing_seed: None, outbox: Default::default(), wiki_open: Default::default(), wiki_writing: Default::default() };
         community.ensure_roles()?;
+        // Bots from before approval was asked for (WYV-89), let be as they were.
+        if let Ok(approved) = community.store.approve_bots_from_before(crate::gates::now()) {
+            if approved > 0 {
+                tracing::info!(approved, "bots there before approval was asked for are approved");
+            }
+        }
         // Tokens from before they were hashed (WYV-63), hashed as it opens.
         match community.store.hash_plain_webhook_tokens() {
             Ok(0) => {}

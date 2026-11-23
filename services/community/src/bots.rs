@@ -82,11 +82,54 @@ pub fn buttons_from(given: &Value) -> Option<Value> {
     (!buttons.is_empty()).then(|| Value::Array(buttons))
 }
 
+/// Let a member's bot: true take effect, or no longer (`approved`). For whoever
+/// may manage roles (WYV-89).
+pub const APPROVE_BOT: &str = "https://wyvrn.app/community/1.0/approve-bot";
+
 impl Store {
-    /// A bot member's commands, if they are one: `Some(commands)` (maybe `[]`).
+    /// A bot member's commands, if they are one: their profile says so and it was
+    /// approved (WYV-89). `Some(commands)` (maybe `[]`).
     pub fn bot(&self, did: &str) -> wyvrn_service::db::Result<Option<Value>> {
+        let found: Option<String> = self.db.lock().query_row(
+            "SELECT b.commands FROM member_bots b JOIN bot_approvals a ON a.did = b.did WHERE b.did = ?1",
+            params![did],
+            |row| row.get(0),
+        )?;
+        Ok(found.map(|text| serde_json::from_str(&text).unwrap_or_else(|_| json!([]))))
+    }
+
+    /// What a member's profile says of being a bot, approved or not.
+    pub fn bot_asked(&self, did: &str) -> wyvrn_service::db::Result<Option<Value>> {
         let found: Option<String> = self.db.lock().query_row("SELECT commands FROM member_bots WHERE did = ?1", params![did], |row| row.get(0))?;
         Ok(found.map(|text| serde_json::from_str(&text).unwrap_or_else(|_| json!([]))))
+    }
+
+    /// Whether a member's being a bot was approved.
+    pub fn bot_approved(&self, did: &str) -> wyvrn_service::db::Result<bool> {
+        Ok(self.db.lock().query_row("SELECT did FROM bot_approvals WHERE did = ?1", params![did], |row| row.get::<String>(0))?.is_some())
+    }
+
+    pub fn set_bot_approved(&self, did: &str, by: Option<&str>, now: i64) -> wyvrn_service::db::Result<()> {
+        let mut db = self.db.lock();
+        match by {
+            Some(by) => db.execute("INSERT OR REPLACE INTO bot_approvals (did, by_did, at) VALUES (?1, ?2, ?3)", params![did, by, now])?,
+            None => db.execute("DELETE FROM bot_approvals WHERE did = ?1", params![did])?,
+        };
+        Ok(())
+    }
+
+    /// Bots there were before approval was asked for are let be, once, as the
+    /// table is first met: they were working, and approving them is no news.
+    pub fn approve_bots_from_before(&self, now: i64) -> wyvrn_service::db::Result<usize> {
+        if self.setting("bot_approvals_seeded")?.is_some() {
+            return Ok(0);
+        }
+        let before: Vec<String> = self.db.lock().query("SELECT did FROM member_bots", params![], |row| row.get(0))?;
+        for did in &before {
+            self.set_bot_approved(did, Some("from-before-approval"), now)?;
+        }
+        self.set_setting("bot_approvals_seeded", "1")?;
+        Ok(before.len())
     }
 
     pub fn set_bot(&self, did: &str, commands: Option<&Value>, now: i64) -> wyvrn_service::db::Result<()> {
@@ -105,12 +148,16 @@ impl Community {
         if profile.get("bot").is_none() && profile.get("commands").is_none() {
             return Ok(false);
         }
-        let held = self.store.bot(sender)?;
+        let held = self.store.bot_asked(sender)?;
         let wanted = (profile["bot"] == true).then(|| commands_from(&profile["commands"]).unwrap_or_else(|| json!([])));
         if held == wanted {
             return Ok(false);
         }
         self.store.set_bot(sender, wanted.as_ref(), now)?;
+        // No longer one: an approval doesn't wait for them to be one again.
+        if wanted.is_none() {
+            self.store.set_bot_approved(sender, None, now)?;
+        }
         Ok(true)
     }
 
@@ -118,6 +165,21 @@ impl Community {
         let body = &message["body"];
         let sender = member.did.as_str();
         match message["type"].as_str().unwrap_or_default() {
+            APPROVE_BOT => {
+                if !self.powers(sender)?.has("manage_roles") {
+                    return refuse(message, "e.p.trust.not-authorized", "Approving a bot takes Manage roles.").map(Some);
+                }
+                let did = body["member"].as_str().unwrap_or_default().to_string();
+                let Some(approved) = body["approved"].as_bool() else {
+                    return refuse(message, "e.p.msg.invalid-approve-bot", "approved is true or false.").map(Some);
+                };
+                if approved && self.store.bot_asked(&did)?.is_none() {
+                    return refuse(message, "e.p.msg.unknown-bot", "Their profile doesn't say they are a bot.").map(Some);
+                }
+                self.store.set_bot_approved(&did, approved.then_some(sender), now)?;
+                self.audit(now, sender, if approved { "bot.approve" } else { "bot.unapprove" }, Some(&did), None);
+                return Ok(Some(Outcome::reply(crate::community::reply_to(message, crate::community::MEMBERS, self.members_for(member)?))));
+            }
             BOT_INVOKE => {
                 let Some(channel) = self.channel_for(sender, body["channel"].as_str().unwrap_or_default())? else {
                     return refuse(message, "e.p.msg.unknown-channel", "There is no such channel.").map(Some);
@@ -217,5 +279,25 @@ mod tests {
         assert_eq!(commands_from(&json!("nope")), None);
         let buttons = buttons_from(&json!([{ "id": "yes", "label": "Yes", "style": "primary" }, { "id": "", "label": "x" }, { "id": "no", "label": "No", "style": "rainbow" }])).unwrap();
         assert_eq!(buttons, json!([{ "id": "yes", "label": "Yes", "style": "primary" }, { "id": "no", "label": "No" }]));
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use crate::store::Store;
+    use serde_json::json;
+
+    #[test]
+    fn a_bot_is_one_once_approved_and_those_from_before_are_approved_once() {
+        let store = Store::in_memory().unwrap();
+        store.set_bot("did:example:old", Some(&json!([])), 1).unwrap();
+        assert_eq!(store.approve_bots_from_before(2).unwrap(), 1);
+        assert!(store.bot("did:example:old").unwrap().is_some(), "there before: let be");
+        store.set_bot("did:example:new", Some(&json!([])), 3).unwrap();
+        assert_eq!(store.approve_bots_from_before(4).unwrap(), 0, "once only");
+        assert!(store.bot("did:example:new").unwrap().is_none(), "new: waits");
+        assert!(store.bot_asked("did:example:new").unwrap().is_some());
+        store.set_bot_approved("did:example:new", Some("did:example:admin"), 5).unwrap();
+        assert!(store.bot("did:example:new").unwrap().is_some());
     }
 }

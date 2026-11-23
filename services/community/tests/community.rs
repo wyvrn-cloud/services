@@ -4699,15 +4699,30 @@ async fn a_bot_says_its_commands_takes_them_through_the_community_and_answers_wi
         .await
         .unwrap();
     let bot_id = server.id(&bot);
-    let mut listed = Value::Null;
-    for _ in 0..50 {
-        let members = member.community("members-request", json!({})).await;
-        listed = members["body"]["members"].as_array().unwrap().iter().find(|m| m["member"] == bot_id.as_str()).cloned().unwrap_or_default();
-        if listed["profile"]["bot"] == true {
-            break;
+    let listed_as = |key: &'static str| {
+        let (member, bot_id) = (&member, bot_id.clone());
+        async move {
+            let mut listed = Value::Null;
+            for _ in 0..50 {
+                let members = member.community("members-request", json!({})).await;
+                listed = members["body"]["members"].as_array().unwrap().iter().find(|m| m["member"] == bot_id.as_str()).cloned().unwrap_or_default();
+                if listed["profile"][key] == true {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            listed
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    };
+    // Saying it is a bot isn't being one: it waits for someone who may manage roles (WYV-89).
+    let pending = listed_as("bot_pending").await;
+    assert_eq!(pending["profile"]["bot_pending"], true, "{pending}");
+    assert!(pending["profile"].get("commands").is_none());
+    assert_eq!(member.community("bot-invoke", json!({ "member": bot_id, "channel": channel, "command": "roll" })).await["body"]["code"], "e.p.msg.unknown-bot");
+    assert_eq!(member.community("approve-bot", json!({ "member": bot_id, "approved": true })).await["body"]["code"], "e.p.trust.not-authorized");
+    let approved = admin.community("approve-bot", json!({ "member": bot_id, "approved": true })).await;
+    assert_eq!(kind(&approved), "members", "{approved}");
+    let listed = listed_as("bot").await;
     assert_eq!(listed["profile"]["commands"][0]["name"], "roll", "{listed}");
 
     // A command the bot has, where the member may post: passed on, with who and where.
