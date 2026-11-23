@@ -3863,6 +3863,18 @@ impl Store {
     }
 
     /// What a post said before AutoMod censored it, if it did.
+    /// Every webhook token still kept as itself, kept as its hash instead
+    /// (security review WYV-63): its URL goes on working, and a copy of the
+    /// database posts nowhere. Says how many.
+    pub fn hash_plain_webhook_tokens(&self) -> Result<usize> {
+        let plain: Vec<(String, String)> =
+            self.db.lock().query("SELECT id, token FROM webhooks WHERE token NOT LIKE 'sha256:%'", params![], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        for (id, token) in &plain {
+            self.db.lock().execute("UPDATE webhooks SET token = ?2 WHERE id = ?1", params![id, crate::webhooks::kept_token(token)])?;
+        }
+        Ok(plain.len())
+    }
+
     pub fn webhooks(&self) -> Result<Vec<Webhook>> {
         self.db.lock().query("SELECT id, channel, name, avatar, token, created_by, created_at FROM webhooks ORDER BY created_at, id", params![], webhook_from)
     }

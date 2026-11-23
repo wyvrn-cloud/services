@@ -994,6 +994,19 @@ mod tests {
         assert!(!super::token_is("plain-old-token", "plain-old-tokeN"));
     }
 
+    #[test]
+    fn a_token_kept_plain_from_before_is_hashed_as_the_community_opens_and_still_works() {
+        use crate::store::{Store, Webhook};
+        let store = Store::in_memory().unwrap();
+        let hook = Webhook { id: "h1".into(), channel: "c1".into(), name: "CI".into(), avatar: None, token: "plain-old-token".into(), created_by: "did:example:o".into(), created_at: 1 };
+        store.save_webhook(&hook).unwrap();
+        let community = crate::community::Community::new(store, crate::config::CommunityConfig::default(), None).unwrap();
+        let kept = community.store.webhook("h1").unwrap().unwrap().token;
+        assert!(kept.starts_with("sha256:"), "hashed in place (WYV-63)");
+        assert!(super::token_is(&kept, "plain-old-token"), "its URL still works");
+        assert_eq!(community.store.hash_plain_webhook_tokens().unwrap(), 0, "once");
+    }
+
     use super::*;
 
     #[test]

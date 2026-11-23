@@ -578,6 +578,12 @@ impl Community {
         };
         let community = Self { store, config, used_bytes: Default::default(), host_full: Default::default(), changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, expressions: None, live: Default::default(), web_url: None, public_url: String::new(), speaks_as: None, importing: Default::default(), signing_seed: None, outbox: Default::default(), wiki_open: Default::default(), wiki_writing: Default::default() };
         community.ensure_roles()?;
+        // Tokens from before they were hashed (WYV-63), hashed as it opens.
+        match community.store.hash_plain_webhook_tokens() {
+            Ok(0) => {}
+            Ok(hashed) => tracing::info!(hashed, "webhook tokens kept as themselves now kept hashed"),
+            Err(error) => tracing::warn!(%error, "couldn't hash webhook tokens kept plain"),
+        }
         Ok(community)
     }
 
