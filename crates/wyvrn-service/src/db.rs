@@ -1090,7 +1090,15 @@ fn update_shape(sql: &str) -> Option<(Named, Vec<(String, Option<usize>)>)> {
         return None;
     }
     let set = upper.find(" SET ")?;
-    let table = named(&trimmed[7..set]);
+    // `UPDATE OR IGNORE t` (SQLite's, `UPDATE IGNORE` on MySQL) names `t`: read as
+    // `OR IGNORE t`, the check was skipped (WYV-60).
+    let mut from = 7;
+    for modifier in ["OR IGNORE ", "OR REPLACE ", "OR ABORT ", "OR FAIL ", "OR ROLLBACK ", "LOW_PRIORITY ", "IGNORE "] {
+        if upper[from..].starts_with(modifier) {
+            from += modifier.len();
+        }
+    }
+    let table = named(&trimmed[from..set]);
     let end = upper[set..].find(" WHERE ").map_or(trimmed.len(), |at| set + at);
     let assignments = trimmed[set + 5..end]
         .split(',')
@@ -1516,6 +1524,9 @@ mod tests {
         // An update is held to the same (WYV-60).
         assert!(writing.execute("UPDATE shaped SET v = ?2 WHERE k = ?1", &[text("c"), text("too long")]).is_err());
         assert_eq!(writing.execute("UPDATE shaped SET v = ?2 WHERE k = ?1", &[text("c"), text("ok")]).unwrap(), 1);
+        // And one that ignores what it can't change, which UPDATE IGNORE would cut too.
+        assert!(writing.execute("UPDATE OR IGNORE shaped SET k = ?2 WHERE k = ?1", &[text("c"), text("too long a key")]).is_err());
+        assert_eq!(writing.execute("UPDATE OR IGNORE shaped SET k = ?2 WHERE k = ?1", &[text("c"), text("d")]).unwrap(), 1);
     }
 
     #[test]
@@ -1536,6 +1547,10 @@ mod tests {
             update_shape("UPDATE \"wyvrn_x\".\"c9_members\" SET role = ?2, at = at + 1 WHERE did = ?1"),
             Some((Named { database: Some("wyvrn_x".to_string()), table: "c9_members".to_string() }, vec![("role".to_string(), Some(1)), ("at".to_string(), None)]))
         );
+        // `UPDATE OR IGNORE` and MySQL's `UPDATE IGNORE` name the table after the word.
+        for sql in ["UPDATE OR IGNORE bans SET did = ?2 WHERE did = ?1", "UPDATE IGNORE \"bans\" SET did = ?2 WHERE did = ?1"] {
+            assert_eq!(update_shape(sql), Some((Named { database: None, table: "bans".to_string() }, vec![("did".to_string(), Some(1))])), "{sql}");
+        }
     }
 
     use super::*;

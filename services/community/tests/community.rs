@@ -4843,7 +4843,23 @@ fn a_did_moves_once_and_a_second_different_move_from_it_is_not_taken() {
 
 #[test]
 fn an_event_receiver_pauses_while_its_maker_is_banned_or_gone_and_follows_them_when_they_move() {
-    let community = Community::new(Store::in_memory().unwrap(), Default::default(), None).unwrap();
+    receiver_pauses_and_moves(Store::in_memory().unwrap());
+}
+
+#[test]
+fn an_event_receiver_pauses_and_moves_in_mysql_too() {
+    let Some(url) = std::env::var("WYVRN_TEST_DATABASE_URL").ok().filter(|url| !url.is_empty()) else { return };
+    let server = url.trim_end_matches('/');
+    let database = format!("wyvrn_test_receivers_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    {
+        let mut admin = mysql::Conn::new(mysql::Opts::from_url(server).unwrap()).unwrap();
+        mysql::prelude::Queryable::query_drop(&mut admin, format!("CREATE DATABASE {database}")).unwrap();
+    }
+    receiver_pauses_and_moves(Store::open(&wyvrn_service::db::Location::MySql(format!("{server}/{database}"))).unwrap());
+}
+
+fn receiver_pauses_and_moves(store: Store) {
+    let community = Community::new(store, Default::default(), None).unwrap();
     let store = &community.store;
     let maker = "did:peer:2.maker";
     store.set_member(maker, wyvrn_community::store::Role::Member, 1).unwrap();
@@ -4879,8 +4895,13 @@ fn an_event_receiver_pauses_while_its_maker_is_banned_or_gone_and_follows_them_w
     assert_eq!(queued(), 2);
     store.set_member(maker, wyvrn_community::store::Role::Member, 6).unwrap();
 
-    // Moved to a new DID (WYV-115): the receiver and the channel go with them.
+    // Moved to a new DID (WYV-115): the receiver and the channel go with them, and
+    // a bot's standing (every UPDATE OR IGNORE held to MySQL's lengths, WYV-60).
+    store.set_bot(maker, Some(&json!([])), 6).unwrap();
+    store.set_bot_approved(maker, Some("did:peer:2.mod"), 6).unwrap();
     store.rotate(maker, "did:peer:2.maker-new", 7).unwrap();
+    assert!(store.bot_approved("did:peer:2.maker-new").unwrap());
+    assert!(store.bot_asked("did:peer:2.maker-new").unwrap().is_some());
     assert_eq!(store.event_hook("h1").unwrap().unwrap().created_by, "did:peer:2.maker-new");
     assert_eq!(store.channel("c1").unwrap().unwrap().created_by, "did:peer:2.maker-new");
     community.emit_event("member.joined", None, json!({}), 8);
