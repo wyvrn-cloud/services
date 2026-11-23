@@ -256,17 +256,10 @@ async fn indieauth_client(client_id: &str) -> Option<Client> {
     client
 }
 
+/// Whether a fetch may go to `address`: one rule for every outbound fetch, with
+/// the special ranges (NAT64, 6to4, Teredo, benchmarking; WYV-91).
 pub(super) fn public_address(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(v4) => !(v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast() || v4.is_documentation() || v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]) || v4.octets()[0] >= 224),
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return public_address(IpAddr::V4(v4));
-            }
-            let first = v6.segments()[0];
-            !(v6.is_loopback() || v6.is_unspecified() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80 || v6.is_multicast())
-        }
-    }
+    wyvrn_service::guard::is_public(address)
 }
 
 async fn fetch_metadata(client_id: &str) -> Result<Option<Client>, String> {
@@ -767,6 +760,9 @@ mod tests {
     fn private_addresses_are_not_public() {
         for private in ["10.0.0.1", "192.168.1.1", "127.0.0.1", "169.254.1.1", "100.64.0.1", "::1", "fd00::1", "fe80::1", "::ffff:10.0.0.1", "0.0.0.0"] {
             assert!(!public_address(private.parse().unwrap()), "{private}");
+        }
+        for special in ["64:ff9b::7f00:1", "2002:7f00:1::", "2001::1", "::127.0.0.1", "198.18.0.1", "192.0.0.8"] {
+            assert!(!public_address(special.parse().unwrap()), "{special}");
         }
         assert!(public_address("93.184.216.34".parse().unwrap()));
         assert!(public_address("2606:4700::1111".parse().unwrap()));
