@@ -5,7 +5,7 @@ use wyvrn_service::db::Location;
 use wyvrn_service::identity;
 
 #[test]
-fn keys_are_sealed_at_rest_read_back_and_those_found_unsealed_are_sealed() {
+fn keys_are_sealed_at_rest_read_back_and_those_found_unsealed_are_sealed_only_when_the_operator_says() {
     let dir = std::env::temp_dir().join(format!("sealed-identity-{}", std::process::id()));
     let community = dir.join("den");
     std::fs::create_dir_all(&community).unwrap();
@@ -17,11 +17,17 @@ fn keys_are_sealed_at_rest_read_back_and_those_found_unsealed_are_sealed() {
     assert!(!plain.contains("wyvrn-sealed-identity"));
 
     identity::seal_with("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=").unwrap();
+    // Found unsealed once there is a key: refused, as someone who can write the
+    // file could have put keys of their own there (WYV-32)...
+    assert!(identity::load(&location, &path, "community").is_err());
+    // ...unless the operator says these are the ones to seal, for the start that does.
+    std::env::set_var("WYVRN_SEAL_ADOPT_PLAIN", "true");
     // Read with the key: the same keys, and sealed from then on.
     let read = identity::load(&location, &path, "community").unwrap().unwrap();
     assert_eq!(read.to_json().unwrap(), made.to_json().unwrap());
     let sealed = std::fs::read_to_string(&path).unwrap();
     assert!(sealed.contains("wyvrn-sealed-identity/1"));
+    std::env::remove_var("WYVRN_SEAL_ADOPT_PLAIN");
     assert!(!sealed.contains(&made.to_json().unwrap()[..40]), "nothing of the keys readable");
     assert_eq!(identity::load(&location, &path, "community").unwrap().unwrap().to_json().unwrap(), made.to_json().unwrap());
 

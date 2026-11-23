@@ -98,6 +98,11 @@ fn from_env() {
                 let _ = PREVIOUS.set(keys);
             }
         }
+        // What a previous key opens is unsealed as it is read: say so, as that may
+        // not be what was meant (WYV-32).
+        if SEAL.get().is_none() && PREVIOUS.get().is_some_and(|keys| !keys.is_empty()) {
+            tracing::warn!("WYVRN_SEAL_KEY_PREVIOUS is set without WYVRN_SEAL_KEY: keys it opens are kept unsealed from now on");
+        }
     });
 }
 
@@ -134,9 +139,27 @@ pub fn open_text(kept: &str, at: &str) -> anyhow::Result<(String, bool)> {
     open_with_keys(kept, at, current(), previous())
 }
 
+/// Whether keys found unsealed while there is a seal key are taken (and sealed):
+/// only on the starts the operator says to, with `WYVRN_SEAL_ADOPT_PLAIN=true`,
+/// as the start that first seals a service's keys. Otherwise someone who could
+/// write to its store could plant keys of their own there (security review WYV-32).
+fn adopting_plain() -> bool {
+    std::env::var("WYVRN_SEAL_ADOPT_PLAIN").is_ok_and(|v| v.trim() == "true")
+}
+
 fn open_with_keys(kept: &str, at: &str, current: Option<&[u8; 32]>, previous: &[[u8; 32]]) -> anyhow::Result<(String, bool)> {
+    open_with_keys_adopting(kept, at, current, previous, adopting_plain())
+}
+
+fn open_with_keys_adopting(kept: &str, at: &str, current: Option<&[u8; 32]>, previous: &[[u8; 32]], adopt_plain: bool) -> anyhow::Result<(String, bool)> {
     let sealed = serde_json::from_str::<serde_json::Value>(kept).ok().filter(|v| v["sealed"] == SEALED);
-    let Some(value) = sealed else { return Ok((kept.to_string(), current.is_some())) };
+    let Some(value) = sealed else {
+        anyhow::ensure!(
+            current.is_none() || adopt_plain,
+            "keys were found unsealed though this service seals them (WYVRN_SEAL_KEY is set): if they are the ones it had before sealing, start it once with WYVRN_SEAL_ADOPT_PLAIN=true to seal them"
+        );
+        return Ok((kept.to_string(), current.is_some()));
+    };
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -261,7 +284,7 @@ pub fn load_or_generate(location: &Location, path: &Path, service: &str) -> anyh
         }
         Location::MySql(_) | Location::Shared { .. } => {
             let db = Db::open(location, &schema(), service).with_context(|| format!("the identity in {location}"))?;
-            in_database(&db, path, service)
+            in_database(&db, location, path, service)
         }
     }
 }
@@ -275,13 +298,37 @@ pub fn load(location: &Location, path: &Path, service: &str) -> anyhow::Result<O
             let db = Db::open(location, &schema(), service).with_context(|| format!("the identity in {location}"))?;
             let held = db.lock().query_row("SELECT identity FROM wyvrn_identity WHERE id = 1", params![], |row| row.get::<String>(0))?;
             let Some(held) = held else { return Ok(None) };
-            let at = format!("db:{service}");
-            let (identity, reseal) = read_kept(&held, &at)?;
+            let at = place_of_db(location, service);
+            let (identity, reseal) = read_kept_db(&held, &at, service)?;
             if reseal {
                 db.lock().execute("UPDATE wyvrn_identity SET identity = ?1 WHERE id = 1", params![kept_form(&identity, &at)?])?;
             }
             Ok(Some(identity))
         }
+    }
+}
+
+/// Where keys in a database are kept, as they are bound to it: the service and the
+/// database (and, on a shared server, the table prefix), so each hosted community's
+/// sealed keys open only where they are (security review WYV-32). Keys sealed before
+/// under the service alone (`db:<service>`) still open, and are sealed again so.
+fn place_of_db(location: &Location, service: &str) -> String {
+    match location {
+        Location::Shared { database, prefix, .. } => format!("db:{service}:{database}.{prefix}"),
+        Location::MySql(url) => format!("db:{service}:{}", url.rsplit('/').next().unwrap_or_default().split('?').next().unwrap_or_default()),
+        Location::Sqlite(_) => format!("db:{service}"),
+    }
+}
+
+/// Keys held in a database read back, under its place or, from before places
+/// named the database, the service alone (then to be sealed again).
+fn read_kept_db(held: &str, at: &str, service: &str) -> anyhow::Result<(Identity, bool)> {
+    match read_kept(held, at) {
+        Ok(read) => Ok(read),
+        Err(error) => match read_kept(held, &format!("db:{service}")) {
+            Ok((identity, _)) => Ok((identity, true)),
+            Err(_) => Err(error),
+        },
     }
 }
 
@@ -297,18 +344,18 @@ pub fn keep(location: &Location, path: &Path, service: &str, identity: &Identity
         Location::Sqlite(_) => write_file(path, &kept_form(identity, &place_of_file(path))?).with_context(|| format!("identity file {}", path.display()))?,
         Location::MySql(_) | Location::Shared { .. } => {
             let db = Db::open(location, &schema(), service)?;
-            db.lock().execute("INSERT INTO wyvrn_identity (id, identity) VALUES (1, ?1)", params![kept_form(identity, &format!("db:{service}"))?])?;
+            db.lock().execute("INSERT INTO wyvrn_identity (id, identity) VALUES (1, ?1)", params![kept_form(identity, &place_of_db(location, service))?])?;
         }
     }
     Ok(())
 }
 
-fn in_database(db: &Db, path: &Path, service: &str) -> anyhow::Result<Identity> {
+fn in_database(db: &Db, location: &Location, path: &Path, service: &str) -> anyhow::Result<Identity> {
     const HELD: &str = "SELECT identity FROM wyvrn_identity WHERE id = 1";
-    let at = format!("db:{service}");
+    let at = place_of_db(location, service);
     let mut session = db.lock();
     if let Some(held) = session.query_row(HELD, params![], |row| row.get::<String>(0))? {
-        let (identity, reseal) = read_kept(&held, &at)?;
+        let (identity, reseal) = read_kept_db(&held, &at, service)?;
         if reseal {
             session.execute("UPDATE wyvrn_identity SET identity = ?1 WHERE id = 1", params![kept_form(&identity, &at)?])?;
             tracing::info!("this service's keys are {} at rest", rewritten());
@@ -325,7 +372,7 @@ fn in_database(db: &Db, path: &Path, service: &str) -> anyhow::Result<Identity> 
     session.execute("INSERT OR IGNORE INTO wyvrn_identity (id, identity) VALUES (1, ?1)", params![kept_form(&identity, &at)?])?;
     let held: String = session.query_value(HELD, params![])?;
     tracing::info!("this service's keys are kept in its database ({from})");
-    Ok(read_kept(&held, &at)?.0)
+    Ok(read_kept_db(&held, &at, service)?.0)
 }
 
 #[cfg(test)]
@@ -359,7 +406,10 @@ mod tests {
         assert!(!sealed.contains("oauth key"));
         assert_eq!(open_with_keys(&sealed, "verify:oauth_key", Some(&key), &[]).unwrap(), ("the oauth key".to_string(), false));
         assert!(open_with_keys(&sealed, "verify:other", Some(&key), &[]).is_err(), "moved, it doesn't open");
-        assert_eq!(open_with_keys("plain", "verify:oauth_key", Some(&key), &[]).unwrap(), ("plain".to_string(), true), "found unsealed: to be sealed");
+        // Found unsealed while sealing: refused, unless the operator says to adopt it (WYV-32).
+        assert!(open_with_keys_adopting("plain", "verify:oauth_key", Some(&key), &[], false).is_err(), "planted plain keys aren't taken");
+        assert_eq!(open_with_keys_adopting("plain", "verify:oauth_key", Some(&key), &[], true).unwrap(), ("plain".to_string(), true), "adopted: to be sealed");
+        assert_eq!(open_with_keys_adopting("plain", "verify:oauth_key", None, &[], false).unwrap(), ("plain".to_string(), false), "no sealing: as it is");
     }
 
     #[test]
@@ -386,17 +436,32 @@ mod tests {
     fn keys_in_a_database_are_made_once_and_a_file_that_was_there_is_taken_in() {
         let nowhere = Path::new("/nonexistent/identity.json");
         let db = Db::scratch(&schema()).unwrap();
-        let first = in_database(&db, nowhere, "test").unwrap();
-        assert_eq!(keys(&in_database(&db, nowhere, "test").unwrap()), keys(&first));
+        let first = in_database(&db, &Location::MySql("mysql://h/wyvrn_test".into()), nowhere, "test").unwrap();
+        assert_eq!(keys(&in_database(&db, &Location::MySql("mysql://h/wyvrn_test".into()), nowhere, "test").unwrap()), keys(&first));
 
         let file = std::env::temp_dir().join(format!("wyvrn-identity-test-{}-{:?}.json", std::process::id(), std::thread::current().id()));
         let before = Identity::generate().unwrap();
         before.save(&file).unwrap();
         let moved = Db::scratch(&schema()).unwrap();
-        assert_eq!(keys(&in_database(&moved, &file, "test").unwrap()), keys(&before));
+        assert_eq!(keys(&in_database(&moved, &Location::MySql("mysql://h/wyvrn_test".into()), &file, "test").unwrap()), keys(&before));
         // Held from then on, whatever becomes of the file.
         std::fs::remove_file(&file).unwrap();
-        assert_eq!(keys(&in_database(&moved, &file, "test").unwrap()), keys(&before));
+        assert_eq!(keys(&in_database(&moved, &Location::MySql("mysql://h/wyvrn_test".into()), &file, "test").unwrap()), keys(&before));
         assert_ne!(keys(&before), keys(&first));
+    }
+
+    #[test]
+    fn keys_in_a_shared_database_are_bound_to_their_own_tables_and_old_ones_still_open() {
+        let shared = |prefix: &str| Location::Shared { server: "mysql://h".into(), database: "wyvrn".into(), prefix: prefix.into() };
+        let (one, two) = (place_of_db(&shared("c1_"), "community"), place_of_db(&shared("c2_"), "community"));
+        assert_ne!(one, two, "each hosted community's its own");
+        let identity = Identity::generate().unwrap();
+        let key = [9u8; 32];
+        let sealed = kept_form_with(&identity, &one, Some(&key)).unwrap();
+        assert!(read_kept_with(&sealed, &two, Some(&key), &[]).is_err(), "moved to another's tables, it doesn't open");
+        // One sealed before places named the database: opens under the old place, to be sealed again.
+        let old = kept_form_with(&identity, "db:community", Some(&key)).unwrap();
+        assert!(read_kept_with(&old, &one, Some(&key), &[]).is_err());
+        assert!(read_kept_with(&old, "db:community", Some(&key), &[]).is_ok());
     }
 }
