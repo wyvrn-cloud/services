@@ -4951,3 +4951,74 @@ fn receiver_pauses_and_moves(store: Store) {
     community.emit_event("member.joined", None, json!({}), 8);
     assert_eq!(queued(), 3);
 }
+
+#[test]
+fn an_announcement_follower_pauses_while_its_maker_is_banned_or_gone_and_follows_them_when_they_move() {
+    follower_pauses_and_moves(Store::in_memory().unwrap());
+}
+
+#[test]
+fn an_announcement_follower_pauses_and_moves_in_mysql_too() {
+    let Some(url) = std::env::var("WYVRN_TEST_DATABASE_URL").ok().filter(|url| !url.is_empty()) else { return };
+    let server = url.trim_end_matches('/');
+    let database = format!("wyvrn_test_followers_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    {
+        let mut admin = mysql::Conn::new(mysql::Opts::from_url(server).unwrap()).unwrap();
+        mysql::prelude::Queryable::query_drop(&mut admin, format!("CREATE DATABASE {database}")).unwrap();
+    }
+    follower_pauses_and_moves(Store::open(&wyvrn_service::db::Location::MySql(format!("{server}/{database}"))).unwrap());
+}
+
+/// As an event receiver does (WYV-99), an announcement follower pauses while
+/// whoever added it is banned or gone, and moves with them (WYV-125).
+fn follower_pauses_and_moves(store: Store) {
+    use wyvrn_community::store::{Follower, Role};
+    let community = Community::new(store, Default::default(), None).unwrap();
+    let store = &community.store;
+    let (admin, maker) = ("did:peer:2.admin", "did:peer:2.maker");
+    store.set_member(admin, Role::Admin, 1).unwrap();
+    store.set_member(maker, Role::Member, 1).unwrap();
+    store.add_channel("news", "news", "", admin, 1).unwrap();
+    store.set_announcement("news", true).unwrap();
+    store
+        .save_follower(&Follower {
+            id: "f1".into(),
+            channel: "news".into(),
+            kind: "service".into(),
+            target: "https://example.com/announcements".into(),
+            name: "Theirs".into(),
+            secret: None,
+            created_by: maker.into(),
+            created_at: 1,
+            failures: 0,
+            off_at: None,
+        })
+        .unwrap();
+    let author = store.member(admin).unwrap().unwrap();
+    let publish = |id: &str, now: i64| {
+        store.add_post("news", id, "news!", &author, None, None, now).unwrap();
+        let message = json!({ "type": "https://wyvrn.app/community/1.0/publish", "id": format!("m-{id}"), "body": { "channel": "news", "post": id } });
+        community.publish(&author, &message, now).unwrap();
+    };
+    let queued = || store.due_announcements(i64::MAX, 100).unwrap().len();
+    publish("p1", 2);
+    assert_eq!(queued(), 1);
+
+    // Banned: nothing more is queued for it.
+    store.ban(&wyvrn_community::store::Ban { did: maker.into(), name: None, by: admin.into(), at: 3, until: None, reason: None }).unwrap();
+    publish("p2", 4);
+    assert_eq!(queued(), 1);
+    store.unban(maker).unwrap();
+
+    // Gone: the same.
+    store.remove_member(maker).unwrap();
+    publish("p3", 5);
+    assert_eq!(queued(), 1);
+    store.set_member(maker, Role::Member, 6).unwrap();
+
+    // Moved to a new DID: it goes with them, and works again.
+    store.rotate(maker, "did:peer:2.maker-new", 7).unwrap();
+    assert_eq!(store.follower("f1").unwrap().unwrap().created_by, "did:peer:2.maker-new");
+    publish("p4", 8);
+    assert_eq!(queued(), 2);
+}

@@ -150,9 +150,13 @@ impl Community {
         body
     }
 
-    /// Queues `post` for every follower of its channel still sent to.
+    /// Queues `post` for every follower of its channel still sent to: not turned
+    /// off, and whose maker (who added it, or asked for the code another community
+    /// followed with) is still here and not banned. One whose maker left or was
+    /// banned is paused, as their webhooks and event receivers are (WYV-99,
+    /// WYV-125): it is sent nothing until they are back.
     fn queue_for_followers(&self, post: &Post, now: i64) -> anyhow::Result<()> {
-        for follower in self.store.followers_of(&post.channel)?.into_iter().filter(|f| f.off_at.is_none()) {
+        for follower in self.store.followers_of(&post.channel)?.into_iter().filter(|f| f.off_at.is_none() && self.maker_here(&f.created_by, now)) {
             self.store.queue_announcement(&follower.id, &post.id, now)?;
         }
         Ok(())
@@ -548,7 +552,13 @@ impl Community {
                         "discord" => "Discord",
                         _ => "a service",
                     };
-                    let off = if follower.off_at.is_some() { " (turned off: it stopped taking posts)" } else { "" };
+                    let off = if follower.off_at.is_some() {
+                        " (turned off: it stopped taking posts)"
+                    } else if !self.maker_here(&follower.created_by, crate::gates::now()) {
+                        " (paused: whoever added it is no longer in the community)"
+                    } else {
+                        ""
+                    };
                     let mut row = vec![json!({ "type": "text", "text": format!("{} · {kind}{off}", follower.name) })];
                     if follower.off_at.is_some() {
                         row.push(json!({ "type": "submit-button", "label": "Turn back on", "event": "on", "input": { "follower": follower.id } }));
@@ -707,7 +717,9 @@ pub async fn send_due(state: &Arc<AppState>, now: i64) -> anyhow::Result<()> {
     community.queue_changed_announcements(now)?;
     for (follower_id, post_id, attempts) in community.store.due_announcements(now, 50)? {
         let done = || community.store.announcement_done(&follower_id, &post_id);
-        let Some(mut follower) = community.store.follower(&follower_id)?.filter(|f| f.off_at.is_none()) else {
+        // Off, or paused since it was queued (its maker gone or banned, WYV-125):
+        // what was waiting for it is dropped, not kept for later.
+        let Some(mut follower) = community.store.follower(&follower_id)?.filter(|f| f.off_at.is_none() && community.maker_here(&f.created_by, now)) else {
             done()?;
             continue;
         };
