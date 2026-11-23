@@ -102,7 +102,15 @@ pub struct Relay {
     sockets: reqwest::Client,
     /// What each client did this minute: so many sends and sockets a minute (WYV-23).
     used: std::sync::Mutex<std::collections::HashMap<String, (i64, u32)>>,
+    /// Whose X-Forwarded-For is believed.
+    pub proxies: wyvrn_service::client_address::Proxies,
+    /// The sockets open, by client address and in all (security review WYV-80).
+    open_sockets: std::sync::Mutex<(std::collections::HashMap<std::net::IpAddr, usize>, usize)>,
 }
+
+/// Sockets one client address keeps open at once, and all clients together.
+pub const SOCKETS_PER_ADDRESS: usize = 16;
+pub const SOCKETS_IN_ALL: usize = 2_000;
 
 /// What a `send` came to: the `sent` body, and the answer's bytes to attach.
 pub struct Posted {
@@ -142,7 +150,41 @@ impl Relay {
             .connect_timeout(Duration::from_secs(config.timeout_seconds))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        Ok(Self { config, store, guard, http, sockets, used: std::sync::Mutex::default() })
+        let proxies = if config.trusted_proxies.is_empty() {
+            wyvrn_service::client_address::Proxies::parse(&wyvrn_service::client_address::docker_gateways())?
+        } else {
+            wyvrn_service::client_address::Proxies::parse(&config.trusted_proxies)?
+        };
+        Ok(Self { config, store, guard, http, sockets, used: std::sync::Mutex::default(), proxies, open_sockets: std::sync::Mutex::default() })
+    }
+
+    /// Counts a socket from `client` in, if there is room for it (WYV-80); give it
+    /// back with [`Relay::socket_closed`].
+    pub fn socket_opened(&self, client: std::net::IpAddr) -> bool {
+        let mut open = self.open_sockets.lock().unwrap_or_else(|p| p.into_inner());
+        let (by_address, all) = &mut *open;
+        let mine = by_address.entry(client).or_default();
+        if *mine >= SOCKETS_PER_ADDRESS || *all >= SOCKETS_IN_ALL {
+            if *mine == 0 {
+                by_address.remove(&client);
+            }
+            return false;
+        }
+        *mine += 1;
+        *all += 1;
+        true
+    }
+
+    pub fn socket_closed(&self, client: std::net::IpAddr) {
+        let mut open = self.open_sockets.lock().unwrap_or_else(|p| p.into_inner());
+        let (by_address, all) = &mut *open;
+        if let Some(mine) = by_address.get_mut(&client) {
+            *mine -= 1;
+            if *mine == 0 {
+                by_address.remove(&client);
+            }
+            *all -= 1;
+        }
     }
 
     /// Whether `did` may register at all.
@@ -236,7 +278,14 @@ impl Relay {
         let endpoint = message["body"]["endpoint"].as_str().ok_or_else(|| Refusal::malformed("open needs an endpoint"))?;
         let url = self.guard.check(endpoint, &["ws", "wss"]).await.map_err(Refusal::endpoint)?;
         use reqwest_websocket::Upgrade;
-        let response = self.sockets.get(url).upgrade().send().await.map_err(|e| Refusal::unreachable(format!("{endpoint}: {e}")))?;
+        // Nothing larger than the relay carries is read whole: a bigger message or
+        // frame ends the connection as it starts, not once 64 MiB are buffered
+        // (security review WYV-80).
+        let mut config = tungstenite::protocol::WebSocketConfig::default();
+        config.max_message_size = Some(self.config.max_bytes);
+        config.max_frame_size = Some(self.config.max_bytes);
+        let response =
+            self.sockets.get(url).upgrade().web_socket_config(config).send().await.map_err(|e| Refusal::unreachable(format!("{endpoint}: {e}")))?;
         response.into_websocket().await.map_err(|e| Refusal::unreachable(format!("{endpoint}: {e}")))
     }
 
@@ -296,5 +345,23 @@ mod tests {
         assert_eq!(all.disclosures(&asked), vec![json!({ "feature-type": "goal-code", "id": "app.wyvrn.relay.all" })]);
         let other = json!({ "queries": [{ "feature-type": "protocol", "match": "https://didcomm.org/*" }] });
         assert!(all.disclosures(&other).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod socket_tests {
+    use super::*;
+
+    #[test]
+    fn sockets_are_counted_per_address_and_given_back() {
+        let relay = Relay::new(RelayConfig::default(), Store::scratch().unwrap()).unwrap();
+        let (one, two): (std::net::IpAddr, std::net::IpAddr) = ("203.0.113.5".parse().unwrap(), "198.51.100.7".parse().unwrap());
+        for _ in 0..SOCKETS_PER_ADDRESS {
+            assert!(relay.socket_opened(one));
+        }
+        assert!(!relay.socket_opened(one), "one address holds no more");
+        assert!(relay.socket_opened(two), "another still may");
+        relay.socket_closed(one);
+        assert!(relay.socket_opened(one), "one given back makes room");
     }
 }

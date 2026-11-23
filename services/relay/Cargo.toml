@@ -19,6 +19,8 @@ reqwest = { workspace = true }
 # A WebSocket to a client's mediator, made with the same client (and so the same
 # address checks) as every post.
 reqwest-websocket = "0.6"
+# The same tungstenite reqwest-websocket uses, for its WebSocketConfig (size caps).
+tungstenite = { version = "0.28", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

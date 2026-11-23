@@ -27,6 +27,10 @@ use crate::relay::{attached, Refusal, Relay, CLOSE, FRAME, OPEN, OPENED, PIURI, 
 
 /// How many connections one client socket may have open through the relay.
 const MAX_TUNNELS: usize = 4;
+/// How long one connection through the relay lasts at most, and how long it is
+/// kept with nothing coming from the far end (security review WYV-80).
+const TUNNEL_LIFETIME: std::time::Duration = std::time::Duration::from_secs(4 * 3600);
+const TUNNEL_IDLE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 pub struct AppState {
     pub agent: Agent,
@@ -229,7 +233,15 @@ async fn open(state: &Arc<AppState>, received: &Received, sender: &str, tunnels:
                 }
             }
         };
-        while let Some(Ok(message)) = downstream.next().await {
+        // A connection lasts at most TUNNEL_LIFETIME, and ends after TUNNEL_IDLE
+        // with nothing from the far end (WYV-80).
+        let ends = tokio::time::Instant::now() + TUNNEL_LIFETIME;
+        loop {
+            let next = match tokio::time::timeout_at(ends.min(tokio::time::Instant::now() + TUNNEL_IDLE), downstream.next()).await {
+                Ok(Some(Ok(message))) => message,
+                _ => break,
+            };
+            let message = next;
             let (text, bytes) = match message {
                 reqwest_websocket::Message::Text(text) => (true, text.into_bytes()),
                 reqwest_websocket::Message::Binary(bytes) => (false, bytes.to_vec()),
@@ -280,11 +292,32 @@ async fn frame_out(state: &AppState, received: &Received, sender: &str, tunnels:
     None
 }
 
-async fn root(State(state): State<Arc<AppState>>, upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>) -> Response {
+async fn root(
+    State(state): State<Arc<AppState>>,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    headers: axum::http::HeaderMap,
+    upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> Response {
     match upgrade {
         Ok(upgrade) => {
+            // So many sockets from one client address, and in all (WYV-80).
+            let client = peer.map(|peer| wyvrn_service::client_address::bucket(state.relay.proxies.client(peer.0 .0.ip(), &headers)));
+            if let Some(client) = client {
+                if !state.relay.socket_opened(client) {
+                    return (axum::http::StatusCode::TOO_MANY_REQUESTS, "Too many connections from this address.").into_response();
+                }
+            }
             let limit = state.relay.config.max_bytes / 3 * 4 + 64 * 1024;
-            upgrade.max_message_size(limit).max_frame_size(limit).on_upgrade(move |socket| connection(state, socket)).into_response()
+            upgrade
+                .max_message_size(limit)
+                .max_frame_size(limit)
+                .on_upgrade(move |socket| async move {
+                    connection(state.clone(), socket).await;
+                    if let Some(client) = client {
+                        state.relay.socket_closed(client);
+                    }
+                })
+                .into_response()
         }
         Err(_) => format!(
             "This is a Wyvrn outbound relay ({PIURI}).\nIts DID: {}\nIt carries: {}.\nConnect a WebSocket here.\n",

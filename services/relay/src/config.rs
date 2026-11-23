@@ -41,13 +41,16 @@ pub struct RelayConfig {
     pub allow: Vec<String>,
     pub max_bytes: usize,
     pub timeout_seconds: u64,
+    /// The proxies whose X-Forwarded-For is believed, for the per-address socket
+    /// cap (security review WYV-80); empty: the Docker networks' gateways.
+    pub trusted_proxies: Vec<String>,
 }
 
 impl Default for RelayConfig {
     fn default() -> Self {
         // Closed unless said otherwise (WYV-23): `open = true` (RELAY_OPEN) for a
         // relay anyone may use.
-        Self { carries: Carries::All, open: false, clients: Vec::new(), allow: Vec::new(), max_bytes: 16 * 1024 * 1024, timeout_seconds: 30 }
+        Self { carries: Carries::All, open: false, clients: Vec::new(), allow: Vec::new(), max_bytes: 16 * 1024 * 1024, timeout_seconds: 30, trusted_proxies: Vec::new() }
     }
 }
 
@@ -56,7 +59,7 @@ impl Config {
     /// often needs to: `RELAY_BIND`, `RELAY_PUBLIC_URL`, `RELAY_DID_METHOD`,
     /// `RELAY_CARRIES` (`sends` or `all`), `RELAY_OPEN` (`true` or `false`),
     /// `RELAY_CLIENTS` (DIDs) and `RELAY_ALLOW` (hosts), separated by commas or
-    /// whitespace, and `RELAY_MAX_BYTES`.
+    /// whitespace, `RELAY_MAX_BYTES`, and `RELAY_TRUSTED_PROXIES`.
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading config {}: {e}", path.display()))?;
@@ -100,6 +103,10 @@ impl Config {
         if let Some(max) = env("RELAY_MAX_BYTES") {
             self.relay.max_bytes = max.trim().parse().map_err(|e| anyhow::anyhow!("RELAY_MAX_BYTES is {max:?}: {e}"))?;
         }
+        if let Some(proxies) = env("RELAY_TRUSTED_PROXIES") {
+            self.relay.trusted_proxies = list(proxies);
+        }
+        wyvrn_service::client_address::Proxies::parse(&self.relay.trusted_proxies).map_err(|e| anyhow::anyhow!("RELAY_TRUSTED_PROXIES: {e}"))?;
         if !self.server.public_url.ends_with('/') {
             self.server.public_url.push('/');
         }

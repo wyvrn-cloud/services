@@ -5509,6 +5509,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tungstenite 0.28.0",
  "uuid",
  "wyvrn-service",
 ]
