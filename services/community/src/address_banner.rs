@@ -91,11 +91,17 @@ async fn fetch_public(url: String) -> Result<Option<String>, String> {
     if response.content_length().is_some_and(|length| length as usize > MAX_FILE_BYTES) {
         return Err(format!("{url} is too large"));
     }
-    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-    if bytes.len() > MAX_FILE_BYTES {
-        return Err(format!("{url} is too large"));
+    // Read a piece at a time, stopping past the cap: a body sent in chunks says no
+    // length to check first (WYV-49).
+    let mut response = response;
+    let mut bytes = Vec::new();
+    while let Some(piece) = response.chunk().await.map_err(|e| e.to_string())? {
+        if bytes.len() + piece.len() > MAX_FILE_BYTES {
+            return Err(format!("{url} is too large"));
+        }
+        bytes.extend_from_slice(&piece);
     }
-    String::from_utf8(bytes.to_vec()).map(Some).map_err(|e| e.to_string())
+    String::from_utf8(bytes).map(Some).map_err(|e| e.to_string())
 }
 
 /// The linked-account credentials the address `address` publishes now, over HTTPS.
