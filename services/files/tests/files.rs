@@ -126,6 +126,9 @@ async fn a_file_is_put_in_chunks_completed_fetched_kept_and_let_go() {
     assert_eq!(whole.status(), 200);
     assert_eq!(whole.headers()["content-type"].to_str().unwrap(), "text/plain");
     assert_eq!(whole.headers()["content-disposition"].to_str().unwrap(), "attachment; filename=\"fox.txt\"");
+    // Never run as a page of the host's, even opened in a tab (WYV-52).
+    assert!(whole.headers()["content-security-policy"].to_str().unwrap().starts_with("sandbox"));
+    assert_eq!(whole.headers()["x-content-type-options"], "nosniff");
     assert_eq!(whole.headers()["accept-ranges"].to_str().unwrap(), "bytes");
     let tag = whole.headers()["etag"].to_str().unwrap().to_string();
     assert_eq!(tag, format!("\"{}\"", hash::of_bytes(bytes)));

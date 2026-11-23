@@ -55,7 +55,8 @@ pub struct ServiceConfig {
     /// Whether anyone who authenticates may become an uploader, until an admin
     /// changes it.
     pub open_signup: bool,
-    /// The most held of everyone's, in bytes; 0 for no limit but the disk.
+    /// The most held of everyone's, in bytes; 0 for no limit but the disk. 100 GiB
+    /// unless set (WYV-52): a disk filled stops every service on it.
     pub total_bytes: u64,
     pub quota_bytes: u64,
     pub max_file_bytes: u64,
@@ -72,7 +73,7 @@ impl Default for ServiceConfig {
             uploaders: Vec::new(),
             admins: Vec::new(),
             open_signup: false,
-            total_bytes: 0,
+            total_bytes: 100 * 1024 * 1024 * 1024,
             quota_bytes: 10 * 1024 * 1024 * 1024,
             max_file_bytes: 4 * 1024 * 1024 * 1024,
             chunk_bytes: 64 * 1024 * 1024,

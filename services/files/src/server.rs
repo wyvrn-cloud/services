@@ -327,8 +327,10 @@ async fn fetch(State(state): State<Arc<AppState>>, Path(id): Path<String>, reque
         headers.insert(header::ETAG, value);
     }
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=3600"));
-    // Bytes are bytes, whatever a browser might make of them.
+    // Bytes are bytes, whatever a browser might make of them: never run as a page
+    // of this host's, even opened in a tab (WYV-52).
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox; default-src 'none'; frame-ancestors 'none'"));
     response
 }
 

@@ -61,12 +61,15 @@ pub struct Host {
     pub config: ServiceConfig,
     /// Ends in `/`.
     public_url: String,
+    /// Held from a quota's check to the file being made, so two uploads granted at
+    /// once can't both fit in what only one does (WYV-52).
+    granting: std::sync::Mutex<()>,
 }
 
 impl Host {
     pub fn new(store: Store, config: ServiceConfig, public_url: &str) -> Self {
         let public_url = if public_url.ends_with('/') { public_url.to_string() } else { format!("{public_url}/") };
-        Self { store, config, public_url }
+        Self { store, config, public_url, granting: std::sync::Mutex::new(()) }
     }
 
     /// Where a stored file is fetched from.
@@ -135,6 +138,7 @@ impl Host {
                 return Ok(self.granted(&existing));
             }
         }
+        let _granting = self.granting.lock().unwrap_or_else(|p| p.into_inner());
         let used = self.store.used_by(sender).map_err(internal)?;
         if used + byte_count > limits.quota_bytes {
             return Err(Refusal::new("e.p.msg.quota", "You keep {1} bytes here of the {2} you may.").with_args(&[used.to_string(), limits.quota_bytes.to_string()]));
