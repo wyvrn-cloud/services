@@ -38,9 +38,17 @@ pub struct AssistantConfig {
     /// Requests one member may make a day; 0 for no limit.
     #[serde(default = "default_daily_requests")]
     pub daily_requests_per_member: u32,
-    /// Tokens (in and out) the service may use in 30 days; 0 for no limit.
-    #[serde(default)]
+    /// Tokens (in and out) the service may use in 30 days; 0 for no limit (said
+    /// so on purpose: left out, it is [`DEFAULT_PERIOD_TOKENS`], WYV-57).
+    #[serde(default = "default_period_tokens")]
     pub period_tokens: u64,
+}
+
+/// What the service may spend in 30 days unless told otherwise: a budget, so a
+/// key isn't spent without end by a configuration that never said (WYV-57).
+pub const DEFAULT_PERIOD_TOKENS: u64 = 10_000_000;
+fn default_period_tokens() -> u64 {
+    DEFAULT_PERIOD_TOKENS
 }
 
 fn default_name() -> String {

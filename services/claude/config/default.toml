@@ -48,6 +48,6 @@ max_tokens = 2048
 # How many of a room's latest posts Claude is given.
 context_posts = 40
 # Requests one member may make a day (0: no limit), and tokens the service may
-# use in 30 days (0: no limit).
+# use in 30 days (0: no limit, said on purpose).
 daily_requests_per_member = 50
-period_tokens = 0
+period_tokens = 10000000

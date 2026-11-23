@@ -26,7 +26,7 @@ environment overrides the first four):
 | `api_key` | `ANTHROPIC_API_KEY` | none | Without one, rooms say Claude couldn't answer. |
 | `model` | `CLAUDE_MODEL` | `claude-sonnet-5-5` | |
 | `daily_requests_per_member` | `CLAUDE_DAILY_REQUESTS` | 50 | Answers one member may ask for a day; 0 for no limit. |
-| `period_tokens` | `CLAUDE_PERIOD_TOKENS` | 0 | Tokens, in and out, the whole service may use in 30 days; 0 for no limit. |
+| `period_tokens` | `CLAUDE_PERIOD_TOKENS` | 10000000 | Tokens, in and out, the whole service may use in 30 days; 0 for no limit. |
 | `name` | | `Claude` | What its posts are signed as. |
 | `system` | | empty | Said to Claude before every room's conversation, besides where it is. |
 | `max_tokens` | | 2048 | The longest answer. |
