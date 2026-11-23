@@ -685,14 +685,15 @@ async fn a_community_at_its_own_domain_once_proved_by_its_txt_record() {
 
     // Claimed, and not yet proved: no certificate, and not its.
     assert!(running.host.registry.claim_domain("club", "club.example.org", "wyvrn-token1", wyvrn_service::now()).unwrap());
-    assert!(!running.host.registry.claim_domain("other", "club.example.org", "wyvrn-token2", wyvrn_service::now()).unwrap(), "another community's");
+    assert!(running.host.registry.claim_domain("other", "club.example.org", "wyvrn-token2", wyvrn_service::now()).unwrap(), "named by another too: whoever proves it first");
     assert_eq!(ask("club.example.org").await.unwrap().status(), 404);
     assert!(domains::txt_records(&dns_url, "_wyvrn.club.example.org").await.unwrap().is_empty());
 
     // The TXT record set: proved.
     *record.lock().unwrap() = "wyvrn-token1".to_string();
     assert_eq!(domains::txt_records(&dns_url, "_wyvrn.club.example.org").await.unwrap(), ["wyvrn-token1"]);
-    running.host.registry.domain_proved("club", 2).unwrap();
+    assert!(running.host.registry.domain_proved("club", 2).unwrap());
+    assert!(!running.host.registry.claim_domain("other", "club.example.org", "wyvrn-token2", wyvrn_service::now()).unwrap(), "proved: another community's");
     assert_eq!(ask("club.example.org").await.unwrap().status(), 200);
     assert_eq!(ask("someone-elses.example.org").await.unwrap().status(), 404);
 

@@ -543,7 +543,7 @@ impl Host {
             match crate::domains::txt_records(&self.config.domains.dns_over_https, &name).await {
                 Ok(records) if !records.iter().any(|r| r == &held.token) => {
                     tracing::warn!(community = %held.name, domain = %held.domain, "a domain's TXT proof is gone: no longer served there until proved again");
-                    if let Err(error) = self.registry.domain_unproved(&held.name) {
+                    if let Err(error) = self.registry.domain_unproved(&held.name, now()) {
                         tracing::warn!(%error, "couldn't mark a domain unproved");
                     }
                     self.unload(&held.name);

@@ -43,7 +43,16 @@ CREATE TABLE IF NOT EXISTS community_domains (
 CREATE TABLE IF NOT EXISTS domain_claims (
     domain TEXT PRIMARY KEY,
     claimed_at INTEGER NOT NULL
-);";
+);
+-- Claims not yet proved, any number to one domain, each with its own token: the
+-- first proved wins, and each runs out a day after it was made (WYV-81).
+CREATE TABLE IF NOT EXISTS domain_pending (
+    name TEXT PRIMARY KEY,
+    domain TEXT NOT NULL,
+    token TEXT NOT NULL,
+    claimed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS domain_pending_by_domain ON domain_pending (domain);";
 
 fn schema() -> Schema {
     static MYSQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
