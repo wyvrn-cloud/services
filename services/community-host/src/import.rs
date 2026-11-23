@@ -33,6 +33,7 @@ impl Host {
     /// changed. Made suspended and served only once everything is in: a copy that
     /// fails leaves nothing behind. Blocks.
     pub fn import(&self, name: &str, title: &str, owner: &str, storage: Storage, from: &Source, now: i64) -> anyhow::Result<String> {
+        self.refuse_leftover(name)?;
         let record = self.registry.create(name, title, storage, owner, "an import", now)?;
         // Not opened (by a host that is running) before it is all here.
         self.registry.set_state(name, State::Suspended, None)?;
@@ -42,6 +43,19 @@ impl Host {
                 Ok(said)
             }
             Err(error) => {
+                // Nothing of it stays (WYV-46): its keys above all, which a community
+                // made later under the same name would otherwise take for its own.
+                if record.storage != Storage::Sqlite {
+                    if let Ok(stores) = self.stores(&record, record.storage) {
+                        let _ = wyvrn_service::db::drop_store(&stores.community, "community");
+                        for (store, service) in [(&stores.stickers, "stickers"), (&stores.files, "files")] {
+                            if let Some(store) = store {
+                                let _ = wyvrn_service::db::drop_store(store, service);
+                            }
+                        }
+                    }
+                }
+                let _ = std::fs::remove_dir_all(self.folder(name));
                 let _ = self.registry.forget(name);
                 Err(error)
             }

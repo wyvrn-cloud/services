@@ -294,6 +294,7 @@ impl Pages for AppState {
                 "" => name.clone(),
                 title => title.to_string(),
             };
+            host.refuse_leftover(&name).map_err(|error| error.to_string())?;
             let record = host.registry.create(&name, &title, storage, owner, admin, now).map_err(|error| error.to_string())?;
             tracing::info!(community = %record.name, owner = %record.owner, by = %admin, "made a community from an admin page");
             return Ok(Some(format!("{} is made, at {}c/{}/.", record.name, host.config.server.public_url, record.name)));

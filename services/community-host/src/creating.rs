@@ -146,6 +146,12 @@ impl Pages for ForAnyone<'_> {
             return Err("That code isn't one, or has been used.".into());
         }
         let storage = Storage::parse(&state.host.config.storage.default).unwrap_or(Storage::Sqlite);
+        if state.host.leftover(&name).is_some() {
+            if mode == Mode::Codes {
+                let _ = registry.unuse_code(code);
+            }
+            return Err("That address is taken.".into());
+        }
         let record = match registry.create(&name, &title, storage, owner, owner, now) {
             Ok(record) => record,
             Err(error) => {

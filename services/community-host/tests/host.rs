@@ -708,3 +708,69 @@ async fn a_community_at_its_own_domain_once_proved_by_its_txt_record() {
     // And its web view's address is the domain.
     assert_eq!(running.host.settings(&running.host.registry.get("club").unwrap().unwrap()).web.public_url.as_deref(), Some("https://club.example.org/"));
 }
+
+#[tokio::test]
+async fn a_failed_import_leaves_nothing_behind_and_a_leftover_folder_is_never_taken_over() {
+    let running = start_host(600).await;
+    let host = running.host.clone();
+    // Nothing to bring in: no keys where it says (WYV-46).
+    let nowhere = std::env::temp_dir().join(format!("wyvrn-no-community-{}", unique()));
+    std::fs::create_dir_all(&nowhere).unwrap();
+    let source = wyvrn_community_host::import::Source { community: wyvrn_service::db::Location::Sqlite(nowhere.join("community.sqlite")), stickers: None, files: None, files_records: None };
+    let in_host = host.clone();
+    let failed = tokio::task::spawn_blocking(move || in_host.import("ghost", "Ghost", "did:example:owner", Storage::Sqlite, &source, 1)).await.unwrap();
+    assert!(failed.is_err());
+    assert!(host.leftover("ghost").is_none(), "its folder went with it");
+    assert!(host.registry.get("ghost").unwrap().is_none());
+
+    // A folder something else left, keys and all, is refused for a new community.
+    std::fs::create_dir_all(host.folder("left")).unwrap();
+    std::fs::write(host.folder("left").join("identity.json"), "{}").unwrap();
+    assert!(host.refuse_leftover("left").is_err());
+    let _ = std::fs::remove_dir_all(&nowhere);
+}
+
+#[tokio::test]
+async fn a_deleted_community_is_purged_once_its_time_to_be_kept_runs_out() {
+    let running = start_host(600).await;
+    let host = running.host.clone();
+    host.registry.create("gone", "Gone", Storage::Sqlite, "did:example:owner", "test", 1).unwrap();
+    host.tenant("gone").await.unwrap().unwrap();
+    host.unload("gone");
+    assert!(host.leftover("gone").is_some());
+    host.registry.set_state("gone", Standing::Deleted, Some(1_000)).unwrap();
+    // Still being kept (WYV-48).
+    host.housekeeping(999).await;
+    assert!(host.registry.get("gone").unwrap().is_some());
+    assert!(host.leftover("gone").is_some());
+    // Its time ran out: gone for good, and the name free again.
+    host.housekeeping(1_000).await;
+    assert!(host.registry.get("gone").unwrap().is_none());
+    assert!(host.leftover("gone").is_none());
+    host.registry.create("gone", "Again", Storage::Sqlite, "did:example:other", "test", 2).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_purged_community_kept_in_mysql_loses_its_tables_and_no_one_elses() {
+    let Some(url) = std::env::var("WYVRN_TEST_DATABASE_URL").ok().filter(|url| !url.is_empty()) else { return };
+    let server = url.trim_end_matches('/');
+    let running = start_host_with(600, server).await;
+    let host = running.host.clone();
+    for name in ["gone", "stays"] {
+        host.registry.create(name, name, Storage::MySqlShared, "did:example:owner", "test", 1).unwrap();
+        host.tenant(name).await.unwrap().unwrap();
+        host.unload(name);
+    }
+    let shared = host.config.storage.shared_database.clone();
+    let tables = |like: String| {
+        let mut admin = mysql::Conn::new(mysql::Opts::from_url(server).unwrap()).unwrap();
+        mysql::prelude::Queryable::exec::<String, _, _>(&mut admin, "SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_name LIKE ?", (shared.clone(), like)).unwrap()
+    };
+    let (gone, stays) = (host.registry.get("gone").unwrap().unwrap(), host.registry.get("stays").unwrap().unwrap());
+    assert!(!tables(format!("c{}\\_%", gone.id)).is_empty());
+    host.registry.set_state("gone", Standing::Deleted, Some(10)).unwrap();
+    host.housekeeping(10).await;
+    assert!(host.registry.get("gone").unwrap().is_none());
+    assert!(tables(format!("c{}\\_%", gone.id)).is_empty(), "its tables went");
+    assert!(!tables(format!("c{}\\_%", stays.id)).is_empty(), "another's stayed");
+}

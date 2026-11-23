@@ -141,6 +141,46 @@ impl Host {
         self.config.storage.dir.join(name)
     }
 
+    /// A folder left at `name`'s place by a community that was there before (a
+    /// failed import, a purge cut short): never taken over by a new one, which
+    /// would find the old one's keys (security review WYV-46).
+    pub fn leftover(&self, name: &str) -> Option<PathBuf> {
+        let folder = self.folder(name);
+        std::fs::read_dir(&folder).ok()?.next().is_some().then_some(folder)
+    }
+
+    /// Refuses to make `name` over what another community left.
+    pub fn refuse_leftover(&self, name: &str) -> anyhow::Result<()> {
+        match self.leftover(name) {
+            Some(folder) => anyhow::bail!("a community called {name} left its folder at {}: move it away (or delete it) first", folder.display()),
+            None => Ok(()),
+        }
+    }
+
+    /// Everything of `record` gone for good (security review WYV-48): its tables,
+    /// wherever it is kept, its folder, and its place in the registry. For a
+    /// community deleted or moved whose time to be kept has run out.
+    pub fn purge(&self, record: &Record) -> anyhow::Result<()> {
+        self.unload(&record.name);
+        let stores = self.stores(record, record.storage)?;
+        if record.storage != Storage::Sqlite {
+            wyvrn_service::db::drop_store(&stores.community, "community")?;
+            if let Some(stickers) = &stores.stickers {
+                wyvrn_service::db::drop_store(stickers, "stickers")?;
+            }
+            if let Some(files) = &stores.files {
+                wyvrn_service::db::drop_store(files, "files")?;
+            }
+        }
+        let folder = self.folder(&record.name);
+        if folder.exists() {
+            std::fs::remove_dir_all(&folder)?;
+        }
+        self.registry.forget(&record.name)?;
+        tracing::warn!(community = %record.name, state = %record.state.as_str(), "purged: its time to be kept ran out");
+        Ok(())
+    }
+
     /// Where `record`'s stores are, kept as `storage`.
     pub fn stores(&self, record: &Record, storage: Storage) -> anyhow::Result<Stores> {
         let folder = self.folder(&record.name);
@@ -351,6 +391,17 @@ impl Host {
 
     /// Opens what is due, and closes what is idle or past the most kept open.
     pub async fn housekeeping(&self, now: i64) {
+        // Deleted or moved, and kept as long as it was to be: gone for good.
+        match self.registry.all() {
+            Ok(all) => {
+                for record in all.into_iter().filter(|r| matches!(r.state, State::Deleted | State::Moved) && r.sealed_until.is_some_and(|until| until <= now)) {
+                    if let Err(error) = self.purge(&record) {
+                        tracing::warn!(community = %record.name, error = %format!("{error:#}"), "couldn't purge a community whose time ran out");
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(%error, "couldn't read the communities to purge"),
+        }
         match self.registry.due(now) {
             Ok(due) => {
                 for record in due {

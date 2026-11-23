@@ -753,6 +753,22 @@ pub fn empty_tables(to: &Location, service: &str, tables: &[String]) -> Result<(
     })
 }
 
+/// Drops every table of the store at `location`, its mark included: what is left
+/// of a community that is gone for good (a host's purge). A store sharing a
+/// database loses only its own tables; one with a database of its own is left an
+/// empty database (dropping that is the database's admin's).
+pub fn drop_store(location: &Location, service: &str) -> Result<usize> {
+    const NOTHING: Schema = Schema { sqlite: "", mysql: "" };
+    let store = Db::open(location, &NOTHING, service)?;
+    let mut writing = store.lock();
+    let tables = writing.tables()?;
+    for table in &tables {
+        writing.execute(&format!("DROP TABLE IF EXISTS \"{table}\""), &[])?;
+    }
+    writing.execute("DROP TABLE IF EXISTS \"wyvrn_service\"", &[])?;
+    Ok(tables.len())
+}
+
 fn copy_tables(from: &Location, to: &Location, service: &str, skip: &[&str], only_held: bool) -> Result<Copied> {
     const NOTHING: Schema = Schema { sqlite: "", mysql: "" };
     let (source, target) = (Db::open(from, &NOTHING, service)?, Db::open(to, &NOTHING, service)?);
