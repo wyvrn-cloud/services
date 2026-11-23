@@ -62,12 +62,52 @@ pub fn render_markdown(content: &str) -> String {
                     }
                 }
             }
+            // A link or picture goes only to the web or an email address
+            // (WYV-58): a `javascript:` one would run as this page.
+            Event::Start(pulldown_cmark::Tag::Link { link_type, dest_url, title, id }) => {
+                let dest_url = if safe_target(&dest_url) { dest_url } else { "#".into() };
+                events.push(Event::Start(pulldown_cmark::Tag::Link { link_type, dest_url, title, id }));
+            }
+            Event::Start(pulldown_cmark::Tag::Image { link_type, dest_url, title, id }) => {
+                let dest_url = if safe_target(&dest_url) && !dest_url.starts_with("mailto:") { dest_url } else { "".into() };
+                events.push(Event::Start(pulldown_cmark::Tag::Image { link_type, dest_url, title, id }));
+            }
             other => events.push(other),
         }
     }
     let mut rendered = String::new();
     html::push_html(&mut rendered, events.into_iter());
     rendered
+}
+
+/// Whether a link may go to `target`: `http(s):` or `mailto:`, or a place on this
+/// site (no scheme at all).
+pub fn safe_target(target: &str) -> bool {
+    let target = target.trim();
+    match target.find(':') {
+        // A colon after a `/`, `?` or `#` is part of a path, not a scheme.
+        Some(colon) if !target[..colon].contains(['/', '?', '#']) => {
+            let scheme = target[..colon].to_ascii_lowercase();
+            matches!(scheme.as_str(), "http" | "https" | "mailto")
+        }
+        _ => true,
+    }
+}
+
+/// The pages' Content-Security-Policy (WYV-58): nothing but what they are made
+/// of, their one style and one script allowed by their hashes.
+pub fn csp() -> &'static str {
+    static CSP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        use base64::Engine;
+        use sha2::Digest;
+        let hash = |text: &str| base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(text.as_bytes()));
+        format!(
+            "default-src 'none'; style-src 'sha256-{}'; script-src 'sha256-{}'; img-src https: data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            hash(STYLE),
+            hash(wyvrn_service::timestamps::SCRIPT)
+        )
+    });
+    &CSP
 }
 
 /// What to call a post that has no title of its own: its first line, without the
@@ -271,6 +311,9 @@ mod tests {
         assert!(rendered.contains("<h1>0.0.9</h1>"));
         assert!(rendered.contains("<strong>Fixed</strong>"));
         assert!(!rendered.contains("<script"));
+        let linked = render_markdown("[click](javascript:alert(1)) [ok](https://example.com/) [mail](mailto:a@example.com) [here](/posts/2) ![x](javascript:alert(2))");
+        assert!(!linked.contains("javascript:"), "{linked}");
+        assert!(linked.contains("href=\"https://example.com/\"") && linked.contains("href=\"mailto:a@example.com\"") && linked.contains("href=\"/posts/2\""), "{linked}");
         assert!(!rendered.contains("<b onclick"));
         assert!(rendered.contains("&lt;script&gt;"));
     }

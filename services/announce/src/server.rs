@@ -115,6 +115,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         // A browser app sends its messages, and resolves a did:web, from another origin.
         .layer(CorsLayer::permissive())
+        .layer(axum::middleware::map_response(|mut response: axum::response::Response| async move {
+            response.headers_mut().insert(axum::http::header::CONTENT_SECURITY_POLICY, axum::http::HeaderValue::from_static(crate::web::csp()));
+            response.headers_mut().insert(axum::http::header::X_CONTENT_TYPE_OPTIONS, axum::http::HeaderValue::from_static("nosniff"));
+            response
+        }))
         .with_state(state)
 }
 

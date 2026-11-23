@@ -712,10 +712,32 @@ async fn answer_post(state: &Arc<AppState>, id: &str) -> anyhow::Result<()> {
     // assistant never answered.
     let day = format!("assistant:day:{}:{}", at / 86_400, crate::assistant::member_key(&asked.author_did));
     let period = format!("assistant:period:{}", at / crate::assistant::PERIOD_SECS);
-    let used: u32 = store.setting(&day)?.and_then(|v| v.parse().ok()).unwrap_or(0);
-    let spent: u64 = store.setting(&period)?.and_then(|v| v.parse().ok()).unwrap_or(0);
-    let text = match assistant.refusal(used, spent) {
-        Some(why) => why.to_string(),
+    // Checked and taken in one go (WYV-57): two questions at once each found room
+    // for one more, and both were asked. The period's tokens are taken at their
+    // most (max_tokens) now and given back but for what was used.
+    static RESERVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let most = assistant.config.max_tokens as u64;
+    let refused = {
+        let _reserving = RESERVING.lock().unwrap_or_else(|p| p.into_inner());
+        let used: u32 = store.setting(&day)?.and_then(|v| v.parse().ok()).unwrap_or(0);
+        let spent: u64 = store.setting(&period)?.and_then(|v| v.parse().ok()).unwrap_or(0);
+        match assistant.refusal(used, spent) {
+            Some(why) => Some(why.to_string()),
+            None => {
+                store.set_setting(&day, &(used + 1).to_string())?;
+                store.set_setting(&period, &(spent + most).to_string())?;
+                None
+            }
+        }
+    };
+    let settle = |tokens: u64| -> anyhow::Result<()> {
+        let _reserving = RESERVING.lock().unwrap_or_else(|p| p.into_inner());
+        let spent: u64 = store.setting(&period)?.and_then(|v| v.parse().ok()).unwrap_or(0);
+        store.set_setting(&period, &(spent.saturating_sub(most) + tokens).to_string())?;
+        Ok(())
+    };
+    let text = match refused {
+        Some(why) => why,
         None => {
             // The room's, or the thread's with the post it grew from first.
             let mut posts = store.channel_posts_before(&asked.channel, asked.thread.as_deref(), Some(asked.seq + 1), assistant.config.context_posts)?;
@@ -724,13 +746,13 @@ async fn answer_post(state: &Arc<AppState>, id: &str) -> anyhow::Result<()> {
                 posts.insert(0, root);
             }
             let turns = crate::assistant::turns_of(&posts, &own);
-            store.set_setting(&day, &(used + 1).to_string())?;
             match assistant.ask(&channel.name, &turns).await {
                 Ok((text, tokens)) => {
-                    store.set_setting(&period, &(spent + tokens).to_string())?;
+                    settle(tokens)?;
                     text
                 }
                 Err(err) => {
+                    settle(0)?;
                     tracing::warn!(post = %id, "the model didn't answer: {err:#}");
                     format!("{} couldn’t answer just now. Try again in a moment.", assistant.config.name)
                 }

@@ -204,11 +204,20 @@ impl Relay {
         let response = self.http.post(url).header(reqwest::header::CONTENT_TYPE, content_type).body(bytes).send().await.map_err(|e| Refusal::unreachable(format!("{endpoint}: {e}")))?;
         let status = response.status().as_u16();
         let answer_type = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_string);
-        let answer = response.bytes().await.map_err(|e| Refusal::unreachable(format!("{endpoint}: {e}")))?;
+        // Read a piece at a time, and stopped as soon as it is too large (WYV-57):
+        // never held whole first.
+        let mut response = response;
+        let mut answer = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| Refusal::unreachable(format!("{endpoint}: {e}")))? {
+            answer.extend_from_slice(&chunk);
+            if answer.len() > self.config.max_bytes {
+                return Err(Refusal::too_large(self.config.max_bytes));
+            }
+        }
         let mut body = json!({ "status": status });
         // Handed back whatever the relay carries: a service may answer on the same
         // connection (return_route), and the request fails without its answer.
-        let answer = (!answer.is_empty()).then(|| answer.to_vec());
+        let answer = (!answer.is_empty()).then_some(answer);
         if let (Some(answer_type), Some(_)) = (answer_type, &answer) {
             body["content_type"] = json!(answer_type);
         }
