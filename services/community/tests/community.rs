@@ -4638,18 +4638,21 @@ async fn new_accounts_are_held_back_where_the_gates_say_and_a_ban_follows_its_li
     assert_eq!(newbie.community("post", json!({ "channel": channel, "content": "see https://example.com" })).await["body"]["code"], "e.p.msg.too-new");
     assert_eq!(kind(&newbie.community("post", json!({ "channel": channel, "content": "hello, I'm new" })).await), "posted");
 
-    // Banned, and back with another DID holding the same Twitch account: banned on sight.
+    // Banned, and back with another DID holding the same Twitch account: the
+    // moderators are told, in a report, and decide (WYV-89).
     admin.community("ban", json!({ "did": member.did(), "reason": "spam" })).await;
     state.community.store.set_member_accounts(&again.did(), std::slice::from_ref(&twitch), 2).unwrap();
-    let (banned, service, account) = state.community.store.banned_holding(&[twitch], wyvrn_service::now()).unwrap().unwrap();
+    let (banned, _, _) = state.community.store.banned_holding(&[twitch], wyvrn_service::now()).unwrap().unwrap();
     assert_eq!(banned, member.did());
-    state.community.ban_evading(&again.did(), &banned, &service, &account, wyvrn_service::now()).unwrap();
-    assert!(state.community.store.member(&again.did()).unwrap().is_none());
-    assert!(state.community.store.banned(&again.did(), wyvrn_service::now()).unwrap().is_some());
+    state.community.ban_holders(&banned, wyvrn_service::now()).unwrap();
+    assert!(state.community.store.member(&again.did()).unwrap().is_some(), "not removed");
+    assert!(state.community.store.banned(&again.did(), wyvrn_service::now()).unwrap().is_none(), "not banned on a match alone");
+    let reports = state.community.store.reports(false).unwrap();
+    assert!(reports.iter().any(|r| r.member.as_deref() == Some(again.did().as_str()) && r.reason == "ban-evasion"));
 }
 
 #[tokio::test]
-async fn a_ban_reaches_another_did_already_in_and_accounts_linked_after_it() {
+async fn a_ban_tells_the_moderators_of_another_did_already_in_and_of_accounts_linked_after_it() {
     let server = start_server("").await;
     let (admin, troll, alt, later) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
     server.admit(&[&admin, &troll, &alt, &later]);
@@ -4665,14 +4668,21 @@ async fn a_ban_reaches_another_did_already_in_and_accounts_linked_after_it() {
     store.set_member_accounts(&later.did(), std::slice::from_ref(&bsky), 1).unwrap();
     admin.community("ban", json!({ "did": troll.did(), "reason": "spam" })).await;
     let now = wyvrn_service::now();
-    assert!(store.banned(&alt.did(), now).unwrap().is_some(), "the alt already in");
-    assert!(store.member(&alt.did()).unwrap().is_none());
-    assert!(store.banned(&later.did(), now).unwrap().is_none(), "not an account the ban knew of");
-    // The banned person's address proves another account since: it's banned too,
-    // and whoever here holds it.
+    let reported = |did: String| store.reports(false).unwrap().iter().filter(|r| r.member.as_deref() == Some(did.as_str()) && r.reason == "ban-evasion").count();
+    // The alt already in, with the same account: reported to the moderators, not banned (WYV-89).
+    assert!(store.banned(&alt.did(), now).unwrap().is_none());
+    assert!(store.member(&alt.did()).unwrap().is_some());
+    assert_eq!(reported(alt.did()), 1, "the alt already in");
+    assert_eq!(reported(later.did()), 0, "not an account the ban knew of");
+    // The banned person's address proves another account since: the ban knows it,
+    // and whoever here holds it is reported.
     assert!(server.state.community.banned_now_hold(&troll.did(), std::slice::from_ref(&bsky), now).unwrap().is_some());
-    assert!(store.banned(&later.did(), now).unwrap().is_some());
+    assert!(store.banned(&later.did(), now).unwrap().is_none());
+    assert_eq!(reported(later.did()), 1);
     assert!(server.state.community.banned_now_hold(&troll.did(), &[bsky], now).unwrap().is_none(), "nothing new the second time");
+    // Looked at again, an open report isn't made twice.
+    server.state.community.ban_holders(&troll.did(), now).unwrap();
+    assert_eq!(reported(alt.did()), 1);
 }
 
 #[tokio::test]

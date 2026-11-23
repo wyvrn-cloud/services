@@ -602,7 +602,10 @@ async fn consider_profile(state: Arc<AppState>, did: String, address: String, li
         if banned == did {
             return Ok(false);
         }
-        let outcome = community.ban_evading(&did, &banned, &service, &account, now())?;
+        // Suggested to the moderators, not acted on (WYV-89); and nothing
+        // imported is made theirs meanwhile.
+        let _ = (service, account);
+        let outcome = community.ban_holders(&banned, now())?;
         carry_out(&state, &did, outcome);
         Ok(true)
     })();

@@ -95,6 +95,9 @@ impl Store {
     }
 }
 
+/// A report's reason when the community itself suggests a ban-evasion match (WYV-89).
+pub const BAN_EVASION: &str = "ban-evasion";
+
 impl Community {
     /// Raid mode, while on: `{ until, by, at }`.
     pub fn raid(&self, now: i64) -> anyhow::Result<Option<Value>> {
@@ -124,50 +127,45 @@ impl Community {
         Ok((joins >= threshold).then_some(joins))
     }
 
-    /// Bans `did`, who holds `service`'s `account` that `banned` was banned holding:
-    /// a ban coming back under another DID, for as long as that one runs.
-    pub fn ban_evading(&self, did: &str, banned: &str, service: &str, account: &str, now: i64) -> anyhow::Result<crate::community::Outcome> {
-        let until = self.store.banned(banned, now)?.and_then(|ban| ban.until);
-        let name = self.store.member(did)?.and_then(|m| m.name).or(self.store.waiting_one(did)?.and_then(|w| w.name));
-        let reason = format!("Holds the {service} account of someone banned here");
-        self.store.ban(&crate::store::Ban { did: did.to_string(), name, by: self.own.clone().unwrap_or_default(), at: now, until, reason: Some(reason.clone()) })?;
-        self.keep_ban_terms(did, &crate::appeals::Terms { shared: true, closed: false, auto: true })?;
-        self.store.ban_accounts_of(did, until, now)?;
-        let was_waiting = self.store.remove_waiting(did)?;
-        let was_member = self.store.member(did)?.is_some();
-        if was_member {
-            self.store.remove_member(did)?;
-        }
-        let mut outcome = crate::community::Outcome::default();
-        if was_member || was_waiting {
-            outcome.notices.push((did.to_string(), self.removed_banned(did, now)?));
-        }
-        if was_waiting {
-            outcome.notices.extend(self.admins_told()?);
-        }
-        self.audit(now, self.own.as_deref().unwrap_or_default(), "member.ban-evasion", Some(did), Some(json!({ "as": banned, "service": service, "account": account, "until": until })));
-        Ok(outcome)
-    }
-
-    /// Bans whoever is here holding one of the accounts `banned` was banned holding:
-    /// a ban reaching what came in before it (another DID of theirs already a
-    /// member), or what it was found to hold since. Not an owner or admin, who is
-    /// left to be looked at, in the audit log.
+    /// Tells the moderators of whoever is here holding one of the accounts `banned`
+    /// was banned holding: a report about them, to look at, not a ban (security
+    /// review WYV-89). A linked account can be proved wrongly, and a ban made on a
+    /// match alone would let someone banned get anyone holding an account they
+    /// claim banned too. One open report a member at a time.
     pub fn ban_holders(&self, banned: &str, now: i64) -> anyhow::Result<crate::community::Outcome> {
         let mut outcome = crate::community::Outcome::default();
         let accounts = self.store.member_accounts(banned)?;
+        let open = self.store.reports(false)?;
         for did in self.store.holders_of(&accounts, banned)? {
             if self.store.banned(&did, now)?.is_some() || (self.store.member(&did)?.is_none() && self.store.waiting_one(&did)?.is_none()) {
                 continue;
             }
-            let held: Vec<(String, String)> = self.store.member_accounts(&did)?.into_iter().filter(|a| accounts.contains(a)).collect();
-            let Some((service, account)) = held.first().cloned() else { continue };
-            if self.powers(&did)?.all() {
-                self.audit(now, self.own.as_deref().unwrap_or_default(), "member.ban-evasion-spared", Some(&did), Some(json!({ "as": banned, "service": service, "account": account })));
+            if open.iter().any(|r| r.member.as_deref() == Some(did.as_str()) && r.reason == BAN_EVASION) {
                 continue;
             }
-            let more = self.ban_evading(&did, banned, &service, &account, now)?;
-            outcome.notices.extend(more.notices);
+            let held: Vec<(String, String)> = self.store.member_accounts(&did)?.into_iter().filter(|a| accounts.contains(a)).collect();
+            let Some((service, account)) = held.first().cloned() else { continue };
+            let mut report = crate::store::Report {
+                id: uuid::Uuid::new_v4().to_string(),
+                reported_at: now,
+                by: self.own.clone().unwrap_or_default(),
+                reason: BAN_EVASION.to_string(),
+                note: Some(format!(
+                    "Holds the {service} account {account}, which someone banned here ({banned}) also proves. It may be them under another DID, or the account may have been linked wrongly: look before banning."
+                )),
+                post_id: None,
+                post: None,
+                member: Some(did.clone()),
+                resolved_at: None,
+                resolved_by: None,
+            };
+            report.id = self.store.add_report(&report)?;
+            self.audit(now, self.own.as_deref().unwrap_or_default(), "member.ban-evasion-suggested", Some(&did), Some(json!({ "as": banned, "service": service, "account": account })));
+            let open_now = self.store.reports(false)?.len();
+            for moderator in self.joined_holding("manage_reports")? {
+                let body = json!({ "reports": [self.report_body(&report, &moderator.did)?], "open": open_now });
+                outcome.notices.push((moderator.did, json!({ "type": crate::community::REPORTS, "id": uuid::Uuid::new_v4().to_string(), "body": body })));
+            }
         }
         Ok(outcome)
     }
