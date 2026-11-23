@@ -176,6 +176,12 @@ impl Host {
         if folder.exists() {
             std::fs::remove_dir_all(&folder)?;
         }
+        // Its backups too: kept as long as it was, and no longer.
+        let backups = self.backups_of(&record.name);
+        if backups.exists() && backups != folder {
+            std::fs::remove_dir_all(&backups)?;
+        }
+        self.exports.forget(&record.name);
         self.registry.forget(&record.name)?;
         tracing::warn!(community = %record.name, state = %record.state.as_str(), "purged: its time to be kept ran out");
         Ok(())
@@ -391,6 +397,7 @@ impl Host {
 
     /// Opens what is due, and closes what is idle or past the most kept open.
     pub async fn housekeeping(&self, now: i64) {
+        self.exports.expire(now);
         // Deleted or moved, and kept as long as it was to be: gone for good.
         match self.registry.all() {
             Ok(all) => {
@@ -449,6 +456,10 @@ impl Host {
     /// Housekeeping every 15 seconds, for as long as the host runs; stores
     /// measured every five minutes.
     pub async fn run_housekeeping(self: Arc<Self>) {
+        {
+            let host = self.clone();
+            let _ = tokio::task::spawn_blocking(move || host.sweep_backup_leftovers()).await;
+        }
         let mut measured = 0;
         let mut backed_up = 0;
         loop {

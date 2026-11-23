@@ -7,9 +7,11 @@
 //! who reaches the disk could read would be the communities' keys for the taking.
 //!
 //! **The sealed file** (`.wyvrn-backup`), version 2 (security review WYV-47):
-//! `WYVRNBK2`, 8 random bytes, the community's name (`u16` big-endian length,
-//! then UTF-8), then the archive in pieces of up to 1 MiB, each `u32` (big-endian)
-//! length and AES-256-GCM ciphertext. A piece's nonce is the 8 bytes and its
+//! `WYVRNBK2`, 8 random bytes, when it was made (`u64` big-endian seconds), which
+//! key sealed it (the first 8 bytes of the key's SHA-256), the community's name
+//! (`u16` big-endian length, then UTF-8), then the archive in pieces of up to
+//! 1 MiB, each `u32` (big-endian) length (at most a piece and its tag) and
+//! AES-256-GCM ciphertext. A piece's nonce is the 8 bytes and its
 //! number (`u32`, big-endian); its associated data is the header (everything
 //! before the first piece), its number, and one byte, 1 for the last piece and 0
 //! otherwise: a file cut short doesn't open as a smaller one, and a piece can't be
@@ -56,6 +58,15 @@ fn nonce(prefix: &[u8; 8], piece: u32) -> [u8; 12] {
     nonce
 }
 
+/// Which key sealed a backup, as its header says: the first 8 bytes of its SHA-256.
+fn key_id(key: &[u8; 32]) -> [u8; 8] {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(key);
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&digest[..8]);
+    id
+}
+
 /// What a v2 piece is bound to: the header, its number, and whether it is the last.
 fn bound(header: &[u8], piece: u32, last: bool) -> Vec<u8> {
     let mut aad = header.to_vec();
@@ -76,14 +87,20 @@ pub struct Sealing<W: Write> {
 }
 
 impl<W: Write> Sealing<W> {
-    pub fn new(key: &[u8; 32], name: &str, mut out: W) -> anyhow::Result<Self> {
-        // (A v4 UUID's bytes are the system's randomness.)
+    pub fn new(key: &[u8; 32], name: &str, out: W) -> anyhow::Result<Self> {
+        Self::made_at(key, name, wyvrn_service::now().max(0) as u64, out)
+    }
+
+    pub fn made_at(key: &[u8; 32], name: &str, made: u64, mut out: W) -> anyhow::Result<Self> {
+        // (A v4 UUID's bytes are the operating system's randomness.)
         let mut prefix = [0u8; 8];
         prefix.copy_from_slice(&uuid::Uuid::new_v4().as_bytes()[..8]);
         let name_bytes = name.as_bytes();
         anyhow::ensure!(name_bytes.len() <= u16::MAX as usize, "that name is too long");
         let mut header = MAGIC_V2.to_vec();
         header.extend_from_slice(&prefix);
+        header.extend_from_slice(&made.to_be_bytes());
+        header.extend_from_slice(&key_id(key));
         header.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
         header.extend_from_slice(name_bytes);
         out.write_all(&header)?;
@@ -147,6 +164,13 @@ pub fn open(key: &[u8; 32], from: &Path, to: &Path) -> anyhow::Result<Option<Str
     let mut header = magic.to_vec();
     header.extend_from_slice(&prefix);
     let name = if v2 {
+        let mut made = [0u8; 8];
+        input.read_exact(&mut made)?;
+        let mut sealed_with = [0u8; 8];
+        input.read_exact(&mut sealed_with)?;
+        header.extend_from_slice(&made);
+        header.extend_from_slice(&sealed_with);
+        anyhow::ensure!(sealed_with == key_id(key), "that backup was sealed with another key");
         let mut length = [0u8; 2];
         input.read_exact(&mut length)?;
         let mut name = vec![0u8; u16::from_be_bytes(length) as usize];
@@ -162,7 +186,11 @@ pub fn open(key: &[u8; 32], from: &Path, to: &Path) -> anyhow::Result<Option<Str
     loop {
         let mut length = [0u8; 4];
         input.read_exact(&mut length).map_err(|_| anyhow::anyhow!("the backup was cut short"))?;
-        let mut sealed = vec![0u8; u32::from_be_bytes(length) as usize];
+        // No piece is more than a piece and its tag: a length past that is a file
+        // that would have it allocate whatever it says.
+        let length = u32::from_be_bytes(length) as usize;
+        anyhow::ensure!(length <= PIECE + 16, "that isn't a community's backup (a piece too long)");
+        let mut sealed = vec![0u8; length];
         input.read_exact(&mut sealed).map_err(|_| anyhow::anyhow!("the backup was cut short"))?;
         // Its last piece, or one more to come: whichever opens it is what it is.
         let nonce = nonce(&prefix, piece);
@@ -203,6 +231,22 @@ impl Host {
         found
     }
 
+    /// What a backup cut short left (the service stopped part-way): its staging
+    /// folders and part-sealed files, swept as the host starts (WYV-47).
+    pub fn sweep_backup_leftovers(&self) {
+        let root = self.config.backups.dir_or(&self.config.storage.dir);
+        for community in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+            for entry in std::fs::read_dir(community.path()).into_iter().flatten().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with(".staging-") {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                } else if name.starts_with('.') && name.ends_with(".part") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
     /// Backs `name` up now: its snapshot packed and sealed, the oldest past
     /// `backups.keep` removed. Blocks. What it made.
     pub fn back_up(&self, name: &str, now: i64) -> anyhow::Result<PathBuf> {
@@ -227,6 +271,11 @@ impl Host {
             let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(sealing, flate2::Compression::default()));
             archive.append_dir_all(name, &staging)?;
             archive.into_inner()?.finish()?.finish()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o600))?;
+            }
             std::fs::rename(&partial, &sealed)?;
             Ok(sealed)
         })();
@@ -297,13 +346,13 @@ mod tests {
         assert!(open(&[8u8; 32], &sealed, &back).is_err());
         // Cut after its first piece: refused, not a smaller archive.
         let whole = std::fs::read(&sealed).unwrap();
-        let header = 16 + 2 + "makers".len();
+        let header = 16 + 8 + 8 + 2 + "makers".len();
         let first = header + 4 + u32::from_be_bytes(whole[header..header + 4].try_into().unwrap()) as usize;
         std::fs::write(&sealed, &whole[..first]).unwrap();
         assert!(open(&key, &sealed, &back).is_err());
         // The name in its header is bound to every piece: another one opens nothing.
         let mut renamed = whole.clone();
-        renamed[18..24].copy_from_slice(b"breakr");
+        renamed[34..40].copy_from_slice(b"breakr");
         std::fs::write(&sealed, &renamed).unwrap();
         assert!(open(&key, &sealed, &back).is_err());
         std::fs::write(&sealed, &whole).unwrap();

@@ -85,6 +85,18 @@ impl Exports {
         });
     }
 
+    /// Lets go of exports whose link has run out, removing their files (WYV-47):
+    /// a community's keys, unsealed, are not left on disk past their 15 minutes.
+    pub fn expire(&self, now: i64) {
+        self.lock().retain(|_, export| {
+            let good = export.expires > now;
+            if !good {
+                let _ = std::fs::remove_file(&export.file);
+            }
+            good
+        });
+    }
+
     fn add(&self, token: String, export: Export) {
         self.lock().insert(token, export);
     }
