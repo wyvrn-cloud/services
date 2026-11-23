@@ -684,8 +684,8 @@ async fn a_community_at_its_own_domain_once_proved_by_its_txt_record() {
     let ask = |domain: &str| reqwest::get(format!("{}domains/ask?domain={domain}", running.url));
 
     // Claimed, and not yet proved: no certificate, and not its.
-    assert!(running.host.registry.claim_domain("club", "club.example.org", "wyvrn-token1").unwrap());
-    assert!(!running.host.registry.claim_domain("other", "club.example.org", "wyvrn-token2").unwrap(), "another community's");
+    assert!(running.host.registry.claim_domain("club", "club.example.org", "wyvrn-token1", wyvrn_service::now()).unwrap());
+    assert!(!running.host.registry.claim_domain("other", "club.example.org", "wyvrn-token2", wyvrn_service::now()).unwrap(), "another community's");
     assert_eq!(ask("club.example.org").await.unwrap().status(), 404);
     assert!(domains::txt_records(&dns_url, "_wyvrn.club.example.org").await.unwrap().is_empty());
 

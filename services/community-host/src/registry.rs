@@ -38,6 +38,11 @@ CREATE TABLE IF NOT EXISTS community_domains (
     domain TEXT NOT NULL UNIQUE,
     token TEXT NOT NULL,
     verified_at INTEGER
+);
+-- When a domain was named, for an unproved claim to run out (domains.rs, WYV-81).
+CREATE TABLE IF NOT EXISTS domain_claims (
+    domain TEXT PRIMARY KEY,
+    claimed_at INTEGER NOT NULL
 );";
 
 fn schema() -> Schema {
@@ -308,7 +313,10 @@ impl Registry {
     }
 
     /// Forgets a community altogether (its stores are the caller's to remove).
+    /// Gone for good: its place, and the domain it had, which is free again for
+    /// whoever proves it next (security review WYV-75).
     pub fn forget(&self, name: &str) -> anyhow::Result<bool> {
+        self.drop_domain(name)?;
         Ok(self.db.lock().execute("DELETE FROM communities WHERE name = ?1", params![name])? > 0)
     }
 }

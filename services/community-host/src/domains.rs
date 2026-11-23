@@ -60,8 +60,19 @@ pub fn mysql() -> String {
             verified_at BIGINT
         ) {}",
         wyvrn_service::db::MYSQL_TABLE
+    ) + &format!(
+        ";
+        CREATE TABLE IF NOT EXISTS domain_claims (
+            domain VARCHAR(253) NOT NULL PRIMARY KEY,
+            claimed_at BIGINT NOT NULL
+        ) {}",
+        wyvrn_service::db::MYSQL_TABLE
     )
 }
+
+/// How long a domain named and not proved holds it against another community
+/// (security review WYV-81): a day is time enough to add a DNS record.
+pub const UNPROVED_FOR: i64 = 24 * 3600;
 
 /// Whether `text` is a domain a community may have: letters, digits and `-` in
 /// dot-separated labels, at least two of them, and none an address of its own.
@@ -83,22 +94,59 @@ impl Registry {
         Ok(self.db.lock().query_row("SELECT name, domain, token, verified_at FROM community_domains WHERE name = ?1", params![name], from_row)?)
     }
 
-    /// The community a proved domain is, if it is one.
+    /// The community a proved domain is, if it is one being served: not one
+    /// deleted or moved, whose domain waits to be freed (security review WYV-75).
     pub fn community_at(&self, domain: &str) -> anyhow::Result<Option<String>> {
-        Ok(self.db.lock().query_row("SELECT name FROM community_domains WHERE domain = ?1 AND verified_at IS NOT NULL", params![domain], |row| row.get(0))?)
+        Ok(self.db.lock().query_row(
+            "SELECT d.name FROM community_domains d JOIN communities c ON c.name = d.name
+             WHERE d.domain = ?1 AND d.verified_at IS NOT NULL AND c.state NOT IN ('deleted', 'moved')",
+            params![domain],
+            |row| row.get(0),
+        )?)
     }
 
     /// Names `domain` for `name`, to be proved with `token`. `false` where another
-    /// community has it.
-    pub fn claim_domain(&self, name: &str, domain: &str, token: &str) -> anyhow::Result<bool> {
+    /// community has proved it, or named it less than [`UNPROVED_FOR`] ago; an
+    /// older unproved claim is let go (security review WYV-81).
+    pub fn claim_domain(&self, name: &str, domain: &str, token: &str, now: i64) -> anyhow::Result<bool> {
         let mut db = self.db.lock();
-        let taken: Option<String> = db.query_row("SELECT name FROM community_domains WHERE domain = ?1", params![domain], |row| row.get(0))?;
-        if taken.is_some_and(|other| other != name) {
-            return Ok(false);
+        let taken: Option<(String, Option<i64>)> =
+            db.query_row("SELECT name, verified_at FROM community_domains WHERE domain = ?1", params![domain], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        if let Some((other, verified_at)) = taken.filter(|(other, _)| other != name) {
+            let claimed_at: Option<i64> = db.query_row("SELECT claimed_at FROM domain_claims WHERE domain = ?1", params![domain], |row| row.get(0))?;
+            // One named before claims were dated counts as run out.
+            if verified_at.is_some() || claimed_at.is_some_and(|at| now - at < UNPROVED_FOR) {
+                return Ok(false);
+            }
+            db.execute("DELETE FROM community_domains WHERE name = ?1", params![other])?;
         }
         db.execute("DELETE FROM community_domains WHERE name = ?1", params![name])?;
         db.execute("INSERT INTO community_domains (name, domain, token, verified_at) VALUES (?1, ?2, ?3, NULL)", params![name, domain, token])?;
+        db.execute("DELETE FROM domain_claims WHERE domain = ?1", params![domain])?;
+        db.execute("INSERT INTO domain_claims (domain, claimed_at) VALUES (?1, ?2)", params![domain, now])?;
         Ok(true)
+    }
+
+    /// Unproved claims older than [`UNPROVED_FOR`], let go.
+    pub fn expire_domain_claims(&self, now: i64) -> anyhow::Result<usize> {
+        let mut db = self.db.lock();
+        let gone = db.execute(
+            "DELETE FROM community_domains WHERE verified_at IS NULL AND domain NOT IN (SELECT domain FROM domain_claims WHERE claimed_at > ?1)",
+            params![now - UNPROVED_FOR],
+        )?;
+        db.execute("DELETE FROM domain_claims WHERE domain NOT IN (SELECT domain FROM community_domains)", params![])?;
+        Ok(gone)
+    }
+
+    /// Every proved domain, with its community and token, for proofs to be checked again.
+    pub fn proved_domains(&self) -> anyhow::Result<Vec<Domain>> {
+        Ok(self.db.lock().query("SELECT name, domain, token, verified_at FROM community_domains WHERE verified_at IS NOT NULL", params![], from_row)?)
+    }
+
+    /// A domain whose proof is gone: back to waiting on it.
+    pub fn domain_unproved(&self, name: &str) -> anyhow::Result<()> {
+        self.db.lock().execute("UPDATE community_domains SET verified_at = NULL WHERE name = ?1", params![name])?;
+        Ok(())
     }
 
     pub fn domain_proved(&self, name: &str, now: i64) -> anyhow::Result<()> {
@@ -107,7 +155,9 @@ impl Registry {
     }
 
     pub fn drop_domain(&self, name: &str) -> anyhow::Result<()> {
-        self.db.lock().execute("DELETE FROM community_domains WHERE name = ?1", params![name])?;
+        let mut db = self.db.lock();
+        db.execute("DELETE FROM domain_claims WHERE domain IN (SELECT domain FROM community_domains WHERE name = ?1)", params![name])?;
+        db.execute("DELETE FROM community_domains WHERE name = ?1", params![name])?;
         Ok(())
     }
 }
@@ -194,7 +244,7 @@ impl Pages for OwnDomain {
                     return Err("That is this host's own domain.".into());
                 }
                 let token = format!("wyvrn-{}", uuid::Uuid::new_v4().simple());
-                if !host.registry.claim_domain(&self.community, &domain, &token).map_err(failed)? {
+                if !host.registry.claim_domain(&self.community, &domain, &token, now).map_err(failed)? {
                     return Err("Another community here has that domain.".into());
                 }
                 format!("Now add the two DNS records shown, then press Check.")
@@ -284,5 +334,39 @@ mod tests {
         for bad in ["localhost", "box.local", "127.0.0.1", "nodot", "-a.com", "a..com", "Caps.com", "x.example", "under_score.com", "a.test"] {
             assert!(!is_domain(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_domain_is_freed_with_its_community_served_only_while_it_is_and_an_unproved_claim_runs_out() {
+        use crate::registry::{Registry, State, Storage};
+        let registry = Registry::scratch().unwrap();
+        for name in ["shop", "squat", "brand"] {
+            registry.create(name, name, Storage::Sqlite, "did:example:o", "did:example:o", 0).unwrap();
+        }
+        // Proved, served; deleted, no longer served; purged, free for the next.
+        assert!(registry.claim_domain("shop", "shop.example.com", "t1", 0).unwrap());
+        registry.domain_proved("shop", 10).unwrap();
+        assert_eq!(registry.community_at("shop.example.com").unwrap().as_deref(), Some("shop"));
+        registry.set_state("shop", State::Deleted, Some(100)).unwrap();
+        assert_eq!(registry.community_at("shop.example.com").unwrap(), None, "deleted: not served");
+        registry.forget("shop").unwrap();
+        registry.create("shop", "shop", Storage::Sqlite, "did:example:x", "did:example:x", 200).unwrap();
+        assert_eq!(registry.community_at("shop.example.com").unwrap(), None, "a newcomer with the name doesn't get it");
+        assert!(registry.domain_of("shop").unwrap().is_none());
+
+        // Named and not proved: held a day, then anyone may name it.
+        assert!(registry.claim_domain("squat", "bigbrand.com", "t2", 1_000).unwrap());
+        assert!(!registry.claim_domain("brand", "bigbrand.com", "t3", 1_000 + 3600).unwrap(), "within a day");
+        assert!(registry.claim_domain("brand", "bigbrand.com", "t3", 1_000 + UNPROVED_FOR).unwrap(), "after a day");
+        assert!(registry.domain_of("squat").unwrap().is_none());
+        // And housekeeping lets an old one go by itself.
+        assert!(registry.claim_domain("squat", "other.example.org", "t4", 0).unwrap());
+        assert_eq!(registry.expire_domain_claims(UNPROVED_FOR + 1).unwrap(), 1, "the day-old one, not brand's fresh one");
+        assert!(registry.domain_of("squat").unwrap().is_none());
+        assert!(registry.domain_of("brand").unwrap().is_some());
+        // A proved one is never taken.
+        assert!(registry.claim_domain("brand", "bigbrand.com", "t5", 0).unwrap());
+        registry.domain_proved("brand", 1).unwrap();
+        assert!(!registry.claim_domain("squat", "bigbrand.com", "t6", 10 * UNPROVED_FOR).unwrap());
     }
 }

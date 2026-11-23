@@ -527,6 +527,33 @@ impl Host {
         }
     }
 
+    /// Each proved domain's `_wyvrn` TXT record read again: one whose token is gone
+    /// is no longer the community's, until proved again (security review WYV-75).
+    /// A lookup that fails says nothing either way, and changes nothing.
+    pub async fn recheck_domains(&self) {
+        if !self.config.domains.enabled {
+            return;
+        }
+        let proved = match self.registry.proved_domains() {
+            Ok(proved) => proved,
+            Err(error) => return tracing::warn!(%error, "couldn't read the proved domains"),
+        };
+        for held in proved {
+            let name = format!("_wyvrn.{}", held.domain);
+            match crate::domains::txt_records(&self.config.domains.dns_over_https, &name).await {
+                Ok(records) if !records.iter().any(|r| r == &held.token) => {
+                    tracing::warn!(community = %held.name, domain = %held.domain, "a domain's TXT proof is gone: no longer served there until proved again");
+                    if let Err(error) = self.registry.domain_unproved(&held.name) {
+                        tracing::warn!(%error, "couldn't mark a domain unproved");
+                    }
+                    self.unload(&held.name);
+                }
+                Ok(_) => {}
+                Err(error) => tracing::info!(domain = %held.domain, %error, "a domain's proof couldn't be read just now"),
+            }
+        }
+    }
+
     /// Housekeeping every 15 seconds, for as long as the host runs; stores
     /// measured every five minutes.
     pub async fn run_housekeeping(self: Arc<Self>) {
@@ -536,11 +563,24 @@ impl Host {
         }
         let mut measured = 0;
         let mut backed_up = 0;
+        // The first check a while after starting, not in its first moments.
+        let mut proofs_checked = now() - 23 * 3600;
         loop {
             if now() - measured >= MEASURE_EVERY {
                 measured = now();
                 let host = self.clone();
                 let _ = tokio::task::spawn_blocking(move || host.measure()).await;
+            }
+            // Domains named and never proved run out (WYV-81).
+            if now() - backed_up >= 600 {
+                if let Err(error) = self.registry.expire_domain_claims(now()) {
+                    tracing::warn!(%error, "couldn't let go of unproved domains");
+                }
+            }
+            // Proved domains whose TXT record is gone stop being served, once a day (WYV-75).
+            if now() - proofs_checked >= 24 * 3600 {
+                proofs_checked = now();
+                self.recheck_domains().await;
             }
             // Backups due, looked for every ten minutes, made one at a time off to the side.
             if now() - backed_up >= 600 {
