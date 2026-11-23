@@ -92,7 +92,9 @@ services:
       # Its web view (WHATS-NEW.md): where it is, if not at COMMUNITY_DOMAIN, and
       # the proxies whose X-Forwarded-* headers it believes (the Docker network).
       COMMUNITY_WEB_URL: "${COMMUNITY_WEB_URL:-}"
-      COMMUNITY_WEB_TRUSTED_PROXIES: "${COMMUNITY_WEB_TRUSTED_PROXIES:-172.16.0.0/12}"
+      # (A Docker network's gateway, where a Caddy on this machine's requests come
+      # from, and not another container on it: WYV-53. Name yours if not one of these.)
+      COMMUNITY_WEB_TRUSTED_PROXIES: "${COMMUNITY_WEB_TRUSTED_PROXIES:-172.16.0.1,172.17.0.1,172.18.0.1,172.19.0.1,172.20.0.1,172.21.0.1,172.22.0.1,172.23.0.1,172.24.0.1,172.25.0.1,172.26.0.1,172.27.0.1,172.28.0.1,172.29.0.1,172.30.0.1,172.31.0.1}"
 
   # Many communities in one process, each its own DID at <domain>/c/<name>/,
   # made and managed by COMMUNITY_HOST_ADMINS from the app. Each community's

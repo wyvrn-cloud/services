@@ -13,6 +13,19 @@
 # A message to a service is a POST, and each is opened and checked: that is what
 # costs, so it is what is held tightest. Reads are documents and pictures, many at
 # once when a pack is opened. Several people behind one address share its count.
+# What every site here says of itself (WYV-53): HTTPS only from now on (HSTS),
+# no sniffing, no framing, and no address of the page sent elsewhere. The
+# services' own pages add a Content-Security-Policy of their own.
+(wyvrn-headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		-Server
+	}
+}
+
 (wyvrn-limits) {
 	rate_limit {
 		zone writes {
@@ -35,6 +48,7 @@
 }
 
 id.example {
+	import wyvrn-headers
 	encode gzip
 	# `route` keeps these in the order written: the limit, then the service.
 	route {
@@ -45,6 +59,7 @@ id.example {
 }
 
 stickers.example {
+	import wyvrn-headers
 	encode gzip
 	route {
 		import wyvrn-limits
