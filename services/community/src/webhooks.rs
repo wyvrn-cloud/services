@@ -210,6 +210,13 @@ fn hook_for(community: &Community, id: &str, token: &str) -> Result<Webhook, Res
     if !same {
         return Err(problem(StatusCode::UNAUTHORIZED, 50027, "Invalid Webhook Token"));
     }
+    // Paused while whoever made it is no longer in the community, or banned from
+    // it (WYV-20): it posts as they allowed, and they no longer may.
+    let now = crate::gates::now();
+    let maker_here = community.store.member(&hook.created_by).ok().flatten().is_some() && community.store.banned(&hook.created_by, now).ok().flatten().is_none();
+    if !maker_here {
+        return Err(problem(StatusCode::FORBIDDEN, 50013, "This webhook is paused: whoever made it is no longer in the community. An admin can make it again."));
+    }
     Ok(hook)
 }
 
@@ -411,10 +418,16 @@ fn post_sent(state: &Arc<AppState>, hook: &Webhook, sent: Sent, query: &ExecuteQ
     if community.channel_off(&channel) {
         return problem(StatusCode::FORBIDDEN, 50013, "Missing Permissions");
     }
-    // Out of the room its host gives it: nothing new, from a webhook either (WYV-20).
-    let room = community.config.max_store_bytes;
-    if room > 0 && community.used_bytes.load(std::sync::atomic::Ordering::Relaxed) >= room {
-        return problem(StatusCode::FORBIDDEN, 50001, "This community has used all the room its host gives it.");
+    // What the host allows everyone (posts a minute in all, the host's room, the
+    // community's room): a webhook as much as anyone (WYV-20).
+    match community.host_refused(now) {
+        Ok(None) => {}
+        Ok(Some(refused)) if refused.code == "e.p.req.rate-limited" => {
+            // As Discord answers one: how long to wait, in seconds.
+            return (StatusCode::TOO_MANY_REQUESTS, [(axum::http::header::RETRY_AFTER, "60")], axum::Json(json!({ "message": refused.comment, "retry_after": 60.0, "global": false }))).into_response();
+        }
+        Ok(Some(refused)) => return problem(StatusCode::FORBIDDEN, 50001, &refused.comment),
+        Err(_) => return problem(StatusCode::INTERNAL_SERVER_ERROR, 0, "Something went wrong."),
     }
     if community.moving().unwrap_or(false) {
         return problem(StatusCode::FORBIDDEN, 50001, "This community is moving, and takes no posts until it has.");

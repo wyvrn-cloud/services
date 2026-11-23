@@ -131,7 +131,12 @@ impl Community {
         if limit > 0 && !powers.all() && self.store.posts_since(&member.did, now - 60)? >= limit {
             return Ok(Some(Refused { code: "e.p.req.rate-limited", comment: "That is faster than anyone posts here. Wait a moment.".into(), args: json!({ "retry_after": 60 }) }));
         }
-        // What its host gives it: so many posts a minute from everyone, and so much room.
+        self.host_refused(now)
+    }
+
+    /// What its host gives it, whoever posts (a member, or a webhook: WYV-20): so
+    /// many posts a minute from everyone, and so much room, its own and the host's.
+    pub fn host_refused(&self, now: i64) -> anyhow::Result<Option<Refused>> {
         let whole = self.config.max_community_posts_per_minute as i64;
         if whole > 0 && self.store.all_posts_since(now - 60)? >= whole {
             return Ok(Some(Refused { code: "e.p.req.rate-limited", comment: "This community takes as many posts a minute as its host allows. Wait a moment.".into(), args: json!({ "retry_after": 60 }) }));
