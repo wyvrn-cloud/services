@@ -280,6 +280,9 @@ pub struct Community {
     /// What its store holds, in bytes, as its host last measured it (0 unmeasured):
     /// what `config.max_store_bytes` is held to.
     pub used_bytes: std::sync::atomic::AtomicU64,
+    /// Set by a host when all it holds has reached its budget, or its disk is
+    /// nearly full (WYV-22): nothing more is posted in any of its communities.
+    pub host_full: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// What an admin has changed of its name, description and picture
     /// (`set-profile`), and where that is kept.
     changed: std::sync::RwLock<Changed>,
@@ -573,7 +576,7 @@ impl Community {
             Some(kept) => kept.load()?,
             None => Changed::default(),
         };
-        let community = Self { store, config, used_bytes: Default::default(), changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, expressions: None, live: Default::default(), web_url: None, public_url: String::new(), speaks_as: None, importing: Default::default(), signing_seed: None, outbox: Default::default(), wiki_open: Default::default(), wiki_writing: Default::default() };
+        let community = Self { store, config, used_bytes: Default::default(), host_full: Default::default(), changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, expressions: None, live: Default::default(), web_url: None, public_url: String::new(), speaks_as: None, importing: Default::default(), signing_seed: None, outbox: Default::default(), wiki_open: Default::default(), wiki_writing: Default::default() };
         community.ensure_roles()?;
         Ok(community)
     }

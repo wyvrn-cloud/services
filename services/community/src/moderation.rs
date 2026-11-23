@@ -136,6 +136,13 @@ impl Community {
         if whole > 0 && self.store.all_posts_since(now - 60)? >= whole {
             return Ok(Some(Refused { code: "e.p.req.rate-limited", comment: "This community takes as many posts a minute as its host allows. Wait a moment.".into(), args: json!({ "retry_after": 60 }) }));
         }
+        if self.host_full.get().is_some_and(|full| full.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Ok(Some(Refused {
+                code: "e.p.msg.quota",
+                comment: "The server this community is on is full for now: nothing more can be posted until its host makes room.".into(),
+                args: json!({}),
+            }));
+        }
         let room = self.config.max_store_bytes;
         if room > 0 && self.used_bytes.load(std::sync::atomic::Ordering::Relaxed) >= room {
             return Ok(Some(Refused {

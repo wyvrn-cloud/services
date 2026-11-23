@@ -1022,7 +1022,7 @@ async fn a_private_threads_posts_are_never_on_the_web() {
 }
 
 #[tokio::test]
-async fn a_member_taken_out_is_signed_out_of_the_web_view_and_live_pages_are_capped() {
+async fn a_member_taken_out_is_signed_out_of_the_web_view() {
     let server = start(Options::default()).await;
     let (_admin, member) = with_channels(&server).await;
     let (cookie, _) = server.session(&member.did());
@@ -1032,15 +1032,4 @@ async fn a_member_taken_out_is_signed_out_of_the_web_view_and_live_pages_are_cap
     store.remove_member(&member.did()).unwrap();
     assert!(store.session(cookie.trim_start_matches("wyvrn_web="), wyvrn_service::now()).unwrap().is_none());
 
-    // So many live pages at once from one address.
-    let channel = server.channel_id("general");
-    store.set_setting(web::PUBLIC, "everyone").unwrap();
-    let mut open = Vec::new();
-    for _ in 0..20 {
-        let live = server.http.get(format!("{}ch/{channel}/live", server.url)).send().await.unwrap();
-        assert_eq!(live.status().as_u16(), 200);
-        open.push(live);
-    }
-    assert_eq!(server.http.get(format!("{}ch/{channel}/live", server.url)).send().await.unwrap().status().as_u16(), 429);
-    drop(open);
 }

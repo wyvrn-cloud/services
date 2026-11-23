@@ -189,7 +189,7 @@ async fn live(State(state): State<Arc<AppState>>, Path(id): Path<String>, reques
     }
     // So many open at once from one address, and from one member (WYV-51).
     let mut keys = Vec::new();
-    if let Some(client) = web.client(&request) {
+    if let Some(client) = web.client(&request).filter(|client| wyvrn_service::guard::is_public(*client)) {
         keys.push((format!("ip:{client}"), LIVE_PER_ADDRESS));
     }
     if let Some((member, _)) = super::sign_in::session_of(&state, &headers) {

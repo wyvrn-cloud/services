@@ -1249,7 +1249,10 @@ async fn take_message(State(state): State<Arc<AppState>>, request: axum::extract
     let address = match &state.web {
         Some(web) => web.client(&request),
         None => request.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|info| info.0.ip()),
-    };
+    }
+    // Only a public address is counted: a private one is a proxy in front (or a
+    // test), and every client behind it would share one limit.
+    .filter(|address| wyvrn_service::guard::is_public(*address));
     if let Some(address) = address {
         static SEEN: std::sync::LazyLock<std::sync::Mutex<HashMap<std::net::IpAddr, (i64, u32)>>> = std::sync::LazyLock::new(Default::default);
         let minute = now() / 60;
