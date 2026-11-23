@@ -68,11 +68,13 @@ stickers.example {
 }
 
 # community.example {
+# 	import wyvrn-headers
 # 	encode gzip
 # 	reverse_proxy 127.0.0.1:8183
 # }
 
 # updates.example {
+# 	import wyvrn-headers
 # 	encode gzip
 # 	reverse_proxy 127.0.0.1:8184
 # }
@@ -80,6 +82,7 @@ stickers.example {
 # An outbound relay: one WebSocket per app, held open, which `reverse_proxy`
 # passes through by itself.
 # relay.example {
+# 	import wyvrn-headers
 # 	route {
 # 		import wyvrn-limits
 # 		reverse_proxy 127.0.0.1:8187
@@ -90,6 +93,7 @@ stickers.example {
 # compressed or not worth compressing, so no `encode`; `request_body` lets a
 # chunk through (the service refuses anything longer itself).
 # files.example {
+# 	import wyvrn-headers
 # 	route {
 # 		import wyvrn-limits
 # 		request_body {
@@ -110,12 +114,53 @@ stickers.example {
 # its OAuth client metadata, apps post DIDComm messages to / and read its DID
 # document and status lists, and websites call its hosted verifier.
 # verify.example {
+# 	import wyvrn-headers
 # 	encode gzip
 # 	route {
 # 		import wyvrn-limits
 # 		reverse_proxy 127.0.0.1:8188
 # 	}
 # }
+
+# A community host (docker-compose.yml's `communities` profile, at
+# COMMUNITY_HOST_PORT, 8189 unless set). Its communities are under /c/<name>/;
+# rate-limit that path, so a client walking through many names can't keep the
+# host opening and closing them.
+# communities.example {
+# 	import wyvrn-headers
+# 	encode gzip
+# 	route {
+# 		import wyvrn-limits
+# 		reverse_proxy 127.0.0.1:8189
+# 	}
+# }
+#
+# Communities at domains of their own ([domains] enabled): Caddy gets a
+# certificate only for a domain the host says is proved. This goes in Caddy's
+# global options block, at the top of the file:
+#
+# {
+# 	on_demand_tls {
+# 		ask http://127.0.0.1:8189/domains/ask
+# 	}
+# }
+#
+# and this catches every other name pointed here:
+#
+# https:// {
+# 	import wyvrn-headers
+# 	tls {
+# 		on_demand
+# 	}
+# 	encode gzip
+# 	route {
+# 		import wyvrn-limits
+# 		reverse_proxy 127.0.0.1:8189
+# 	}
+# }
+#
+# (A Caddy in Docker on this stack's network names it community-host:8095, the
+# port inside the container, instead of 127.0.0.1:8189.)
 
 # Link cards, in front of the web app (README.md, "Link cards"): add these to the
 # block the web app's domain already has, above what serves the app itself.

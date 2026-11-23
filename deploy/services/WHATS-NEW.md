@@ -345,7 +345,7 @@ and Caddy gets certificates for proved domains only, asking the host:
 ```caddyfile
 {
 	on_demand_tls {
-		ask http://community-host:8080/domains/ask
+		ask http://community-host:8095/domains/ask
 	}
 }
 
@@ -353,9 +353,11 @@ https:// {
 	tls {
 		on_demand
 	}
-	reverse_proxy community-host:8080
+	reverse_proxy community-host:8095
 }
 ```
+
+(That is for a Caddy in Docker on this stack's network; `community-host` listens on 8095 inside its container. A Caddy on the machine itself goes to `127.0.0.1:8189`, `COMMUNITY_HOST_PORT`: see `Caddyfile.example`.)
 
 The community's DID stays as it is (members' apps know it by it); its web view and the links it gives use the domain.
 
