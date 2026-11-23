@@ -425,9 +425,11 @@ impl Community {
 
     /// Whether someone with `powers` (`did`) may see `channel` at all: without
     /// `view_channel` there, it isn't there for them (nothing of it reaches them,
-    /// and asked of by id it is unknown). Whoever opened it sees it.
+    /// and asked of by id it is unknown). Whoever opened it sees it, while they are
+    /// a member and not banned: having opened it gives no sight to someone gone
+    /// (WYV-99).
     pub fn sees(&self, did: &str, powers: &Powers, channel: &Channel) -> anyhow::Result<bool> {
-        Ok(powers.all() || channel.created_by == did || self.channel_permissions(did, powers, channel)?.contains("view_channel"))
+        Ok(powers.all() || (channel.created_by == did && self.maker_here(did, crate::gates::now())) || self.channel_permissions(did, powers, channel)?.contains("view_channel"))
     }
 
     /// Whether `did` reads the thread `thread` of `channel`: any thread but a private

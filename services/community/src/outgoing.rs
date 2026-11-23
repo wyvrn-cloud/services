@@ -49,14 +49,23 @@ const ANSWER_WITHIN: Duration = Duration::from_secs(10);
 const CURSOR: &str = "outgoing_serial";
 
 impl Community {
+    /// Whether `did`, who made a webhook or an event receiver, is still in the
+    /// community and not banned from it: what either goes on working for, as they
+    /// allowed it and may no longer once they are gone (WYV-20, WYV-99).
+    pub fn maker_here(&self, did: &str, now: i64) -> bool {
+        self.store.member(did).ok().flatten().is_some() && self.store.banned(did, now).ok().flatten().is_none()
+    }
+
     /// Queues `kind` for every receiver that takes it, of `channel` (or of none:
-    /// a member's coming and going), whose maker still sees that channel.
+    /// a member's coming and going), whose maker is still here and sees that
+    /// channel. One whose maker left or was banned is paused, as their webhooks
+    /// are (WYV-99): it is sent nothing until they are back.
     pub fn emit_event(&self, kind: &str, channel: Option<&Channel>, data: Value, now: i64) {
         let hooks = match self.store.event_hooks() {
             Ok(hooks) => hooks,
             Err(error) => return tracing::warn!(%error, "couldn't read where events go"),
         };
-        for hook in hooks.into_iter().filter(|hook| hook.off_at.is_none() && hook.events.iter().any(|e| e == kind)) {
+        for hook in hooks.into_iter().filter(|hook| hook.off_at.is_none() && hook.events.iter().any(|e| e == kind) && self.maker_here(&hook.created_by, now)) {
             let fits = match (channel, &hook.channel) {
                 (Some(channel), Some(only)) => only == &channel.id,
                 (Some(_), None) => true,
@@ -250,7 +259,9 @@ async fn send_due(state: &Arc<AppState>, now: i64) -> anyhow::Result<()> {
     let community = &state.community;
     let private = community.config.outgoing_private;
     for (id, hook_id, body, attempts) in community.store.due_events(now, 50)? {
-        let Some(mut hook) = community.store.event_hook(&hook_id)?.filter(|hook| hook.off_at.is_none()) else {
+        // Off, or paused since it was queued (its maker gone or banned, WYV-99):
+        // what was waiting for it is dropped, not kept for later.
+        let Some(mut hook) = community.store.event_hook(&hook_id)?.filter(|hook| hook.off_at.is_none() && community.maker_here(&hook.created_by, now)) else {
             community.store.event_done(&id)?;
             continue;
         };

@@ -4840,3 +4840,49 @@ fn a_did_moves_once_and_a_second_different_move_from_it_is_not_taken() {
     store.rotate(old, new, 4).unwrap();
     assert_eq!(store.current_did(old).unwrap(), new);
 }
+
+#[test]
+fn an_event_receiver_pauses_while_its_maker_is_banned_or_gone_and_follows_them_when_they_move() {
+    let community = Community::new(Store::in_memory().unwrap(), Default::default(), None).unwrap();
+    let store = &community.store;
+    let maker = "did:peer:2.maker";
+    store.set_member(maker, wyvrn_community::store::Role::Member, 1).unwrap();
+    store.add_channel("c1", "theirs", "", maker, 1).unwrap();
+    let channel = store.channel("c1").unwrap().unwrap();
+    let hook = wyvrn_community::store::EventHook {
+        id: "h1".into(),
+        url: "https://example.com/events".into(),
+        secret: "whsec_x".into(),
+        events: vec!["post.created".into(), "member.joined".into()],
+        channel: None,
+        created_by: maker.into(),
+        created_at: 1,
+        failures: 0,
+        off_at: None,
+    };
+    store.save_event_hook(&hook).unwrap();
+    let queued = || store.due_events(i64::MAX, 100).unwrap().len();
+    community.emit_event("member.joined", None, json!({}), 2);
+    community.emit_event("post.created", Some(&channel), json!({}), 2);
+    assert_eq!(queued(), 2);
+
+    // Banned (WYV-99): nothing more, not even from the channel they opened.
+    store.ban(&wyvrn_community::store::Ban { did: maker.into(), name: None, by: "did:peer:2.mod".into(), at: 3, until: None, reason: None }).unwrap();
+    community.emit_event("member.joined", None, json!({}), 4);
+    community.emit_event("post.created", Some(&channel), json!({}), 4);
+    assert_eq!(queued(), 2);
+    store.unban(maker).unwrap();
+
+    // Gone: the same.
+    store.remove_member(maker).unwrap();
+    community.emit_event("member.joined", None, json!({}), 5);
+    assert_eq!(queued(), 2);
+    store.set_member(maker, wyvrn_community::store::Role::Member, 6).unwrap();
+
+    // Moved to a new DID (WYV-115): the receiver and the channel go with them.
+    store.rotate(maker, "did:peer:2.maker-new", 7).unwrap();
+    assert_eq!(store.event_hook("h1").unwrap().unwrap().created_by, "did:peer:2.maker-new");
+    assert_eq!(store.channel("c1").unwrap().unwrap().created_by, "did:peer:2.maker-new");
+    community.emit_event("member.joined", None, json!({}), 8);
+    assert_eq!(queued(), 3);
+}

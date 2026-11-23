@@ -213,8 +213,7 @@ fn hook_for(community: &Community, id: &str, token: &str) -> Result<Webhook, Res
     // Paused while whoever made it is no longer in the community, or banned from
     // it (WYV-20): it posts as they allowed, and they no longer may.
     let now = crate::gates::now();
-    let maker_here = community.store.member(&hook.created_by).ok().flatten().is_some() && community.store.banned(&hook.created_by, now).ok().flatten().is_none();
-    if !maker_here {
+    if !community.maker_here(&hook.created_by, now) {
         return Err(problem(StatusCode::FORBIDDEN, 50013, "This webhook is paused: whoever made it is no longer in the community. An admin can make it again."));
     }
     Ok(hook)

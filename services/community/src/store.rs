@@ -2389,6 +2389,18 @@ impl Store {
             tx.execute("UPDATE OR IGNORE bans SET did = ?2 WHERE did = ?1", params![prior, new])?;
             tx.execute("UPDATE OR IGNORE timeouts SET did = ?2 WHERE did = ?1", params![prior, new])?;
             tx.execute("UPDATE OR IGNORE join_answers SET did = ?2 WHERE did = ?1", params![prior, new])?;
+            // What they made goes on working for them (WYV-115): the channels they
+            // opened, their webhooks and event receivers (paused while their maker
+            // isn't a member, WYV-20, WYV-99), the bots they approved; and, for a
+            // bot, being one and the commands it offers.
+            tx.execute("UPDATE channels SET created_by = ?2 WHERE created_by = ?1", params![prior, new])?;
+            tx.execute("UPDATE webhooks SET created_by = ?2 WHERE created_by = ?1", params![prior, new])?;
+            tx.execute("UPDATE event_hooks SET created_by = ?2 WHERE created_by = ?1", params![prior, new])?;
+            tx.execute("UPDATE bot_approvals SET by_did = ?2 WHERE by_did = ?1", params![prior, new])?;
+            for table in ["member_bots", "bot_approvals"] {
+                tx.execute(&format!("UPDATE OR IGNORE {table} SET did = ?2 WHERE did = ?1"), params![prior, new])?;
+                tx.execute(&format!("DELETE FROM {table} WHERE did = ?1"), params![prior])?;
+            }
             // On the web: their lasting key (and with it their sessions, the websites
             // they let sign them in, and the ids those know them by), and their picture.
             tx.execute("UPDATE OR IGNORE member_keys SET did = ?2 WHERE did = ?1", params![prior, new])?;
