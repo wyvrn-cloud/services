@@ -67,25 +67,40 @@ where
     found.profile
 }
 
+/// A file of a public address's, over HTTPS (`None` for a 404), fetched only from
+/// a public address (security review WYV-49): the URL comes from a DID someone
+/// gave, and the server fetching it is inside its own network. Its host is
+/// checked as written and again as resolved, and no redirect is followed.
+async fn fetch_public(url: String) -> Result<Option<String>, String> {
+    static HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .dns_resolver(wyvrn_service::guard::Guard::default())
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("a client with a timeout builds")
+    });
+    wyvrn_service::guard::Guard::default().check(&url, &["https"]).await?;
+    let response = HTTP.get(&url).send().await.map_err(|e| e.to_string())?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err(format!("{url}: {}", response.status()));
+    }
+    if response.content_length().is_some_and(|length| length as usize > MAX_FILE_BYTES) {
+        return Err(format!("{url} is too large"));
+    }
+    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err(format!("{url} is too large"));
+    }
+    String::from_utf8(bytes.to_vec()).map(Some).map_err(|e| e.to_string())
+}
+
 /// The linked-account credentials the address `address` publishes now, over HTTPS.
 pub async fn linked_of_address(address: &str) -> Option<Vec<Value>> {
-    static HTTP: std::sync::LazyLock<reqwest::Client> =
-        std::sync::LazyLock::new(|| reqwest::Client::builder().timeout(Duration::from_secs(5)).build().expect("a client with a timeout builds"));
-    let profile = profile_of(address, |url| async move {
-        let response = HTTP.get(&url).send().await.map_err(|e| e.to_string())?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !response.status().is_success() {
-            return Err(format!("{url}: {}", response.status()));
-        }
-        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-        if bytes.len() > MAX_FILE_BYTES {
-            return Err(format!("{url} is too large"));
-        }
-        String::from_utf8(bytes.to_vec()).map(Some).map_err(|e| e.to_string())
-    })
-    .await?;
+    let profile = profile_of(address, fetch_public).await?;
     Some(profile.linked)
 }
 
@@ -97,23 +112,7 @@ pub async fn banner_of_address(address: &str) -> Option<(String, String)> {
             return banner.clone();
         }
     }
-    static HTTP: std::sync::LazyLock<reqwest::Client> =
-        std::sync::LazyLock::new(|| reqwest::Client::builder().timeout(Duration::from_secs(5)).build().expect("a client with a timeout builds"));
-    let banner = banner_of(address, |url| async move {
-        let response = HTTP.get(&url).send().await.map_err(|e| e.to_string())?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !response.status().is_success() {
-            return Err(format!("{url}: {}", response.status()));
-        }
-        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-        if bytes.len() > MAX_FILE_BYTES {
-            return Err(format!("{url} is too large"));
-        }
-        String::from_utf8(bytes.to_vec()).map(Some).map_err(|e| e.to_string())
-    })
-    .await;
+    let banner = banner_of(address, fetch_public).await;
     let mut seen = SEEN.lock().expect("lock");
     seen.retain(|_, (at, _)| at.elapsed() < KEPT_FOR);
     seen.insert(address.to_string(), (Instant::now(), banner.clone()));
@@ -134,6 +133,13 @@ pub fn with_banner(message: &mut Value, (media_type, base64): (String, String)) 
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn an_address_is_fetched_from_only_over_https_and_never_from_inside_the_network() {
+        for url in ["https://127.0.0.1/.well-known/did.json", "https://10.0.0.1/x", "https://localhost/x", "http://example.com/x"] {
+            assert!(super::fetch_public(url.to_string()).await.is_err(), "{url}");
+        }
+    }
+
     use super::*;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use std::collections::HashMap;
