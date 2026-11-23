@@ -1003,18 +1003,18 @@ impl Community {
     /// A new follower's signing secret as it is kept: sealed with the service's
     /// seal key where it has one (WYV-32).
     pub fn seal_follower_secret(&self, follower_id: &str, plain: &str) -> anyhow::Result<String> {
-        wyvrn_service::identity::seal_text(plain, &self.secret_place(&format!("follower-{follower_id}")))
+        self.sealing().seal(plain, &format!("follower-{follower_id}"))
     }
 
     /// A follower's signing secret (a Discord webhook has none), opened; kept again
     /// where it should be (found unsealed, or sealed with a previous key).
     pub fn follower_secret(&self, follower: &Follower) -> anyhow::Result<Option<String>> {
         let Some(kept) = &follower.secret else { return Ok(None) };
-        let place = self.secret_place(&format!("follower-{}", follower.id));
-        let (plain, again) = wyvrn_service::identity::open_text(kept, &place)?;
+        let (sealing, what) = (self.sealing(), format!("follower-{}", follower.id));
+        let (plain, again) = sealing.open(kept, &what)?;
         if again {
             let mut resealed = follower.clone();
-            resealed.secret = Some(wyvrn_service::identity::seal_text(&plain, &place)?);
+            resealed.secret = Some(sealing.seal(&plain, &what)?);
             self.store.save_follower(&resealed)?;
         }
         Ok(Some(plain))

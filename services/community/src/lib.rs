@@ -39,6 +39,7 @@ pub mod posting;
 pub mod protection;
 pub mod questions;
 pub mod roles;
+pub mod sealing;
 pub mod serve;
 pub mod server;
 pub mod store;

@@ -294,6 +294,9 @@ pub struct Community {
     pub assistant: Option<Value>,
     /// The server's own DID, for what it posts itself (AutoMod's alerts).
     pub own: Option<String>,
+    /// What the community's sealed secrets are bound to: its keys (sealing.rs,
+    /// WYV-124). Unset, its DID (`own`).
+    pub sealed_to: Option<String>,
     /// Files members attach, where the community keeps them (files.rs).
     pub files: Option<crate::files::Files>,
     /// The community's own sticker and emoji packs (expressions.rs).
@@ -576,7 +579,7 @@ impl Community {
             Some(kept) => kept.load()?,
             None => Changed::default(),
         };
-        let community = Self { store, config, used_bytes: Default::default(), host_full: Default::default(), changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, files: None, expressions: None, live: Default::default(), web_url: None, public_url: String::new(), speaks_as: None, importing: Default::default(), signing_seed: None, outbox: Default::default(), wiki_open: Default::default(), wiki_writing: Default::default() };
+        let community = Self { store, config, used_bytes: Default::default(), host_full: Default::default(), changed: std::sync::RwLock::new(changed), kept, voice: None, assistant: None, own: None, sealed_to: None, files: None, expressions: None, live: Default::default(), web_url: None, public_url: String::new(), speaks_as: None, importing: Default::default(), signing_seed: None, outbox: Default::default(), wiki_open: Default::default(), wiki_writing: Default::default() };
         community.ensure_roles()?;
         // Bots from before approval was asked for (WYV-89), let be as they were.
         if let Ok(approved) = community.store.approve_bots_from_before(crate::gates::now()) {

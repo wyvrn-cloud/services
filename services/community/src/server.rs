@@ -85,6 +85,7 @@ impl AppState {
     /// The parts a new server starts with, beside what `main` builds.
     pub fn new(agent: Agent, voice: wyvrn_service::Voice, mut community: Community, did_document: Option<address::Published>, resolver: Box<dyn DIDResolver>) -> Self {
         community.own = Some(agent.did());
+        community.sealed_to = Some(crate::sealing::bound_to(agent.identity()));
         community.speaks_as = voice.speaking_as().filter(|did| *did != agent.did());
         Self {
             agent,

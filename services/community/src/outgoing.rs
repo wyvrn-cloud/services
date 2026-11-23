@@ -49,26 +49,31 @@ const ANSWER_WITHIN: Duration = Duration::from_secs(10);
 const CURSOR: &str = "outgoing_serial";
 
 impl Community {
-    /// Where a signing secret of the community's is bound when it is kept sealed
-    /// (WYV-32): the community, by its DID, and which secret it is.
-    pub(crate) fn secret_place(&self, what: &str) -> String {
-        format!("{}#{what}", self.own.as_deref().unwrap_or_default())
+    /// What the community's secrets are sealed for when they are kept sealed
+    /// (WYV-32): its keys, wherever it runs (sealing.rs, WYV-124), with its DID,
+    /// what they were sealed for before.
+    pub fn sealing(&self) -> crate::sealing::Sealing {
+        let own = self.own.clone().unwrap_or_default();
+        match &self.sealed_to {
+            Some(to) => crate::sealing::Sealing { to: to.clone(), before: Some(own) },
+            None => crate::sealing::Sealing { to: own, before: None },
+        }
     }
 
     /// A new event receiver's signing secret as it is kept: sealed with the
     /// service's seal key where it has one (WYV-32).
     pub fn seal_hook_secret(&self, hook_id: &str, plain: &str) -> anyhow::Result<String> {
-        wyvrn_service::identity::seal_text(plain, &self.secret_place(&format!("event-hook-{hook_id}")))
+        self.sealing().seal(plain, &format!("event-hook-{hook_id}"))
     }
 
     /// An event receiver's signing secret, opened; kept again where it should be
     /// (found unsealed, or sealed with a previous key).
     pub fn hook_secret(&self, hook: &EventHook) -> anyhow::Result<String> {
-        let place = self.secret_place(&format!("event-hook-{}", hook.id));
-        let (plain, again) = wyvrn_service::identity::open_text(&hook.secret, &place)?;
+        let (sealing, what) = (self.sealing(), format!("event-hook-{}", hook.id));
+        let (plain, again) = sealing.open(&hook.secret, &what)?;
         if again {
             let mut kept = hook.clone();
-            kept.secret = wyvrn_service::identity::seal_text(&plain, &place)?;
+            kept.secret = sealing.seal(&plain, &what)?;
             self.store.save_event_hook(&kept)?;
         }
         Ok(plain)

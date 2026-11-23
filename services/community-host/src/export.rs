@@ -236,7 +236,16 @@ impl Host {
         let data = staging.join("data");
         self.snapshot(name, &data)?;
         // Not moving any more, where it arrives.
-        wyvrn_community::store::Store::open(&Location::Sqlite(data.join("community.sqlite")))?.set_setting(wyvrn_community::community::MOVING_SETTING, "0")?;
+        let exported = wyvrn_community::store::Store::open(&Location::Sqlite(data.join("community.sqlite")))?;
+        exported.set_setting(wyvrn_community::community::MOVING_SETTING, "0")?;
+        // Its secrets unsealed, as its keys are: the server it goes to hasn't this
+        // host's seal key (WYV-124). Bound to its keys, they would open there
+        // under a seal key of its own, as they do here.
+        let identity = didcomm_agent::Identity::load(data.join("identity.json"))?;
+        let hosted_did = self.loaded(name).map(|tenant| tenant.state.agent.did());
+        let sealing = wyvrn_community::sealing::Sealing { to: wyvrn_community::sealing::bound_to(&identity), before: hosted_did };
+        wyvrn_community::sealing::unseal_all(&exported, &sealing)?;
+        drop(exported);
         std::fs::create_dir_all(staging.join("config"))?;
         std::fs::write(staging.join("config").join("default.toml"), self.single_config(&record))?;
         std::fs::write(staging.join("README.txt"), self.export_readme(name)?)?;
@@ -310,7 +319,7 @@ impl Host {
     fn export_readme(&self, name: &str) -> anyhow::Result<String> {
         let address = self.address(name)?.map(|address| address.did_web);
         let mut text = format!(
-            "This is the community {name}, as it was kept at {host}c/{name}/: its keys (data/identity.json, which are the community: keep them safe), everything it keeps, and a configuration.\n\nTo run it at your own domain:\n\n1. Put this folder on your server, and have HTTPS in front of it.\n2. In config/default.toml, set public_url to where it is reached.\n3. Run wyvrn-community in this folder (or its Docker image, with this folder as /app).\n",
+            "This is the community {name}, as it was kept at {host}c/{name}/: its keys (data/identity.json, which are the community: keep them safe), everything it keeps, and a configuration.\n\nTo run it at your own domain:\n\n1. Put this folder on your server, and have HTTPS in front of it.\n2. In config/default.toml, set public_url to where it is reached.\n3. Run wyvrn-community in this folder (or its Docker image, with this folder as /app). Its keys and secrets are here unsealed: to keep them sealed (WYVRN_SEAL_KEY), start it the first time with WYVRN_SEAL_ADOPT_PLAIN=true as well.\n",
             host = self.config.server.public_url
         );
         if let Some(address) = address {

@@ -456,7 +456,7 @@ fn shown_picture(store: &crate::store::Store, did: &str) -> Option<(String, Stri
 fn picture_href(state: &AppState, did: &str, root: &str) -> Option<String> {
     let store = &state.community.store;
     shown_picture(store, did)?;
-    let secret = super::secret(store, &state.agent.did()).ok()?;
+    let secret = super::secret(store, &state.community.sealing()).ok()?;
     let token = store.picture_token(&store.member_key(did).ok()?, "pages", &secret).ok()?;
     Some(format!("{root}p/{token}"))
 }
@@ -477,7 +477,7 @@ fn post_view(state: &AppState, post: &Post, channel: &Channel, root: &str, focus
     let extra = post.extra.clone().unwrap_or(Value::Null);
     let attachments: HashMap<&str, &Value> = extra["attachments"].as_array().into_iter().flatten().filter_map(|a| Some((a["id"].as_str()?, a))).collect();
     // Pack files (custom emoji, stickers) are shown through this server (outside.rs).
-    let secret = super::secret(&state.community.store, &state.agent.did()).ok();
+    let secret = super::secret(&state.community.store, &state.community.sealing()).ok();
     let through_here = |address: &str| secret.as_deref().and_then(|secret| super::outside::href(secret, root, address));
     let media = extra["media"]
         .as_array()
@@ -630,7 +630,7 @@ async fn outside_file(State(state): State<Arc<AppState>>, Path(file): Path<Strin
         return nothing();
     }
     let Some((stem, _)) = super::outside::pack_file(&file) else { return nothing() };
-    let Ok(secret) = super::secret(store, &state.agent.did()) else { return nothing() };
+    let Ok(secret) = super::secret(store, &state.community.sealing()) else { return nothing() };
     if !super::outside::signed(&secret, &file, &asked.from, &asked.key) {
         return nothing();
     }
@@ -666,7 +666,7 @@ async fn preview_picture(State(state): State<Arc<AppState>>, Path(name): Path<St
     if !page_on(store) {
         return nothing();
     }
-    let Ok(secret) = super::secret(store, &state.agent.did()) else { return nothing() };
+    let Ok(secret) = super::secret(store, &state.community.sealing()) else { return nothing() };
     if !super::outside::picture_signed(&secret, &name, &asked.from, &asked.key) {
         return nothing();
     }

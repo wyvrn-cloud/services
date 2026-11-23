@@ -57,7 +57,7 @@ pub const THEME: &str = "web.theme";
 pub const CSS: &str = "web.css";
 pub const DYNAMIC: &str = "oidc.dynamic";
 pub const INDIEAUTH: &str = "oidc.indieauth";
-const SECRET: &str = "web.secret";
+pub(crate) const SECRET: &str = "web.secret";
 
 /// Who is shown who is in voice: `off`, `members`, `counts` or `names`.
 pub const VOICE_CHOICES: [&str; 4] = ["off", "members", "counts", "names"];
@@ -209,28 +209,28 @@ pub fn voice_choice(store: &Store) -> String {
 
 /// The community's own secret for the web view: pairwise ids, picture addresses.
 /// Kept sealed with the service's seal key where it has one, bound to the
-/// community (its DID, `did`, which goes with it wherever its store is moved)
+/// community (`sealing`: its keys, which go with it wherever it is moved, WYV-124)
 /// (security review WYV-32).
-pub fn secret(store: &Store, did: &str) -> anyhow::Result<String> {
-    let at = format!("{did}#web-secret");
+pub fn secret(store: &Store, sealing: &crate::sealing::Sealing) -> anyhow::Result<String> {
+    const WHAT: &str = "web-secret";
     if let Some(kept) = store.setting(SECRET)? {
-        let (secret, again) = wyvrn_service::identity::open_text(&kept, &at)?;
+        let (secret, again) = sealing.open(&kept, WHAT)?;
         if again {
-            store.set_setting(SECRET, &wyvrn_service::identity::seal_text(&secret, &at)?)?;
+            store.set_setting(SECRET, &sealing.seal(&secret, WHAT)?)?;
         }
         return Ok(secret);
     }
-    store.set_setting(SECRET, &wyvrn_service::identity::seal_text(&store::secret(), &at)?)?;
+    store.set_setting(SECRET, &sealing.seal(&store::secret(), WHAT)?)?;
     let kept = store.setting(SECRET)?.unwrap_or_default();
-    Ok(wyvrn_service::identity::open_text(&kept, &at)?.0)
+    Ok(sealing.open(&kept, WHAT)?.0)
 }
 
 /// The web secret, where one is kept, opened and sealed again where it should be:
 /// at start-up, beside the identity, so the start that adopts unsealed keys
 /// adopts it too, and one that doesn't open stops the server (WYV-111).
-pub fn settle_secret(store: &Store, did: &str) -> anyhow::Result<()> {
+pub fn settle_secret(store: &Store, sealing: &crate::sealing::Sealing) -> anyhow::Result<()> {
     if store.setting(SECRET)?.is_some() {
-        secret(store, did).map_err(|e| e.context("the community's web secret"))?;
+        secret(store, sealing).map_err(|e| e.context("the community's web secret"))?;
     }
     Ok(())
 }
