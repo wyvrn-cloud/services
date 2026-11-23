@@ -2244,6 +2244,8 @@ impl Store {
         let mut db = self.db.lock();
         db.execute("DELETE FROM member_left WHERE did = ?1", params![did])?;
         db.execute("DELETE FROM member_roles WHERE did = ?1", params![did])?;
+        // Signed in on the web view: signed out with it (WYV-51).
+        db.execute("DELETE FROM web_sessions WHERE mkey IN (SELECT mkey FROM member_keys WHERE did = ?1)", params![did])?;
         let removed = db.execute("DELETE FROM members WHERE did = ?1", params![did])? > 0;
         if removed {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);

@@ -67,6 +67,8 @@ pub struct AppState {
     /// post and change, which then don't go through their mediator.
     pub watching: Mutex<HashSet<u64>>,
     pub next_live: AtomicU64,
+    /// Live pages and connections open now, by address and by member (WYV-51).
+    pub live_open: crate::web::posting::LiveCounts,
     /// The AI assistant answering in its channels, where it has one
     /// (wyvrn-claude; assistant.rs).
     pub assistant: Option<Arc<crate::assistant::Assistant>>,
@@ -95,6 +97,7 @@ impl AppState {
             live: Mutex::new(HashMap::new()),
             watching: Mutex::new(HashSet::new()),
             next_live: AtomicU64::new(1),
+            live_open: Default::default(),
             assistant: None,
             owner_pages: None,
             owner_admin: Default::default(),
@@ -787,6 +790,10 @@ fn watch(state: &Arc<AppState>, live: u64, sender: &str, message: &Value) -> any
 const LIVE_PING_EVERY: Duration = Duration::from_secs(20);
 const LIVE_SILENT_FOR: Duration = Duration::from_secs(60);
 
+/// Live connections open at once, in all and for one DID (WYV-51).
+const LIVE_IN_ALL: usize = 5_000;
+const LIVE_PER_DID: usize = 8;
+
 /// A member's live connection (community-voice/1.0's Connectivity): DIDComm over a
 /// WebSocket. What they send is answered on it, and presence and keys are pushed
 /// on it. It is one member's: the first authenticated message says whose.
@@ -850,6 +857,13 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket) {
         }
     });
     let service = CommunityService(state.clone());
+    // So many live connections in all, and for one DID (WYV-51): held while open.
+    let Some(_all) = crate::web::posting::LiveHeld::take(&state.live_open, vec![("ws:all".into(), LIVE_IN_ALL)]) else {
+        packing.abort();
+        writing.abort();
+        return;
+    };
+    let mut _theirs: Option<crate::web::posting::LiveHeld> = None;
     // Nothing heard for this long, not even the answer to a ping: gone, and out of
     // any room it was in, rather than listed there until TCP gives up on it.
     while let Ok(Some(Ok(frame))) = tokio::time::timeout(LIVE_SILENT_FOR, stream.next()).await {
@@ -867,6 +881,8 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket) {
         let (Some(sender), Some(sender_kid)) = (received.sender.clone(), unpacked.sender_kid) else { continue };
         match &holder {
             None => {
+                let Some(held) = crate::web::posting::LiveHeld::take(&state.live_open, vec![(format!("ws:{sender}"), LIVE_PER_DID)]) else { break };
+                _theirs = Some(held);
                 holder = Some(sender.clone());
                 *holder_cell.lock().unwrap_or_else(|p| p.into_inner()) = Some(sender.clone());
                 state.live.lock().unwrap_or_else(|p| p.into_inner()).insert(id, (sender.clone(), out.clone()));
