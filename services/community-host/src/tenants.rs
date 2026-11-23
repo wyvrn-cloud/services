@@ -107,6 +107,10 @@ pub struct Host {
     /// For each community closed while still owing someone a delivery, the wait
     /// it was last given (`next_retry`). Forgotten once it owes nothing.
     retrying: Mutex<HashMap<String, i64>>,
+    /// Every community's store as last measured, open or not, for the budget.
+    measured: Mutex<HashMap<String, u64>>,
+    /// Whether the host is full (its budget, or its disk): given to every community.
+    pub full: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Host {
@@ -115,6 +119,8 @@ impl Host {
             config,
             registry,
             exports: Default::default(),
+            measured: Default::default(),
+            full: Default::default(),
             me: me.clone(),
             open: Mutex::default(),
             opening: std::sync::Mutex::default(),
@@ -329,6 +335,8 @@ impl Host {
         ));
         let opening = Opening { profile_env: None, address: self.address(&record.name)?, voice_tokens: format!("{}.", record.name), assistant: None, owner_pages: Some(owner_pages) };
         let Opened { state, holding } = serve::open(&config, &stores, opening).await?;
+        // Whether the host is full, as every community here is told (WYV-22).
+        let _ = state.community.host_full.set(self.full.clone());
         // What the host says of it stands over what it says of itself.
         state.community.set_moving(record.state == State::Moving)?;
         let mut tasks = vec![
@@ -447,8 +455,24 @@ impl Host {
         for tenant in self.open_map().values() {
             let community = &tenant.state.community;
             match community.store.bytes_used() {
-                Ok(bytes) => community.used_bytes.store(bytes, Ordering::Relaxed),
+                Ok(bytes) => {
+                    community.used_bytes.store(bytes, Ordering::Relaxed);
+                    self.measured.lock().unwrap_or_else(|p| p.into_inner()).insert(tenant.name.clone(), bytes);
+                }
                 Err(error) => tracing::warn!(community = %tenant.name, %error, "couldn't measure a community's store"),
+            }
+        }
+        // The host as a whole (WYV-22): its budget, and the disk.
+        let storage = &self.config.storage;
+        let total: u64 = self.measured.lock().unwrap_or_else(|p| p.into_inner()).values().sum();
+        let over_budget = storage.budget_bytes > 0 && total >= storage.budget_bytes;
+        let disk_low = storage.min_free_bytes > 0 && free_bytes(&storage.dir).is_some_and(|free| free < storage.min_free_bytes);
+        let full = over_budget || disk_low;
+        if self.full.swap(full, Ordering::Relaxed) != full {
+            if full {
+                tracing::warn!(total, over_budget, disk_low, "the host is full: nothing more is posted in any community until there is room");
+            } else {
+                tracing::info!(total, "the host has room again");
             }
         }
     }
@@ -580,4 +604,18 @@ mod tests {
         assert_eq!(*waits.last().unwrap(), RETRY_AT_MOST);
         assert!(waits.windows(2).all(|pair| pair[1] >= pair[0]));
     }
+}
+
+/// How much is free on the disk `path` is on, in bytes, where that can be asked.
+#[cfg(unix)]
+fn free_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    (unsafe { libc::statvfs(path.as_ptr(), &mut stat) } == 0).then(|| stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn free_bytes(_path: &std::path::Path) -> Option<u64> {
+    None
 }

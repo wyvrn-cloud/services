@@ -5389,6 +5389,7 @@ dependencies = [
  "didcomm-core",
  "didcomm-quickstart",
  "flate2",
+ "libc",
  "mysql",
  "reqwest",
  "rusqlite",

@@ -139,11 +139,23 @@ pub struct StorageConfig {
     pub database_prefix: String,
     /// The database `mysql-shared` communities share, each in tables of its own.
     pub shared_database: String,
+    /// All the communities' stores together, in bytes, past which nothing more is
+    /// posted in any (WYV-22); 0 for no budget.
+    #[serde(default)]
+    pub budget_bytes: u64,
+    /// Kept free on the disk `dir` is on: past it, nothing more is posted
+    /// anywhere either. 1 GiB unless set; 0 not to look.
+    #[serde(default = "default_min_free")]
+    pub min_free_bytes: u64,
+}
+
+fn default_min_free() -> u64 {
+    1024 * 1024 * 1024
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
-        Self { default: "sqlite".into(), dir: "communities".into(), mysql: String::new(), database_prefix: "wyvrn_c".into(), shared_database: "wyvrn_communities".into() }
+        Self { default: "sqlite".into(), dir: "communities".into(), mysql: String::new(), database_prefix: "wyvrn_c".into(), shared_database: "wyvrn_communities".into(), budget_bytes: 0, min_free_bytes: default_min_free() }
     }
 }
 

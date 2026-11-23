@@ -774,3 +774,17 @@ async fn a_purged_community_kept_in_mysql_loses_its_tables_and_no_one_elses() {
     assert!(tables(format!("c{}\\_%", gone.id)).is_empty(), "its tables went");
     assert!(!tables(format!("c{}\\_%", stays.id)).is_empty(), "another's stayed");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_past_its_budget_takes_no_more_posts_in_any_community() {
+    let running = start_host_with_extra(600, "", "").await;
+    let mut config = running.host.config.clone();
+    config.storage.budget_bytes = 1;
+    let host = Host::new(config, Registry::scratch().unwrap());
+    host.registry.create("busy", "Busy", Storage::Sqlite, "did:example:owner", "test", 1).unwrap();
+    let tenant = host.tenant("busy").await.unwrap().unwrap();
+    // Measured: one byte is the whole budget, and any store is more (WYV-22).
+    tokio::task::block_in_place(|| host.measure());
+    assert!(host.full.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(tenant.state.community.host_full.get().is_some_and(|full| full.load(std::sync::atomic::Ordering::Relaxed)));
+}
