@@ -4568,7 +4568,7 @@ async fn posting_in_threads_and_making_polls_are_permissions_of_their_own() {
     member.community("create-thread", json!({ "to": { "id": "root" } })).await;
     // Everyone may by default, as before.
     assert_eq!(kind(&member.community("post", json!({ "channel": channel, "content": "in it", "thread": "root" })).await), "posted");
-    let poll = json!({ "question": "Pizza?", "answers": [{ "id": "a", "text": "Yes" }, { "id": "b", "text": "No" }], "ends_at": wyvrn_service::now() + 3600 });
+    let poll = json!({ "question": "Pizza?", "answers": [{ "id": "a", "text": "Yes" }, { "id": "b", "text": "No" }], "ends_at": wyvrn_service::now() + 7200 });
     let polled = member.community("post", json!({ "channel": channel, "content": "", "poll": poll.clone() })).await;
     assert_eq!(kind(&polled), "posted", "{polled}");
 
