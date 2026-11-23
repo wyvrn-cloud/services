@@ -124,6 +124,8 @@ services:
       COMMUNITY_HOST_MYSQL_URL: "${COMMUNITY_HOST_MYSQL_URL:-}"
       COMMUNITY_HOST_VOICE_RELAY_URL: "${COMMUNITY_HOST_VOICE_RELAY_URL:-}"
       COMMUNITY_HOST_VOICE_RELAY_FINGERPRINT: "${COMMUNITY_HOST_VOICE_RELAY_FINGERPRINT:-}"
+      # The proxy (Caddy) whose X-Forwarded-For is believed; empty: the Docker gateways.
+      COMMUNITY_HOST_WEB_TRUSTED_PROXIES: "${COMMUNITY_HOST_WEB_TRUSTED_PROXIES:-}"
     # Each open community holds a few files open, and each member's live connection one.
     ulimits:
       nofile:

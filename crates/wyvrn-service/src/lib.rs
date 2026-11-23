@@ -27,6 +27,7 @@
 
 pub mod address;
 pub mod admin;
+pub mod client_address;
 pub mod db;
 pub mod guard;
 pub mod hosted_address;

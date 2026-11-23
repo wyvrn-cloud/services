@@ -234,7 +234,9 @@ impl Config {
     /// often needs to: `COMMUNITY_HOST_BIND`, `COMMUNITY_HOST_PUBLIC_URL`,
     /// `COMMUNITY_HOST_ADMINS`, `COMMUNITY_HOST_DID_HOST`, `COMMUNITY_HOST_STORAGE`
     /// (the default kind), `COMMUNITY_HOST_DIR`, `COMMUNITY_HOST_MYSQL_URL`, and
-    /// `COMMUNITY_HOST_VOICE_RELAY_URL` with `COMMUNITY_HOST_VOICE_RELAY_FINGERPRINT`.
+    /// `COMMUNITY_HOST_VOICE_RELAY_URL` with `COMMUNITY_HOST_VOICE_RELAY_FINGERPRINT`,
+    /// and `COMMUNITY_HOST_WEB_TRUSTED_PROXIES` (comma-separated; the Docker gateways
+    /// when none are named).
     /// The host's own store is `COMMUNITY_HOST_DATABASE_URL` if set ([`crate::registry`]).
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
@@ -272,7 +274,11 @@ impl Config {
                 voice.relay_fingerprint = Some(fingerprint);
             }
         }
+        if let Some(proxies) = env("COMMUNITY_HOST_WEB_TRUSTED_PROXIES") {
+            config.web.trusted_proxies = proxies.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
+        }
         config.settle();
+        wyvrn_service::client_address::Proxies::parse(&config.web.trusted_proxies).map_err(|e| anyhow::anyhow!("[web] trusted_proxies: {e}"))?;
         Ok(config)
     }
 
@@ -281,6 +287,13 @@ impl Config {
     pub fn settle(&mut self) {
         if !self.server.public_url.ends_with('/') {
             self.server.public_url.push('/');
+        }
+        // The host is run behind a proxy in a container: with none named, the
+        // Docker networks' gateways, as the community's compose entry has it. Its
+        // communities take this (tenants.rs), so they see each client, not the
+        // gateway (security review WYV-74).
+        if self.web.trusted_proxies.is_empty() {
+            self.web.trusted_proxies = wyvrn_service::client_address::docker_gateways();
         }
     }
 }

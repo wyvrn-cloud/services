@@ -94,6 +94,8 @@ const MEASURE_EVERY: i64 = 300;
 
 pub struct Host {
     pub config: Config,
+    /// The proxies whose X-Forwarded-For is believed (config.web.trusted_proxies).
+    proxies: wyvrn_service::client_address::Proxies,
     pub registry: Registry,
     /// Exports made for owners moving out, waiting to be fetched (export.rs).
     pub exports: crate::export::Exports,
@@ -141,17 +143,19 @@ impl PerMinute {
 /// Who a request is from, to be counted: its peer if that is public; through a
 /// proxy in front (a private peer), the last public address it was forwarded for.
 /// None to count (this machine, a test) otherwise.
-fn client_of(request: &Request<Body>) -> Option<std::net::IpAddr> {
+/// Who `request` is from, by the host's trusted proxies (one rule for every
+/// service: wyvrn_service::client_address), as a limit counts it.
+fn client_of(proxies: &wyvrn_service::client_address::Proxies, request: &Request<Body>) -> Option<std::net::IpAddr> {
     let peer = request.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|info| info.0.ip())?;
-    if wyvrn_service::guard::is_public(peer) {
-        return Some(peer);
-    }
-    request.headers().get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).map(str::trim).filter_map(|a| a.parse().ok()).filter(|a| wyvrn_service::guard::is_public(*a)).last()
+    Some(wyvrn_service::client_address::bucket(proxies.client(peer, request.headers())))
 }
 
 impl Host {
     pub fn new(config: Config, registry: Registry) -> Arc<Self> {
+        // Checked as the configuration was read (config.rs).
+        let proxies = wyvrn_service::client_address::Proxies::parse(&config.web.trusted_proxies).unwrap_or_default();
         Arc::new_cyclic(|me| Self {
+            proxies,
             config,
             registry,
             exports: Default::default(),
@@ -433,7 +437,7 @@ impl Host {
         // Messages from one address to all the communities here together (WYV-62):
         // a flood of joins spread over many communities is still one address's.
         if request.method() == axum::http::Method::POST {
-            if let Some(client) = client_of(&request) {
+            if let Some(client) = client_of(&self.proxies, &request) {
                 if !self.posts.allow(client, now()) {
                     return (StatusCode::TOO_MANY_REQUESTS, "Too many messages from this address: wait a minute.").into_response();
                 }
