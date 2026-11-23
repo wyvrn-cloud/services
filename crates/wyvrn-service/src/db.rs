@@ -1045,25 +1045,67 @@ struct Outcome {
 /// read from `information_schema` the first time a table is written, kept.
 type TableShape = HashMap<String, (Option<u64>, bool)>;
 
-fn shape_of(connection: &mut impl Queryable, table: &str) -> Option<TableShape> {
+fn shape_of(connection: &mut impl Queryable, table: &Named) -> Option<TableShape> {
     static SHAPES: std::sync::LazyLock<Mutex<HashMap<String, TableShape>>> = std::sync::LazyLock::new(Default::default);
-    if let Some(shape) = SHAPES.lock().unwrap_or_else(|p| p.into_inner()).get(table) {
+    let key = format!("{}.{}", table.database.as_deref().unwrap_or(""), table.table);
+    if let Some(shape) = SHAPES.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return Some(shape.clone());
     }
     let rows: Vec<(String, Option<u64>, String)> = connection
-        .exec("SELECT COLUMN_NAME, CHARACTER_MAXIMUM_LENGTH, COLUMN_KEY FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ?", (table,))
+        .exec(
+            "SELECT COLUMN_NAME, CHARACTER_MAXIMUM_LENGTH, COLUMN_KEY FROM information_schema.columns WHERE table_schema = COALESCE(?, DATABASE()) AND table_name = ?",
+            (table.database.clone(), table.table.clone()),
+        )
         .ok()?;
     if rows.is_empty() {
         return None;
     }
     let shape: TableShape = rows.into_iter().map(|(column, most, key)| (column.to_ascii_lowercase(), (most, key == "PRI" || key == "UNI"))).collect();
-    SHAPES.lock().unwrap_or_else(|p| p.into_inner()).insert(table.to_string(), shape.clone());
+    SHAPES.lock().unwrap_or_else(|p| p.into_inner()).insert(key, shape.clone());
     Some(shape)
+}
+
+/// A table as a statement names it: `t`, `"t"`, or `"db"."t"` (a shared server's,
+/// as [`renamed`] writes it).
+#[derive(Debug, PartialEq)]
+struct Named {
+    database: Option<String>,
+    table: String,
+}
+
+fn named(text: &str) -> Named {
+    let unquote = |part: &str| part.trim().trim_matches('"').trim_matches('`').to_string();
+    match text.trim().split_once("\".\"").or_else(|| text.trim().split_once("`.`")) {
+        Some((database, table)) => Named { database: Some(unquote(database)), table: unquote(table) },
+        None => Named { database: None, table: unquote(text) },
+    }
+}
+
+/// The table, columns and parameter places of `UPDATE t SET a = ?1, b = ?2 ...`,
+/// where every assignment is that simple; a column set otherwise has no place.
+fn update_shape(sql: &str) -> Option<(Named, Vec<(String, Option<usize>)>)> {
+    let trimmed = sql.trim_start();
+    let upper = trimmed.to_ascii_uppercase();
+    if !upper.starts_with("UPDATE ") {
+        return None;
+    }
+    let set = upper.find(" SET ")?;
+    let table = named(&trimmed[7..set]);
+    let end = upper[set..].find(" WHERE ").map_or(trimmed.len(), |at| set + at);
+    let assignments = trimmed[set + 5..end]
+        .split(',')
+        .filter_map(|assignment| {
+            let (column, value) = assignment.split_once('=')?;
+            let place = value.trim().strip_prefix('?').and_then(|n| n.parse::<usize>().ok()).map(|n| n - 1);
+            Some((column.trim().trim_matches('"').trim_matches('`').to_ascii_lowercase(), place))
+        })
+        .collect();
+    Some((table, assignments))
 }
 
 /// The table, columns and parameter places of `INSERT [OR ...] INTO t (a, b) VALUES (?1, ?2)`,
 /// where it is that; a column given a literal has no place.
-fn insert_shape(sql: &str) -> Option<(String, Vec<(String, Option<usize>)>)> {
+fn insert_shape(sql: &str) -> Option<(Named, Vec<(String, Option<usize>)>)> {
     let upper = sql.trim_start().to_ascii_uppercase();
     if !(upper.starts_with("INSERT") || upper.starts_with("REPLACE")) {
         return None;
@@ -1071,7 +1113,7 @@ fn insert_shape(sql: &str) -> Option<(String, Vec<(String, Option<usize>)>)> {
     let into = upper.find(" INTO ")? + 6;
     let rest = &sql.trim_start()[into..];
     let open = rest.find('(')?;
-    let table = rest[..open].trim().trim_matches('"').trim_matches('`').to_string();
+    let table = named(&rest[..open]);
     let close = rest.find(')')?;
     let columns: Vec<String> = rest[open + 1..close].split(',').map(|c| c.trim().trim_matches('"').trim_matches('`').to_ascii_lowercase()).collect();
     let after = &rest[close + 1..];
@@ -1086,10 +1128,12 @@ fn insert_shape(sql: &str) -> Option<(String, Vec<(String, Option<usize>)>)> {
 /// `INSERT IGNORE` cuts a value too long for its column to fit, where SQLite keeps
 /// it whole; and its `_bin` collations pad, so `'x'` and `'x '` are one key there
 /// and two in SQLite. Refused here instead: a value longer than its column, and a
-/// key with spaces round it.
+/// key with spaces round it. Inserts and simple updates, on a database of its own
+/// or a shared server's (`"db"."prefix_t"`).
 fn check_written(connection: &mut impl Queryable, sql: &str, params: &[Value]) -> Result<()> {
-    let Some((table, columns)) = insert_shape(sql) else { return Ok(()) };
-    let Some(shape) = shape_of(connection, &table) else { return Ok(()) };
+    let Some((named, columns)) = insert_shape(sql).or_else(|| update_shape(sql)) else { return Ok(()) };
+    let Some(shape) = shape_of(connection, &named) else { return Ok(()) };
+    let table = &named.table;
     for (column, place) in columns {
         let (Some(place), Some((most, key))) = (place, shape.get(&column)) else { continue };
         let (length, padded) = match params.get(place) {
@@ -1469,16 +1513,29 @@ mod tests {
         assert!(writing.execute("INSERT INTO shaped (k, v) VALUES (?1, ?2)", &[text("b "), text("x")]).is_err());
         assert_eq!(writing.execute("INSERT OR IGNORE INTO shaped (k, v) VALUES (?1, ?2)", &[text("c"), text("fits")]).unwrap(), 1);
         assert_eq!(writing.execute("INSERT OR IGNORE INTO shaped (k, v) VALUES (?1, ?2)", &[text("c"), text("dup")]).unwrap(), 0);
+        // An update is held to the same (WYV-60).
+        assert!(writing.execute("UPDATE shaped SET v = ?2 WHERE k = ?1", &[text("c"), text("too long")]).is_err());
+        assert_eq!(writing.execute("UPDATE shaped SET v = ?2 WHERE k = ?1", &[text("c"), text("ok")]).unwrap(), 1);
     }
 
     #[test]
     fn an_inserts_table_columns_and_places_are_read_off_it() {
         assert_eq!(
             insert_shape("INSERT OR IGNORE INTO \"members\" (did, role, at) VALUES (?1, 'admin', ?3)"),
-            Some(("members".to_string(), vec![("did".to_string(), Some(0)), ("role".to_string(), None), ("at".to_string(), Some(2))]))
+            Some((Named { database: None, table: "members".to_string() }, vec![("did".to_string(), Some(0)), ("role".to_string(), None), ("at".to_string(), Some(2))]))
         );
         assert_eq!(insert_shape("SELECT 1"), None);
         assert_eq!(insert_shape("INSERT INTO t SELECT * FROM u"), None);
+        // A shared server's table, as `renamed` writes it, is read with its database (WYV-60).
+        assert_eq!(
+            insert_shape("INSERT INTO \"wyvrn_x\".\"c9_members\" (did) VALUES (?1)").map(|(named, _)| named),
+            Some(Named { database: Some("wyvrn_x".to_string()), table: "c9_members".to_string() })
+        );
+        // And an update's simple assignments.
+        assert_eq!(
+            update_shape("UPDATE \"wyvrn_x\".\"c9_members\" SET role = ?2, at = at + 1 WHERE did = ?1"),
+            Some((Named { database: Some("wyvrn_x".to_string()), table: "c9_members".to_string() }, vec![("role".to_string(), Some(1)), ("at".to_string(), None)]))
+        );
     }
 
     use super::*;
