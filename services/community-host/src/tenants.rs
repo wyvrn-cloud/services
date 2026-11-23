@@ -111,6 +111,42 @@ pub struct Host {
     measured: Mutex<HashMap<String, u64>>,
     /// Whether the host is full (its budget, or its disk): given to every community.
     pub full: Arc<std::sync::atomic::AtomicBool>,
+    /// Messages a minute from each address, to every community together (WYV-62).
+    posts: PerMinute,
+}
+
+/// So many a minute for each address.
+#[derive(Default)]
+struct PerMinute(Mutex<HashMap<std::net::IpAddr, (i64, u32)>>);
+
+/// Messages one address may send all the communities together, a minute.
+const POSTS_PER_ADDRESS_A_MINUTE: u32 = 600;
+
+impl PerMinute {
+    fn allow(&self, address: std::net::IpAddr, now: i64) -> bool {
+        let minute = now / 60;
+        let mut seen = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if seen.len() > 50_000 {
+            seen.retain(|_, (at, _)| *at == minute);
+        }
+        let entry = seen.entry(address).or_insert((minute, 0));
+        if entry.0 != minute {
+            *entry = (minute, 0);
+        }
+        entry.1 += 1;
+        entry.1 <= POSTS_PER_ADDRESS_A_MINUTE
+    }
+}
+
+/// Who a request is from, to be counted: its peer if that is public; through a
+/// proxy in front (a private peer), the last public address it was forwarded for.
+/// None to count (this machine, a test) otherwise.
+fn client_of(request: &Request<Body>) -> Option<std::net::IpAddr> {
+    let peer = request.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|info| info.0.ip())?;
+    if wyvrn_service::guard::is_public(peer) {
+        return Some(peer);
+    }
+    request.headers().get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).map(str::trim).filter_map(|a| a.parse().ok()).filter(|a| wyvrn_service::guard::is_public(*a)).last()
 }
 
 impl Host {
@@ -121,6 +157,7 @@ impl Host {
             exports: Default::default(),
             measured: Default::default(),
             full: Default::default(),
+            posts: Default::default(),
             me: me.clone(),
             open: Mutex::default(),
             opening: std::sync::Mutex::default(),
@@ -393,6 +430,15 @@ impl Host {
     /// Hands `request` to the community called `name` (its path already without
     /// `/c/<name>`), opening it first if need be.
     pub async fn forward(&self, name: &str, request: Request<Body>) -> Response {
+        // Messages from one address to all the communities here together (WYV-62):
+        // a flood of joins spread over many communities is still one address's.
+        if request.method() == axum::http::Method::POST {
+            if let Some(client) = client_of(&request) {
+                if !self.posts.allow(client, now()) {
+                    return (StatusCode::TOO_MANY_REQUESTS, "Too many messages from this address: wait a minute.").into_response();
+                }
+            }
+        }
         match self.tenant(name).await {
             Ok(Some(tenant)) => tenant.serve(request).await,
             Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -613,6 +659,20 @@ fn free_bytes(path: &std::path::Path) -> Option<u64> {
     let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     (unsafe { libc::statvfs(path.as_ptr(), &mut stat) } == 0).then(|| stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+#[cfg(test)]
+mod per_minute_tests {
+    #[test]
+    fn so_many_a_minute_from_one_address_across_every_community() {
+        let limit = super::PerMinute::default();
+        let address: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        for _ in 0..super::POSTS_PER_ADDRESS_A_MINUTE {
+            assert!(limit.allow(address, 60));
+        }
+        assert!(!limit.allow(address, 61));
+        assert!(limit.allow(address, 120), "a new minute");
+    }
 }
 
 #[cfg(not(unix))]
