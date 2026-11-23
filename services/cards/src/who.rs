@@ -209,29 +209,8 @@ pub fn of_invite(oob: &str) -> Option<Who> {
 }
 
 /// Whether an address is one out on the internet: not this machine, not the
-/// network it is on, nothing set aside for anything else.
-pub fn is_public(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
-            !(v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_broadcast() || v4.is_documentation() || v4.is_unspecified() || v4.is_multicast()
-                || a == 0
-                // Carrier-grade NAT, and what is reserved.
-                || (a == 100 && (64..128).contains(&b))
-                || a >= 240)
-        }
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => is_public(IpAddr::V4(v4)),
-            None => {
-                let first = v6.segments()[0];
-                !(v6.is_loopback() || v6.is_unspecified() || v6.is_multicast()
-                    // Unique local, and link local.
-                    || (first & 0xfe00) == 0xfc00
-                    || (first & 0xffc0) == 0xfe80)
-            }
-        },
-    }
-}
+/// network it is on, nothing set aside for anything else (the shared guard's rule).
+pub use wyvrn_service::guard::is_public;
 
 /// Names looked up, less every address that isn't out on the internet: a DID names
 /// any host it likes, and this service is not a way to reach what is beside it.

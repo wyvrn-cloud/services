@@ -16,11 +16,14 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::Url;
 
 /// Whether `ip` is on the public internet: not this machine, not a private or
-/// shared network, not link-local, multicast or reserved.
+/// shared network, not link-local, multicast or reserved, and not an IPv6 form that
+/// carries or translates an IPv4 address (NAT64, 6to4, Teredo, v4-compatible),
+/// whose other end may be a private one (WYV-91). The same table of ranges is
+/// tested in wyvrn-verify's and the app's guards.
 pub fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
+            let [a, b, c, _] = v4.octets();
             !(v4.is_private()
                 || v4.is_loopback()
                 || v4.is_link_local()
@@ -28,22 +31,37 @@ pub fn is_public(ip: IpAddr) -> bool {
                 || v4.is_documentation()
                 || v4.is_unspecified()
                 || v4.is_multicast()
-                // Carrier-grade NAT (100.64.0.0/10), "this network" and the reserved block.
+                // Carrier-grade NAT (100.64.0.0/10) and "this network" (0.0.0.0/8).
                 || (a == 100 && (b & 0xc0) == 64)
                 || a == 0
+                // IETF protocol assignments (192.0.0.0/24), benchmarking (198.18.0.0/15).
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 198 && (b & 0xfe) == 18)
+                // Reserved (240.0.0.0/4), and the broadcast address in it.
                 || a >= 240)
         }
         IpAddr::V6(v6) => {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_public(IpAddr::V4(v4));
             }
-            let first = v6.segments()[0];
+            let s = v6.segments();
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
+                // IPv4-compatible (::a.b.c.d, deprecated): the first 96 bits zero.
+                || s[..6].iter().all(|&x| x == 0)
+                // NAT64: the well-known prefix (64:ff9b::/96) and local use (64:ff9b:1::/48).
+                || (s[0] == 0x64 && s[1] == 0xff9b && s[2..6].iter().all(|&x| x == 0))
+                || (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1)
+                // Discard-only (100::/64).
+                || (s[0] == 0x100 && s[1..4].iter().all(|&x| x == 0))
+                // Teredo (2001::/32), documentation (2001:db8::/32), 6to4 (2002::/16).
+                || (s[0] == 0x2001 && s[1] == 0)
+                || (s[0] == 0x2001 && s[1] == 0xdb8)
+                || s[0] == 0x2002
                 // Unique local (fc00::/7) and link-local (fe80::/10).
-                || (first & 0xfe00) == 0xfc00
-                || (first & 0xffc0) == 0xfe80)
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80)
         }
     }
 }
@@ -112,13 +130,49 @@ impl Resolve for Guard {
 mod tests {
     use super::*;
 
+    const NOT_PUBLIC: &[(&str, &str)] = &[
+        ("0.0.0.0/8", "0.1.2.3"),
+        ("10.0.0.0/8", "10.1.2.3"),
+        ("100.64.0.0/10", "100.64.0.1"),
+        ("127.0.0.0/8", "127.0.0.1"),
+        ("169.254.0.0/16", "169.254.1.1"),
+        ("172.16.0.0/12", "172.16.0.1"),
+        ("192.0.0.0/24", "192.0.0.8"),
+        ("192.0.2.0/24", "192.0.2.1"),
+        ("192.168.0.0/16", "192.168.1.1"),
+        ("198.18.0.0/15", "198.18.0.1"),
+        ("198.18.0.0/15", "198.19.255.254"),
+        ("198.51.100.0/24", "198.51.100.1"),
+        ("203.0.113.0/24", "203.0.113.1"),
+        ("224.0.0.0/4", "224.0.0.1"),
+        ("240.0.0.0/4", "240.0.0.1"),
+        ("240.0.0.0/4", "255.255.255.255"),
+        ("::/128", "::"),
+        ("::1/128", "::1"),
+        ("::ffff:0:0/96 (mapped)", "::ffff:10.0.0.1"),
+        ("::/96 (v4-compatible)", "::10.0.0.1"),
+        ("::/96 (v4-compatible)", "::8.8.8.8"),
+        ("64:ff9b::/96 (NAT64)", "64:ff9b::a00:1"),
+        ("64:ff9b::/96 (NAT64)", "64:ff9b::808:808"),
+        ("64:ff9b:1::/48 (NAT64)", "64:ff9b:1::1"),
+        ("100::/64", "100::1"),
+        ("2001::/32 (Teredo)", "2001:0:4136:e378::1"),
+        ("2001:db8::/32", "2001:db8::1"),
+        ("2002::/16 (6to4)", "2002:a00:1::1"),
+        ("fc00::/7", "fd00::1"),
+        ("fe80::/10", "fe80::1"),
+        ("ff00::/8", "ff02::1"),
+    ];
+
+    const PUBLIC: &[&str] = &["1.1.1.1", "8.8.8.8", "198.17.255.1", "198.20.0.1", "192.0.1.1", "2606:4700:4700::1111", "2a00:1450:4001::1", "2001:4860::8888", "::ffff:8.8.8.8"];
+
     #[test]
-    fn private_and_local_addresses_are_not_public() {
-        for private in ["127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.1.1", "100.64.0.1", "0.0.0.0", "::1", "fd00::1", "fe80::1", "::ffff:10.0.0.1"] {
-            assert!(!is_public(private.parse().unwrap()), "{private}");
+    fn special_ranges_are_not_public() {
+        for (range, address) in NOT_PUBLIC {
+            assert!(!is_public(address.parse().unwrap()), "{address} in {range}");
         }
-        for public in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
-            assert!(is_public(public.parse().unwrap()), "{public}");
+        for address in PUBLIC {
+            assert!(is_public(address.parse().unwrap()), "{address}");
         }
     }
 

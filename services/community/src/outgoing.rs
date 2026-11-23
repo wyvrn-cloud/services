@@ -165,22 +165,7 @@ pub fn signature(secret: &str, at: i64, body: &str) -> String {
 /// Whether events may go to `ip`: an address out on the internet, unless private
 /// ones are allowed.
 fn reachable(ip: IpAddr, private: bool) -> bool {
-    if private {
-        return true;
-    }
-    match ip {
-        IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
-            !(v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast() || v4.is_multicast() || v4.is_documentation() || (a == 100 && (64..128).contains(&b)) || a == 0)
-        }
-        IpAddr::V6(v6) => {
-            let first = v6.segments()[0];
-            match v6.to_ipv4_mapped() {
-                Some(v4) => reachable(IpAddr::V4(v4), false),
-                None => !(v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80),
-            }
-        }
-    }
+    private || wyvrn_service::guard::is_public(ip)
 }
 
 /// Checks a receiver's URL as an admin gives it: what is wrong with it, if anything.
