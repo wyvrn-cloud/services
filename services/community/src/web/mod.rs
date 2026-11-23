@@ -32,10 +32,10 @@ pub mod sign_in;
 pub mod store;
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -87,7 +87,6 @@ pub struct Web {
     pub url: url::Url,
     /// Its path, ending in `/`: `/` at the root of its origin.
     pub path: String,
-    proxies: Vec<(IpAddr, u8)>,
     pub sign_in: sign_in::Signing,
     limits: Mutex<HashMap<IpAddr, (i64, u32)>>,
 }
@@ -106,8 +105,7 @@ impl Web {
         if !matches!(url.scheme(), "https" | "http") || url.query().is_some() || url.fragment().is_some() {
             anyhow::bail!("[web] public_url is an http(s) address with a path and nothing after it");
         }
-        let proxies = config.web.trusted_proxies.iter().map(|range| parse_range(range).ok_or_else(|| anyhow::anyhow!("[web] trusted_proxies: {range:?} isn't an address or a range"))).collect::<anyhow::Result<_>>()?;
-        Ok(Some(Self { server_url: config.server.public_url.clone(), path: url.path().to_string(), url, proxies, config: config.web.clone(), sign_in: sign_in::Signing::default(), limits: Mutex::new(HashMap::new()) }))
+        Ok(Some(Self { server_url: config.server.public_url.clone(), path: url.path().to_string(), url, config: config.web.clone(), sign_in: sign_in::Signing::default(), limits: Mutex::new(HashMap::new()) }))
     }
 
     /// An absolute address inside the web view: `relative` is a path from its root,
@@ -131,26 +129,6 @@ impl Web {
         self.url.scheme() == "https"
     }
 
-    /// Who a request is from: the address it came from, or, from a trusted proxy,
-    /// the last address in `X-Forwarded-For` that isn't one.
-    pub fn client(&self, request: &Request) -> Option<IpAddr> {
-        let peer = request.extensions().get::<ConnectInfo<SocketAddr>>().map(|info| info.0.ip())?;
-        Some(self.client_from(peer, request.headers()))
-    }
-
-    /// The same, from the connection's address and the request's headers.
-    pub fn client_from(&self, peer: IpAddr, headers: &axum::http::HeaderMap) -> IpAddr {
-        if !self.trusted(peer) {
-            return peer;
-        }
-        let forwarded = headers.get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).map(str::trim).collect::<Vec<_>>();
-        forwarded.iter().rev().filter_map(|a| a.parse::<IpAddr>().ok()).find(|a| !self.trusted(*a)).unwrap_or(peer)
-    }
-
-    fn trusted(&self, address: IpAddr) -> bool {
-        self.proxies.iter().any(|(net, bits)| in_range(address, *net, *bits))
-    }
-
     /// Whether `client` may make another request this minute.
     fn allowed(&self, client: IpAddr, now: i64) -> bool {
         let mut limits = self.limits.lock().unwrap_or_else(|p| p.into_inner());
@@ -167,36 +145,6 @@ impl Web {
     }
 }
 
-/// `10.0.0.0/8`, `fd00::/8`, or a single address.
-fn parse_range(text: &str) -> Option<(IpAddr, u8)> {
-    let (address, bits) = match text.trim().split_once('/') {
-        Some((address, bits)) => (address.parse::<IpAddr>().ok()?, bits.parse::<u8>().ok()?),
-        None => {
-            let address = text.trim().parse::<IpAddr>().ok()?;
-            (address, if address.is_ipv4() { 32 } else { 128 })
-        }
-    };
-    let most = if address.is_ipv4() { 32 } else { 128 };
-    (bits <= most).then_some((address, bits))
-}
-
-fn in_range(address: IpAddr, net: IpAddr, bits: u8) -> bool {
-    let address = match (address, net) {
-        (IpAddr::V6(v6), IpAddr::V4(_)) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(address),
-        _ => address,
-    };
-    match (address, net) {
-        (IpAddr::V4(a), IpAddr::V4(n)) => {
-            let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
-            u32::from(a) & mask == u32::from(n) & mask
-        }
-        (IpAddr::V6(a), IpAddr::V6(n)) => {
-            let mask = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
-            u128::from(a) & mask == u128::from(n) & mask
-        }
-        _ => false,
-    }
-}
 
 /// HMAC-SHA256 of `message` under `key`, hex: pairwise ids and picture addresses.
 pub fn keyed(key: &str, message: &str) -> String {
@@ -322,7 +270,8 @@ pub fn router(state: Arc<AppState>, web: &Web) -> Router {
 /// provider's, which websites' servers call).
 async fn guard(State(state): State<Arc<AppState>>, request: Request, next: Next) -> Response {
     let Some(web) = &state.web else { return StatusCode::NOT_FOUND.into_response() };
-    if let Some(client) = web.client(&request) {
+    // By the server's trusted proxies, an IPv6 client by its /64 (WYV-98, WYV-106).
+    if let Some(client) = state.clients.of(&request) {
         if !web.allowed(client, wyvrn_service::now()) {
             return page_error(StatusCode::TOO_MANY_REQUESTS, "Slow down", "Too many requests from here just now. Try again in a minute.");
         }
@@ -396,18 +345,6 @@ pub fn page_error(status: StatusCode, title: &str, said: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ranges_hold_what_they_say() {
-        let (net, bits) = parse_range("10.0.0.0/8").unwrap();
-        assert!(in_range("10.1.2.3".parse().unwrap(), net, bits));
-        assert!(!in_range("11.0.0.1".parse().unwrap(), net, bits));
-        assert!(in_range("::ffff:10.0.0.9".parse().unwrap(), net, bits));
-        let (net, bits) = parse_range("::1").unwrap();
-        assert!(in_range("::1".parse().unwrap(), net, bits));
-        assert!(parse_range("10.0.0.0/33").is_none());
-        assert!(parse_range("not an address").is_none());
-    }
 
     #[test]
     fn hmac_is_hmac() {

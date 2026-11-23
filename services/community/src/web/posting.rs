@@ -181,7 +181,9 @@ async fn react_form(State(state): State<Arc<AppState>>, Path((id, seq)): Path<(S
 /// `voice` (a fingerprint, only where the page shows any). The page fetches itself
 /// again when either moves. Only for a channel the viewer may read, signed in or not.
 async fn live(State(state): State<Arc<AppState>>, Path(id): Path<String>, request: axum::extract::Request) -> Response {
-    let Some(web) = state.web.as_ref() else { return StatusCode::NOT_FOUND.into_response() };
+    if state.web.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let headers = request.headers().clone();
     let viewer = Viewer::of(&state, &headers);
     if super::pages::visible_channel(&state, &viewer, &id).is_none() {
@@ -189,10 +191,10 @@ async fn live(State(state): State<Arc<AppState>>, Path(id): Path<String>, reques
     }
     // So many open at once from one address, and from one member (WYV-51).
     let mut keys = Vec::new();
-    // Every client but this machine's own (WYV-74): the trusted proxies give the
-    // client, so a private address is a client on a private network, not a proxy.
-    if let Some(client) = web.client(&request).filter(|client| !client.is_loopback()) {
-        keys.push((format!("ip:{}", wyvrn_service::client_address::bucket(client)), LIVE_PER_ADDRESS));
+    // Every client but a trusted proxy's own (WYV-74, WYV-98): the trusted proxies
+    // give the client, so a private address is a client on a private network.
+    if let Some(client) = state.clients.of(&request) {
+        keys.push((format!("ip:{client}"), LIVE_PER_ADDRESS));
     }
     if let Some((member, _)) = super::sign_in::session_of(&state, &headers) {
         keys.push((format!("member:{}", member.did), LIVE_PER_MEMBER));

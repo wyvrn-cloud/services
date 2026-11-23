@@ -77,6 +77,8 @@ pub struct AppState {
     pub owner_admin: wyvrn_service::admin::Admin,
     /// The community on the web, where the server shows it (web/).
     pub web: Option<Arc<crate::web::Web>>,
+    /// Who a request is from, for every limit by address (clients.rs, WYV-98).
+    pub clients: crate::clients::Clients,
 }
 
 impl AppState {
@@ -101,6 +103,7 @@ impl AppState {
             owner_pages: None,
             owner_admin: Default::default(),
             web: None,
+            clients: Default::default(),
         }
     }
 
@@ -884,7 +887,9 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket, client: Option
         }
     });
     let (reply_tx, mut reply_rx) = mpsc::channel::<Vec<u8>>(64);
-    let writing = tokio::spawn(async move {
+    // Closing it, saying why: too many messages from its address (WYV-97).
+    let (close_tx, mut close_rx) = mpsc::channel::<(u16, &'static str)>(1);
+    let mut writing = tokio::spawn(async move {
         // A ping now and then: what tells a connection that has died without
         // closing (a device asleep, its network changed) from a quiet one. Its
         // answer, or anything else, keeps the reading below going.
@@ -892,6 +897,10 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket, client: Option
         pings.tick().await;
         loop {
             let packed = tokio::select! {
+                Some((code, reason)) = close_rx.recv() => {
+                    let _ = sink.send(Message::Close(Some(axum::extract::ws::CloseFrame { code, reason: reason.into() }))).await;
+                    break;
+                }
                 Some(p) = packed_rx.recv() => p,
                 Some(p) = reply_rx.recv() => p,
                 _ = pings.tick() => {
@@ -913,11 +922,11 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket, client: Option
     });
     let service = CommunityService(state.clone());
     // So many live connections in all, and for one DID (WYV-51): held while open.
-    // And so many from one client address (WYV-79): this machine's own aren't
-    // counted (a test, a tool beside it).
+    // And so many from one client address (WYV-79): a trusted proxy's own (this
+    // machine's: a test, a tool beside it) aren't counted.
     let mut counted = vec![("ws:all".to_string(), LIVE_IN_ALL)];
-    if let Some(client) = client.filter(|client| !client.is_loopback()) {
-        counted.push((format!("ws-at:{}", wyvrn_service::client_address::bucket(client)), LIVE_PER_ADDRESS));
+    if let Some(client) = client {
+        counted.push((format!("ws-at:{client}"), LIVE_PER_ADDRESS));
     }
     let Some(_all) = crate::web::posting::LiveHeld::take(&state.live_open, counted) else {
         packing.abort();
@@ -930,6 +939,10 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket, client: Option
     // Until it has said who it is, it has LIVE_HELLO_WITHIN to (WYV-79): an idle
     // socket no one speaks on holds no place.
     let hello_by = tokio::time::Instant::now() + LIVE_HELLO_WITHIN;
+    // Whom the holder's frames say they are from, as read without opening them
+    // (`frame_sender`), where it could be: anyone else's are dropped unopened.
+    let mut holder_skid: Option<String> = None;
+    let mut limited = false;
     loop {
         let wait = tokio::time::Instant::now() + LIVE_SILENT_FOR;
         let until = if holder.is_none() { wait.min(hello_by) } else { wait };
@@ -943,6 +956,22 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket, client: Option
         if bytes.len() > 4 * 1024 * 1024 {
             continue;
         }
+        // Each frame counts against its address's messages a minute, as a POST does
+        // (WYV-97). Over that, the connection is closed with "try again later",
+        // WebSocket's 429: the frame is never opened, so there is nobody to answer
+        // in DIDComm.
+        if let Some(client) = client {
+            if !message_allowed(client) {
+                limited = true;
+                let _ = close_tx.try_send((1013, "Too many messages from this address: wait a minute."));
+                break;
+            }
+        }
+        // One member's connection: anyone else's message on it is dropped before
+        // anything is resolved or opened (WYV-97).
+        if holder_skid.is_some() && frame_sender(&bytes) != holder_skid {
+            continue;
+        }
         let Ok(mut received) = state.agent.receive(&bytes).await else { continue };
         let Ok(unpacked) = state.agent.messaging().unpack_verified(&bytes).await else { continue };
         let (Some(sender), Some(sender_kid)) = (received.sender.clone(), unpacked.sender_kid) else { continue };
@@ -950,6 +979,7 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket, client: Option
             None => {
                 let Some(held) = crate::web::posting::LiveHeld::take(&state.live_open, vec![(format!("ws:{sender}"), LIVE_PER_DID)]) else { break };
                 _theirs = Some(held);
+                holder_skid = frame_sender(&bytes);
                 holder = Some(sender.clone());
                 *holder_cell.lock().unwrap_or_else(|p| p.into_inner()) = Some(sender.clone());
                 state.live.lock().unwrap_or_else(|p| p.into_inner()).insert(id, (sender.clone(), out.clone()));
@@ -1016,7 +1046,22 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket, client: Option
     let presence = state.rooms.close_live(&state.community, id);
     voice_send(&state, &VoiceOutcome { live: presence, ..VoiceOutcome::default() });
     packing.abort();
+    if limited {
+        // Let the close frame go out first.
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut writing).await;
+    }
     writing.abort();
+}
+
+/// The DID an authcrypted frame says it is from (its protected header's `skid`),
+/// read without resolving or opening anything; `None` for anything else.
+fn frame_sender(bytes: &[u8]) -> Option<String> {
+    use base64::Engine;
+    let message: Value = serde_json::from_slice(bytes).ok()?;
+    let protected = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(message.get("protected")?.as_str()?.trim_end_matches('=')).ok()?;
+    let header: Value = serde_json::from_slice(&protected).ok()?;
+    let skid = header.get("skid")?.as_str()?;
+    Some(skid.split('#').next().unwrap_or(skid).to_string())
 }
 
 /// The forwarding service's question, by moq-auth's auth contract: may the session
@@ -1267,33 +1312,32 @@ pub async fn run_pruning(state: Arc<AppState>) {
 }
 
 /// DIDComm messages one address may send a minute (WYV-62): a flood of joins from
-/// fresh DIDs, or of anything, comes from somewhere. Behind the web view's trusted
-/// proxies, the address `X-Forwarded-For` gives; otherwise the connection's.
+/// fresh DIDs, or of anything, comes from somewhere. Behind the trusted proxies,
+/// the address `X-Forwarded-For` gives; otherwise the connection's. Posted or sent
+/// on a live connection alike (WYV-97).
 const MESSAGES_PER_ADDRESS_A_MINUTE: u32 = 300;
 
-async fn take_message(State(state): State<Arc<AppState>>, request: axum::extract::Request) -> Response {
-    let address = match &state.web {
-        Some(web) => web.client(&request),
-        None => request.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|info| info.0.ip()),
+/// Counts one message from `address` (a bucket, `clients.rs`): whether it may be taken.
+fn message_allowed(address: std::net::IpAddr) -> bool {
+    static SEEN: std::sync::LazyLock<std::sync::Mutex<HashMap<std::net::IpAddr, (i64, u32)>>> = std::sync::LazyLock::new(Default::default);
+    let minute = now() / 60;
+    let mut seen = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+    if seen.len() > 50_000 {
+        seen.retain(|_, (at, _)| *at == minute);
     }
-    // Every client but this machine's own (a test, a tool beside it), an IPv6 one
-    // by its /64 (WYV-74): through the trusted proxies, a private address is a
-    // client on a private network, not the proxy in front.
-    .filter(|address| !address.is_loopback())
-    .map(wyvrn_service::client_address::bucket);
-    if let Some(address) = address {
-        static SEEN: std::sync::LazyLock<std::sync::Mutex<HashMap<std::net::IpAddr, (i64, u32)>>> = std::sync::LazyLock::new(Default::default);
-        let minute = now() / 60;
-        let mut seen = SEEN.lock().unwrap_or_else(|p| p.into_inner());
-        if seen.len() > 50_000 {
-            seen.retain(|_, (at, _)| *at == minute);
-        }
-        let entry = seen.entry(address).or_insert((minute, 0));
-        if entry.0 != minute {
-            *entry = (minute, 0);
-        }
-        entry.1 += 1;
-        if entry.1 > MESSAGES_PER_ADDRESS_A_MINUTE {
+    let entry = seen.entry(address).or_insert((minute, 0));
+    if entry.0 != minute {
+        *entry = (minute, 0);
+    }
+    entry.1 += 1;
+    entry.1 <= MESSAGES_PER_ADDRESS_A_MINUTE
+}
+
+async fn take_message(State(state): State<Arc<AppState>>, request: axum::extract::Request) -> Response {
+    // Every client but a trusted proxy's own (a test, a tool beside it), an IPv6
+    // one by its /64 (WYV-74, WYV-98).
+    if let Some(address) = state.clients.of(&request) {
+        if !message_allowed(address) {
             return (StatusCode::TOO_MANY_REQUESTS, "Too many messages from this address: wait a minute.").into_response();
         }
     }
@@ -1450,10 +1494,8 @@ async fn root(
 ) -> Response {
     match upgrade {
         Ok(upgrade) => {
-            let client = peer.map(|peer| match &state.web {
-                Some(web) => web.client_from(peer.0 .0.ip(), &headers),
-                None => peer.0 .0.ip(),
-            });
+            // The bucket it is counted in, by the trusted proxies (WYV-98).
+            let client = peer.and_then(|peer| state.clients.counted(peer.0 .0.ip(), &headers));
             upgrade.max_message_size(4 * 1024 * 1024).on_upgrade(move |socket| live_connection(state, socket, client)).into_response()
         }
         Err(_) if state.web.is_some() && crate::web::page_on(&state.community.store) => crate::web::pages::home(State(state), headers).await,

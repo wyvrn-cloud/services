@@ -115,6 +115,8 @@ pub async fn open(config: &Config, stores: &Stores, opening: Opening) -> anyhow:
     state.rooms = crate::voice::Rooms::with_token_prefix(&opening.voice_tokens);
     state.owner_pages = opening.owner_pages;
     state.web = web;
+    // Read whether or not the web view is on (WYV-98).
+    state.clients = crate::clients::Clients::new(&config.trusted_proxies())?;
     let state = Arc::new(match opening.assistant {
         Some(assistant) => {
             tracing::info!(name = %assistant.config.name, model = %assistant.config.model, "an assistant answers in every channel");

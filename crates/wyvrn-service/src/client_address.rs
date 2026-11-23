@@ -43,23 +43,38 @@ impl Proxies {
     }
 
     /// The client a request from `peer` with `headers` is from.
+    ///
+    /// An entry that isn't an address (`unknown`, an obfuscated name) is where the
+    /// client is, as far as the proxy that wrote it knew: it isn't skipped, which
+    /// would believe what the client wrote further left (WYV-106). Every such client
+    /// is then [`UNKNOWN`], one bucket. `ip:port` and `[ip]:port` are read as the address.
     pub fn client(&self, peer: IpAddr, headers: &HeaderMap) -> IpAddr {
         if !self.trusts(peer) {
             return peer;
         }
-        headers
-            .get_all("x-forwarded-for")
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .flat_map(|v| v.split(','))
-            .map(str::trim)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .filter_map(|a| a.parse::<IpAddr>().ok())
-            .find(|a| !self.trusts(*a))
-            .unwrap_or(peer)
+        let forwarded = headers.get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).map(str::trim).filter(|a| !a.is_empty()).collect::<Vec<_>>();
+        for entry in forwarded.into_iter().rev() {
+            match forwarded_address(entry) {
+                Some(address) if self.trusts(address) => continue,
+                Some(address) => return address,
+                None => return UNKNOWN,
+            }
+        }
+        peer
     }
+}
+
+/// The client behind a proxy that didn't say who it was (an `X-Forwarded-For`
+/// entry that isn't an address): all of them are one client.
+pub const UNKNOWN: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+
+/// An `X-Forwarded-For` entry's address: `203.0.113.5`, `2001:db8::1`, or with a
+/// port (`203.0.113.5:4711`, `[2001:db8::1]:4711`).
+fn forwarded_address(entry: &str) -> Option<IpAddr> {
+    if let Ok(address) = entry.parse::<IpAddr>() {
+        return Some(address);
+    }
+    entry.parse::<std::net::SocketAddr>().ok().map(|socket| socket.ip()).or_else(|| entry.strip_prefix('[')?.strip_suffix(']')?.parse().ok())
 }
 
 /// What a per-client limit is keyed on: an IPv4 address as it is, an IPv6 one by
@@ -129,6 +144,11 @@ mod tests {
         assert_eq!(proxies.client(other, &headers(&["203.0.113.5"])), other);
         // A proxy with nothing forwarded is the client.
         assert_eq!(proxies.client(caddy, &headers(&[])), caddy);
+        // An entry that isn't an address stops the reading there: what the client
+        // wrote to its left isn't believed (WYV-106).
+        assert_eq!(proxies.client(caddy, &headers(&["203.0.113.9, unknown"])), UNKNOWN);
+        assert_eq!(proxies.client(caddy, &headers(&["203.0.113.9, 198.51.100.7:4711"])), "198.51.100.7".parse::<IpAddr>().unwrap());
+        assert_eq!(proxies.client(caddy, &headers(&["203.0.113.9, [2001:db8::1]:4711"])), "2001:db8::1".parse::<IpAddr>().unwrap());
         // With no proxies, nobody's header is believed.
         assert_eq!(Proxies::default().client(caddy, &headers(&["203.0.113.5"])), caddy);
     }

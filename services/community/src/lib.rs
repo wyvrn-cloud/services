@@ -27,6 +27,7 @@ pub mod events;
 pub mod filters;
 pub mod forms;
 pub mod community;
+pub mod clients;
 pub mod config;
 pub mod expressions;
 pub mod files;

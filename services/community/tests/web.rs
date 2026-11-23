@@ -108,11 +108,13 @@ struct Options<'a> {
     public: &'a str,
     /// With voice channels (a relay named, never reached).
     voice: bool,
+    /// This machine counted like any client, not as a proxy beside the server.
+    counted: bool,
 }
 
 impl Default for Options<'_> {
     fn default() -> Self {
-        Self { name: "The Workshop", web_url: None, fresh: true, limit: 10_000, public: "chosen", voice: false }
+        Self { name: "The Workshop", web_url: None, fresh: true, limit: 10_000, public: "chosen", voice: false, counted: false }
     }
 }
 
@@ -145,6 +147,9 @@ async fn start(options: Options<'_>) -> Running {
     community.web_url = web.as_ref().map(|w| w.url.to_string());
     let mut state = AppState::new(agent, Default::default(), community, did_document, didcomm_quickstart::default_resolver());
     state.web = web;
+    if options.counted {
+        state.clients = wyvrn_community::clients::Clients::new(&["192.0.2.1"]).unwrap();
+    }
     let state = Arc::new(state);
     let app = server::router(state.clone());
     tokio::spawn(async move { axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap() });
@@ -565,7 +570,7 @@ async fn a_members_picture_is_kept_and_shown_beside_their_posts() {
 
 #[tokio::test]
 async fn too_many_requests_from_one_address_are_slowed() {
-    let server = start(Options { limit: 3, ..Options::default() }).await;
+    let server = start(Options { limit: 3, counted: true, ..Options::default() }).await;
     for _ in 0..3 {
         assert_eq!(server.text("robots.txt").await.0, 200);
     }

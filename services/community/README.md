@@ -44,6 +44,7 @@ and keeps its data in `data/`).
 | `COMMUNITY_NAME` | What the community is called. |
 | `COMMUNITY_ADMINS` | DIDs let in as admins, separated by commas. |
 | `COMMUNITY_MEMBERS` | DIDs let in as members. |
+| `COMMUNITY_TRUSTED_PROXIES` | `[server] trusted_proxies`: the reverse proxies in front of it (addresses or ranges, separated by commas), whose `X-Forwarded-For` every limit by address believes, with the web view on or off. Unset, the Docker networks' gateways (`172.16.0.1` to `172.31.0.1`) and this machine. A trusted proxy's own requests, with nobody forwarded, aren't counted. |
 
 Both lists are added to what the server holds each time it starts. They never
 take anyone out: that is done from an admin's app, or here.
@@ -138,7 +139,7 @@ JavaScript but for the light/dark switch and signing in.
 |---|---|---|---|
 | `enabled` | `COMMUNITY_WEB=off` | on | Whether anything is shown on the web. |
 | `public_url` | `COMMUNITY_WEB_URL` | the server's `public_url` | Where the web view is: any origin and path, ending in `/`. Every absolute address in it is made from this, never from a request. |
-| `trusted_proxies` | `COMMUNITY_WEB_TRUSTED_PROXIES` | none | Proxies whose `X-Forwarded-For` is believed, for rate limits. |
+| `trusted_proxies` | `COMMUNITY_WEB_TRUSTED_PROXIES` | | The older place for `[server] trusted_proxies` (`COMMUNITY_TRUSTED_PROXIES`), read when that isn't set, whether or not the web view is on. |
 | `hsts` | | off | Send `Strict-Transport-Security`. |
 | `sign_in_issuers` | | `did:web:verify.wyvrn.app` | Whose sign-in credential is trusted. |
 | `requests_per_minute` | | 300 | Per address. |

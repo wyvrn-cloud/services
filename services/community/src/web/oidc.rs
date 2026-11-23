@@ -669,11 +669,12 @@ struct Registration {
 }
 
 async fn register(State(state): State<Arc<AppState>>, request: Request) -> Response {
-    let Some(web) = on(&state) else { return oauth_error(StatusCode::NOT_FOUND, "not_found", "There's no identity provider here.") };
+    let Some(_) = on(&state) else { return oauth_error(StatusCode::NOT_FOUND, "not_found", "There's no identity provider here.") };
     if !setting_on(&state, super::DYNAMIC) {
         return oauth_error(StatusCode::FORBIDDEN, "access_denied", "Websites can't register themselves here.");
     }
-    let from = web.client(&request).map(|a| a.to_string()).unwrap_or_default();
+    // An IPv6 client by its /64, as every limit by address (WYV-106).
+    let from = state.clients.of(&request).map(|a| a.to_string()).unwrap_or_default();
     let Ok(bytes) = axum::body::to_bytes(request.into_body(), 64 * 1024).await else { return oauth_error(StatusCode::BAD_REQUEST, "invalid_client_metadata", "Too long.") };
     let Ok(asked) = serde_json::from_slice::<Registration>(&bytes) else { return oauth_error(StatusCode::BAD_REQUEST, "invalid_client_metadata", "That isn't client metadata.") };
     let store = &state.community.store;

@@ -50,9 +50,8 @@ pub struct WebConfig {
     /// own `public_url` when left out. Every absolute address in its pages, and
     /// the identity provider's issuer, is made from this and never from a request.
     pub public_url: Option<String>,
-    /// The reverse proxies in front of it, as addresses or ranges (`10.0.0.0/8`,
-    /// `::1`): only a request from one of these is believed about whom it is for
-    /// (`X-Forwarded-For`), which rate limits go by.
+    /// The older place for `[server] trusted_proxies`, still read (whether or not
+    /// the web view is on) when that isn't set.
     pub trusted_proxies: Vec<String>,
     /// Whether pages send `Strict-Transport-Security`.
     pub hsts: bool,
@@ -129,6 +128,14 @@ pub struct ServerConfig {
     pub public_url: String,
     #[serde(default)]
     pub did_method: DidMethod,
+    /// The reverse proxies in front of the server, as addresses or ranges
+    /// (`10.0.0.0/8`, `::1`): only a request from one of these is believed about
+    /// whom it is for (`X-Forwarded-For`), which every limit by address goes by --
+    /// messages, live connections and the web view, whether or not the web view is
+    /// on (WYV-98). Left out, `[web] trusted_proxies` where that is set, and
+    /// otherwise the Docker networks' gateways and this machine.
+    #[serde(default)]
+    pub trusted_proxies: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -271,7 +278,8 @@ impl Config {
     /// `COMMUNITY_VOICE_TRANSPORT`; for the files members attach `COMMUNITY_FILES_DIR`
     /// and `COMMUNITY_FILES_MAX_BYTES`, for the community's own packs
     /// `COMMUNITY_STICKERS_PATH`, and for the web view `COMMUNITY_WEB` (`off`),
-    /// `COMMUNITY_WEB_URL` and `COMMUNITY_WEB_TRUSTED_PROXIES`.
+    /// `COMMUNITY_WEB_URL` and `COMMUNITY_WEB_TRUSTED_PROXIES`; the proxies in front
+    /// of it, `COMMUNITY_TRUSTED_PROXIES`.
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading config {}: {e}", path.display()))?;
@@ -337,9 +345,25 @@ impl Config {
         if let Some(proxies) = env("COMMUNITY_WEB_TRUSTED_PROXIES") {
             config.web.trusted_proxies = dids(&proxies);
         }
+        if let Some(proxies) = env("COMMUNITY_TRUSTED_PROXIES") {
+            config.server.trusted_proxies = Some(dids(&proxies));
+        }
+        crate::clients::Clients::new(&config.trusted_proxies())?;
         if !config.server.public_url.ends_with('/') {
             config.server.public_url.push('/');
         }
         Ok(config)
+    }
+}
+
+impl Config {
+    /// The proxies whose `X-Forwarded-For` is believed: `[server] trusted_proxies`,
+    /// or `[web]`'s where only that is set, or the Docker gateways and this machine.
+    pub fn trusted_proxies(&self) -> Vec<String> {
+        match &self.server.trusted_proxies {
+            Some(proxies) => proxies.clone(),
+            None if !self.web.trusted_proxies.is_empty() => self.web.trusted_proxies.clone(),
+            None => crate::clients::default_proxies(),
+        }
     }
 }

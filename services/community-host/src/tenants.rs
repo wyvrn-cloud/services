@@ -277,7 +277,7 @@ impl Host {
         let folder = self.folder(&record.name);
         let limits = record.limits.clone().unwrap_or_else(|| self.config.limits.clone());
         let mut settings = CommunityServerConfig {
-            server: ServerConfig { bind: String::new(), public_url: format!("{}c/{}/", self.config.server.public_url, record.name), did_method: self.config.server.did_method },
+            server: ServerConfig { bind: String::new(), public_url: format!("{}c/{}/", self.config.server.public_url, record.name), did_method: self.config.server.did_method, trusted_proxies: None },
             identity: PathConfig { path: folder.join("identity.json") },
             store: PathConfig { path: folder.join("community.sqlite") },
             community: CommunityConfig {
