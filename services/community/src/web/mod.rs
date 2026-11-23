@@ -260,12 +260,21 @@ pub fn voice_choice(store: &Store) -> String {
 }
 
 /// The community's own secret for the web view: pairwise ids, picture addresses.
-pub fn secret(store: &Store) -> anyhow::Result<String> {
-    if let Some(secret) = store.setting(SECRET)? {
+/// Kept sealed with the service's seal key where it has one, bound to the
+/// community (its DID, `did`, which goes with it wherever its store is moved)
+/// (security review WYV-32).
+pub fn secret(store: &Store, did: &str) -> anyhow::Result<String> {
+    let at = format!("{did}#web-secret");
+    if let Some(kept) = store.setting(SECRET)? {
+        let (secret, again) = wyvrn_service::identity::open_text(&kept, &at)?;
+        if again {
+            store.set_setting(SECRET, &wyvrn_service::identity::seal_text(&secret, &at)?)?;
+        }
         return Ok(secret);
     }
-    store.set_setting(SECRET, &store::secret())?;
-    Ok(store.setting(SECRET)?.unwrap_or_default())
+    store.set_setting(SECRET, &wyvrn_service::identity::seal_text(&store::secret(), &at)?)?;
+    let kept = store.setting(SECRET)?.unwrap_or_default();
+    Ok(wyvrn_service::identity::open_text(&kept, &at)?.0)
 }
 
 /// `community`'s `web`, for a server with a web view.

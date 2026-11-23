@@ -115,18 +115,40 @@ async fn discovery(State(state): State<Arc<AppState>>) -> Response {
 
 /// The key id tokens are signed with now, made (and the old ones let go) as they
 /// come due.
+/// Where an ID-token signing key is bound when it is kept sealed (WYV-32): the
+/// community, by its DID, and the key's id.
+fn key_place(state: &AppState, kid: &str) -> String {
+    format!("{}#oidc-{kid}", state.agent.did())
+}
+
+/// A signing key as kept (sealed with the service's seal key where it has one),
+/// read back as its JWK: one found unsealed, or sealed with a previous key, is
+/// kept again as it should be (security review WYV-32).
+fn opened_jwk(state: &AppState, kid: &str, kept: &str, made: i64) -> anyhow::Result<String> {
+    let place = key_place(state, kid);
+    let (jwk, again) = wyvrn_service::identity::open_text(kept, &place)?;
+    if again {
+        state.community.store.remove_oidc_key(kid)?;
+        state.community.store.add_oidc_key(kid, &wyvrn_service::identity::seal_text(&jwk, &place)?, made)?;
+    }
+    Ok(jwk)
+}
+
 fn signing_key(state: &AppState) -> anyhow::Result<(String, SecretKey)> {
     let store = &state.community.store;
     let at = now();
     let keys = store.oidc_keys()?;
     let current = keys.first().filter(|(_, _, made)| *made > at - KEY_FOR).cloned();
     let (kid, jwk) = match current {
-        Some((kid, jwk, _)) => (kid, jwk),
+        Some((kid, kept, made)) => {
+            let jwk = opened_jwk(state, &kid, &kept, made)?;
+            (kid, jwk)
+        }
         None => {
             let key = SecretKey::generate_p256();
             let kid = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
             let jwk = key.to_jwk().to_string();
-            store.add_oidc_key(&kid, &jwk, at)?;
+            store.add_oidc_key(&kid, &wyvrn_service::identity::seal_text(&jwk, &key_place(state, &kid))?, at)?;
             (kid, jwk)
         }
     };
@@ -152,7 +174,8 @@ async fn jwks(State(state): State<Arc<AppState>>) -> Response {
         .oidc_keys()
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|(kid, jwk, _)| {
+        .filter_map(|(kid, kept, made)| {
+            let jwk = opened_jwk(&state, &kid, &kept, made).ok()?;
             let key = SecretKey::from_jwk(&serde_json::from_str(&jwk).ok()?).ok()?;
             let mut public = key.public().to_jwk();
             public["kid"] = json!(kid);
@@ -572,7 +595,7 @@ async fn token(State(state): State<Arc<AppState>>, headers: HeaderMap, Form(form
 
 /// A member's id at a website: different at each, the same through changes of DID.
 fn sub(state: &AppState, client: &Client, mkey: &str) -> String {
-    let secret = super::secret(&state.community.store).unwrap_or_default();
+    let secret = super::secret(&state.community.store, &state.agent.did()).unwrap_or_default();
     keyed(&secret, &format!("sub\n{}\n{mkey}", sector(client)))[..40].to_string()
 }
 
@@ -587,7 +610,7 @@ fn claims(state: &AppState, web: &Web, client: &Client, member: &Member, mkey: &
     if has("profile") {
         claims["name"] = json!(member.name.clone().unwrap_or_else(|| "A member".to_string()));
         if store.member_picture(&member.did).ok().flatten().is_some() {
-            if let Ok(token) = super::secret(store).and_then(|secret| Ok(store.picture_token(mkey, &client.id, &secret)?)) {
+            if let Ok(token) = super::secret(store, &state.agent.did()).and_then(|secret| Ok(store.picture_token(mkey, &client.id, &secret)?)) {
                 claims["picture"] = json!(web.absolute(&format!("p/{token}")));
             }
         }
