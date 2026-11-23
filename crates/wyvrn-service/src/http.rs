@@ -20,6 +20,10 @@ pub fn internal(error: impl std::fmt::Display) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "something went wrong").into_response()
 }
 
+/// What a sender is told when its reply couldn't be delivered: fixed, whatever
+/// the reason (security review WYV-92).
+pub const DELIVERY_FAILED: &str = "couldn't deliver the reply";
+
 /// A packed DIDComm message posted to the service: unpacked, answered by the
 /// service, and the answer sent back -- in the response, or to the sender's own
 /// address if that is how they asked to be answered.
@@ -58,9 +62,13 @@ pub async fn receive<S: Service>(service: Arc<S>, body: Bytes) -> Response {
     match agent.respond(&received, &reply).await {
         Ok(Some(packed)) => ([(header::CONTENT_TYPE, "application/didcomm-encrypted+json")], packed).into_response(),
         Ok(None) => StatusCode::ACCEPTED.into_response(),
+        // The detail is logged, never sent: it carries what the sender's endpoint
+        // answered, and that endpoint can be any address (redirected to one), so
+        // echoing it would read an internal response back to a stranger (security
+        // review WYV-92).
         Err(e) => {
             tracing::warn!(error = %e, "couldn't deliver reply");
-            (StatusCode::BAD_GATEWAY, format!("couldn't deliver reply: {e}")).into_response()
+            (StatusCode::BAD_GATEWAY, DELIVERY_FAILED).into_response()
         }
     }
 }
