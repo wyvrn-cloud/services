@@ -1041,7 +1041,74 @@ struct Outcome {
 }
 
 /// Says a statement on a MySQL connection.
+/// Which columns of a table hold at most how many characters, and which are keys:
+/// read from `information_schema` the first time a table is written, kept.
+type TableShape = HashMap<String, (Option<u64>, bool)>;
+
+fn shape_of(connection: &mut impl Queryable, table: &str) -> Option<TableShape> {
+    static SHAPES: std::sync::LazyLock<Mutex<HashMap<String, TableShape>>> = std::sync::LazyLock::new(Default::default);
+    if let Some(shape) = SHAPES.lock().unwrap_or_else(|p| p.into_inner()).get(table) {
+        return Some(shape.clone());
+    }
+    let rows: Vec<(String, Option<u64>, String)> = connection
+        .exec("SELECT COLUMN_NAME, CHARACTER_MAXIMUM_LENGTH, COLUMN_KEY FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ?", (table,))
+        .ok()?;
+    if rows.is_empty() {
+        return None;
+    }
+    let shape: TableShape = rows.into_iter().map(|(column, most, key)| (column.to_ascii_lowercase(), (most, key == "PRI" || key == "UNI"))).collect();
+    SHAPES.lock().unwrap_or_else(|p| p.into_inner()).insert(table.to_string(), shape.clone());
+    Some(shape)
+}
+
+/// The table, columns and parameter places of `INSERT [OR ...] INTO t (a, b) VALUES (?1, ?2)`,
+/// where it is that; a column given a literal has no place.
+fn insert_shape(sql: &str) -> Option<(String, Vec<(String, Option<usize>)>)> {
+    let upper = sql.trim_start().to_ascii_uppercase();
+    if !(upper.starts_with("INSERT") || upper.starts_with("REPLACE")) {
+        return None;
+    }
+    let into = upper.find(" INTO ")? + 6;
+    let rest = &sql.trim_start()[into..];
+    let open = rest.find('(')?;
+    let table = rest[..open].trim().trim_matches('"').trim_matches('`').to_string();
+    let close = rest.find(')')?;
+    let columns: Vec<String> = rest[open + 1..close].split(',').map(|c| c.trim().trim_matches('"').trim_matches('`').to_ascii_lowercase()).collect();
+    let after = &rest[close + 1..];
+    let values_at = after.to_ascii_uppercase().find("VALUES")?;
+    let tuple = &after[values_at + 6..];
+    let (start, end) = (tuple.find('(')?, tuple.find(')')?);
+    let places: Vec<Option<usize>> = tuple[start + 1..end].split(',').map(|v| v.trim().strip_prefix('?').and_then(|n| n.parse::<usize>().ok()).map(|n| n - 1)).collect();
+    (places.len() == columns.len()).then(|| (table, columns.into_iter().zip(places).collect()))
+}
+
+/// What MySQL would take differently from SQLite (security review WYV-60): an
+/// `INSERT IGNORE` cuts a value too long for its column to fit, where SQLite keeps
+/// it whole; and its `_bin` collations pad, so `'x'` and `'x '` are one key there
+/// and two in SQLite. Refused here instead: a value longer than its column, and a
+/// key with spaces round it.
+fn check_written(connection: &mut impl Queryable, sql: &str, params: &[Value]) -> Result<()> {
+    let Some((table, columns)) = insert_shape(sql) else { return Ok(()) };
+    let Some(shape) = shape_of(connection, &table) else { return Ok(()) };
+    for (column, place) in columns {
+        let (Some(place), Some((most, key))) = (place, shape.get(&column)) else { continue };
+        let (length, padded) = match params.get(place) {
+            Some(Value::Text(text)) => (text.chars().count() as u64, text.trim() != text),
+            Some(Value::Blob(bytes)) => (bytes.len() as u64, false),
+            _ => continue,
+        };
+        if most.is_some_and(|most| length > most) {
+            return Err(Error::Other(format!("{table}.{column} holds at most {} characters; it was given {length}", most.unwrap_or(0))));
+        }
+        if *key && padded {
+            return Err(Error::Other(format!("{table}.{column} is a key, and a key has no spaces round it")));
+        }
+    }
+    Ok(())
+}
+
 fn say_on(connection: &mut impl Queryable, sql: &str, params: &[Value]) -> Result<Outcome> {
+    check_written(connection, sql, params)?;
     let (said, values) = to_mysql(sql, params)?;
     let mut answer = connection.exec_iter(said, values)?;
     let affected = answer.affected_rows() as usize;
@@ -1387,6 +1454,33 @@ impl Session<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn on_mysql_a_value_too_long_or_a_key_with_spaces_round_it_is_refused_not_cut() {
+        if std::env::var("WYVRN_TEST_DATABASE_URL").map_or(true, |url| url.is_empty()) {
+            return;
+        }
+        const SHAPED: Schema = Schema { sqlite: "CREATE TABLE IF NOT EXISTS shaped (k TEXT PRIMARY KEY, v TEXT)", mysql: "CREATE TABLE IF NOT EXISTS shaped (k VARCHAR(8) PRIMARY KEY, v VARCHAR(4))" };
+        let db = Db::scratch(&SHAPED).unwrap();
+        let mut writing = db.lock();
+        let text = |t: &str| Value::Text(t.to_string());
+        // INSERT IGNORE would have cut it to fit (WYV-60).
+        assert!(writing.execute("INSERT OR IGNORE INTO shaped (k, v) VALUES (?1, ?2)", &[text("a"), text("too long")]).is_err());
+        // 'b' and 'b ' are one key on MySQL, two on SQLite.
+        assert!(writing.execute("INSERT INTO shaped (k, v) VALUES (?1, ?2)", &[text("b "), text("x")]).is_err());
+        assert_eq!(writing.execute("INSERT OR IGNORE INTO shaped (k, v) VALUES (?1, ?2)", &[text("c"), text("fits")]).unwrap(), 1);
+        assert_eq!(writing.execute("INSERT OR IGNORE INTO shaped (k, v) VALUES (?1, ?2)", &[text("c"), text("dup")]).unwrap(), 0);
+    }
+
+    #[test]
+    fn an_inserts_table_columns_and_places_are_read_off_it() {
+        assert_eq!(
+            insert_shape("INSERT OR IGNORE INTO \"members\" (did, role, at) VALUES (?1, 'admin', ?3)"),
+            Some(("members".to_string(), vec![("did".to_string(), Some(0)), ("role".to_string(), None), ("at".to_string(), Some(2))]))
+        );
+        assert_eq!(insert_shape("SELECT 1"), None);
+        assert_eq!(insert_shape("INSERT INTO t SELECT * FROM u"), None);
+    }
+
     use super::*;
 
     /// The MySQL server the tests were given, if they were given one.
