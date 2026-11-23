@@ -135,11 +135,16 @@ impl Web {
     /// the last address in `X-Forwarded-For` that isn't one.
     pub fn client(&self, request: &Request) -> Option<IpAddr> {
         let peer = request.extensions().get::<ConnectInfo<SocketAddr>>().map(|info| info.0.ip())?;
+        Some(self.client_from(peer, request.headers()))
+    }
+
+    /// The same, from the connection's address and the request's headers.
+    pub fn client_from(&self, peer: IpAddr, headers: &axum::http::HeaderMap) -> IpAddr {
         if !self.trusted(peer) {
-            return Some(peer);
+            return peer;
         }
-        let forwarded = request.headers().get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).map(str::trim).collect::<Vec<_>>();
-        Some(forwarded.iter().rev().filter_map(|a| a.parse::<IpAddr>().ok()).find(|a| !self.trusted(*a)).unwrap_or(peer))
+        let forwarded = headers.get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).map(str::trim).collect::<Vec<_>>();
+        forwarded.iter().rev().filter_map(|a| a.parse::<IpAddr>().ok()).find(|a| !self.trusted(*a)).unwrap_or(peer)
     }
 
     fn trusted(&self, address: IpAddr) -> bool {

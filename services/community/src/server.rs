@@ -831,14 +831,19 @@ fn watch(state: &Arc<AppState>, live: u64, sender: &str, message: &Value) -> any
 const LIVE_PING_EVERY: Duration = Duration::from_secs(20);
 const LIVE_SILENT_FOR: Duration = Duration::from_secs(60);
 
-/// Live connections open at once, in all and for one DID (WYV-51).
+/// Live connections open at once, in all and for one DID (WYV-51), and from one
+/// client address (WYV-79).
 const LIVE_IN_ALL: usize = 5_000;
 const LIVE_PER_DID: usize = 8;
+const LIVE_PER_ADDRESS: usize = 20;
+/// How soon a new live connection says who it is (an authenticated message: the
+/// app sends watch-presence as it opens), or is closed (WYV-79).
+const LIVE_HELLO_WITHIN: Duration = Duration::from_secs(10);
 
 /// A member's live connection (community-voice/1.0's Connectivity): DIDComm over a
 /// WebSocket. What they send is answered on it, and presence and keys are pushed
 /// on it. It is one member's: the first authenticated message says whose.
-async fn live_connection(state: Arc<AppState>, socket: WebSocket) {
+async fn live_connection(state: Arc<AppState>, socket: WebSocket, client: Option<std::net::IpAddr>) {
     let id = state.next_live.fetch_add(1, Ordering::Relaxed);
     let (mut sink, mut stream) = socket.split();
     let (out, mut outgoing) = mpsc::channel::<Value>(256);
@@ -899,7 +904,13 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket) {
     });
     let service = CommunityService(state.clone());
     // So many live connections in all, and for one DID (WYV-51): held while open.
-    let Some(_all) = crate::web::posting::LiveHeld::take(&state.live_open, vec![("ws:all".into(), LIVE_IN_ALL)]) else {
+    // And so many from one client address (WYV-79): this machine's own aren't
+    // counted (a test, a tool beside it).
+    let mut counted = vec![("ws:all".to_string(), LIVE_IN_ALL)];
+    if let Some(client) = client.filter(|client| !client.is_loopback()) {
+        counted.push((format!("ws-at:{}", wyvrn_service::client_address::bucket(client)), LIVE_PER_ADDRESS));
+    }
+    let Some(_all) = crate::web::posting::LiveHeld::take(&state.live_open, counted) else {
         packing.abort();
         writing.abort();
         return;
@@ -907,7 +918,13 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket) {
     let mut _theirs: Option<crate::web::posting::LiveHeld> = None;
     // Nothing heard for this long, not even the answer to a ping: gone, and out of
     // any room it was in, rather than listed there until TCP gives up on it.
-    while let Ok(Some(Ok(frame))) = tokio::time::timeout(LIVE_SILENT_FOR, stream.next()).await {
+    // Until it has said who it is, it has LIVE_HELLO_WITHIN to (WYV-79): an idle
+    // socket no one speaks on holds no place.
+    let hello_by = tokio::time::Instant::now() + LIVE_HELLO_WITHIN;
+    loop {
+        let wait = tokio::time::Instant::now() + LIVE_SILENT_FOR;
+        let until = if holder.is_none() { wait.min(hello_by) } else { wait };
+        let Ok(Some(Ok(frame))) = tokio::time::timeout_at(until, stream.next()).await else { break };
         let bytes: Vec<u8> = match frame {
             Message::Text(text) => text.as_bytes().to_vec(),
             Message::Binary(bytes) => bytes.to_vec(),
@@ -1414,9 +1431,20 @@ fn picture_bytes(media_type: String, data: &str) -> Response {
 
 /// A live connection, if the request asks for a WebSocket; otherwise the
 /// community's page, where it has one on, or what this is.
-async fn root(State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap, upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>) -> Response {
+async fn root(
+    State(state): State<Arc<AppState>>,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    headers: axum::http::HeaderMap,
+    upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> Response {
     match upgrade {
-        Ok(upgrade) => upgrade.max_message_size(4 * 1024 * 1024).on_upgrade(move |socket| live_connection(state, socket)).into_response(),
+        Ok(upgrade) => {
+            let client = peer.map(|peer| match &state.web {
+                Some(web) => web.client_from(peer.0 .0.ip(), &headers),
+                None => peer.0 .0.ip(),
+            });
+            upgrade.max_message_size(4 * 1024 * 1024).on_upgrade(move |socket| live_connection(state, socket, client)).into_response()
+        }
         Err(_) if state.web.is_some() && crate::web::page_on(&state.community.store) => crate::web::pages::home(State(state), headers).await,
         Err(_) => index(State(state)).await.into_response(),
     }
