@@ -45,18 +45,13 @@ impl Host {
             Err(error) => {
                 // Nothing of it stays (WYV-46): its keys above all, which a community
                 // made later under the same name would otherwise take for its own.
-                if record.storage != Storage::Sqlite {
-                    if let Ok(stores) = self.stores(&record, record.storage) {
-                        let _ = wyvrn_service::db::drop_store(&stores.community, "community");
-                        for (store, service) in [(&stores.stickers, "stickers"), (&stores.files, "files")] {
-                            if let Some(store) = store {
-                                let _ = wyvrn_service::db::drop_store(store, service);
-                            }
-                        }
-                    }
+                // Purged now; where its tables couldn't be dropped (a MySQL server
+                // away a moment), it stays deleted, which keeps the name from being
+                // taken, and housekeeping purges it again until they are gone.
+                let _ = self.registry.set_state(name, State::Deleted, Some(now));
+                if let Err(purging) = self.purge(&record) {
+                    tracing::warn!(community = %name, error = %format!("{purging:#}"), "a failed import couldn't be cleared yet: kept deleted, tried again by housekeeping");
                 }
-                let _ = std::fs::remove_dir_all(self.folder(name));
-                let _ = self.registry.forget(name);
                 Err(error)
             }
         }
