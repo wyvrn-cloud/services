@@ -188,6 +188,7 @@ fn place_of_file(path: &Path) -> String {
 }
 
 fn file_load(path: &Path) -> anyhow::Result<Identity> {
+    owner_only(path)?;
     let text = std::fs::read_to_string(path)?;
     let at = place_of_file(path);
     let (identity, reseal) = read_kept(&text, &at)?;
@@ -198,13 +199,40 @@ fn file_load(path: &Path) -> anyhow::Result<Identity> {
     Ok(identity)
 }
 
+/// Written whole or not at all, readable by the service's own user alone (0600):
+/// with no seal key, the file is the keys (security review WYV-78).
 fn write_file(path: &Path, text: &str) -> anyhow::Result<()> {
+    use std::io::Write;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let partial = path.with_extension("json.partial");
-    std::fs::write(&partial, text)?;
+    let _ = std::fs::remove_file(&partial);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&partial)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
     std::fs::rename(&partial, path)?;
+    Ok(())
+}
+
+/// A keys file written before it was owner-only made so, as it is read.
+fn owner_only(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o700))?;
+            tracing::warn!(path = %path.display(), "keys file was readable by others: made owner-only");
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -303,6 +331,22 @@ fn in_database(db: &Db, path: &Path, service: &str) -> anyhow::Result<Identity> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_keys_file_is_the_owners_alone_and_an_old_open_one_is_made_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("wyvrn-identity-mode-{}", std::process::id()));
+        let path = dir.join("den").join("identity.json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let made = load_or_generate(&Location::Sqlite(dir.join("den.db")), &path, "test").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let read = load_or_generate(&Location::Sqlite(dir.join("den.db")), &path, "test").unwrap();
+        assert_eq!(read.to_json().unwrap(), made.to_json().unwrap());
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn keys(identity: &Identity) -> String {
         identity.to_json().unwrap()
