@@ -192,13 +192,45 @@ fn copy_dir(from: &Path, to: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `dir`, made if need be, and readable by the service's user alone.
+fn owner_only_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 impl Host {
+    /// Exports left from before a restart: their links were in memory and are gone,
+    /// so nothing can fetch them, and they hold a community's keys unsealed. Removed
+    /// as the host starts (WYV-47).
+    pub fn sweep_export_leftovers(&self) {
+        let exports = self.config.storage.dir.join(".exports");
+        let mut removed = 0;
+        for entry in std::fs::read_dir(&exports).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let gone = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+            if gone.is_ok() {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            tracing::info!(removed, "exports left from before a restart removed");
+        }
+    }
+
     /// Makes `name`'s export, as `wyvrn-community` keeps a community in SQLite, and
     /// offers it at a link good for 15 minutes. Blocks.
     pub fn export(&self, name: &str, now: i64) -> anyhow::Result<String> {
         let record = self.registry.get(name)?.ok_or_else(|| anyhow::anyhow!("there is no community called {name}"))?;
         anyhow::ensure!(record.state == Standing::Moving, "{name} isn't moving");
         let exports = self.config.storage.dir.join(".exports");
+        // Its keys, unsealed, are in what is made here: the service's user's alone
+        // (WYV-47), the folder and the file both.
+        owner_only_dir(&exports)?;
         let token = token();
         let staging = exports.join(&token);
         let data = staging.join("data");
@@ -211,7 +243,11 @@ impl Host {
 
         // One file to fetch.
         let file = exports.join(format!("{token}.tar.gz"));
-        let packed = std::fs::File::create(&file)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let packed = options.open(&file)?;
         let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(packed, flate2::Compression::default()));
         archive.append_dir_all(name, &staging)?;
         archive.into_inner()?.finish()?.flush()?;

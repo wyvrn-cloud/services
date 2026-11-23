@@ -559,7 +559,11 @@ impl Host {
     pub async fn run_housekeeping(self: Arc<Self>) {
         {
             let host = self.clone();
-            let _ = tokio::task::spawn_blocking(move || host.sweep_backup_leftovers()).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                host.sweep_backup_leftovers();
+                host.sweep_export_leftovers();
+            })
+            .await;
         }
         let mut measured = 0;
         let mut backed_up = 0;

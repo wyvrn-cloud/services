@@ -92,9 +92,10 @@ impl<W: Write> Sealing<W> {
     }
 
     pub fn made_at(key: &[u8; 32], name: &str, made: u64, mut out: W) -> anyhow::Result<Self> {
-        // (A v4 UUID's bytes are the operating system's randomness.)
+        // 64 bits from the operating system (WYV-47): a v4 UUID's first 8 bytes
+        // hold its version, so only 60 of them were random.
         let mut prefix = [0u8; 8];
-        prefix.copy_from_slice(&uuid::Uuid::new_v4().as_bytes()[..8]);
+        aes_gcm::aead::rand_core::RngCore::fill_bytes(&mut aes_gcm::aead::OsRng, &mut prefix);
         let name_bytes = name.as_bytes();
         anyhow::ensure!(name_bytes.len() <= u16::MAX as usize, "that name is too long");
         let mut header = MAGIC_V2.to_vec();
