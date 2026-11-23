@@ -376,6 +376,8 @@ rate_limit {
 
 **Communities gone for good (WYV-46, WYV-48).** A community deleted or moved is now purged once its time to be kept runs out (`sealed_until`): its tables (in MySQL, its own; a database of its own is left empty for you to drop), its folder, and its name in the registry, which is then free again. Back up first if you want to keep them longer. A new community or an import is refused over a folder left at its name (keys and all); a failed import now leaves nothing behind.
 
+**Backups, version 2 (WYV-47).** A community's backup is now packed and sealed in one go (no unsealed archive on disk), its snapshot staged where only the service's user can read it, and each piece bound to the file's header and the community's name. `open-backup` opens both versions and says whose a new one is.
+
 **Keys sealed for every service (WYV-32).** `WYVRN_SEAL_KEY` (and `_FILE`, `_PREVIOUS`) seals each service's own keys, the mediator's and verify's included; see the README's "Keys at rest". Give each service a database user of its own.
 
 **Mediator (WYV-05, WYV-13/14).** socketdock's webhooks are now on a listener of their own: set `WEBHOOK_BIND=0.0.0.0:8081` (not published) and `SOCKETDOCK_URL=http://socketdock:8765` on the mediator, and point socketdock's `--connect-uri`/`--message-uri`/`--disconnect-uri` at `http://mediator:8081/webhooks/...`. Until you do, live delivery stops. New, all optional: `QUEUE_MAX_MESSAGES` (10000), `QUEUE_MAX_MB` (256), `FORWARD_MAX_MB` (10), `FORWARDS_PER_MINUTE` (600), `QUEUE_TTL_DAYS` (30), `REQUESTS_PER_MINUTE_PER_IP` (1200; behind Caddy set `TRUST_FORWARDED_FOR=true`).

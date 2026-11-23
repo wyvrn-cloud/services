@@ -112,7 +112,10 @@ async fn main() -> anyhow::Result<()> {
         [] | ["serve"] => serve(config).await,
         ["open-backup", file, out] => {
             let key = wyvrn_community_host::backups::key(&config.backups)?.context("no backup key: set backups.key or COMMUNITY_HOST_BACKUP_KEY")?;
-            wyvrn_community_host::backups::open(&key, std::path::Path::new(file), std::path::Path::new(out))?;
+            let of = wyvrn_community_host::backups::open(&key, std::path::Path::new(file), std::path::Path::new(out))?;
+            if let Some(name) = of {
+                println!("a backup of {name}");
+            }
             println!("opened: {out}");
             Ok(())
         }
