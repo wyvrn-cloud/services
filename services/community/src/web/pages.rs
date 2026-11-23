@@ -1569,7 +1569,15 @@ fn widget_body(state: &AppState, web: &Web, asked: &WidgetAsked) -> anyhow::Resu
     let mut channels: Vec<Channel> = state.community.store.channels()?.into_iter().filter(|c| readable.contains_key(&c.id)).collect();
     channels.sort_by_key(|c| c.created_at);
     let online = state.community.seen_online()?.len();
-    let in_voice: usize = state.rooms.in_rooms().values().map(Vec::len).sum();
+    // Only voice channels everyone may see are counted (WYV-89): who is in a
+    // private one is that channel's members' to know.
+    let in_voice: usize = state
+        .rooms
+        .in_rooms()
+        .into_iter()
+        .filter(|(channel, _)| state.community.store.channel(channel).ok().flatten().is_some_and(|c| state.community.everyone_sees(&c).unwrap_or(false)))
+        .map(|(_, dids)| dids.len())
+        .sum();
     let chosen = asked.channel.as_deref().and_then(|id| channels.iter().find(|c| c.id == id)).or_else(|| channels.first());
     let mut recent = Vec::new();
     if let Some(channel) = chosen {
