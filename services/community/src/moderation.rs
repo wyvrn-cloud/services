@@ -169,6 +169,14 @@ impl Community {
                     return refuse(message, "e.p.msg.invalid-ban", "That isn't a DID.").map(Some);
                 };
                 if message_type == UNBAN {
+                    // Lifted by whoever banned, the owner, or someone who outranks
+                    // whoever banned (WYV-50): not by a junior moderator undoing a
+                    // senior one's.
+                    if let Some(ban) = self.store.banned(did, now)? {
+                        if ban.by != sender && !powers.owner && !self.outranks(&powers, &ban.by)? {
+                            return refuse(message, "e.p.trust.not-authorized", "Only someone ranked above whoever banned them can lift it.").map(Some);
+                        }
+                    }
                     if !self.lift_ban(did)? {
                         return refuse(message, "e.p.msg.unknown-ban", "They aren't banned.").map(Some);
                     }
@@ -355,7 +363,7 @@ impl Community {
                 for report in self.store.reports(true)? {
                     let about = report.member.as_deref() == Some(did) || report.post.as_ref().is_some_and(|post| post["author"]["did"] == did);
                     if about {
-                        reports.push(self.report_body(&report)?);
+                        reports.push(self.report_body(&report, sender)?);
                     }
                 }
                 let actions = self.store.audit_entries(None, 100, None, Some(did), None)?.iter().map(|entry| self.audit_entry(entry)).collect::<anyhow::Result<Vec<_>>>()?;

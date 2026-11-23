@@ -52,6 +52,9 @@ pub const RULES: &str = "https://wyvrn.app/community/1.0/rules";
 pub const ACCEPT_RULES: &str = "https://wyvrn.app/community/1.0/accept-rules";
 pub const SET_RULES: &str = "https://wyvrn.app/community/1.0/set-rules";
 pub const REPORT: &str = "https://wyvrn.app/community/1.0/report";
+/// How many reports one member may make in `REPORTS_WINDOW` seconds.
+const REPORTS_PER_WINDOW: usize = 5;
+const REPORTS_WINDOW: i64 = 600;
 pub const REPORT_RECEIVED: &str = "https://wyvrn.app/community/1.0/report-received";
 pub const REPORTS_REQUEST: &str = "https://wyvrn.app/community/1.0/reports-request";
 pub const REPORTS: &str = "https://wyvrn.app/community/1.0/reports";
@@ -904,12 +907,17 @@ impl Community {
         Ok(Some(Outcome::reply(reply_to(message, RULES, json!({ "name": name, "rules": rules.text, "rules_version": rules.version })))))
     }
 
-    pub(crate) fn report_body(&self, report: &Report) -> anyhow::Result<Value> {
+    /// A report as `viewer` is shown it: a post reported in a channel they can't
+    /// see is named by its channel alone, not what it said (WYV-50).
+    pub(crate) fn report_body(&self, report: &Report, viewer: &str) -> anyhow::Result<Value> {
         let mut body = json!({ "id": report.id, "reported_at": report.reported_at, "by": self.who(&report.by)?, "reason": report.reason });
         if let Some(note) = &report.note {
             body["note"] = json!(note);
         }
-        if let Some(post) = &report.post {
+        let channel_of = |post: &Value| post["channel"].as_str().map(str::to_string);
+        if let Some(post) = report.post.as_ref().filter(|post| channel_of(post).is_some_and(|channel| !self.sees_id(viewer, &channel).unwrap_or(false))) {
+            body["post"] = json!({ "channel": post["channel"], "hidden": true });
+        } else if let Some(post) = &report.post {
             let mut post = post.clone();
             let removed = match &report.post_id {
                 Some(id) => self.store.post_by_id(id)?.is_none_or(|now| now.deleted),
@@ -930,8 +938,8 @@ impl Community {
         Ok(body)
     }
 
-    pub(crate) fn reports_body(&self, resolved_too: bool) -> anyhow::Result<Value> {
-        let reports = self.store.reports(resolved_too)?.iter().map(|report| self.report_body(report)).collect::<anyhow::Result<Vec<_>>>()?;
+    pub(crate) fn reports_body(&self, resolved_too: bool, viewer: &str) -> anyhow::Result<Value> {
+        let reports = self.store.reports(resolved_too)?.iter().map(|report| self.report_body(report, viewer)).collect::<anyhow::Result<Vec<_>>>()?;
         Ok(json!({ "reports": reports }))
     }
 
@@ -1373,7 +1381,8 @@ impl Community {
             }
         }
         for did in self.config.members.iter().filter(written_from) {
-            if !self.store.is_superseded(did)? {
+            // A ban stands over being named here (WYV-50).
+            if !self.store.is_superseded(did)? && self.store.banned(did, now)?.is_none() {
                 self.store.admit(did, Role::Member, now)?;
             }
         }
@@ -2555,6 +2564,12 @@ impl Community {
             }
 
             REPORT => {
+                // At most a few at a time from anyone (WYV-50): each one goes to every
+                // moderator.
+                let lately = self.store.reports(true)?.iter().filter(|report| report.by == sender && report.reported_at > now - REPORTS_WINDOW).count();
+                if lately >= REPORTS_PER_WINDOW {
+                    return refuse(message, "e.p.msg.too-many-reports", "You've reported a lot just now: wait a few minutes.");
+                }
                 let reason = body["reason"].as_str().unwrap_or_default();
                 if !REPORT_REASONS.contains(&reason) {
                     return refuse(message, "e.p.msg.invalid-report", "A report gives one of the reasons listed.");
@@ -2607,10 +2622,14 @@ impl Community {
                     _ => return refuse(message, "e.p.msg.invalid-report", "A report names a post or a member, one of them."),
                 }
                 let id = self.store.add_report(&report)?;
+                report.id = id.clone();
                 let mut outcome = Outcome::reply(reply_to(message, REPORT_RECEIVED, json!({ "id": id })));
-                let open = self.reports_body(false)?;
+                // Each moderator is sent the new report alone, as they may see it, and
+                // how many are open: not every open report again each time.
+                let open = self.store.reports(false)?.len();
                 for admin in self.joined_holding("manage_reports")?.into_iter().filter(|joined| joined.did != sender) {
-                    outcome.notices.push((admin.did, json!({ "type": REPORTS, "id": uuid::Uuid::new_v4().to_string(), "body": open.clone() })));
+                    let body = json!({ "reports": [self.report_body(&report, &admin.did)?], "open": open });
+                    outcome.notices.push((admin.did, json!({ "type": REPORTS, "id": uuid::Uuid::new_v4().to_string(), "body": body })));
                 }
                 Ok(outcome)
             }
@@ -2627,7 +2646,7 @@ impl Community {
                     self.store.resolve_report(id, sender, now)?;
                     self.audit(now, sender, "report.resolve", Some(id), None);
                 }
-                Ok(Outcome::reply(reply_to(message, REPORTS, self.reports_body(body["resolved"] == true)?)))
+                Ok(Outcome::reply(reply_to(message, REPORTS, self.reports_body(body["resolved"] == true, sender)?)))
             }
 
             SET_PROFILE => {
@@ -2673,6 +2692,10 @@ impl Community {
                 };
                 let powers = self.powers(sender)?;
                 let existing = self.store.member(did)?;
+                // Someone banned is let back in only by lifting the ban (WYV-50).
+                if existing.is_none() && body["role"].is_string() && self.store.banned(did, now)?.is_some() {
+                    return refuse(message, "e.p.msg.banned", "They're banned: lift the ban first.");
+                }
                 let waiting = if existing.is_none() { self.store.waiting_one(did)? } else { None };
                 let was_waiting = waiting.is_some();
                 if existing.is_some() && self.is_owner(did)? {

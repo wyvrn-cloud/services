@@ -426,7 +426,7 @@ impl CommunityService {
                 if let Some(named) = wyvrn_service::named::holder_among(state.resolver.as_ref(), &config.admins, &sender, kid).await {
                     store.set_member(&sender, crate::store::Role::Admin, now())?;
                     tracing::info!(%sender, %named, "an admin named by their public address wrote, and is one under the DID they write from");
-                } else if role.is_none() {
+                } else if role.is_none() && store.banned(&sender, now())?.is_none() {
                     if let Some(named) = wyvrn_service::named::holder_among(state.resolver.as_ref(), &config.members, &sender, kid).await {
                         store.admit(&sender, crate::store::Role::Member, now())?;
                         tracing::info!(%sender, %named, "a member named by their public address wrote, and is let in under the DID they write from");

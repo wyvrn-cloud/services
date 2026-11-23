@@ -4723,3 +4723,40 @@ async fn a_bot_says_its_commands_takes_them_through_the_community_and_answers_wi
     let pressed = bot.next_of("https://wyvrn.app/bot-commands/1.0/press").await;
     assert_eq!((pressed["body"]["post"].as_str(), pressed["body"]["button"].as_str()), (Some("r1"), Some("again")));
 }
+
+#[tokio::test]
+async fn a_ban_is_lifted_only_from_above_a_banned_did_isnt_let_back_in_sideways_and_reports_are_kept_few() {
+    let server = start_server("").await;
+    let (owner, admin, other_admin, member, bob) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &admin, &other_admin, &member, &bob]);
+    let channel = open_channel(&owner, "general").await;
+    for peer in [&owner, &admin, &other_admin, &member, &bob] {
+        peer.community("join", json!({})).await;
+    }
+    owner.community("set-member", json!({ "did": admin.did(), "role": "admin" })).await;
+    owner.community("set-member", json!({ "did": other_admin.did(), "role": "admin" })).await;
+
+    // Banned by an admin: another of the same rank can't lift it (WYV-50).
+    assert_eq!(kind(&admin.community("ban", json!({ "did": member.did(), "reason": "spam" })).await), "bans");
+    assert_eq!(other_admin.community("unban", json!({ "did": member.did() })).await["body"]["code"], "e.p.trust.not-authorized");
+    // Nor let them back in as a member.
+    assert_eq!(owner.community("set-member", json!({ "did": member.did(), "role": "member" })).await["body"]["code"], "e.p.msg.banned");
+    // Whoever banned can, and so can the owner.
+    assert_eq!(kind(&admin.community("unban", json!({ "did": member.did() })).await), "bans");
+    assert_eq!(kind(&other_admin.community("ban", json!({ "did": member.did() })).await), "bans");
+    assert_eq!(kind(&owner.community("unban", json!({ "did": member.did() })).await), "bans");
+
+    // Five reports in ten minutes, then a wait. Each moderator is sent the new one alone.
+    for n in 0..6 {
+        bob.community("post", json!({ "channel": channel, "id": format!("p{n}"), "content": format!("post {n}") })).await;
+    }
+    for n in 0..5 {
+        assert_eq!(kind(&owner.community("report", json!({ "post": format!("p{n}"), "reason": "spam" })).await), "report-received");
+    }
+    assert_eq!(owner.community("report", json!({ "post": "p5", "reason": "spam" })).await["body"]["code"], "e.p.msg.too-many-reports");
+    for n in 1..=5 {
+        let told = admin.next_of(&format!("{C}reports")).await;
+        assert_eq!(told["body"]["reports"].as_array().map(Vec::len), Some(1), "{told}");
+        assert_eq!(told["body"]["open"], n);
+    }
+}
