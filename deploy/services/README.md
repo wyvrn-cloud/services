@@ -31,19 +31,38 @@ public address, a pack's address): it can't be changed afterwards.
 
 Each service needs **a database of its own**. Their tables share names
 (`members`, `posts`), so a service started on another's database refuses to
-run and says whose it is. One user for all of them is fine:
+run and says whose it is. Give each **a user of its own** too, allowed only its
+own database: then a bug in one service, or someone who gets into it, reaches
+no other service's data or keys (security review WYV-32).
 
 ```sql
 CREATE DATABASE wyvrn_did_host;
+CREATE USER 'wyvrn_did_host'@'172.16.0.0/255.240.0.0' IDENTIFIED BY 'a long password';
+GRANT ALL ON wyvrn_did_host.* TO 'wyvrn_did_host'@'172.16.0.0/255.240.0.0';
+
 CREATE DATABASE wyvrn_stickers;
--- CREATE DATABASE wyvrn_community;
--- CREATE DATABASE wyvrn_announce;
--- CREATE DATABASE wyvrn_files;
--- CREATE DATABASE wyvrn_relay;
-CREATE USER 'wyvrn'@'%' IDENTIFIED BY 'a long password';
-GRANT ALL ON wyvrn_did_host.* TO 'wyvrn'@'%';
-GRANT ALL ON wyvrn_stickers.* TO 'wyvrn'@'%';
+CREATE USER 'wyvrn_stickers'@'172.16.0.0/255.240.0.0' IDENTIFIED BY 'another long password';
+GRANT ALL ON wyvrn_stickers.* TO 'wyvrn_stickers'@'172.16.0.0/255.240.0.0';
+
+-- And so on for wyvrn_community, wyvrn_announce, wyvrn_files, wyvrn_relay,
+-- wyvrn_claude, wyvrn_verify, each its own user. The community host makes a
+-- database a community (`wyvrn_c_<name>`) besides its own and the shared one:
+CREATE USER 'wyvrn_community_host'@'172.16.0.0/255.240.0.0' IDENTIFIED BY 'yet another';
+GRANT ALL ON `wyvrn\_c\_%`.* TO 'wyvrn_community_host'@'172.16.0.0/255.240.0.0';
+GRANT ALL ON wyvrn_community_host.* TO 'wyvrn_community_host'@'172.16.0.0/255.240.0.0';
+GRANT ALL ON wyvrn_communities.* TO 'wyvrn_community_host'@'172.16.0.0/255.240.0.0';
 ```
+
+(`172.16.0.0/255.240.0.0` is Docker's default range: use your network's. One user
+for everything, `'wyvrn'@'%'`, still works, and is what an older setup has.)
+
+**Keys at rest.** Every service keeps its own keys in its database. Give each
+`WYVRN_SEAL_KEY` (base64 of 32 bytes: `openssl rand -base64 32`; or
+`WYVRN_SEAL_KEY_FILE`, a secrets file) and they are kept sealed with it, sealed
+as they are next read; a database dump alone then makes nobody any service. Keep
+the key out of the database and its backups. To rotate it, give the new one and
+the old in `WYVRN_SEAL_KEY_PREVIOUS`. Without the key, nothing sealed opens. (The
+community host's own `COMMUNITY_HOST_SEAL_KEY` works as before.)
 
 A service makes its own tables the first time it starts. MySQL 8 and MariaDB 11
 are what the tests are run against.

@@ -61,14 +61,57 @@ pub fn opens_with_previous(keys: &str) -> anyhow::Result<()> {
 
 const SEALED: &str = "wyvrn-sealed-identity/1";
 
+/// The seal key now, once the environment has been read for one.
+fn current() -> Option<&'static [u8; 32]> {
+    from_env();
+    SEAL.get()
+}
+
+/// Keys sealed with before, once the environment has been read for them.
+fn previous() -> &'static [[u8; 32]] {
+    from_env();
+    PREVIOUS.get().map(Vec::as_slice).unwrap_or_default()
+}
+
+/// Every service seals its own keys where it is given `WYVRN_SEAL_KEY` (or
+/// `WYVRN_SEAL_KEY_FILE`), and opens what an old one sealed with
+/// `WYVRN_SEAL_KEY_PREVIOUS` (or `_FILE`), as the community host does with its own
+/// names (security review WYV-32). Read once; a key given by the program first
+/// ([`seal_with`]) stands. A key that isn't one stops the service: better than
+/// keeping keys unsealed the operator meant sealed.
+fn from_env() {
+    static READ: std::sync::Once = std::sync::Once::new();
+    READ.call_once(|| {
+        let given = |name: &str| -> Option<String> {
+            let direct = std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+            direct.or_else(|| std::env::var(format!("{name}_FILE")).ok().filter(|p| !p.trim().is_empty()).map(|path| std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}_FILE {path}: {e}"))))
+        };
+        if let Some(key) = given("WYVRN_SEAL_KEY") {
+            if SEAL.get().is_none() {
+                let key = key_from(&key).unwrap_or_else(|e| panic!("WYVRN_SEAL_KEY: {e}"));
+                let _ = SEAL.set(key);
+            }
+        }
+        if let Some(keys) = given("WYVRN_SEAL_KEY_PREVIOUS") {
+            if PREVIOUS.get().is_none() {
+                let keys = keys.split(|c: char| c == ',' || c.is_whitespace()).filter(|k| !k.is_empty()).map(key_from).collect::<anyhow::Result<Vec<_>>>().unwrap_or_else(|e| panic!("WYVRN_SEAL_KEY_PREVIOUS: {e}"));
+                let _ = PREVIOUS.set(keys);
+            }
+        }
+    });
+}
+
 /// `identity` as it is kept: sealed, where there is a key, else as it is.
 fn kept_form(identity: &Identity, at: &str) -> anyhow::Result<String> {
-    kept_form_with(identity, at, SEAL.get())
+    kept_form_with(identity, at, current())
 }
 
 fn kept_form_with(identity: &Identity, at: &str, key: Option<&[u8; 32]>) -> anyhow::Result<String> {
-    let plain = identity.to_json()?;
-    let Some(key) = key else { return Ok(plain) };
+    seal_with_key(&identity.to_json()?, at, key)
+}
+
+fn seal_with_key(plain: &str, at: &str, key: Option<&[u8; 32]>) -> anyhow::Result<String> {
+    let Some(key) = key else { return Ok(plain.to_string()) };
     use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
     use base64::Engine;
     let cipher = aes_gcm::Aes256Gcm::new_from_slice(&derived(key, at)).expect("a 32-byte key");
@@ -78,17 +121,22 @@ fn kept_form_with(identity: &Identity, at: &str, key: Option<&[u8; 32]>) -> anyh
     Ok(serde_json::json!({ "sealed": SEALED, "nonce": b64.encode(nonce), "keys": b64.encode(sealed) }).to_string())
 }
 
-/// Keys as kept (sealed or not) read back; and whether they were unsealed, to be
-/// sealed now.
-fn read_kept(text: &str, at: &str) -> anyhow::Result<(Identity, bool)> {
-    read_kept_with(text, at, SEAL.get(), PREVIOUS.get().map(Vec::as_slice).unwrap_or_default())
+/// Any secret a service keeps (a key in its settings), as it is kept: sealed with
+/// the seal key where it has one, bound to `at` (where it is kept), else as it is
+/// (security review WYV-32).
+pub fn seal_text(plain: &str, at: &str) -> anyhow::Result<String> {
+    seal_with_key(plain, at, current())
 }
 
-fn read_kept_with(text: &str, at: &str, current: Option<&[u8; 32]>, previous: &[[u8; 32]]) -> anyhow::Result<(Identity, bool)> {
-    let value: serde_json::Value = serde_json::from_str(text).context("the keys aren't JSON")?;
-    if value["sealed"] != SEALED {
-        return Ok((Identity::from_json(text)?, current.is_some()));
-    }
+/// A secret kept by [`seal_text`] read back (sealed or not), and whether it should
+/// be kept again (sealed now, sealed again with a new key, or unsealed).
+pub fn open_text(kept: &str, at: &str) -> anyhow::Result<(String, bool)> {
+    open_with_keys(kept, at, current(), previous())
+}
+
+fn open_with_keys(kept: &str, at: &str, current: Option<&[u8; 32]>, previous: &[[u8; 32]]) -> anyhow::Result<(String, bool)> {
+    let sealed = serde_json::from_str::<serde_json::Value>(kept).ok().filter(|v| v["sealed"] == SEALED);
+    let Some(value) = sealed else { return Ok((kept.to_string(), current.is_some())) };
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -99,8 +147,7 @@ fn read_kept_with(text: &str, at: &str, current: Option<&[u8; 32]>, previous: &[
         let cipher = aes_gcm::Aes256Gcm::new_from_slice(&derived(key, at)).expect("a 32-byte key");
         cipher.decrypt(aes_gcm::Nonce::from_slice(&nonce), Payload { msg: &sealed, aad: at.as_bytes() }).ok()
     };
-    anyhow::ensure!(current.is_some() || !previous.is_empty(), "these keys are sealed: the key they were sealed with is needed (COMMUNITY_HOST_SEAL_KEY)");
-    // With the key now, kept as they are; with an old one, sealed again (or unsealed).
+    anyhow::ensure!(current.is_some() || !previous.is_empty(), "these keys are sealed: the key they were sealed with is needed (WYVRN_SEAL_KEY, or COMMUNITY_HOST_SEAL_KEY)");
     let (plain, again) = match current.and_then(open) {
         Some(plain) => (plain, false),
         None => (
@@ -108,12 +155,24 @@ fn read_kept_with(text: &str, at: &str, current: Option<&[u8; 32]>, previous: &[
             true,
         ),
     };
-    Ok((Identity::from_json(std::str::from_utf8(&plain)?)?, again))
+    Ok((String::from_utf8(plain)?, again))
+}
+
+/// Keys as kept (sealed or not) read back; and whether they were unsealed, to be
+/// sealed now.
+fn read_kept(text: &str, at: &str) -> anyhow::Result<(Identity, bool)> {
+    read_kept_with(text, at, current(), previous())
+}
+
+fn read_kept_with(text: &str, at: &str, current: Option<&[u8; 32]>, previous: &[[u8; 32]]) -> anyhow::Result<(Identity, bool)> {
+    serde_json::from_str::<serde_json::Value>(text).context("the keys aren't JSON")?;
+    let (plain, again) = open_with_keys(text, at, current, previous)?;
+    Ok((Identity::from_json(&plain)?, again))
 }
 
 /// What keys read and kept again became: sealed with the key now, or unsealed.
 fn rewritten() -> &'static str {
-    if SEAL.get().is_some() { "sealed" } else { "unsealed" }
+    if current().is_some() { "sealed" } else { "unsealed" }
 }
 
 fn derived(key: &[u8; 32], at: &str) -> [u8; 32] {
@@ -247,6 +306,16 @@ mod tests {
 
     fn keys(identity: &Identity) -> String {
         identity.to_json().unwrap()
+    }
+
+    #[test]
+    fn any_secret_is_sealed_as_keys_are_and_bound_to_where_it_is_kept() {
+        let key = [7u8; 32];
+        let sealed = seal_with_key("the oauth key", "verify:oauth_key", Some(&key)).unwrap();
+        assert!(!sealed.contains("oauth key"));
+        assert_eq!(open_with_keys(&sealed, "verify:oauth_key", Some(&key), &[]).unwrap(), ("the oauth key".to_string(), false));
+        assert!(open_with_keys(&sealed, "verify:other", Some(&key), &[]).is_err(), "moved, it doesn't open");
+        assert_eq!(open_with_keys("plain", "verify:oauth_key", Some(&key), &[]).unwrap(), ("plain".to_string(), true), "found unsealed: to be sealed");
     }
 
     #[test]
