@@ -427,7 +427,9 @@ impl CommunityService {
         // before anything else is done with it. A ban then follows the address.
         if received.message["type"] == crate::community::JOIN && store.member(&sender)?.is_none() && state.community.requires_address()? {
             let named: Vec<String> = match state.resolver.resolve(&sender).await {
-                Ok(document) => document["alsoKnownAs"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect(),
+                // At most five of the names a document gives are looked up (WYV-62):
+                // each is a resolution, and a document can list any number.
+                Ok(document) => document["alsoKnownAs"].as_array().into_iter().flatten().filter_map(Value::as_str).take(5).map(str::to_string).collect(),
                 Err(_) => Vec::new(),
             };
             let Some(address) = wyvrn_service::named::holder_among(state.resolver.as_ref(), &named, &sender, kid).await.map(str::to_string) else {
