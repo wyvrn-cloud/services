@@ -1,0 +1,66 @@
+# Builds and tests every push and pull request, and audits the dependencies
+# (security review WYV-31). The community server depends on wyvrn-sign-in by
+# path, so it is checked out beside this one; it is private, and this
+# repository's own token can't read it: a read-only deploy key on it is kept here
+# as the secret SIGNIN_DEPLOY_KEY. The tests run on SQLite; the MySQL checks are
+# run by hand (see the README).
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          path: wyvrn-services
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          repository: wyvrn-cloud/signin
+          path: wyvrn-sign-in
+          ssh-key: ${{ secrets.SIGNIN_DEPLOY_KEY }}
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: wyvrn-services -> target
+      - name: cargo build
+        working-directory: wyvrn-services
+        run: cargo build --workspace --all-targets --locked
+      - name: cargo test
+        working-directory: wyvrn-services
+        run: cargo test --workspace --locked
+
+  audit:
+    name: Dependency advisories
+    runs-on: ubuntu-24.04
+    # Blocking (security review WYV-30): an advisory that can't be fixed yet is
+    # listed, with why, in .cargo/audit.toml.
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          path: wyvrn-services
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - run: cargo install --locked cargo-audit --version 0.22.2
+      - name: cargo audit
+        working-directory: wyvrn-services
+        run: cargo audit
