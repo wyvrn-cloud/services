@@ -292,6 +292,19 @@ async fn frame_out(state: &AppState, received: &Received, sender: &str, tunnels:
     None
 }
 
+/// A socket counted against its address and the total, given back when dropped:
+/// however the connection ends, or if it never starts (WYV-110).
+struct SocketHeld {
+    state: Arc<AppState>,
+    client: std::net::IpAddr,
+}
+
+impl Drop for SocketHeld {
+    fn drop(&mut self) {
+        self.state.relay.socket_closed(self.client);
+    }
+}
+
 async fn root(
     State(state): State<Arc<AppState>>,
     peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
@@ -302,20 +315,22 @@ async fn root(
         Ok(upgrade) => {
             // So many sockets from one client address, and in all (WYV-80).
             let client = peer.map(|peer| wyvrn_service::client_address::bucket(state.relay.proxies.client(peer.0 .0.ip(), &headers)));
-            if let Some(client) = client {
-                if !state.relay.socket_opened(client) {
+            let held = match client {
+                Some(client) if !state.relay.socket_opened(client) => {
                     return (axum::http::StatusCode::TOO_MANY_REQUESTS, "Too many connections from this address.").into_response();
                 }
-            }
+                Some(client) => Some(SocketHeld { state: state.clone(), client }),
+                None => None,
+            };
             let limit = state.relay.config.max_bytes / 3 * 4 + 64 * 1024;
             upgrade
                 .max_message_size(limit)
                 .max_frame_size(limit)
                 .on_upgrade(move |socket| async move {
+                    // Released when this is dropped: after the connection, or
+                    // unrun if the upgrade fails (WYV-110).
+                    let _held = held;
                     connection(state.clone(), socket).await;
-                    if let Some(client) = client {
-                        state.relay.socket_closed(client);
-                    }
                 })
                 .into_response()
         }
