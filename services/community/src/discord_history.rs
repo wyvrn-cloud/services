@@ -894,24 +894,35 @@ static USER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<@!?(\d+)>").expect
 static ROLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<@&(\d+)>").expect("a valid pattern"));
 static CHANNEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<#(\d+)>").expect("a valid pattern"));
 static EMOJI: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<a?:(\w{1,64}):(\d+)>").expect("a valid pattern"));
-static TIME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<t:(-?\d{1,13})(?::[tTdDfFR])?>").expect("a valid pattern"));
 
 /// A message's text as it reads here: people, roles and channels by name, the
-/// server's own emoji as its packs' (others as `:name:`), times written out. And
-/// who it calls on, as `mentions` (nobody is told: it is history).
+/// server's own emoji as its packs' (others as `:name:`). And who it calls on, as
+/// `mentions` (nobody is told: it is history). A time (`<t:1767225600:F>`) is
+/// left as written: the app and the web view show it in the reader's zone.
 pub fn rewrite(m: &Message, ctx: &Context) -> (String, Vec<Value>) {
     let mut mentions = Vec::new();
-    let names: HashMap<&str, &User> = m.mentions.iter().map(|u| (u.id.as_str(), u)).collect();
-    let text = USER.replace_all(&m.content, |c: &regex::Captures| match names.get(&c[1]) {
+    let text = rewrite_text(&m.content, m, ctx, &mut mentions);
+    (text, mentions)
+}
+
+/// `text`, of `m` (its content, or its embeds' words), as [`rewrite`] has it: who
+/// it calls on added to `mentions`, each once.
+fn rewrite_text(text: &str, m: &Message, ctx: &Context, mentions: &mut Vec<Value>) -> String {
+    let mut mention = |who: String, name: &str| {
+        if !mentions.iter().any(|known| known["who"] == who.as_str()) {
+            mentions.push(json!({ "who": who, "name": name }));
+        }
+    };
+    let text = USER.replace_all(text, |c: &regex::Captures| match m.mentions.iter().find(|u| u.id == c[1]) {
         Some(user) => {
-            mentions.push(json!({ "who": format!("{AUTHOR_PREFIX}{}", user.id), "name": user.shown_as() }));
+            mention(format!("{AUTHOR_PREFIX}{}", user.id), user.shown_as());
             format!("@{}", user.shown_as())
         }
         None => "@someone".to_string(),
     });
     let text = ROLE.replace_all(&text, |c: &regex::Captures| match ctx.roles.get(&c[1]) {
         Some((id, name)) => {
-            mentions.push(json!({ "who": format!("role:{id}"), "name": name }));
+            mention(format!("role:{id}"), name);
             format!("@{name}")
         }
         None => "@a-role".to_string(),
@@ -924,10 +935,13 @@ pub fn rewrite(m: &Message, ctx: &Context) -> (String, Vec<Value>) {
         Some((shortcode, url)) => format!("![:{shortcode}:]({url})"),
         None => format!(":{}:", &c[1]),
     });
-    let text = TIME.replace_all(&text, |c: &regex::Captures| {
-        c[1].parse::<i64>().ok().and_then(|s| chrono::DateTime::from_timestamp(s, 0)).map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_else(|| c[0].to_string())
-    });
-    (text.into_owned(), mentions)
+    text.into_owned()
+}
+
+/// `m`'s embeds as cards (ten at most), their words rewritten as its text is, and
+/// who they call on added to `mentions`.
+pub fn cards(m: &Message, ctx: &Context, mentions: &mut Vec<Value>) -> Vec<Value> {
+    m.embeds.iter().filter_map(|e| card(e, &mut |text| rewrite_text(text, m, ctx, mentions))).take(10).collect()
 }
 
 /// A file sealed as wyvrn-chat seals one: its ciphertext, and `ciphering`.
@@ -955,16 +969,21 @@ fn keep_file(files: &Files, owner: &str, path: &Path, name: &str, now: i64) -> a
 }
 
 /// A card as the app draws a webhook's (Discord's embed object): pictures by their
-/// address on the web.
-fn card(e: &Embed) -> Option<Value> {
+/// address on the web; its title, description and fields' words through
+/// `rewrite` (Discord's markup in them is Markdown, as a message's is).
+fn card(e: &Embed, rewrite: &mut dyn FnMut(&str) -> String) -> Option<Value> {
     let mut card = serde_json::Map::new();
     let mut put = |key: &str, value: Option<Value>| {
         if let Some(value) = value {
             card.insert(key.to_string(), value);
         }
     };
-    put("title", e.title.clone().filter(|t| !t.is_empty()).map(Value::from));
-    put("description", e.description.clone().filter(|t| !t.is_empty()).map(Value::from));
+    let mut words = |text: &Option<String>| text.as_deref().filter(|t| !t.is_empty()).map(|t| Value::from(rewrite(t)));
+    let title = words(&e.title);
+    let description = words(&e.description);
+    let fields: Vec<Value> = e.fields.iter().map(|f| json!({ "name": rewrite(&f.name), "value": rewrite(&f.value), "inline": f.is_inline })).collect();
+    put("title", title);
+    put("description", description);
     put("url", e.url.clone().filter(|u| u.starts_with("http")).map(Value::from));
     put("timestamp", e.timestamp.clone().map(Value::from));
     put("color", e.color.as_deref().and_then(|c| i64::from_str_radix(c.trim_start_matches('#'), 16).ok()).map(Value::from));
@@ -973,8 +992,8 @@ fn card(e: &Embed) -> Option<Value> {
     let picture = e.image.iter().chain(e.images.iter()).find_map(Image::web).map(|u| json!({ "url": u }));
     put("image", picture);
     put("thumbnail", e.thumbnail.as_ref().and_then(Image::web).map(|u| json!({ "url": u })));
-    if !e.fields.is_empty() {
-        put("fields", Some(json!(e.fields.iter().map(|f| json!({ "name": f.name, "value": f.value, "inline": f.is_inline })).collect::<Vec<_>>())));
+    if !fields.is_empty() {
+        put("fields", Some(json!(fields)));
     }
     (!card.is_empty()).then(|| Value::Object(card))
 }
@@ -1051,7 +1070,8 @@ pub fn write(store: &Store, export: &Export, channel: &Channel, ctx: &Context, p
                 extra.insert("media".into(), json!(media));
                 extra.insert("attachments".into(), json!(attachments));
             }
-            let cards: Vec<Value> = m.embeds.iter().filter_map(card).take(10).collect();
+            let (mut content, mut mentions) = rewrite(m, ctx);
+            let cards = cards(m, ctx, &mut mentions);
             if !cards.is_empty() {
                 extra.insert("embeds".into(), json!(cards));
             }
@@ -1078,7 +1098,6 @@ pub fn write(store: &Store, export: &Export, channel: &Channel, ctx: &Context, p
             if forum && thread_id.as_deref() == Some(m.id.as_str()) {
                 extra.insert("title".into(), json!(export.channel.name.chars().take(100).collect::<String>()));
             }
-            let (mut content, mentions) = rewrite(m, ctx);
             for sticker in &m.stickers {
                 let shown = match ctx.expressions.get(&sticker.id) {
                     Some((shortcode, url)) => format!("![:{shortcode}:]({url})"),
@@ -1162,6 +1181,61 @@ pub fn write(store: &Store, export: &Export, channel: &Channel, ctx: &Context, p
     Ok(written)
 }
 
+/// What [`refresh_embeds`] did.
+#[derive(Debug, Default)]
+pub struct Refreshed {
+    /// Posts whose embeds were written again.
+    pub posts: usize,
+    /// Posts here already as the export has them.
+    pub same: usize,
+    /// The export's posts that aren't here (never imported, or taken back).
+    pub missing: usize,
+}
+
+/// The embeds of `export`'s posts already imported into `channel`, written again
+/// from it as [`write`] would write them now, and each post that changed marked
+/// changed (as an edit is), so members' apps take it up. Nothing else of a post is
+/// touched: what it says, who it calls on, its reactions and files stay as they are.
+/// `dry_run`: only counted.
+pub fn refresh_embeds(store: &Store, export: &Export, channel: &Channel, ctx: &Context, dry_run: bool) -> anyhow::Result<Refreshed> {
+    let mut refreshed = Refreshed::default();
+    let have = imported_here(store, &channel.id)?;
+    store.db.grouped(|| -> anyhow::Result<()> {
+        for m in export.messages.iter().filter(|m| is_said(&m.kind)) {
+            let id = format!("{POST_PREFIX}{}", m.id);
+            let extra: Option<String> = match have.contains(&id) {
+                true => store.db.lock().query_row("SELECT extra FROM post_extra WHERE post = ?1", params![id], |row| row.get(0))?,
+                false => None,
+            };
+            // (A post taken back has no extra left: it stays gone.)
+            let Some(mut extra) = extra.and_then(|text| serde_json::from_str::<Value>(&text).ok()).filter(Value::is_object) else {
+                refreshed.missing += 1;
+                continue;
+            };
+            let cards = cards(m, ctx, &mut Vec::new());
+            let now = if cards.is_empty() { None } else { Some(json!(cards)) };
+            if extra.get("embeds") == now.as_ref() {
+                refreshed.same += 1;
+                continue;
+            }
+            refreshed.posts += 1;
+            if dry_run {
+                continue;
+            }
+            match now {
+                Some(cards) => extra["embeds"] = cards,
+                None => {
+                    extra.as_object_mut().map(|e| e.remove("embeds"));
+                }
+            }
+            store.set_post_extra(&id, &extra)?;
+            store.touch_post(&id)?;
+        }
+        Ok(())
+    })?;
+    Ok(refreshed)
+}
+
 /// Discord channel ids to names, for `<#id>`, from every export's header.
 pub fn channel_names(files: &[PathBuf]) -> HashMap<String, String> {
     files.iter().filter_map(|f| header(f).ok()).map(|(_, c)| (c.id, c.name)).collect()
@@ -1199,7 +1273,8 @@ mod tests {
         let mut m = message("1", "2020-01-01T00:00:00+00:00", "hi <@222> and <@!333>, <@&700> <#900> <:frostyhi:555> <a:other:666> <t:0:R>");
         m.mentions = vec![User { id: "222".into(), name: "bob".into(), nickname: Some("Bobby".into()), ..Default::default() }];
         let (text, mentions) = rewrite(&m, &ctx(&dir));
-        assert_eq!(text, "hi @Bobby and @someone, @Artists #fanart ![:frostyhi:](https://c.example/c/f/s/frosty-emoji/a.png) :other: 1970-01-01 00:00 UTC");
+        // (A time is left as written: the app shows it in the reader's zone.)
+        assert_eq!(text, "hi @Bobby and @someone, @Artists #fanart ![:frostyhi:](https://c.example/c/f/s/frosty-emoji/a.png) :other: <t:0:R>");
         assert_eq!(mentions, vec![json!({ "who": "did:wyvrn:tmp:discord:222", "name": "Bobby" }), json!({ "who": "role:r1", "name": "Artists" })]);
     }
 
@@ -1308,6 +1383,73 @@ mod tests {
         assert!(store.is_private_thread("discord-80").unwrap());
         // Nothing of it was counted as a change.
         assert_eq!(store.latest_rev().unwrap(), 0);
+    }
+
+    /// A bot's post of rules: no text, its words in embeds, in Discord's markup.
+    fn rules(id: &str) -> Message {
+        let mut m = message(id, "2022-12-22T00:00:00+00:00", "");
+        m.author.is_bot = true;
+        m.embeds = vec![
+            Embed { title: Some("**Rules:**".into()), fields: vec![Field { name: "**__1. Be kind__**".into(), value: "Ask <@&700> in <#900> <:frostyhi:555>".into(), is_inline: false }], ..Default::default() },
+            Embed { description: Some("__**you agree**__ <@&700>, <@&701> <t:1798750800:F>".into()), color: Some("#2ECC71".into()), ..Default::default() },
+        ];
+        m
+    }
+
+    #[test]
+    fn an_embeds_words_read_as_a_messages_text_does() {
+        let store = Store::in_memory().unwrap();
+        store.add_channel("rules", "rules", "", "did:example:owner", 100).unwrap();
+        let export = Export { guild: Named { id: "1".into(), name: "G".into() }, channel: ExportChannel { id: "901".into(), name: "rules".into(), ..Default::default() }, messages: vec![rules("20")] };
+        let channel = store.channel("rules").unwrap().unwrap();
+        let dir = std::env::temp_dir();
+        write(&store, &export, &channel, &ctx(&dir), |_, _| {}).unwrap();
+        let post = store.post_by_id("discord-20").unwrap().unwrap();
+        let embeds = &post.extra.as_ref().unwrap()["embeds"];
+        // Markdown stays Markdown; Discord's mentions, channels and emoji read as here.
+        assert_eq!(embeds[0]["title"], "**Rules:**");
+        assert_eq!(embeds[0]["fields"][0], json!({ "name": "**__1. Be kind__**", "value": "Ask @Artists in #fanart ![:frostyhi:](https://c.example/c/f/s/frosty-emoji/a.png)", "inline": false }));
+        assert_eq!(embeds[1]["description"], "__**you agree**__ @Artists, @a-role <t:1798750800:F>");
+        assert_eq!(embeds[1]["color"], 0x2ecc71);
+        // The role they call on is the post's mention, once.
+        assert_eq!(post.mentions.iter().map(|m| m.who.as_str()).collect::<Vec<_>>(), ["role:r1"]);
+    }
+
+    #[test]
+    fn embeds_imported_before_are_written_again_and_nothing_else() {
+        let store = Store::in_memory().unwrap();
+        store.add_channel("rules", "rules", "", "did:example:owner", 100).unwrap();
+        let channel = store.channel("rules").unwrap().unwrap();
+        let dir = std::env::temp_dir();
+        let mut old = rules("20");
+        old.embeds[0].fields[0].value = "first words".into();
+        let mut plain = message("21", "2022-12-23T00:00:00+00:00", "hello");
+        plain.embeds = vec![];
+        let export = |messages| Export { guild: Named { id: "1".into(), name: "G".into() }, channel: ExportChannel { id: "901".into(), name: "rules".into(), ..Default::default() }, messages };
+        write(&store, &export(vec![old, plain.clone()]), &channel, &ctx(&dir), |_, _| {}).unwrap();
+        // As an earlier import wrote it: the embed's words verbatim.
+        let mut extra = store.post_by_id("discord-20").unwrap().unwrap().extra.unwrap();
+        extra["embeds"][0]["fields"][0]["value"] = json!("Ask <@&700>");
+        store.set_post_extra("discord-20", &extra).unwrap();
+        assert_eq!(store.latest_rev().unwrap(), 0);
+        // A dry run only counts.
+        let counted = refresh_embeds(&store, &export(vec![rules("20")]), &channel, &ctx(&dir), true).unwrap();
+        assert_eq!((counted.posts, store.latest_rev().unwrap()), (1, 0));
+
+        let refreshed = refresh_embeds(&store, &export(vec![rules("20"), plain, message("22", "2022-12-24T00:00:00+00:00", "never imported")]), &channel, &ctx(&dir), false).unwrap();
+        assert_eq!((refreshed.posts, refreshed.same, refreshed.missing), (1, 1, 1));
+        let post = store.post_by_id("discord-20").unwrap().unwrap();
+        let extra = post.extra.unwrap();
+        assert_eq!(extra["embeds"][0]["fields"][0]["value"], "Ask @Artists in #fanart ![:frostyhi:](https://c.example/c/f/s/frosty-emoji/a.png)");
+        assert_eq!(extra["imported"]["id"], "20");
+        // Sent as changed, as an edit is; nothing else of it, nor of the others.
+        assert!(post.rev > 0);
+        assert_eq!((post.content.as_str(), post.edited_at), ("", None));
+        assert_eq!(store.post_by_id("discord-21").unwrap().unwrap().rev, 0);
+        assert!(store.post_by_id("discord-22").unwrap().is_none());
+        // Again: nothing to change.
+        let again = refresh_embeds(&store, &export(vec![rules("20")]), &channel, &ctx(&dir), false).unwrap();
+        assert_eq!((again.posts, again.same), (0, 1));
     }
 
     #[test]

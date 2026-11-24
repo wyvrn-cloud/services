@@ -24,6 +24,9 @@ pub struct Asked {
     pub dry_run: bool,
     /// A channel's threads come with it.
     pub threads: bool,
+    /// Only the embeds of the posts already imported, written again from the export
+    /// (`--refresh-embeds`): nothing new is brought in.
+    pub refresh_embeds: bool,
 }
 
 /// The export files `chosen` names, from `folder`: each a Discord channel's id, or
@@ -94,6 +97,10 @@ pub fn run(host: &Host, name: &str, asked: &Asked, now: i64) -> anyhow::Result<(
         }
         None => HashMap::new(),
     };
+    let channel_names = history::channel_names(&history::files_in(&asked.folder)?);
+    if asked.refresh_embeds {
+        return refresh(&store, name, asked, &targets, channel_names, expressions, now);
+    }
     println!("Into {name}{}:", if asked.media { "" } else { " (text only)" });
     let mut planned_bytes = 0u64;
     let mut ready = Vec::new();
@@ -140,7 +147,6 @@ pub fn run(host: &Host, name: &str, asked: &Asked, now: i64) -> anyhow::Result<(
             println!("its files may now take {} in all (was {})", history::bytes(raised.files_total), history::bytes(limits.files_total));
         }
     }
-    let channel_names = history::channel_names(&history::files_in(&asked.folder)?);
     for (channel, export) in &ready {
         let setting = Setting {
             folder: &asked.folder,
@@ -172,5 +178,37 @@ pub fn run(host: &Host, name: &str, asked: &Asked, now: i64) -> anyhow::Result<(
         }
     }
     println!("members read it the next time they open those channels and scroll back; nobody is notified");
+    Ok(())
+}
+
+/// `--refresh-embeds`: the embeds of the posts of `targets` already here, written
+/// again from the export, each that changed sent as changed (as an edit is).
+fn refresh(
+    store: &wyvrn_community::store::Store,
+    name: &str,
+    asked: &Asked,
+    targets: &[Target],
+    channel_names: HashMap<String, String>,
+    expressions: HashMap<String, (String, String)>,
+    now: i64,
+) -> anyhow::Result<()> {
+    println!("The embeds of what was imported into {name}{}:", if asked.dry_run { " (dry run: nothing is changed)" } else { "" });
+    for target in targets {
+        println!("  {}", shown(target));
+        let Ok(channel) = &target.channel else { continue };
+        let export = history::read(&target.file)?;
+        let setting = Setting { folder: &asked.folder, files: None, channel_names: channel_names.clone(), roles: history::roles_by_name(store, &export)?, expressions: expressions.clone(), now };
+        let refreshed = history::refresh_embeds(store, &export, channel, &setting, asked.dry_run)?;
+        println!(
+            "    {} posts' embeds {}, {} already as the export has them, {} not here",
+            refreshed.posts,
+            if asked.dry_run { "to write again" } else { "written again" },
+            refreshed.same,
+            refreshed.missing
+        );
+    }
+    if !asked.dry_run {
+        println!("members' apps take up the changed posts as they do an edit");
+    }
     Ok(())
 }

@@ -43,14 +43,17 @@ wyvrn-community-host [--config <path>] discord-survey <folder> [<channel>...] [-
                                                                   take: messages, attachments, GIF links,
                                                                   disk space. Counts only, as Markdown.
 wyvrn-community-host [--config <path>] import-discord <name> <folder> <channel>... [--map <discord-id>=<channel>]
-                     [--text-only] [--no-threads] [--expressions <folder>] [--dry-run]
+                     [--text-only] [--no-threads] [--expressions <folder>] [--refresh-embeds] [--dry-run]
                                                                   a Discord channel's history and its threads
                                                                   (by its id or name; a forum's by name) into the channel
                                                                   here of the same category and name (or as
                                                                   --map says), read among its posts by time.
                                                                   Files sealed; nobody notified; again, only
-                                                                  what isn't there yet. --dry-run says what
-                                                                  it would do.
+                                                                  what isn't there yet. --refresh-embeds
+                                                                  brings nothing in: it writes again the
+                                                                  embeds of the posts already imported from
+                                                                  those channels, sent as edits are.
+                                                                  --dry-run says what it would do.
 wyvrn-community-host [--config <path>] backup <name>              back one up now (backups.key set)
 wyvrn-community-host [--config <path>] open-backup <file> <out.tar.gz>
                                                                   open a backup with the backup key: the
@@ -206,6 +209,7 @@ async fn main() -> anyhow::Result<()> {
                 expressions: None,
                 dry_run: false,
                 threads: true,
+                refresh_embeds: false,
             };
             let mut args = rest.iter();
             while let Some(arg) = args.next() {
@@ -213,6 +217,7 @@ async fn main() -> anyhow::Result<()> {
                     "--dry-run" => asked.dry_run = true,
                     "--text-only" => asked.media = false,
                     "--no-threads" => asked.threads = false,
+                    "--refresh-embeds" => asked.refresh_embeds = true,
                     "--expressions" => asked.expressions = Some(args.next().context("--expressions needs a folder")?.into()),
                     "--map" => {
                         let given = args.next().context("--map needs <discord-id>=<channel>")?;

@@ -35,6 +35,25 @@ wyvrn-community-host limits <name> <members> <channels>
 
 A community's owner is its first admin. A removed community is kept for 30 days and can be restored until then.
 
+## Bringing in a Discord server's history
+
+From a DiscordChatExporter backup (JSON, with `--media`), a channel at a time:
+
+```
+wyvrn-community-host discord-survey <folder> [<channel>...]
+wyvrn-community-host import-discord <name> <folder> <channel>... [--map <discord-id>=<channel>]
+                     [--text-only] [--no-threads] [--expressions <folder>] [--refresh-embeds] [--dry-run]
+```
+
+`discord-survey` counts what a backup holds. `import-discord` brings each channel's posts (and its threads) into the channel here of the same name, oldest first, read among its posts by time; nobody is notified. Run again, it brings only what isn't there yet. Discord's markup is Markdown here, as the app draws it: `<@id>`, `<@&id>` and `<#id>` become `@name` and `#channel`, the server's own emoji its packs' (`--expressions`, the folder `import-expressions` filled), and `<t:…>` is left for the app to show in the reader's zone. The same goes for the words of a post's embeds (a bot's rules, a webhook's cards): title, description, and each field's name and value.
+
+`--refresh-embeds` brings in nothing new: for the posts already imported from those channels it writes their embeds again from the backup, as an import does now, and marks each one that changed as changed (as an edit is), so members' apps take it up. What a post says, its reactions and files are left as they are. It is how posts imported before embeds were read this way are put right, without importing again:
+
+```
+wyvrn-community-host import-discord <name> <folder> rules --refresh-embeds --dry-run   # what it would change
+wyvrn-community-host import-discord <name> <folder> rules --refresh-embeds
+```
+
 ## Moving out to a server of its own
 
 A community's owner (its owner in community/1.0's sense, which follows them when their DID changes and when they hand the community on) has a page in the community's own admin workflows, "Move to your own server", listed to them alone:
