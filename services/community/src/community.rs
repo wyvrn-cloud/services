@@ -31,6 +31,10 @@ pub const DECIDE_CLAIM: &str = "https://wyvrn.app/community/1.0/decide-claim";
 /// Raid mode, turned on for `{ minutes }` or off (`0`).
 pub const SET_RAID: &str = "https://wyvrn.app/community/1.0/set-raid";
 pub const MEMBERS: &str = "https://wyvrn.app/community/1.0/members";
+/// One member's whole entry, for their profile card: `{ member }`, answered with
+/// `member` (roster.rs).
+pub const MEMBER_REQUEST: &str = "https://wyvrn.app/community/1.0/member-request";
+pub const MEMBER: &str = "https://wyvrn.app/community/1.0/member";
 pub const MEMBER_CHANGED: &str = "https://wyvrn.app/community/1.0/member-changed";
 pub const SET_MEMBER_PROFILE: &str = "https://wyvrn.app/community/1.0/set-member-profile";
 pub const MESSAGE_REQUEST: &str = "https://wyvrn.app/community/1.0/message-request";
@@ -1283,7 +1287,7 @@ impl Community {
     }
 
     /// Who is waiting, as an admin is told: `waiting` in `members`.
-    fn waiting_body(&self) -> anyhow::Result<Vec<Value>> {
+    pub(crate) fn waiting_body(&self) -> anyhow::Result<Vec<Value>> {
         self.store.waiting()?.iter().map(|waiting| self.waiting_entry(waiting)).collect()
     }
 
@@ -1321,63 +1325,10 @@ impl Community {
             .collect()
     }
 
-    /// `members`, as `asker` is told: with who is waiting for an admin.
+    /// `members`, as `asker` is told: everyone, with who is waiting for an admin
+    /// (roster.rs).
     pub(crate) fn members_for(&self, asker: &Member) -> anyhow::Result<Value> {
-        let mut body = self.members_body()?;
-        if self.powers(&asker.did)?.has("timeout_members") {
-            let now = crate::gates::now();
-            for listed in body["members"].as_array_mut().into_iter().flatten() {
-                if let Some(until) = self.store.timed_out_until(listed["did"].as_str().unwrap_or_default(), now)? {
-                    listed["timed_out_until"] = json!(until);
-                }
-            }
-        }
-        if self.powers(&asker.did)?.has("admit_members") {
-            body["waiting"] = json!(self.waiting_body()?);
-        }
-        Ok(body)
-    }
-
-    fn members_body(&self) -> anyhow::Result<Value> {
-        let online = self.seen_online()?;
-        // Not the community itself: it is kept as a member so that what it posts
-        // (a welcome, AutoMod's alerts, a webhook's or the assistant's posts) has an
-        // author, but it is nobody in the list (found 2026-11-20: it was listed by
-        // its DID).
-        let own = self.own_dids();
-        let mut members = Vec::new();
-        for member in self.store.members()?.into_iter().filter(|member| !own.contains(&member.did)) {
-            let powers = self.powers(&member.did)?;
-            members.push((member, powers));
-        }
-        let members = members.iter().map(|(member, powers)| self.member_entry(member, powers, &online)).collect::<anyhow::Result<Vec<Value>>>()?;
-        Ok(json!({ "members": members }))
-    }
-
-    /// One member as `members` lists them: by DID here, which member_ids.rs turns
-    /// into their member id for whoever is sent it; with what their profile says.
-    pub(crate) fn member_entry(&self, member: &Member, powers: &crate::roles::Powers, online: &std::collections::HashMap<String, String>) -> anyhow::Result<Value> {
-        let mut listed = json!({ "did": member.did, "role": powers.older_role(), "roles": powers.roles, "joined": member.joined, "since": member.since });
-        if let Some(status) = online.get(&member.did) {
-            listed["presence"] = json!(status);
-        }
-        let (name, profile, here) = self.profile_entry(&member.did, member.name.as_deref())?;
-        if let Some(name) = name {
-            listed["name"] = json!(name);
-        }
-        if let Some(profile) = profile {
-            listed["profile"] = profile;
-        }
-        if let Some(here) = here {
-            listed["here"] = here;
-        }
-        if let Some(left_at) = member.left_at.filter(|_| !member.joined) {
-            listed["left_at"] = json!(left_at);
-        }
-        if let Some(signature) = self.store.signature(&member.did)? {
-            listed["signature"] = json!(signature);
-        }
-        Ok(listed)
+        self.members_answer(asker, &crate::roster::Asked::default(), None)
     }
 
     /// The answer to a message that changed the post `id`: the post as it now
@@ -2361,22 +2312,18 @@ impl Community {
                     },
                     None => None,
                 };
-                let mut body = self.members_for(&member)?;
-                if let Some(channel) = channel {
-                    let mut seeing = Vec::new();
-                    for listed in body["members"].as_array().into_iter().flatten() {
-                        let did = listed["did"].as_str().unwrap_or_default();
-                        if self.sees(did, &self.powers(did)?, &channel)? {
-                            seeing.push(listed.clone());
-                        }
-                    }
-                    body["members"] = json!(seeing);
-                    body["channel"] = json!(channel.id);
-                    if let Some(object) = body.as_object_mut() {
-                        object.remove("waiting");
-                    }
+                // Briefly, a page, some (roster.rs); with none of it, everyone.
+                let asked = crate::roster::Asked::read(&message["body"]);
+                Ok(Outcome::reply(reply_to(message, MEMBERS, self.members_answer(&member, &asked, channel.as_ref())?)))
+            }
+
+            MEMBER_REQUEST => {
+                // (A member id, turned into the DID it names on the way in.)
+                let named = message["body"]["member"].as_str().or(message["body"]["did"].as_str()).unwrap_or_default();
+                match self.member_entry_for(&member, named)? {
+                    Some(entry) => Ok(Outcome::reply(reply_to(message, MEMBER, json!({ "member": entry })))),
+                    None => refuse(message, "e.p.msg.invalid-member", "They aren't in this community."),
                 }
-                Ok(Outcome::reply(reply_to(message, MEMBERS, body)))
             }
 
             SET_ADMISSION => {
@@ -2854,14 +2801,14 @@ impl Community {
                                 self.store.set_name(did, waiting.name.as_deref())?;
                             }
                             let admitted = self.store.member(did)?.expect("just let in");
-                            let mut outcome = Outcome::reply(reply_to(message, MEMBERS, self.members_for(&member)?));
+                            let mut outcome = Outcome::reply(self.change_answer(message, &member, did)?);
                             outcome.posted = self.welcome(did, now)?;
                             outcome.notices.push((did.to_string(), json!({ "type": COMMUNITY, "body": self.community(&admitted)? })));
                             outcome.notices.extend(self.admins_told()?);
                             return Ok(outcome);
                         }
                         // Someone whose roles changed is told what they may do now.
-                        let mut outcome = Outcome::reply(reply_to(message, MEMBERS, self.members_for(&member)?));
+                        let mut outcome = Outcome::reply(self.change_answer(message, &member, did)?);
                         if let Some(changed) = self.store.member(did)?.filter(|m| m.joined && m.did != sender) {
                             outcome.notices.push((did.to_string(), json!({ "type": COMMUNITY, "body": self.community(&changed)? })));
                         }
@@ -2886,7 +2833,7 @@ impl Community {
                         } else if existing.is_some() {
                             self.audit(now, sender, "member.remove", Some(did), None);
                         }
-                        let mut outcome = Outcome::reply(reply_to(message, MEMBERS, self.members_for(&member)?));
+                        let mut outcome = Outcome::reply(self.change_answer(message, &member, did)?);
                         if was_waiting {
                             outcome.notices.push((did.to_string(), json!({ "type": REMOVED, "body": { "was": "waiting" } })));
                             outcome.notices.extend(self.admins_told()?);

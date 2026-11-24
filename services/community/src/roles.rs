@@ -99,6 +99,22 @@ pub struct Powers {
 }
 
 impl Powers {
+    /// What holding `held` of `roles` (every role there is) gives, and being the
+    /// owner: worked out from what was read already, for a list of many members
+    /// ([`Community::powers`] reads it for one).
+    pub fn of(roles: &[RoleDef], held: &[String], owner: bool) -> Self {
+        let mut permissions = BTreeSet::new();
+        let mut rank = 0;
+        for role in roles.iter().filter(|role| role.id == EVERYONE_ROLE || held.contains(&role.id)) {
+            permissions.extend(role.permissions.iter().cloned());
+            if role.id != EVERYONE_ROLE {
+                rank = rank.max(role.position);
+            }
+        }
+        let roles = held.iter().filter(|id| roles.iter().any(|role| role.id == **id)).cloned().collect();
+        Self { owner, roles, permissions, rank }
+    }
+
     /// Whether they may do everything: the owner, or `administrator`.
     pub fn all(&self) -> bool {
         self.owner || self.permissions.contains("administrator")
@@ -368,19 +384,7 @@ impl Community {
 
     /// What `did` may do in the community.
     pub fn powers(&self, did: &str) -> anyhow::Result<Powers> {
-        let roles = self.store.roles()?;
-        let held = self.store.member_roles(did)?;
-        let mut permissions = BTreeSet::new();
-        let mut rank = 0;
-        for role in roles.iter().filter(|role| role.id == EVERYONE_ROLE || held.contains(&role.id)) {
-            permissions.extend(role.permissions.iter().cloned());
-            if role.id != EVERYONE_ROLE {
-                rank = rank.max(role.position);
-            }
-        }
-        let owner = self.is_owner(did)?;
-        let roles = held.into_iter().filter(|id| roles.iter().any(|role| role.id == *id)).collect();
-        Ok(Powers { owner, roles, permissions, rank })
+        Ok(Powers::of(&self.store.roles()?, &self.store.member_roles(did)?, self.is_owner(did)?))
     }
 
     /// Whether `actor` may act on the member `target`: ranked above them, and not

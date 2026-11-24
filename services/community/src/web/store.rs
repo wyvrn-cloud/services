@@ -107,7 +107,7 @@ impl Store {
         let mut db = self.db.lock();
         db.execute("DELETE FROM member_pictures WHERE did = ?1", params![did])?;
         if let Some((media_type, data)) = picture {
-            db.execute("INSERT INTO member_pictures (did, media_type, data, at) VALUES (?1, ?2, ?3, ?4)", params![did, media_type, data, now])?;
+            db.execute("INSERT INTO member_pictures (did, media_type, data, at, hash) VALUES (?1, ?2, ?3, ?4, ?5)", params![did, media_type, data, now, crate::member_ids::picture_hash(data)])?;
         }
         Ok(())
     }

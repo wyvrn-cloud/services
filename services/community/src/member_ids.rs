@@ -12,7 +12,7 @@
 //! and picture kept already (members, member_pictures): their description, banner,
 //! linked accounts and public address, and what they are in this community alone.
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
@@ -36,6 +36,7 @@ const WITH_DIDS: &[&str] = &[
     crate::community::MEMBERS,
     crate::community::ASKED_TO_JOIN,
     crate::community::MEMBER_CHANGED,
+    crate::community::MEMBER,
     "https://wyvrn.app/community/1.0/bans",
     "https://wyvrn.app/community/1.0/member-history",
 ];
@@ -175,7 +176,7 @@ impl Store {
         let mut db = self.db.lock();
         db.execute("DELETE FROM member_profiles WHERE did = ?1", params![did])?;
         db.execute(
-            "INSERT INTO member_profiles (did, description, banner_type, banner_data, linked, public_address, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO member_profiles (did, description, banner_type, banner_data, linked, public_address, at, banner_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 did,
                 profile.description,
@@ -183,7 +184,8 @@ impl Store {
                 profile.banner.as_ref().map(|(_, data)| data.clone()),
                 profile.linked.as_ref().map(Value::to_string),
                 profile.public_address,
-                profile.at
+                profile.at,
+                profile.banner.as_ref().map(|(_, data)| picture_hash(data))
             ],
         )?;
         Ok(())
@@ -203,14 +205,15 @@ impl Store {
         let mut db = self.db.lock();
         db.execute("DELETE FROM member_here WHERE did = ?1", params![did])?;
         db.execute(
-            "INSERT INTO member_here (did, nickname, picture_type, picture_data, requests, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO member_here (did, nickname, picture_type, picture_data, requests, at, picture_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 did,
                 here.nickname,
                 here.picture.as_ref().map(|(media_type, _)| media_type.clone()),
                 here.picture.as_ref().map(|(_, data)| data.clone()),
                 i64::from(here.requests),
-                here.at
+                here.at,
+                here.picture.as_ref().map(|(_, data)| picture_hash(data))
             ],
         )?;
         Ok(())
@@ -279,8 +282,6 @@ impl Community {
         Ok(unmasked)
     }
 
-    /// The address a member's picture is at (community/1.0's "A picture is an
-    /// address"): `kind` is `picture`, `banner` or `here`.
     /// The community's picture as Discord's webhook avatar takes it: at most
     /// `SMALL_PICTURE` pixels a side, and a PNG, JPEG or GIF (`media type, bytes`).
     pub fn own_picture_small(&self) -> Option<(String, Vec<u8>)> {
@@ -296,77 +297,21 @@ impl Community {
         Some(format!("{}/picture/{}", self.public_url.trim_end_matches('/'), picture_hash(&picture.base64)))
     }
 
-    pub fn picture_url(&self, member: &str, kind: &str, data: &str) -> String {
-        let base = self.public_url.trim_end_matches('/');
-        format!("{base}/m/{member}/{kind}/{}", picture_hash(data))
-    }
-
-    /// The picture at an address [`Self::picture_url`] gave, while it is still that
-    /// picture: `(media type, base64)`.
+    /// The picture at an address a list gave (roster.rs), while it is still that
+    /// picture: `(media type, base64)`. Found by the hash kept beside it.
     pub fn picture_at(&self, member: &str, kind: &str, hash: &str) -> anyhow::Result<Option<(String, String)>> {
         let Some(did) = self.store.did_of_member(member)? else { return Ok(None) };
-        let picture = match kind {
-            "picture" => self.store.member_picture(&did)?.map(|(media_type, data, _)| (media_type, data)),
-            "banner" => self.store.member_profile(&did)?.and_then(|profile| profile.banner),
-            "here" => self.store.member_here(&did)?.and_then(|here| here.picture),
-            _ => None,
+        let sql = match kind {
+            "picture" => "SELECT media_type, data, hash FROM member_pictures WHERE did = ?1",
+            "banner" => "SELECT banner_type, banner_data, banner_hash FROM member_profiles WHERE did = ?1",
+            "here" => "SELECT picture_type, picture_data, picture_hash FROM member_here WHERE did = ?1",
+            _ => return Ok(None),
         };
-        Ok(picture.filter(|(_, data)| picture_hash(data) == hash))
-    }
-
-    /// What `members` says of `did`'s profile, and of what they are here:
-    /// `(name, profile, here)`, each `None` with nothing to say.
-    pub fn profile_entry(&self, did: &str, name: Option<&str>) -> anyhow::Result<(Option<String>, Option<Value>, Option<Value>)> {
-        let member = self.store.member_id(did, crate::gates::now())?;
-        let profile = self.store.member_profile(did)?;
-        let picture = self.store.member_picture(did)?;
-        let here = self.store.member_here(did)?;
-        let mut said = Map::new();
-        if let Some(name) = name {
-            said.insert("displayName".into(), json!(name));
-        }
-        let mut at = picture.as_ref().map(|(_, _, at)| *at).unwrap_or(0);
-        if let Some((_, data, _)) = &picture {
-            said.insert("picture".into(), json!(self.picture_url(&member, "picture", data)));
-        }
-        if let Some(profile) = &profile {
-            at = at.max(profile.at);
-            if let Some(description) = &profile.description {
-                said.insert("description".into(), json!(description));
-            }
-            if let Some((_, data)) = &profile.banner {
-                said.insert("banner".into(), json!(self.picture_url(&member, "banner", data)));
-            }
-            if let Some(linked) = &profile.linked {
-                said.insert("linkedAccounts".into(), linked.clone());
-            }
-            if let Some(address) = &profile.public_address {
-                said.insert("publicAddress".into(), json!(address));
-            }
-        }
-        if let Some(commands) = self.store.bot(&did)? {
-            said.insert("bot".into(), json!(true));
-            said.insert("commands".into(), commands);
-        } else if self.store.bot_asked(&did)?.is_some() {
-            // Says it is a bot, not yet approved (WYV-89): shown as asking, not as one.
-            said.insert("bot_pending".into(), json!(true));
-        }
-        let profile_value = (!said.is_empty()).then(|| {
-            said.insert("at".into(), json!(at));
-            Value::Object(said)
-        });
-        let mut here_said = Map::new();
-        let mut shown = name.map(str::to_string);
-        if let Some(here) = &here {
-            if let Some(nickname) = &here.nickname {
-                here_said.insert("nickname".into(), json!(nickname));
-                shown = Some(nickname.clone());
-            }
-            if let Some((_, data)) = &here.picture {
-                here_said.insert("picture".into(), json!(self.picture_url(&member, "here", data)));
-            }
-        }
-        Ok((shown, profile_value, (!here_said.is_empty()).then_some(Value::Object(here_said))))
+        let found = self.store.db.lock().query_row(sql, params![did], |row| Ok((row.get::<Option<String>>(0)?, row.get::<Option<String>>(1)?, row.get::<Option<String>>(2)?)))?;
+        Ok(match found {
+            Some((Some(media_type), Some(data), kept)) if kept.as_deref().map_or_else(|| picture_hash(&data) == hash, |kept| kept == hash) => Some((media_type, data)),
+            _ => None,
+        })
     }
 }
 
@@ -410,8 +355,9 @@ impl Masker<'_> {
                 // `{ did, name? }`: `{ member, name? }`, with the DID kept beside it
                 // for a member told DIDs, where the message carries them.
                 if let Some(did) = fields.get("did").and_then(Value::as_str).filter(|did| self.is_person(did)).map(str::to_string) {
-                    let id = self.id_of(&did)?;
+                    // A member id put beside it already (roster.rs) isn't looked up again.
                     if !fields.get("member").and_then(Value::as_str).is_some_and(|member| !member.starts_with("did:")) {
+                        let id = self.id_of(&did)?;
                         fields.insert("member".into(), json!(id));
                     }
                     if !self.keep_dids {
@@ -500,7 +446,7 @@ impl Community {
     /// `members` as it now stands, or that they are gone.
     pub(crate) fn member_changed(&self, did: &str) -> anyhow::Result<Value> {
         let entry = match self.store.member(did)? {
-            Some(member) => self.member_entry(&member, &self.powers(did)?, &self.seen_online()?)?,
+            Some(member) => crate::roster::Roster::load(self, Some(did), true, false)?.entry(self, &member, false)?,
             None => json!({ "did": did, "gone": true }),
         };
         Ok(json!({ "type": crate::community::MEMBER_CHANGED, "id": uuid::Uuid::new_v4().to_string(), "body": { "member": entry } }))
@@ -547,7 +493,7 @@ impl Community {
 
     /// `set-member-profile`: what this community alone shows of the sender.
     pub(crate) fn set_member_profile(&self, sender: &str, message: &Value, now: i64) -> anyhow::Result<crate::community::Outcome> {
-        use crate::community::{refuse, reply_to, Outcome, MEMBERS};
+        use crate::community::{refuse, Outcome};
         let body = &message["body"];
         let mut here = self.store.member_here(sender)?.unwrap_or_default();
         let mut said = false;
@@ -595,7 +541,7 @@ impl Community {
         let Some(member) = self.store.member(sender)? else {
             return refuse(message, "e.p.trust.not-authorized", "You aren't in this community.");
         };
-        let mut outcome = Outcome::reply(reply_to(message, MEMBERS, self.members_for(&member)?));
+        let mut outcome = Outcome::reply(self.change_answer(message, &member, sender)?);
         outcome.live.push(self.member_changed(sender)?);
         Ok(outcome)
     }

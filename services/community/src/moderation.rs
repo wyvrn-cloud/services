@@ -5,7 +5,7 @@
 
 use serde_json::{json, Value};
 
-use crate::community::{line, problem, refuse, reply_to, Community, Outcome, MEMBERS};
+use crate::community::{line, problem, refuse, reply_to, Community, Outcome};
 use crate::store::{AuditEntry, Ban, Channel, Member};
 
 pub const BAN: &str = "https://wyvrn.app/community/1.0/ban";
@@ -300,7 +300,7 @@ impl Community {
                     details["reason"] = json!(reason);
                 }
                 self.audit(now, sender, "member.timeout", Some(did), Some(details));
-                let mut outcome = Outcome::reply(reply_to(message, MEMBERS, self.members_for(member)?));
+                let mut outcome = Outcome::reply(self.change_answer(message, member, did)?);
                 if target.joined {
                     outcome.notices.push((did.to_string(), json!({ "type": crate::community::COMMUNITY, "body": self.community(&target)? })));
                 }

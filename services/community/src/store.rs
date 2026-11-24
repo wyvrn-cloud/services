@@ -1356,7 +1356,8 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         did TEXT PRIMARY KEY,
         media_type TEXT NOT NULL,
         data TEXT NOT NULL,
-        at INTEGER NOT NULL
+        at INTEGER NOT NULL,
+        hash TEXT
     );
     -- Channels made public on the web, and from when.
     CREATE TABLE IF NOT EXISTS web_channels (
@@ -1454,7 +1455,8 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         banner_data TEXT,
         linked TEXT,
         public_address TEXT,
-        at INTEGER NOT NULL
+        at INTEGER NOT NULL,
+        banner_hash TEXT
     );
     -- What a member is in this community alone (set-member-profile).
     CREATE TABLE IF NOT EXISTS member_here (
@@ -1463,7 +1465,8 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         picture_type TEXT,
         picture_data TEXT,
         requests INTEGER NOT NULL DEFAULT 1,
-        at INTEGER NOT NULL
+        at INTEGER NOT NULL,
+        picture_hash TEXT
     );
     -- Message requests passed on, one a day from a member to the same member.
     CREATE TABLE IF NOT EXISTS message_requests (
@@ -2058,7 +2061,8 @@ fn schema() -> Schema {
                 did {MYSQL_DID} NOT NULL PRIMARY KEY,
                 media_type VARCHAR(64) NOT NULL,
                 data MEDIUMTEXT NOT NULL,
-                at BIGINT NOT NULL
+                at BIGINT NOT NULL,
+                hash VARCHAR(32)
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS web_channels (
                 channel VARCHAR(255) NOT NULL PRIMARY KEY,
@@ -2144,7 +2148,8 @@ fn schema() -> Schema {
                 banner_data MEDIUMTEXT,
                 linked MEDIUMTEXT,
                 public_address VARCHAR(1024),
-                at BIGINT NOT NULL
+                at BIGINT NOT NULL,
+                banner_hash VARCHAR(32)
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS member_here (
                 did {MYSQL_DID} NOT NULL PRIMARY KEY,
@@ -2152,7 +2157,8 @@ fn schema() -> Schema {
                 picture_type VARCHAR(64),
                 picture_data MEDIUMTEXT,
                 requests BIGINT NOT NULL DEFAULT 1,
-                at BIGINT NOT NULL
+                at BIGINT NOT NULL,
+                picture_hash VARCHAR(32)
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS message_requests (
                 from_did {MYSQL_DID} NOT NULL,
@@ -2189,7 +2195,42 @@ fn schema() -> Schema {
 
 impl Store {
     pub fn open(location: &Location) -> anyhow::Result<Self> {
-        Ok(Self::with_cache(Db::open(location, &schema(), "community")?))
+        let store = Self::with_cache(Db::open(location, &schema(), "community")?);
+        store.hash_pictures()?;
+        Ok(store)
+    }
+
+    /// The columns added to tables after they were first made, `(table, column,
+    /// type)`: added to a store made before them as it is opened. Neither SQLite
+    /// nor MySQL 8 has `ADD COLUMN IF NOT EXISTS`, so each is added, and "duplicate
+    /// column" taken as its being there already.
+    const ADDED_COLUMNS: &'static [(&'static str, &'static str)] = &[
+        // The addresses members' pictures are at (community/1.0's "A picture is
+        // an address"), kept as each picture is, rather than worked out from
+        // every picture whenever the member list is asked for.
+        ("member_pictures", "hash"),
+        ("member_profiles", "banner_hash"),
+        ("member_here", "picture_hash"),
+    ];
+
+    /// Adds [`Self::ADDED_COLUMNS`] where they aren't yet, and gives every picture
+    /// kept before them its hash.
+    fn hash_pictures(&self) -> anyhow::Result<()> {
+        for (table, column) in Self::ADDED_COLUMNS {
+            match self.db.lock().execute(&format!("ALTER TABLE {table} ADD COLUMN {column} VARCHAR(32)"), params![]) {
+                Err(error) if error.to_string().to_ascii_lowercase().contains("duplicate column") => {}
+                said => {
+                    said?;
+                }
+            }
+        }
+        for (table, data, hash) in [("member_pictures", "data", "hash"), ("member_profiles", "banner_data", "banner_hash"), ("member_here", "picture_data", "picture_hash")] {
+            let unhashed = self.db.lock().query(&format!("SELECT did, {data} FROM {table} WHERE {hash} IS NULL AND {data} IS NOT NULL"), params![], |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)))?;
+            for (did, picture) in unhashed {
+                self.db.lock().execute(&format!("UPDATE {table} SET {hash} = ?2 WHERE did = ?1"), params![did, crate::member_ids::picture_hash(&picture)])?;
+            }
+        }
+        Ok(())
     }
 
     /// Who is who, what each role may do, and the community's settings are asked
@@ -2203,7 +2244,9 @@ impl Store {
     }
 
     pub fn in_memory() -> anyhow::Result<Self> {
-        Ok(Self::with_cache(Db::scratch(&schema())?))
+        let store = Self::with_cache(Db::scratch(&schema())?);
+        store.hash_pictures()?;
+        Ok(store)
     }
 
     // --- Members ---------------------------------------------------------------
@@ -4651,5 +4694,43 @@ mod indexes {
             let plan = plan(&store, sql);
             assert!(plan.contains(index), "{sql}: {plan}");
         }
+    }
+}
+
+#[cfg(test)]
+mod picture_hashes {
+    use super::*;
+
+    #[test]
+    fn a_picture_kept_before_hashes_were_is_given_one_as_the_store_is_opened() {
+        // A file of its own, or the MySQL database `WYVRN_TEST_DATABASE_URL` names
+        // (as production is: MySQL's "duplicate column" is a code, SQLite's words).
+        let path = std::env::temp_dir().join(format!("wyvrn-community-hashes-{}.db", uuid::Uuid::new_v4()));
+        let location = match std::env::var("WYVRN_TEST_DATABASE_URL").ok().filter(|url| !url.is_empty()) {
+            Some(url) => Location::parse(&url).unwrap(),
+            None => Location::Sqlite(path.clone()),
+        };
+        {
+            let store = Store::open(&location).unwrap();
+            store.set_member("did:example:old", Role::Member, 1).unwrap();
+            store.set_member_picture("did:example:old", Some(("image/png", "b2xk")), 1).unwrap();
+            // As a store made before the column was.
+            store.db.lock().execute("ALTER TABLE member_pictures DROP COLUMN hash", params![]).unwrap();
+        }
+        let store = Store::open(&location).unwrap();
+        let hash: Option<String> = store.db.lock().query_row("SELECT hash FROM member_pictures WHERE did = ?1", params!["did:example:old"], |row| row.get(0)).unwrap().flatten();
+        assert_eq!(hash.as_deref(), Some(crate::member_ids::picture_hash("b2xk").as_str()));
+        drop(store);
+        // Opened again, the column there: nothing is refused.
+        Store::open(&location).unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_picture_set_now_is_kept_with_its_hash() {
+        let store = Store::in_memory().unwrap();
+        store.set_member_picture("did:example:new", Some(("image/png", "bmV3")), 1).unwrap();
+        let hash: Option<String> = store.db.lock().query_row("SELECT hash FROM member_pictures WHERE did = ?1", params!["did:example:new"], |row| row.get(0)).unwrap().flatten();
+        assert_eq!(hash.as_deref(), Some(crate::member_ids::picture_hash("bmV3").as_str()));
     }
 }

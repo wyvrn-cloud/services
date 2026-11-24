@@ -379,6 +379,9 @@ impl Service for CommunityService {
     async fn answer(&self, incoming: &Incoming<'_>) -> anyhow::Result<Option<Value>> {
         let state = &self.0;
         let mut received = incoming.received.clone();
+        if let Some(sender) = &received.sender {
+            received.message = state.community.untold_dids_dropped(sender, &received.message)?;
+        }
         received.message = state.community.unmasked_from(&received.message)?;
         let reply = self.answer_unmasked(&Incoming { received: &received, sender_kid: incoming.sender_kid.clone() }).await?;
         match (reply, &received.sender) {
