@@ -550,6 +550,11 @@ impl Community {
                 if let Some(icon) = &role.icon {
                     listed["icon"] = json!(icon);
                 }
+                // Only whether it grants everything, for showing an owner who holds
+                // no such role apart (a crown); its other permissions stay unsaid.
+                if role.permissions.iter().any(|p| p == "administrator") {
+                    listed["administrator"] = json!(true);
+                }
                 listed
             })
             .collect())

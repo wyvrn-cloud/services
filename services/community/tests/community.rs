@@ -1586,6 +1586,11 @@ async fn roles_are_made_given_and_ranked_through_workflows() {
     assert_eq!(advance(&owner, "r1", "create", json!({ "name": "artist" })).await["body"]["code"], "guard_failed");
     let roles = owner.community("join", json!({})).await["body"]["roles"].clone();
     let artist_role = roles.as_array().unwrap().iter().find(|r| r["name"] == "Artist").unwrap()["id"].as_str().unwrap().to_string();
+    // Only a role that grants everything says so, and no other permission is listed.
+    let admin = roles.as_array().unwrap().iter().find(|r| r["name"] == "Admin").unwrap();
+    assert_eq!(admin["administrator"], true, "{admin}");
+    assert!(admin.get("permissions").is_none());
+    assert!(roles.as_array().unwrap().iter().find(|r| r["name"] == "Artist").unwrap().get("administrator").is_none());
     advance(&owner, "r1", "edit", json!({ "role": artist_role })).await;
     let bad = advance(&owner, "r1", "save", json!({ "name": "Artist", "color": "blue" })).await;
     assert_eq!(bad["body"]["code"], "guard_failed");
