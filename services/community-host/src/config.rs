@@ -121,6 +121,10 @@ pub struct HostConfig {
     /// The domain of the DID host each community holds its public address at
     /// (`community:<name>`); empty for none.
     pub did_host: String,
+    /// Whose linked-account credentials every community here trusts, for a member
+    /// to claim the posts imported under their Discord account (wyvrn-community's
+    /// claims.rs): DIDs. Empty for wyvrn-verify's alone, as a community's default.
+    pub linked_account_issuers: Vec<String>,
 }
 
 /// Where a community's stores go: what [`crate::registry::Storage`] names.
@@ -235,8 +239,9 @@ impl Config {
     /// `COMMUNITY_HOST_ADMINS`, `COMMUNITY_HOST_DID_HOST`, `COMMUNITY_HOST_STORAGE`
     /// (the default kind), `COMMUNITY_HOST_DIR`, `COMMUNITY_HOST_MYSQL_URL`, and
     /// `COMMUNITY_HOST_VOICE_RELAY_URL` with `COMMUNITY_HOST_VOICE_RELAY_FINGERPRINT`,
-    /// and `COMMUNITY_HOST_WEB_TRUSTED_PROXIES` (comma-separated; the Docker gateways
-    /// when none are named).
+    /// `COMMUNITY_HOST_WEB_TRUSTED_PROXIES` (comma-separated; the Docker gateways
+    /// when none are named), and `COMMUNITY_HOST_LINKED_ACCOUNT_ISSUERS`
+    /// (comma-separated DIDs).
     /// The host's own store is `COMMUNITY_HOST_DATABASE_URL` if set ([`crate::registry`]).
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
@@ -254,6 +259,9 @@ impl Config {
         }
         if let Some(admins) = env("COMMUNITY_HOST_ADMINS") {
             config.host.admins = dids(&admins);
+        }
+        if let Some(issuers) = env("COMMUNITY_HOST_LINKED_ACCOUNT_ISSUERS") {
+            config.host.linked_account_issuers = dids(&issuers);
         }
         if let Some(did_host) = env("COMMUNITY_HOST_DID_HOST") {
             config.host.did_host = did_host;

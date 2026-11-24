@@ -20,6 +20,10 @@ admins = []
 # The DID host each community holds its public address at (community:<name>);
 # empty for none.
 did_host = ""
+# Whose linked-account credentials every community here trusts, for a member to
+# claim the posts imported under their Discord account (DIDs); empty for
+# wyvrn-verify's (did:web:verify.wyvrn.app). Or COMMUNITY_HOST_LINKED_ACCOUNT_ISSUERS.
+linked_account_issuers = []
 
 [storage]
 # What a new community is kept in, unless said otherwise: "sqlite" (a folder of

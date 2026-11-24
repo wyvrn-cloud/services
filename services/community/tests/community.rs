@@ -4528,7 +4528,8 @@ async fn a_member_asks_for_the_posts_imported_under_their_discord_account_and_a_
     // Not checked yet: nothing to claim.
     let refused = member.community("claim-imported", json!({})).await;
     assert_eq!(refused["body"]["code"], "e.p.msg.no-claim", "{refused}");
-    // Their profile proved the Discord account (as consider_claim records it, past their first day).
+    // Their profile proved the Discord account while someone else had a hand in it
+    // (as consider_profile records it then), and nothing proves it now: asked for.
     store.set_claim(&wyvrn_community::claims::Claim { discord_id: "111".into(), did: member.did(), state: "verified".into(), at: 1, decided_by: None }).unwrap();
     let standing = member.community("join", json!({})).await;
     assert_eq!(standing["body"]["imported_claim"], json!({ "from": "discord", "state": "verified", "posts": 1 }), "{standing}");
@@ -4552,6 +4553,173 @@ async fn a_member_asks_for_the_posts_imported_under_their_discord_account_and_a_
     assert_eq!(post.extra.unwrap()["imported"]["claimed"], true);
     let after = member.community("join", json!({})).await;
     assert_eq!(after["body"]["imported_claim"]["state"], "claimed");
+}
+
+/// The issuer of linked-account credentials in the claims tests, and its key.
+const ISSUER: &str = "did:web:verify.example";
+const ISSUER_JWK: &str = r#"{"kty":"OKP","crv":"Ed25519","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo","d":"nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A"}"#;
+
+/// A server trusting [`ISSUER`], whose DID document it fetches as if over HTTPS,
+/// with one post imported in #fanart under the Discord account 111.
+async fn server_with_imported_post() -> (Running, Peer) {
+    use wyvrn_community::discord_history as history;
+    let server = start_server(&format!("linked_account_issuers = [\"{ISSUER}\"]")).await;
+    let document = json!({ "id": ISSUER, "verificationMethod": [{ "id": format!("{ISSUER}#key-1"), "type": "Multikey", "controller": ISSUER, "publicKeyMultibase": wyvrn_hosted_did::write::public_multikey(ISSUER_JWK).unwrap() }], "assertionMethod": [format!("{ISSUER}#key-1")] });
+    let fetch: wyvrn_community::server::JsonFetch = Arc::new(move |url: String| {
+        let document = document.clone();
+        Box::pin(async move { (url == "https://verify.example/.well-known/did.json").then_some(document) })
+    });
+    *server.state.fetch_json.write().unwrap() = Some(fetch);
+    let admin = Peer::start(&server).await;
+    server.admit(&[&admin]);
+    server.state.community.store.set_joined(&admin.did(), true).unwrap();
+    let channel = open_channel(&admin, "fanart").await;
+    let store = &server.state.community.store;
+    let export = history::Export {
+        guild: history::Named { id: "1".into(), name: "G".into() },
+        channel: history::ExportChannel { id: "900".into(), kind: "GuildTextChat".into(), name: "fanart".into(), ..Default::default() },
+        messages: vec![history::Message {
+            id: "10".into(),
+            kind: "Default".into(),
+            timestamp: "2020-01-01T00:00:00+00:00".into(),
+            content: "old art".into(),
+            author: history::User { id: "111".into(), name: "ann".into(), ..Default::default() },
+            ..Default::default()
+        }],
+    };
+    let folder = std::env::temp_dir();
+    let setting = history::Context { folder: &folder, files: None, channel_names: Default::default(), roles: Default::default(), expressions: Default::default(), now: 1 };
+    history::write(store, &export, &store.channel(&channel).unwrap().unwrap(), &setting, |_, _| {}).unwrap();
+    (server, admin)
+}
+
+/// A linked-account credential for the Discord account 111, about `address`, signed by [`ISSUER`].
+async fn discord_credential(address: &str) -> Value {
+    use affinidi_data_integrity::{DataIntegrityProof, SignOptions};
+    let mut value = json!({
+        "@context": ["https://www.w3.org/ns/credentials/v2", "https://wyvrn.app/ns/linked-account/v1"],
+        "type": ["VerifiableCredential", "LinkedAccountCredential"],
+        "issuer": ISSUER,
+        "validFrom": "2026-01-01T00:00:00Z",
+        "credentialSubject": { "id": address, "account": { "type": "OnlineAccount", "accountServiceHomepage": "https://discord.com", "accountName": "111" } },
+    });
+    let signer = wyvrn_hosted_did::write::signing_secret(ISSUER_JWK, Some(&format!("{ISSUER}#key-1"))).unwrap();
+    let contexts = value["@context"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_string()).collect();
+    let proof = DataIntegrityProof::sign(&value, &signer, SignOptions::new().with_proof_purpose("assertionMethod").with_context(contexts)).await.unwrap();
+    value["proof"] = serde_json::to_value(proof).unwrap();
+    value
+}
+
+/// `did`'s profile as the server keeps it: `address` shown to be theirs, and `linked`.
+fn keep_profile(server: &Running, did: &str, address: &str, linked: &[Value]) {
+    let profile = wyvrn_community::member_ids::MemberProfile { public_address: Some(address.to_string()), linked: Some(json!(linked)), at: 1, ..Default::default() };
+    server.state.community.store.set_member_profile(did, &profile).unwrap();
+}
+
+fn imported_author(server: &Running) -> String {
+    server.state.community.store.post_by_id("discord-10").unwrap().unwrap().author_did
+}
+
+#[tokio::test]
+async fn a_member_of_long_standing_proving_their_discord_account_has_its_posts_at_once_where_nobody_else_has_a_hand_in_them() {
+    let (server, _admin) = server_with_imported_post().await;
+    let member = Peer::start(&server).await;
+    // Let in long ago.
+    server.state.community.store.admit(&member.did(), wyvrn_community::store::Role::Member, 1).unwrap();
+    member.community("join", json!({})).await;
+    let address = "did:webvh:abc:ann.example";
+    // About another address: not theirs.
+    wyvrn_community::server::consider_profile(server.state.clone(), member.did(), address.into(), vec![discord_credential("did:webvh:abc:bob.example").await]).await;
+    assert!(imported_author(&server).starts_with("did:wyvrn:tmp:discord:"));
+    wyvrn_community::server::consider_profile(server.state.clone(), member.did(), address.into(), vec![discord_credential(address).await]).await;
+    assert_eq!(imported_author(&server), member.did());
+    let claim = server.state.community.store.claim("111").unwrap().unwrap();
+    assert_eq!((claim.did.as_str(), claim.state.as_str(), claim.decided_by), (member.did().as_str(), "claimed", None));
+    let told = member.next_of(&format!("{C}community")).await;
+    assert_eq!(told["body"]["imported_claim"]["state"], "claimed", "{told}");
+}
+
+#[tokio::test]
+async fn a_discord_account_someone_else_holds_or_asked_for_is_left_to_a_moderator() {
+    let (server, admin) = server_with_imported_post().await;
+    let (member, other) = (Peer::start(&server).await, Peer::start(&server).await);
+    let store = &server.state.community.store;
+    for peer in [&member, &other] {
+        store.admit(&peer.did(), wyvrn_community::store::Role::Member, 1).unwrap();
+        peer.community("join", json!({})).await;
+    }
+    let address = "did:webvh:abc:ann.example";
+    let credential = discord_credential(address).await;
+    // Another member's profile proved the same Discord account.
+    store.set_member_accounts(&other.did(), &[("https://discord.com".to_string(), "111".to_string())], 1).unwrap();
+    wyvrn_community::server::consider_profile(server.state.clone(), member.did(), address.into(), vec![credential.clone()]).await;
+    assert!(imported_author(&server).starts_with("did:wyvrn:tmp:discord:"), "not made theirs");
+    assert_eq!(store.claim("111").unwrap().unwrap().state, "verified");
+    // Asked for, proven again: still someone else's hand in it, so a moderator decides.
+    keep_profile(&server, &member.did(), address, std::slice::from_ref(&credential));
+    let asked = member.community("claim-imported", json!({})).await;
+    assert_eq!(asked["body"]["imported_claim"]["state"], "asked", "{asked}");
+    assert!(imported_author(&server).starts_with("did:wyvrn:tmp:discord:"));
+    // The other one, proving it after, doesn't undo the ask; nor is it theirs at once.
+    store.set_member_accounts(&other.did(), &[], 1).unwrap();
+    wyvrn_community::server::consider_profile(server.state.clone(), other.did(), "did:webvh:abc:other.example".into(), vec![discord_credential("did:webvh:abc:other.example").await]).await;
+    let claim = store.claim("111").unwrap().unwrap();
+    assert_eq!((claim.did.as_str(), claim.state.as_str()), (member.did().as_str(), "asked"));
+    let decided = admin.community("decide-claim", json!({ "member": server.id(&member), "approve": true })).await;
+    assert_eq!(kind(&decided), "community", "{decided}");
+    assert_eq!(imported_author(&server), member.did());
+}
+
+#[tokio::test]
+async fn asking_for_imported_posts_proves_the_account_again_and_has_them_at_once_where_nobody_else_has_a_hand_in_them() {
+    let (server, _admin) = server_with_imported_post().await;
+    let member = Peer::start(&server).await;
+    server.state.community.store.admit(&member.did(), wyvrn_community::store::Role::Member, 1).unwrap();
+    member.community("join", json!({})).await;
+    let address = "did:webvh:abc:ann.example";
+    // Kept, but no longer checking out (changed since it was signed): asked for.
+    let mut changed = discord_credential(address).await;
+    changed["validFrom"] = json!("2026-02-01T00:00:00Z");
+    keep_profile(&server, &member.did(), address, &[changed]);
+    let store = &server.state.community.store;
+    store.set_claim(&wyvrn_community::claims::Claim { discord_id: "111".into(), did: member.did(), state: "verified".into(), at: 1, decided_by: None }).unwrap();
+    let asked = member.community("claim-imported", json!({})).await;
+    assert_eq!(asked["body"]["imported_claim"]["state"], "asked", "{asked}");
+    // Proven now: theirs at once, the ask with it.
+    keep_profile(&server, &member.did(), address, &[discord_credential(address).await]);
+    let claimed = member.community("claim-imported", json!({})).await;
+    assert_eq!(claimed["body"]["imported_claim"]["state"], "claimed", "{claimed}");
+    assert_eq!(imported_author(&server), member.did());
+    assert!(store.claims_asked().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn someone_let_in_from_the_waiting_list_has_their_profile_looked_at_again() {
+    let (server, admin) = server_with_imported_post().await;
+    let newcomer = Peer::start(&server).await;
+    assert_eq!(kind(&newcomer.community("join", json!({})).await), "waiting");
+    let address = "did:webvh:abc:ann.example";
+    // Proven while waiting: noted, nothing made theirs.
+    wyvrn_community::server::consider_profile(server.state.clone(), newcomer.did(), address.into(), vec![discord_credential(address).await]).await;
+    assert!(imported_author(&server).starts_with("did:wyvrn:tmp:discord:"));
+    keep_profile(&server, &newcomer.did(), address, &[discord_credential(address).await]);
+    admin.community("set-member", json!({ "did": newcomer.did(), "role": "member" })).await;
+    for _ in 0..100 {
+        if imported_author(&server) == newcomer.did() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(imported_author(&server), newcomer.did());
+}
+
+#[tokio::test]
+async fn someone_let_in_whose_profile_isnt_kept_is_asked_for_it() {
+    let (server, admin) = server_with_imported_post().await;
+    let newcomer = Peer::start(&server).await;
+    assert_eq!(kind(&newcomer.community("join", json!({})).await), "waiting");
+    admin.community("set-member", json!({ "did": newcomer.did(), "role": "member" })).await;
+    newcomer.next_of("https://didcomm.org/user-profile/1.0/request-profile").await;
 }
 
 #[tokio::test]

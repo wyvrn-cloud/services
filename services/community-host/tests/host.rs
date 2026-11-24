@@ -789,3 +789,13 @@ async fn a_host_past_its_budget_takes_no_more_posts_in_any_community() {
     assert!(host.full.load(std::sync::atomic::Ordering::Relaxed));
     assert!(tenant.state.community.host_full.get().is_some_and(|full| full.load(std::sync::atomic::Ordering::Relaxed)));
 }
+
+#[tokio::test]
+async fn every_community_trusts_the_linked_account_issuers_the_host_names_or_wyvrn_verify() {
+    let plain = start_host(600).await;
+    let record = plain.host.registry.create("alpha", "Alpha", Storage::Sqlite, "did:example:ann", "test", 1).unwrap();
+    assert_eq!(plain.host.settings(&record).community.linked_account_issuers, [wyvrn_community::claims::DEFAULT_ISSUER]);
+    let named = start_host_with_extra(600, "", "[host]\nlinked_account_issuers = [\"did:web:verify.example\", \"did:web:other.example\"]").await;
+    let record = named.host.registry.create("beta", "Beta", Storage::Sqlite, "did:example:bea", "test", 1).unwrap();
+    assert_eq!(named.host.settings(&record).community.linked_account_issuers, ["did:web:verify.example", "did:web:other.example"]);
+}

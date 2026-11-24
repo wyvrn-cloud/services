@@ -79,7 +79,13 @@ pub struct AppState {
     pub web: Option<Arc<crate::web::Web>>,
     /// Who a request is from, for every limit by address (clients.rs, WYV-98).
     pub clients: crate::clients::Clients,
+    /// How an issuer's DID document and status list are fetched, to check a linked
+    /// account (claims.rs): [`fetch_small_json`] unless a test serves them.
+    pub fetch_json: std::sync::RwLock<Option<JsonFetch>>,
 }
+
+/// Gets a URL's JSON, as [`fetch_small_json`] does.
+pub type JsonFetch = Arc<dyn Fn(String) -> futures_util::future::BoxFuture<'static, Option<Value>> + Send + Sync>;
 
 impl AppState {
     /// The parts a new server starts with, beside what `main` builds.
@@ -105,6 +111,16 @@ impl AppState {
             owner_admin: Default::default(),
             web: None,
             clients: Default::default(),
+            fetch_json: Default::default(),
+        }
+    }
+
+    /// Fetches `url`'s JSON for checking a linked account ([`AppState::fetch_json`]).
+    async fn issuer_json(&self, url: String) -> Option<Value> {
+        let fetch = self.fetch_json.read().unwrap_or_else(|p| p.into_inner()).clone();
+        match fetch {
+            Some(fetch) => fetch(url).await,
+            None => fetch_small_json(url).await,
         }
     }
 
@@ -576,14 +592,46 @@ impl CommunityService {
             &received.message
         };
         // A profile whose address is theirs, with linked accounts: one of them may be
-        // a Discord account posts were imported under (claims.rs). Checked apart.
-        let first_profile = message["type"] == community::PROFILE && matches!(state.community.store.member_profile(&sender), Ok(None));
-        let linked_with = (message["type"] == community::PROFILE)
-            .then(|| (message["body"]["profile"]["publicAddress"].as_str().map(str::to_string), message["body"]["profile"]["linkedAccounts"].as_array().cloned()))
-            .and_then(|(address, linked)| Some((address?, linked?)));
+        // a Discord account posts were imported under (claims.rs). Checked apart,
+        // with what the message said, or else what was kept of their profile (an
+        // address kept was shown to be theirs when it was sent).
+        let linked_with = if message["type"] == community::PROFILE {
+            let profile = &message["body"]["profile"];
+            let said = (profile["publicAddress"].as_str().map(str::to_string), profile["linkedAccounts"].as_array().cloned());
+            if said.0.is_some() || said.1.is_some() {
+                let kept = state.community.store.member_profile(&sender)?;
+                let address = said.0.or_else(|| kept.as_ref().and_then(|k| k.public_address.clone()));
+                let linked = said.1.or_else(|| kept.and_then(|k| k.linked).and_then(|l| l.as_array().cloned()));
+                address.zip(linked)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        // Asking for imported posts: proven again now, from what their profile
+        // shows, they are theirs at once where nobody else has a hand in them;
+        // else it is asked for, and decided (claims.rs, Community::handle).
+        if message["type"] == community::CLAIM_IMPORTED && state.community.store.member(&sender)?.is_some() && !state.community.moving()? {
+            if let Some(outcome) = claim_now(state, &sender, message).await? {
+                return Ok(carry_out(state, &sender, outcome));
+            }
+        }
+        // Someone waiting let in (by a moderator, or by joining again with an
+        // invite): their profile is looked at again, as it was skipped while they
+        // waited.
+        let admitting = match message["type"].as_str() {
+            Some(community::SET_MEMBER) => message["body"]["did"].as_str().map(str::to_string),
+            Some(community::JOIN) => Some(sender.clone()),
+            _ => None,
+        }
+        .filter(|did| matches!(state.community.store.waiting_one(did), Ok(Some(_))));
         let outcome = state.community.handle(&sender, message, now())?;
         if let Some((address, linked)) = linked_with {
-            tokio::spawn(consider_profile(Arc::clone(state), sender.clone(), address, linked, first_profile));
+            tokio::spawn(consider_profile(Arc::clone(state), sender.clone(), address, linked));
+        }
+        if let Some(admitted) = admitting.filter(|did| matches!(state.community.store.member(did), Ok(Some(_)))) {
+            look_again_at_admitted(state, &admitted);
         }
         if message["type"] != community::PROFILE {
             ask_for_profile(state, &sender);
@@ -592,60 +640,81 @@ impl CommunityService {
     }
 }
 
-/// Notes the Discord account a member's profile proves (`linked`, about `address`),
-/// where posts were imported under it; and, within a day of joining (or on the
-/// first profile they send), makes those posts theirs at once (claims.rs). Fetches
-/// only from the trusted issuers' own addresses, with a time and size limit.
-async fn consider_profile(state: Arc<AppState>, did: String, address: String, linked: Vec<Value>, first_profile: bool) {
+/// Someone just let in from the waiting list: their profile's linked accounts
+/// are checked as a member's are, from the profile kept of them; or, none kept
+/// (a profile sent while waiting isn't), their app is asked for it.
+fn look_again_at_admitted(state: &Arc<AppState>, did: &str) {
+    let kept = state.community.store.member_profile(did).ok().flatten();
+    let linked = kept.as_ref().and_then(|k| k.linked.as_ref()).and_then(Value::as_array).cloned().filter(|l| !l.is_empty());
+    match (kept.as_ref().and_then(|k| k.public_address.clone()), linked) {
+        (Some(address), Some(linked)) => {
+            tokio::spawn(consider_profile(Arc::clone(state), did.to_string(), address, linked));
+        }
+        _ => send_later(state, did.to_string(), json!({ "type": community::REQUEST_PROFILE, "id": uuid::Uuid::new_v4().to_string(), "body": {} })),
+    }
+}
+
+/// The accounts `linked` proves (about `address`, a member's or someone waiting's
+/// public address), kept as theirs, for bans and the gates (protection.rs). None
+/// when one is held by someone banned: that ban coming back, which is suggested to
+/// the moderators, and nothing imported is made theirs meanwhile (WYV-89).
+async fn prove_accounts(state: &Arc<AppState>, did: &str, address: &str, linked: &[Value]) -> Option<Vec<(String, String)>> {
     let community = &state.community;
     let issuers = community.config.linked_account_issuers.clone();
     let now_text = chrono::DateTime::from_timestamp(now(), 0).map(|t| t.to_rfc3339()).unwrap_or_default();
-    let accounts = crate::claims::verified_accounts(&linked, &address, &issuers, &now_text, fetch_small_json).await;
+    let accounts = crate::claims::verified_accounts(linked, address, &issuers, &now_text, |url| state.issuer_json(url)).await;
     let store = &community.store;
-    // The accounts they hold, for bans and the gates; and one held by someone banned
-    // is that ban coming back (protection.rs).
     let evading = (|| -> anyhow::Result<bool> {
-        if store.member(&did)?.is_none() && store.waiting_one(&did)?.is_none() {
+        if store.member(did)?.is_none() && store.waiting_one(did)?.is_none() {
             return Ok(false);
         }
-        store.set_member_accounts(&did, &accounts, now())?;
-        let Some((banned, service, account)) = store.banned_holding(&accounts, now())? else { return Ok(false) };
+        store.set_member_accounts(did, &accounts, now())?;
+        let Some((banned, _service, _account)) = store.banned_holding(&accounts, now())? else { return Ok(false) };
         if banned == did {
             return Ok(false);
         }
-        // Suggested to the moderators, not acted on (WYV-89); and nothing
-        // imported is made theirs meanwhile.
-        let _ = (service, account);
         let outcome = community.ban_holders(&banned, now())?;
-        carry_out(&state, &did, outcome);
+        carry_out(state, did, outcome);
         Ok(true)
     })();
     match evading {
-        Ok(true) => return,
-        Ok(false) => {}
-        Err(error) => tracing::warn!(%error, "a member's linked accounts couldn't be kept"),
+        Ok(true) => None,
+        Ok(false) => Some(accounts),
+        Err(error) => {
+            tracing::warn!(%error, "a member's linked accounts couldn't be kept");
+            Some(accounts)
+        }
     }
-    let Some(discord_id) = accounts.iter().find(|(service, _)| service == "https://discord.com" || service == "https://discord.gg").map(|(_, id)| id.clone()) else { return };
+}
+
+/// The Discord account among `accounts`, by its id.
+fn discord_of(accounts: &[(String, String)]) -> Option<String> {
+    accounts.iter().find(|(service, _)| service == "https://discord.com" || service == "https://discord.gg").map(|(_, id)| id.clone())
+}
+
+/// What a claim made at once comes to: the posts sent as changed, and those who
+/// decide claims told, had it been asked for.
+fn claimed_outcome(community: &community::Community, changed: Vec<String>, had_asked: bool) -> anyhow::Result<community::Outcome> {
+    Ok(community::Outcome { changed, notices: if had_asked { community.admins_told()? } else { Vec::new() }, ..Default::default() })
+}
+
+/// Notes the Discord account a member's profile proves (`linked`, about `address`),
+/// where posts were imported under it; and makes those posts theirs at once where
+/// nobody else has a hand in them (claims.rs, `Community::proven_discord`). Fetches
+/// only from the trusted issuers' own addresses, with a time and size limit.
+pub async fn consider_profile(state: Arc<AppState>, did: String, address: String, linked: Vec<Value>) {
+    let community = &state.community;
+    let Some(accounts) = prove_accounts(&state, &did, &address, &linked).await else { return };
+    let Some(discord_id) = discord_of(&accounts) else { return };
     let result = (|| -> anyhow::Result<()> {
-        if !store.has_imported_from(&discord_id)? {
-            return Ok(());
-        }
-        let Some(member) = store.member(&did)? else { return Ok(()) };
-        let held = store.claim(&discord_id)?;
-        if held.as_ref().is_some_and(|c| c.state == "claimed" || (c.did == did && c.state == "asked")) {
-            return Ok(());
-        }
-        let now = now();
-        let joining = first_profile || now - member.since <= crate::claims::AT_JOINING;
-        let mut claim = crate::claims::Claim { discord_id: discord_id.clone(), did: did.clone(), state: "verified".into(), at: now, decided_by: None };
-        if joining {
-            let changed = store.claim_imported_posts(&discord_id, &did, now)?;
-            claim.state = "claimed".into();
-            store.set_claim(&claim)?;
-            community.audit(now, &did, "claim.at-joining", None, Some(json!({ "discord_id": discord_id, "posts": changed.len() })));
-            carry_out(&state, &did, community::Outcome { changed, ..Default::default() });
-        } else {
-            store.set_claim(&claim)?;
+        // Someone waiting is looked at again once let in (look_again_at_admitted).
+        let Some(member) = community.store.member(&did)? else { return Ok(()) };
+        match community.proven_discord(&did, &discord_id, now())? {
+            crate::claims::Proven::Nothing => return Ok(()),
+            crate::claims::Proven::Claimed { changed, had_asked } => {
+                carry_out(&state, &did, claimed_outcome(community, changed, had_asked)?);
+            }
+            crate::claims::Proven::Review => {}
         }
         // Told where they stand with them.
         let body = community.community(&member)?;
@@ -655,6 +724,22 @@ async fn consider_profile(state: Arc<AppState>, did: String, address: String, li
     if let Err(error) = result {
         tracing::warn!(%error, "a claim on imported posts couldn't be considered");
     }
+}
+
+/// `claim-imported` from a member: their profile's Discord account proven again
+/// now, from the profile kept of them, and the posts theirs at once if nobody else
+/// has a hand in them. None where it isn't so: then it is asked for.
+async fn claim_now(state: &Arc<AppState>, did: &str, message: &Value) -> anyhow::Result<Option<community::Outcome>> {
+    let community = &state.community;
+    let Some(kept) = community.store.member_profile(did)? else { return Ok(None) };
+    let (Some(address), Some(linked)) = (kept.public_address, kept.linked.as_ref().and_then(Value::as_array).cloned()) else { return Ok(None) };
+    let Some(accounts) = prove_accounts(state, did, &address, &linked).await else { return Ok(None) };
+    let Some(discord_id) = discord_of(&accounts) else { return Ok(None) };
+    let crate::claims::Proven::Claimed { changed, had_asked } = community.proven_discord(did, &discord_id, now())? else { return Ok(None) };
+    let mut outcome = claimed_outcome(community, changed, had_asked)?;
+    let Some(member) = community.store.member(did)? else { return Ok(None) };
+    outcome.reply = Some(community::reply_to(message, community::COMMUNITY, community.community(&member)?));
+    Ok(Some(outcome))
 }
 
 /// A small JSON document at an HTTPS address (a DID document, a status list): at
@@ -1303,7 +1388,7 @@ pub async fn look_at_bans_again(state: &Arc<AppState>) {
         let Ok(Some(address)) = community.store.member_profile(&ban.did).map(|p| p.and_then(|p| p.public_address)) else { continue };
         let Some(linked) = crate::address_banner::linked_of_address(&address).await else { continue };
         let now_text = chrono::DateTime::from_timestamp(now(), 0).map(|t| t.to_rfc3339()).unwrap_or_default();
-        let accounts = crate::claims::verified_accounts(&linked, &address, &issuers, &now_text, fetch_small_json).await;
+        let accounts = crate::claims::verified_accounts(&linked, &address, &issuers, &now_text, |url| state.issuer_json(url)).await;
         match community.banned_now_hold(&ban.did, &accounts, now()) {
             Ok(Some(outcome)) => {
                 carry_out(state, &ban.did, outcome);

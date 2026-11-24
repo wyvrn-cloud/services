@@ -296,6 +296,12 @@ impl Host {
                 max_emoji_per_pack: limits.emoji_per_pack,
                 disabled_channel_kinds: limits.disabled_kinds(&self.config.limits),
                 deleted_text_days: limits.deleted_text_days,
+                // The issuers the host trusts, or a community's own default.
+                linked_account_issuers: if self.config.host.linked_account_issuers.is_empty() {
+                    CommunityConfig::default().linked_account_issuers
+                } else {
+                    self.config.host.linked_account_issuers.clone()
+                },
                 ..CommunityConfig::default()
             },
             mediator: None,

@@ -3,8 +3,10 @@
 //! from an issuer the community trusts) takes over the posts brought in under that
 //! account (`did:wyvrn:tmp:discord:<id>`, discord_history.rs).
 //!
-//! Within a day of joining it is done at once, as their profile is first checked.
-//! Later, they ask, and someone who may let members in decides. Claimed, the
+//! Done at once when nobody else has a hand in it: the account proven (its
+//! credential checked then), and no other DID holding it, having claimed it or
+//! asked for it, and no ban come back with it. Otherwise they ask, and someone who
+//! may let members in decides. Claimed, the
 //! imported author is superseded by the member (as a member changing DID is), and
 //! each post says it is theirs now (`imported.claimed`), so apps name them.
 
@@ -16,8 +18,8 @@ use crate::store::Store;
 
 /// The issuer trusted by default: wyvrn-verify.
 pub const DEFAULT_ISSUER: &str = "did:web:verify.wyvrn.app";
-/// How long after joining a claim is made without asking.
-pub const AT_JOINING: i64 = 24 * 3600;
+/// A Discord account, as linked-accounts/1.0 names its service.
+const DISCORD_HOMES: [&str; 2] = ["https://discord.com", "https://discord.gg"];
 
 /// Where a member stands with the posts imported under their Discord account.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,26 +90,45 @@ where
     let mut found = Vec::new();
     for credential in linked.iter().take(10) {
         let Some(id) = account_of(credential) else { continue };
-        if credential["credentialSubject"]["id"].as_str() != Some(address) {
-            continue;
-        }
+        let service = id.0.as_str();
+        // Why one isn't taken is logged (never the credential): a member whose
+        // posts don't come to them is otherwise a mystery.
         let issuer = credential["issuer"].as_str().or(credential["issuer"]["id"].as_str()).unwrap_or_default();
-        if !issuers.iter().any(|trusted| trusted == issuer) {
+        if credential["credentialSubject"]["id"].as_str() != Some(address) {
+            tracing::info!(service, issuer, "a linked account isn't taken: it is about another address than the profile's");
             continue;
         }
-        let Some(document_url) = did_web_url(issuer) else { continue };
+        if !issuers.iter().any(|trusted| trusted == issuer) {
+            tracing::info!(service, issuer, "a linked account isn't taken: its issuer isn't one this community trusts");
+            continue;
+        }
+        let Some(document_url) = did_web_url(issuer) else {
+            tracing::info!(service, issuer, "a linked account isn't taken: its issuer isn't a did:web");
+            continue;
+        };
         let Some(issuer_origin) = origin(&document_url) else { continue };
-        let Some(document) = fetch(document_url).await else { continue };
+        let Some(document) = fetch(document_url).await else {
+            tracing::info!(service, issuer, "a linked account isn't taken: its issuer's DID document couldn't be fetched");
+            continue;
+        };
         let status = match wyvrn_hosted_did::linked::status_of(credential) {
             Some((url, _)) if origin(&url).as_deref() == Some(issuer_origin.as_str()) => match fetch(url).await {
                 Some(list) => Some(list),
-                None => continue,
+                None => {
+                    tracing::info!(service, issuer, "a linked account isn't taken: its status list couldn't be fetched");
+                    continue;
+                }
             },
-            Some(_) => continue,
+            Some(_) => {
+                tracing::info!(service, issuer, "a linked account isn't taken: its status list is elsewhere than its issuer's");
+                continue;
+            }
             None => None,
         };
-        if wyvrn_hosted_did::linked::check(credential, &document, status.as_ref(), now).is_ok() && !found.contains(&id) {
-            found.push(id);
+        match wyvrn_hosted_did::linked::check(credential, &document, status.as_ref(), now) {
+            Ok(()) if !found.contains(&id) => found.push(id),
+            Ok(()) => {}
+            Err(why) => tracing::info!(service, issuer, %why, "a linked account isn't taken: it doesn't check out"),
         }
     }
     found
@@ -174,6 +195,65 @@ impl Store {
             }
             Ok(posts.len())
         })
+    }
+}
+
+/// What came of a member being shown to hold a Discord account
+/// ([`crate::community::Community::proven_discord`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Proven {
+    /// Nothing was imported under it (or nothing more), or they aren't a member.
+    Nothing,
+    /// Theirs at once: the posts made theirs, to be sent as changed; and whether
+    /// they had asked for them (so those who decide are told it's done).
+    Claimed { changed: Vec<String>, had_asked: bool },
+    /// Someone else has a hand in it, or it was refused them: theirs only once
+    /// asked for and approved (`claim-imported`, `decide-claim`).
+    Review,
+}
+
+impl crate::community::Community {
+    /// `did`, a member, was just shown to hold the Discord account `discord_id`
+    /// (its credential checked now, [`verified_accounts`]). The posts imported
+    /// under it are made theirs at once if nobody else has a hand in it: no other
+    /// DID holds the account (a member, or someone waiting), has claimed it or
+    /// asked for it, and no ban came back with it; nor was it refused them. Else
+    /// where they stand is noted, without undoing anyone else's claim or ask.
+    pub(crate) fn proven_discord(&self, did: &str, discord_id: &str, now: i64) -> anyhow::Result<Proven> {
+        let store = &self.store;
+        if !store.has_imported_from(discord_id)? || store.member(did)?.is_none() {
+            return Ok(Proven::Nothing);
+        }
+        let held = store.claim(discord_id)?;
+        // (A claim made under a DID they have since moved from is theirs.)
+        let held_by_another = match &held {
+            Some(claim) => claim.did != did && store.current_did(&claim.did)? != did,
+            None => false,
+        };
+        let refused = !held_by_another && held.as_ref().is_some_and(|claim| claim.state == "refused");
+        let accounts: Vec<(String, String)> = DISCORD_HOMES.iter().map(|home| (home.to_string(), discord_id.to_string())).collect();
+        let mut others_hold = false;
+        for holder in store.holders_of(&accounts, did)? {
+            if store.current_did(&holder)? != did && (store.member(&holder)?.is_some() || store.waiting_one(&holder)?.is_some()) {
+                others_hold = true;
+                break;
+            }
+        }
+        let ban_back = store.banned_holding(&accounts, now)?.is_some_and(|(banned, _, _)| banned != did);
+        if held_by_another || refused || others_hold || ban_back {
+            // One claim is kept per account: someone else's ask or claim stands,
+            // and so does their own ask or refusal.
+            let stands = held.as_ref().is_some_and(|claim| if held_by_another { matches!(claim.state.as_str(), "asked" | "claimed") } else { matches!(claim.state.as_str(), "asked" | "refused") });
+            if !stands {
+                store.set_claim(&Claim { discord_id: discord_id.to_string(), did: did.to_string(), state: "verified".into(), at: now, decided_by: None })?;
+            }
+            return Ok(Proven::Review);
+        }
+        let had_asked = held.as_ref().is_some_and(|claim| claim.state == "asked");
+        let changed = store.claim_imported_posts(discord_id, did, now)?;
+        store.set_claim(&Claim { discord_id: discord_id.to_string(), did: did.to_string(), state: "claimed".into(), at: now, decided_by: None })?;
+        self.audit(now, did, "claim.proven", None, Some(json!({ "discord_id": discord_id, "posts": changed.len() })));
+        Ok(Proven::Claimed { changed, had_asked })
     }
 }
 
