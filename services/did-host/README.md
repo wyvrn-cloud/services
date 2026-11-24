@@ -132,8 +132,8 @@ environment overrides `DID_HOST_BIND`, `DID_HOST_PUBLIC_URL`,
 `DID_HOST_DID_METHOD`, `DID_HOST_DOMAIN` and `DID_HOST_ADMINS`. Under `[host]`
 there are also `hold_seconds` (600: how long a name is held for whoever asked),
 `max_labels` (2), `require_portable` (true), `max_log_bytes` (256 KiB) and
-`max_whois_bytes` (160 KiB: a picture and banner, and the twelve linked
-accounts a profile shows at most), `max_whois_pictures` (12) and
+`max_whois_bytes` (256 KiB: a picture and banner, and the twelve linked
+accounts a profile shows at most, with room to spare), `max_whois_pictures` (12) and
 `max_whois_pictures_bytes` (96 KiB): the linked accounts' pictures, which go
 beside the whois rather than in it. A `[mediator]` section has messages to the host arrive through a
 mediator instead of at `public_url`. They are the same messages either way: a

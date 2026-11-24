@@ -112,9 +112,10 @@ fn default_max_log_bytes() -> usize {
 }
 /// A profile picture and banner at the most an app publishes (about 120 KB), and
 /// room beside them for the twelve linked accounts a profile shows at most (about
-/// 2.5 KB a credential at its largest: their pictures are published apart).
+/// 2.5 KB a credential at its largest: their pictures are published apart), with
+/// plenty to spare: a smaller whois takes no more room for the limit being high.
 fn default_max_whois_bytes() -> usize {
-    160 * 1024
+    256 * 1024
 }
 /// Twelve linked accounts' pictures of the most each may be.
 fn default_max_whois_pictures() -> usize {
