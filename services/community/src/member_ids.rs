@@ -489,7 +489,9 @@ fn attached_picture(message: &Value, reference: &Value) -> std::result::Result<w
 }
 
 const MAX_LINKED_ACCOUNTS: usize = 10;
-const MAX_LINKED_BYTES: usize = 64 * 1024;
+/// Ten credentials of the largest wyvrn-verify issues (about 10 KB, with the
+/// account's 8 KiB picture).
+const MAX_LINKED_BYTES: usize = 128 * 1024;
 const MAX_NICKNAME_CHARS: usize = 32;
 const MAX_NOTE_CHARS: usize = 200;
 

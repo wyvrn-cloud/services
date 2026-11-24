@@ -103,8 +103,11 @@ fn yes() -> bool {
 fn default_max_log_bytes() -> usize {
     256 * 1024
 }
+/// A profile picture and banner at the most an app publishes (about 120 KB), and
+/// room beside them for linked accounts, each of which may carry a picture of its
+/// own (wyvrn-verify's, at most about 10 KB a credential).
 fn default_max_whois_bytes() -> usize {
-    128 * 1024
+    256 * 1024
 }
 fn default_ask_after_days() -> i64 {
     365
