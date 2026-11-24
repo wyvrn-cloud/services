@@ -472,16 +472,45 @@ impl Host {
                     return Ok(Err(Refusal::new("e.p.msg.too-large", "The whois is over this host's limit of {1} bytes.").with(self.config.max_whois_bytes.to_string())));
                 }
                 let document: Value = record.log.as_deref().and_then(last_document).unwrap_or_default();
-                if let Err(why) = whois::check(&bytes, &did, &document) {
-                    return Ok(Err(Refusal::new("e.p.msg.whois-invalid", why)));
+                match whois::check(&bytes, &did, &document) {
+                    Ok(presentation) => Some((bytes, presentation)),
+                    Err(why) => return Ok(Err(Refusal::new("e.p.msg.whois-invalid", why))),
                 }
-                Some(bytes)
             }
         };
+        // The pictures its linked accounts refer to, beside it: each the bytes a
+        // credential in it names by their digest, and nothing else.
+        let mut pictures = Vec::new();
+        for attachment in message["attachments"].as_array().into_iter().flatten().filter(|a| a["id"] != "whois") {
+            let Some((_, presentation)) = &whois else {
+                return Ok(Err(Refusal::new("e.p.msg.whois-invalid", "Pictures go with a whois that refers to them.")));
+            };
+            let id = attachment["id"].as_str().unwrap_or_default();
+            let referred = wyvrn_hosted_did::linked::pictures_of(&wyvrn_hosted_did::linked::of(presentation, &did));
+            let Some(bytes) = attachment_bytes(attachment) else {
+                return Ok(Err(Refusal::new("e.p.msg.whois-invalid", "An attachment isn't base64.")));
+            };
+            if bytes.len() > wyvrn_hosted_did::linked::MAX_PICTURE_BYTES {
+                return Ok(Err(Refusal::new("e.p.msg.too-large", "A linked account's picture is at most {1} bytes.").with(wyvrn_hosted_did::linked::MAX_PICTURE_BYTES.to_string())));
+            }
+            let Some(picture) = referred.iter().find(|picture| picture.name() == id && picture.matches(&bytes)) else {
+                return Ok(Err(Refusal::new("e.p.msg.whois-invalid", "An attachment isn't a picture a linked account in the whois refers to (by its digest).")));
+            };
+            if !pictures.iter().any(|(name, _, _): &(String, String, Vec<u8>)| *name == picture.name()) {
+                pictures.push((picture.name(), picture.media_type.clone(), bytes));
+            }
+        }
+        let pictures_bytes: usize = pictures.iter().map(|(_, _, bytes)| bytes.len()).sum();
+        if pictures.len() > self.config.max_whois_pictures || pictures_bytes > self.config.max_whois_pictures_bytes {
+            return Ok(Err(Refusal::new("e.p.msg.too-large", "The pictures are over this host's limit of {1} pictures and {2} bytes.")
+                .with(self.config.max_whois_pictures.to_string())
+                .with(self.config.max_whois_pictures_bytes.to_string())));
+        }
+        let whois = whois.map(|(bytes, _)| bytes);
         // The did:web says where its whois is, published or not: did:webvh has it so.
         let web_document = record.web_document.as_deref().and_then(|text| serde_json::from_str::<Value>(text).ok()).unwrap_or_default();
         let web_document = with_whois_service(web_document, &self.config.domain, &name);
-        self.store.set_whois(&key, whois.as_deref(), &serde_json::to_string(&web_document)?)?;
+        self.store.set_whois(&key, whois.as_deref(), &serde_json::to_string(&web_document)?, &pictures)?;
         self.shown_to_hold(sender, &key)?;
         let record = self.store.get(&key)?;
         Ok(Ok((STATUS, self.status_body(&name, record.as_ref(), true, now))))
@@ -578,13 +607,17 @@ impl Host {
 /// An attachment's bytes, and its `jws` if it has one.
 fn attachment<'a>(message: &'a Value, id: &str) -> Option<(Vec<u8>, Option<&'a Value>)> {
     let attachment = message["attachments"].as_array()?.iter().find(|a| a["id"] == id)?;
+    Some((attachment_bytes(attachment)?, attachment["data"].get("jws")))
+}
+
+/// An attachment's `data.base64`, as bytes.
+fn attachment_bytes(attachment: &Value) -> Option<Vec<u8>> {
     let text = attachment["data"]["base64"].as_str()?;
     // base64url as DIDComm says, and the ordinary alphabet as some senders write it.
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(text.trim_end_matches('='))
         .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(text.trim_end_matches('=')))
-        .ok()?;
-    Some((bytes, attachment["data"].get("jws")))
+        .ok()
 }
 
 /// The document a stored log's last entry gives. (The log was checked when stored.)

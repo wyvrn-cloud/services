@@ -578,13 +578,23 @@ impl CommunityService {
                 if let Some(profile) = checked["body"]["profile"].as_object_mut() {
                     profile.remove("publicAddress");
                     profile.remove("linkedAccounts");
+                    profile.remove("memberStatement");
                 }
-            } else if checked["body"]["profile"].get("banner").is_none() {
-                // Theirs, and their app sent no banner (one that said "none" has
-                // `banner: null`): the one their address publishes, for the
-                // member list (address_banner.rs).
-                if let Some(banner) = crate::address_banner::banner_of_address(&address).await {
-                    crate::address_banner::with_banner(&mut checked, banner);
+            } else {
+                if checked["body"]["profile"].get("banner").is_none() {
+                    // Theirs, and their app sent no banner (one that said "none" has
+                    // `banner: null`): the one their address publishes, for the
+                    // member list (address_banner.rs).
+                    if let Some(banner) = crate::address_banner::banner_of_address(&address).await {
+                        crate::address_banner::with_banner(&mut checked, banner);
+                    }
+                }
+                // The address's own word that it is this member here: kept only
+                // where it checks out against the address as it resolves now.
+                if checked["body"]["profile"]["memberStatement"].is_object() && !statement_checks_out(state, &sender, &address, &checked["body"]["profile"]["memberStatement"]).await {
+                    if let Some(profile) = checked["body"]["profile"].as_object_mut() {
+                        profile.remove("memberStatement");
+                    }
                 }
             }
             &checked
@@ -654,6 +664,33 @@ fn look_again_at_admitted(state: &Arc<AppState>, did: &str) {
     }
 }
 
+/// Whether `statement` is `address`'s, made for this community (one of its own
+/// DIDs, as `domain`) and `sender`'s member id here (as `challenge`), by one of
+/// the address's `authentication` keys (wyvrn_hosted_did::member).
+async fn statement_checks_out(state: &Arc<AppState>, sender: &str, address: &str, statement: &Value) -> bool {
+    let Ok(member) = state.community.store.member_id(sender, now()) else { return false };
+    let document = match state.resolver.resolve(address).await {
+        Ok(document) => document,
+        Err(error) => {
+            tracing::info!(%address, %error, "a member's statement isn't kept: their address couldn't be read");
+            return false;
+        }
+    };
+    let document: Value = serde_json::to_value(&document).unwrap_or_default();
+    let community = statement["proof"]["domain"].as_str().unwrap_or_default();
+    if !state.community.own_dids().iter().any(|own| own == community) {
+        tracing::info!("a member's statement isn't kept: it is for another community");
+        return false;
+    }
+    match wyvrn_hosted_did::member::check(statement, &document, address, community, &member) {
+        Ok(_) => true,
+        Err(why) => {
+            tracing::info!(%why, "a member's statement isn't kept: it doesn't check out");
+            false
+        }
+    }
+}
+
 /// The accounts `linked` proves (about `address`, a member's or someone waiting's
 /// public address), kept as theirs, for bans and the gates (protection.rs). None
 /// when one is held by someone banned: that ban coming back, which is suggested to
@@ -662,13 +699,27 @@ async fn prove_accounts(state: &Arc<AppState>, did: &str, address: &str, linked:
     let community = &state.community;
     let issuers = community.config.linked_account_issuers.clone();
     let now_text = chrono::DateTime::from_timestamp(now(), 0).map(|t| t.to_rfc3339()).unwrap_or_default();
-    let accounts = crate::claims::verified_accounts(linked, address, &issuers, &now_text, |url| state.issuer_json(url)).await;
+    let verified = crate::claims::verified_linked(linked, address, &issuers, &now_text, |url| state.issuer_json(url)).await;
+    let accounts: Vec<(String, String)> = verified.iter().map(|(_, account)| account.clone()).collect();
     let store = &community.store;
     let evading = (|| -> anyhow::Result<bool> {
         if store.member(did)?.is_none() && store.waiting_one(did)?.is_none() {
             return Ok(false);
         }
         store.set_member_accounts(did, &accounts, now())?;
+        // What the member list says of them: a summary of each checked now
+        // (linked_summary.rs), told to everyone connected where it changed.
+        let pictures = store.member_linked_picture_names(did)?;
+        let summaries: Vec<Value> = verified.iter().filter_map(|(index, _)| crate::linked_summary::summary(&linked[*index], now(), &pictures)).collect();
+        let mut kept = store.member_linked(did)?;
+        let before = kept.summaries.clone();
+        kept.summaries = (!summaries.is_empty()).then(|| json!(summaries));
+        // (Checked again and found the same is no change to tell anyone of.)
+        let changed = without_times(before.as_ref()) != without_times(kept.summaries.as_ref());
+        store.set_member_linked(did, &kept, now())?;
+        if changed && store.member(did)?.is_some() {
+            carry_out(state, did, community::Outcome { live: vec![community.member_changed(did)?], ..Default::default() });
+        }
         let Some((banned, _service, _account)) = store.banned_holding(&accounts, now())? else { return Ok(false) };
         if banned == did {
             return Ok(false);
@@ -685,6 +736,24 @@ async fn prove_accounts(state: &Arc<AppState>, did: &str, address: &str, linked:
             Some(accounts)
         }
     }
+}
+
+/// Summaries as they would be but for when each was checked.
+fn without_times(summaries: Option<&Value>) -> Option<Vec<Value>> {
+    summaries.map(|summaries| {
+        summaries
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|summary| {
+                let mut summary = summary.clone();
+                if let Some(fields) = summary.as_object_mut() {
+                    fields.remove("checkedAt");
+                }
+                summary
+            })
+            .collect()
+    })
 }
 
 /// The Discord account among `accounts`, by its id.

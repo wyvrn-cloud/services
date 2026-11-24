@@ -54,6 +54,13 @@ pub struct HostConfig {
     pub max_log_bytes: usize,
     #[serde(default = "default_max_whois_bytes")]
     pub max_whois_bytes: usize,
+    /// The pictures a whois's linked accounts refer to, published beside it
+    /// (did-hosting/1.0, "Linked accounts' pictures"): how many, and how many
+    /// bytes in all. Each is at most 8 KiB (linked-accounts/1.0).
+    #[serde(default = "default_max_whois_pictures")]
+    pub max_whois_pictures: usize,
+    #[serde(default = "default_max_whois_pictures_bytes")]
+    pub max_whois_pictures_bytes: usize,
     /// The DIDs naming decisions are taken from.
     #[serde(default)]
     pub admins: Vec<String>,
@@ -104,10 +111,17 @@ fn default_max_log_bytes() -> usize {
     256 * 1024
 }
 /// A profile picture and banner at the most an app publishes (about 120 KB), and
-/// room beside them for linked accounts, each of which may carry a picture of its
-/// own (wyvrn-verify's, at most about 10 KB a credential).
+/// room beside them for the twelve linked accounts a profile shows at most (about
+/// 2.5 KB a credential at its largest: their pictures are published apart).
 fn default_max_whois_bytes() -> usize {
-    256 * 1024
+    160 * 1024
+}
+/// Twelve linked accounts' pictures of the most each may be.
+fn default_max_whois_pictures() -> usize {
+    12
+}
+fn default_max_whois_pictures_bytes() -> usize {
+    12 * wyvrn_hosted_did::linked::MAX_PICTURE_BYTES
 }
 fn default_ask_after_days() -> i64 {
     365

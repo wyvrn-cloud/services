@@ -7,6 +7,7 @@
 use serde_json::{json, Value};
 use wyvrn_community::{
     community::Community,
+    linked_summary::Kept,
     member_ids::MemberProfile,
     store::{Role, Store},
 };
@@ -43,6 +44,9 @@ fn filled(n: usize) -> Community {
                 &did,
                 &MemberProfile { description: Some("About me".into()), linked: Some(json!([{ "credentialSubject": { "account": format!("person{i}") } }])), at: 1, ..Default::default() },
             )
+            .unwrap();
+        store
+            .set_member_linked(&did, &Kept { summaries: Some(json!([{ "platform": "bluesky", "homepage": "https://bsky.app", "account": format!("did:plc:{i}"), "handle": format!("person{i}.example"), "checkedAt": 1 }])), statement: None }, 1)
             .unwrap();
         if i % 10 == 5 {
             store.give_role(&did, "moderator").unwrap();
@@ -142,7 +146,10 @@ fn without_any_of_it_the_list_is_whole_as_before() {
     let one = &members[3];
     assert!(one["did"].as_str().unwrap().starts_with("did:example:"), "an admin is told DIDs");
     assert_eq!(one["profile"]["description"], "About me");
-    assert!(one["profile"]["linkedAccounts"].is_array());
+    // The list carries what the server found of linked accounts, never the
+    // credentials: those are one member's whole entry's (member-request).
+    assert!(one["profile"].get("linkedAccounts").is_none(), "{one}");
+    assert_eq!(one["profile"]["linkedAccountSummaries"][0]["handle"], "person3.example");
     assert_eq!(one["joined"], true);
     // A brief entry is the whole one, with less in it.
     let brief = ask(&community, &admin, "members-request", json!({ "brief": true }));
@@ -234,7 +241,11 @@ fn member_request_gives_one_whole_entry_as_the_list_does() {
     // (The server is handed DIDs: server.rs turns member ids into them first.)
     let one = ask(&community, &asker, "member-request", json!({ "member": did(4) }));
     assert_eq!(kind(&one), "member");
-    assert_eq!(one["body"]["member"], listed);
+    // The same, with the credentials themselves beside their summaries.
+    let mut whole_one = one["body"]["member"].clone();
+    assert_eq!(whole_one["profile"]["linkedAccounts"], json!([{ "credentialSubject": { "account": "person4" } }]));
+    whole_one["profile"].as_object_mut().unwrap().remove("linkedAccounts");
+    assert_eq!(whole_one, listed);
     let none = ask(&community, &asker, "member-request", json!({ "member": "did:example:nobody" }));
     assert_eq!(none["body"]["code"], "e.p.msg.invalid-member");
 }
@@ -258,13 +269,101 @@ fn a_change_may_be_answered_with_the_member_it_changed() {
 #[test]
 fn a_page_of_whole_entries_ends_before_it_is_too_big() {
     let community = filled(30);
-    let big = json!([{ "proof": "x".repeat(60 * 1024) }]);
+    let big = json!([{ "handle": "x".repeat(60 * 1024) }]);
     for i in 0..30 {
-        community.store.set_member_profile(&did(i), &MemberProfile { linked: Some(big.clone()), at: 3, ..Default::default() }).unwrap();
+        community.store.set_member_linked(&did(i), &Kept { summaries: Some(big.clone()), statement: None }, 3).unwrap();
     }
     let page = ask(&community, &did(1), "members-request", json!({ "limit": 200 }));
     let listed = page["body"]["members"].as_array().unwrap().len();
     assert!(listed < 25, "{listed}");
     assert!(page.to_string().len() < wyvrn_community::roster::PAGE_BYTES + 64 * 1024, "{}", page.to_string().len());
     assert!(page["body"]["next"].is_string());
+}
+
+/// A profile sent to the community, as server.rs passes it on once it has seen
+/// the public address is the sender's.
+fn send_profile(community: &Community, sender: &str, profile: Value, attachments: Value) {
+    let message = json!({ "id": uuid::Uuid::new_v4().to_string(), "type": wyvrn_community::community::PROFILE, "body": { "profile": profile }, "attachments": attachments });
+    community.handle(sender, &message, 20).unwrap();
+}
+
+fn webp(fill: u8) -> Vec<u8> {
+    let mut bytes = b"RIFF\0\0\0\0WEBPVP8 ".to_vec();
+    bytes.extend(std::iter::repeat_n(fill, 1500));
+    bytes
+}
+
+/// A credential referring to the picture `bytes`, as wyvrn-verify issues them.
+fn referring(n: usize, bytes: &[u8]) -> Value {
+    use wyvrn_hosted_did::linked::{digest_name, digest_sri, sha384};
+    let url = format!("https://verify.example/pictures/{}.webp", digest_name(&sha384(bytes)));
+    json!({
+        "id": format!("urn:uuid:{n}"),
+        "type": ["VerifiableCredential", "LinkedAccountCredential"],
+        "issuer": "did:web:verify.example",
+        "credentialSubject": { "id": "did:webvh:Qm:id.example:alice", "account": { "type": "OnlineAccount", "accountServiceHomepage": "https://bsky.app", "accountName": format!("did:plc:{n}"), "wyvrn": { "handle": format!("a{n}.example"), "image": url } } },
+        "relatedResource": [{ "id": url, "mediaType": "image/webp", "digestSRI": digest_sri(bytes) }],
+    })
+}
+
+#[test]
+fn a_profiles_linked_accounts_come_with_their_pictures_twelve_at_most() {
+    use wyvrn_hosted_did::linked::{digest_name, sha384};
+    let community = filled(3);
+    let alice = did(1);
+    let address = "did:webvh:Qm:id.example:alice";
+    let attach = |bytes: &[u8]| json!({ "id": digest_name(&sha384(bytes)), "media_type": "image/webp", "data": { "base64": base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes) } });
+    let twelve: Vec<Value> = (0..12).map(|n| referring(n, &webp(n as u8))).collect();
+    // One picture is sent as it is; another isn't what its credential names.
+    send_profile(&community, &alice, json!({ "publicAddress": address, "linkedAccounts": twelve }), json!([attach(&webp(0)), { "id": "x", "data": { "base64": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, webp(99)) } }]));
+    let kept = community.store.member_profile(&alice).unwrap().unwrap();
+    assert_eq!(kept.linked.unwrap().as_array().unwrap().len(), 12);
+    assert_eq!(community.store.member_linked_picture_names(&alice).unwrap(), vec![digest_name(&sha384(&webp(0)))]);
+    // Served under its digest, as members' pictures are.
+    let member = community.store.member_id(&alice, 1).unwrap();
+    let (media_type, data) = community.picture_at(&member, "linked", &digest_name(&sha384(&webp(0)))).unwrap().unwrap();
+    assert_eq!(media_type, "image/webp");
+    assert_eq!(base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data).unwrap(), webp(0));
+    assert_eq!(community.picture_at(&member, "linked", &digest_name(&sha384(&webp(99)))).unwrap(), None);
+    // A thirteenth is one more than a member shows: the profile's accounts are
+    // left as they were.
+    let thirteen: Vec<Value> = (0..13).map(|n| referring(n, &webp(n as u8))).collect();
+    send_profile(&community, &alice, json!({ "publicAddress": address, "linkedAccounts": thirteen }), json!([]));
+    assert_eq!(community.store.member_profile(&alice).unwrap().unwrap().linked.unwrap().as_array().unwrap().len(), 12);
+    // None shown: no pictures either.
+    send_profile(&community, &alice, json!({ "publicAddress": address, "linkedAccounts": [] }), json!([]));
+    assert!(community.store.member_linked_picture_names(&alice).unwrap().is_empty());
+}
+
+#[test]
+fn a_members_statement_is_kept_for_their_address_and_member_id_and_shown_beside_the_summaries() {
+    let mut community = filled(3);
+    community.own = Some("did:web:community.example".into());
+    let alice = did(1);
+    let address = "did:webvh:Qm:id.example:alice";
+    let member = community.store.member_id(&alice, 1).unwrap();
+    let statement = |holder: &str, domain: &str, challenge: &str| {
+        json!({ "@context": ["https://www.w3.org/ns/credentials/v2"], "type": ["VerifiablePresentation"], "holder": holder, "proof": { "type": "DataIntegrityProof", "cryptosuite": "eddsa-jcs-2022", "proofPurpose": "authentication", "challenge": challenge, "domain": domain, "proofValue": "z1" } })
+    };
+    // For another member, another community or another address: not kept.
+    for wrong in [statement(address, "did:web:community.example", "m-other"), statement(address, "did:web:elsewhere.example", &member), statement("did:webvh:Qm:id.example:bob", "did:web:community.example", &member)] {
+        send_profile(&community, &alice, json!({ "publicAddress": address, "memberStatement": wrong }), json!([]));
+        assert_eq!(community.store.member_linked(&alice).unwrap().statement, None);
+    }
+    let good = statement(address, "did:web:community.example", &member);
+    send_profile(&community, &alice, json!({ "publicAddress": address, "memberStatement": good }), json!([]));
+    assert_eq!(community.store.member_linked(&alice).unwrap().statement, Some(good.clone()));
+    // In their entry, as signed (its holder no member id), beside the summaries;
+    // in a brief one, neither.
+    let entry = ask(&community, &did(2), "member-request", json!({ "member": alice }))["body"]["member"].clone();
+    assert_eq!(entry["profile"]["memberStatement"], good);
+    assert_eq!(entry["member"], member.as_str());
+    let brief = ask(&community, &did(2), "members-request", json!({ "brief": true, "ids": [member] }));
+    let brief = &brief["body"]["members"][0]["profile"];
+    assert!(brief.get("memberStatement").is_none() && brief.get("linkedAccountSummaries").is_none(), "{brief}");
+    // A profile saying nothing of it keeps it; a new address ends it.
+    send_profile(&community, &alice, json!({ "publicAddress": address }), json!([]));
+    assert_eq!(community.store.member_linked(&alice).unwrap().statement, Some(good));
+    send_profile(&community, &alice, json!({ "publicAddress": "did:webvh:Qm:id.example:alice2" }), json!([]));
+    assert_eq!(community.store.member_linked(&alice).unwrap().statement, None);
 }

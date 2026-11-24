@@ -32,6 +32,7 @@ pub mod config;
 pub mod expressions;
 pub mod files;
 pub mod gates;
+pub mod linked_summary;
 pub mod member_ids;
 pub mod moderation;
 pub mod outgoing;

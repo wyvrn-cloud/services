@@ -513,6 +513,88 @@ async fn a_whois_is_published_by_the_holder_signed_by_the_did_and_about_nothing_
     assert!(web.to_string().contains("LinkedVerifiablePresentation"));
 }
 
+/// Linked accounts' pictures travel beside the whois, as attachments of its
+/// `publish-whois`: each the bytes a credential in it refers to by its digest,
+/// served beside it under that digest, and gone with it.
+#[tokio::test]
+async fn a_whois_carries_its_linked_accounts_pictures_beside_it() {
+    use wyvrn_hosted_did::linked::{digest_name, digest_sri, sha384};
+    let host = start_host_with(&[], "max_whois_pictures = 2").await;
+    let mut alice = Holder::new(&host, "alice");
+    alice.register().await;
+    let did = alice.did();
+    let webp = |fill: u8| {
+        let mut bytes = b"RIFF\0\0\0\0WEBPVP8 ".to_vec();
+        bytes.extend(std::iter::repeat_n(fill, 3000));
+        bytes
+    };
+    let linked = |bytes: &[u8]| {
+        let url = format!("https://verify.example/pictures/{}.webp", digest_name(&sha384(bytes)));
+        json!({
+            "@context": ["https://www.w3.org/ns/credentials/v2", "https://wyvrn.app/ns/linked-account/v1"],
+            "type": ["VerifiableCredential", "LinkedAccountCredential"],
+            "issuer": "did:web:verify.example",
+            "credentialSubject": { "id": did, "account": { "type": "OnlineAccount", "accountServiceHomepage": "https://bsky.app", "accountName": "did:plc:x", "wyvrn": { "handle": "alice.test", "image": url } } },
+            "relatedResource": [{ "id": url, "mediaType": "image/webp", "digestSRI": digest_sri(bytes) }],
+        })
+    };
+    let (one, two, three) = (webp(1), webp(2), webp(3));
+    let whois_of = |credentials: Vec<Value>| {
+        let mut key = alice.auth.clone();
+        key.id = format!("{did}#key-1");
+        let mut presentation = json!({
+            "@context": ["https://www.w3.org/ns/credentials/v2", "https://wyvrn.app/ns/profile/v1"],
+            "type": ["VerifiablePresentation"],
+            "holder": did,
+            "verifiableCredential": [{ "@context": ["https://www.w3.org/ns/credentials/v2", "https://wyvrn.app/ns/profile/v1"], "type": ["VerifiableCredential", "ProfileCredential"], "issuer": did, "credentialSubject": { "id": did, "type": "Person", "name": "Alice" } }],
+        });
+        presentation["verifiableCredential"].as_array_mut().unwrap().extend(credentials);
+        async move {
+            let proof = DataIntegrityProof::sign(&presentation, &key, SignOptions::new().with_proof_purpose("authentication")).await.unwrap();
+            presentation["proof"] = serde_json::to_value(proof).unwrap();
+            presentation
+        }
+    };
+    let picture = |id: &str, bytes: &[u8]| json!({ "id": id, "media_type": "image/webp", "data": { "base64": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes) } });
+    let name = |bytes: &[u8]| digest_name(&sha384(bytes));
+    let whois = whois_of(vec![linked(&one), linked(&two), linked(&three)]).await;
+    let signed = signed_attachment("whois", "application/vp", whois.to_string().as_bytes(), &alice.auth);
+
+    let answer = alice.ask("publish-whois", json!({ "name": "alice" }), Some(json!([signed, picture(&name(&one), &one), picture(&name(&two), &two)]))).await;
+    assert_eq!(kind(&answer), "status", "{answer}");
+    let served = fetch(&host, &format!("alice/{}.webp", name(&one))).await;
+    assert_eq!(served.status(), 200);
+    assert_eq!(served.headers()["content-type"], "image/webp");
+    assert!(served.headers()["cache-control"].to_str().unwrap().contains("immutable"));
+    assert_eq!(served.bytes().await.unwrap().as_ref(), one.as_slice());
+    assert_eq!(fetch(&host, &format!("alice/{}.jpg", name(&one))).await.status(), 404, "not what it is");
+    assert_eq!(fetch(&host, &format!("alice/{}.webp", name(&three))).await.status(), 404, "not sent");
+
+    // Bytes that aren't what the credential names, under its name or another's;
+    // a picture no credential in it refers to; more than the host takes.
+    for attachments in [
+        json!([signed, picture(&name(&one), &two)]),
+        json!([signed, picture("whatever", &one)]),
+        json!([signed, picture(&name(&webp(9)), &webp(9))]),
+    ] {
+        refused_with(&alice.ask("publish-whois", json!({ "name": "alice" }), Some(attachments)).await, "e.p.msg.whois-invalid");
+    }
+    let all = json!([signed, picture(&name(&one), &one), picture(&name(&two), &two), picture(&name(&three), &three)]);
+    refused_with(&alice.ask("publish-whois", json!({ "name": "alice" }), Some(all)).await, "e.p.msg.too-large");
+    // Pictures with no whois are nothing to publish.
+    refused_with(&alice.ask("publish-whois", json!({ "name": "alice" }), Some(json!([picture(&name(&one), &one)]))).await, "e.p.msg.whois-invalid");
+    // What was published stands.
+    assert_eq!(fetch(&host, &format!("alice/{}.webp", name(&two))).await.status(), 200);
+
+    // A whois published again with other pictures has those; taken down, none.
+    let answer = alice.ask("publish-whois", json!({ "name": "alice" }), Some(json!([signed, picture(&name(&three), &three)]))).await;
+    assert_eq!(kind(&answer), "status", "{answer}");
+    assert_eq!(fetch(&host, &format!("alice/{}.webp", name(&one))).await.status(), 404);
+    assert_eq!(fetch(&host, &format!("alice/{}.webp", name(&three))).await.status(), 200);
+    alice.ask("publish-whois", json!({ "name": "alice" }), None).await;
+    assert_eq!(fetch(&host, &format!("alice/{}.webp", name(&three))).await.status(), 404);
+}
+
 #[tokio::test]
 async fn a_holder_ends_its_did_and_a_silent_one_goes_stale_until_it_speaks() {
     let host = start_host(&[]).await;

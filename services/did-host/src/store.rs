@@ -91,7 +91,16 @@ const SQLITE: &str = r#"CREATE TABLE IF NOT EXISTS names (
         proven INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY ("key", name)
     );
-    CREATE INDEX IF NOT EXISTS keys_by_name ON "keys" (name);"#;
+    CREATE INDEX IF NOT EXISTS keys_by_name ON "keys" (name);
+    -- The pictures a name's whois refers to (its linked accounts'), by their
+    -- digest: served beside it, and gone with it.
+    CREATE TABLE IF NOT EXISTS whois_pictures (
+        name TEXT NOT NULL,
+        picture TEXT NOT NULL,
+        media_type TEXT NOT NULL,
+        data BLOB NOT NULL,
+        PRIMARY KEY (name, picture)
+    );"#;
 
 fn schema() -> Schema {
     static MYSQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -119,6 +128,13 @@ fn schema() -> Schema {
                 proven BIGINT NOT NULL DEFAULT 0,
                 PRIMARY KEY ("key", name),
                 INDEX keys_by_name (name)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS whois_pictures (
+                name VARCHAR(255) NOT NULL,
+                picture VARCHAR(64) NOT NULL,
+                media_type VARCHAR(32) NOT NULL,
+                data BLOB NOT NULL,
+                PRIMARY KEY (name, picture)
             ) {MYSQL_TABLE}"#
         )
     });
@@ -227,10 +243,23 @@ impl Store {
         })
     }
 
-    /// Sets or removes a DID's whois, with the `did:web` document that says so.
-    pub fn set_whois(&self, name: &str, whois: Option<&[u8]>, web_document: &str) -> anyhow::Result<()> {
-        self.db.lock().execute("UPDATE names SET whois = ?2, web_document = ?3 WHERE name = ?1", params![name, whois, web_document])?;
-        Ok(())
+    /// Sets or removes a DID's whois, with the `did:web` document that says so, and
+    /// the pictures it refers to (`(picture, media type, bytes)`, `picture` its
+    /// name): those of a whois before are gone.
+    pub fn set_whois(&self, name: &str, whois: Option<&[u8]>, web_document: &str, pictures: &[(String, String, Vec<u8>)]) -> anyhow::Result<()> {
+        self.db.lock().transaction(|tx| {
+            tx.execute("UPDATE names SET whois = ?2, web_document = ?3 WHERE name = ?1", params![name, whois, web_document])?;
+            tx.execute("DELETE FROM whois_pictures WHERE name = ?1", params![name])?;
+            for (picture, media_type, bytes) in pictures {
+                tx.execute("INSERT OR REPLACE INTO whois_pictures (name, picture, media_type, data) VALUES (?1, ?2, ?3, ?4)", params![name, picture, media_type, bytes])?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+    }
+
+    /// A picture `name`'s whois refers to, by its name: `(media type, bytes)`.
+    pub fn whois_picture(&self, name: &str, picture: &str) -> anyhow::Result<Option<(String, Vec<u8>)>> {
+        Ok(self.db.lock().query_row("SELECT media_type, data FROM whois_pictures WHERE name = ?1 AND picture = ?2", params![name, picture], |row| Ok((row.get::<String>(0)?, row.get::<Vec<u8>>(1)?)))?)
     }
 
     /// An admin's word on who may claim a name: `Some(did)`, or nobody.
@@ -245,6 +274,7 @@ impl Store {
     pub fn free(&self, name: &str) -> anyhow::Result<()> {
         self.db.lock().transaction(|tx| {
             tx.execute(r#"DELETE FROM "keys" WHERE name = ?1"#, params![name])?;
+            tx.execute("DELETE FROM whois_pictures WHERE name = ?1", params![name])?;
             tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
             Ok::<_, anyhow::Error>(())
         })

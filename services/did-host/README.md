@@ -68,6 +68,7 @@ docker compose up -d did-host
 | `/<name>/did.jsonl` | The `did:webvh` log, as its holder wrote it. |
 | `/<name>/did.json` | The parallel `did:web` document, derived from the log as `did:webvh` says to: with its `#files` and `#whois` services, whether or not a whois is published. |
 | `/<name>/whois.vp` | The holder's whois, if it has published one. |
+| `/<name>/<digest>.webp`, `.jpg` | A picture a linked account in the whois refers to, published beside it as an attachment of `publish-whois` and checked against the digest the credential signs (did-hosting/1.0, "Linked accounts' pictures"). Kept for good by whoever fetches it (`immutable`); gone with the whois. |
 | `POST /` | `did-hosting/1.0` messages. Only ones their sender authenticated (authcrypt): anything else is answered 403. |
 | `/did`, `/.well-known/did.json` | The host's own DID. |
 | `/.well-known/did-configuration.json` | With `DID_HOST_DID_METHOD=web`: the host's own DID saying, signed, that this domain is its own. Its DID document names the domain back, so the two are a linked domain an app can check. Made by the host itself, each day; there is nothing to set up. |
@@ -131,8 +132,10 @@ environment overrides `DID_HOST_BIND`, `DID_HOST_PUBLIC_URL`,
 `DID_HOST_DID_METHOD`, `DID_HOST_DOMAIN` and `DID_HOST_ADMINS`. Under `[host]`
 there are also `hold_seconds` (600: how long a name is held for whoever asked),
 `max_labels` (2), `require_portable` (true), `max_log_bytes` (256 KiB) and
-`max_whois_bytes` (256 KiB: a picture and banner, and linked accounts that
-carry pictures of their own). A `[mediator]` section has messages to the host arrive through a
+`max_whois_bytes` (160 KiB: a picture and banner, and the twelve linked
+accounts a profile shows at most), `max_whois_pictures` (12) and
+`max_whois_pictures_bytes` (96 KiB): the linked accounts' pictures, which go
+beside the whois rather than in it. A `[mediator]` section has messages to the host arrive through a
 mediator instead of at `public_url`. They are the same messages either way: a
 mediator carries what a sender sealed, and the host opens it and knows the sender
 by the key it used. What the host serves is fetched over HTTPS regardless.

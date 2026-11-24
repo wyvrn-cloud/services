@@ -301,6 +301,10 @@ impl Community {
     /// picture: `(media type, base64)`. Found by the hash kept beside it.
     pub fn picture_at(&self, member: &str, kind: &str, hash: &str) -> anyhow::Result<Option<(String, String)>> {
         let Some(did) = self.store.did_of_member(member)? else { return Ok(None) };
+        // A linked account's picture: named by its digest (linked_summary.rs).
+        if kind == "linked" {
+            return Ok(self.store.member_linked_picture(&did, hash)?);
+        }
         let sql = match kind {
             "picture" => "SELECT media_type, data, hash FROM member_pictures WHERE did = ?1",
             "banner" => "SELECT banner_type, banner_data, banner_hash FROM member_profiles WHERE did = ?1",
@@ -367,7 +371,9 @@ impl Masker<'_> {
                     }
                 }
                 for (field, inner) in fields.iter_mut() {
-                    if field == "did" || field == "content" || field == "snippet" {
+                    // (A member's statement and their credentials are signed: their
+                    // `holder` and the rest are as signed, never a member id.)
+                    if field == "did" || field == "content" || field == "snippet" || field == "memberStatement" || field == "linkedAccounts" {
                         continue;
                     }
                     self.walk(inner, Some(field.as_str()))?;
@@ -417,7 +423,7 @@ fn unmask(store: &Store, value: &mut Value) -> anyhow::Result<()> {
                 }
             }
             for (key, inner) in fields.iter_mut() {
-                if key != "content" {
+                if key != "content" && key != "memberStatement" && key != "linkedAccounts" {
                     unmask(store, inner)?;
                 }
             }
@@ -434,10 +440,13 @@ fn attached_picture(message: &Value, reference: &Value) -> std::result::Result<w
     wyvrn_service::profile::Change::read(&asked).map(|change| change.picture)
 }
 
-const MAX_LINKED_ACCOUNTS: usize = 10;
-/// Ten credentials of the largest wyvrn-verify issues (about 10 KB, with the
-/// account's 8 KiB picture).
-const MAX_LINKED_BYTES: usize = 128 * 1024;
+/// The most linked accounts a member shows at once (community/1.0's Profiles).
+pub const MAX_LINKED_ACCOUNTS: usize = 12;
+/// Twelve credentials of the largest wyvrn-verify issues (about 2.5 KB: their
+/// pictures travel beside them, as attachments, and are kept apart).
+pub const MAX_LINKED_BYTES: usize = 64 * 1024;
+/// The most a member's statement may be: a presentation carrying no credential.
+const MAX_STATEMENT_BYTES: usize = 4 * 1024;
 const MAX_NICKNAME_CHARS: usize = 32;
 const MAX_NOTE_CHARS: usize = 200;
 
@@ -469,11 +478,22 @@ impl Community {
                 _ => {}
             }
         }
+        let mut pictures = None;
         if let Some(linked) = profile.get("linkedAccounts") {
             kept.linked = match linked {
-                Value::Array(accounts) if !accounts.is_empty() && accounts.len() <= MAX_LINKED_ACCOUNTS && accounts.iter().all(Value::is_object) && linked.to_string().len() <= MAX_LINKED_BYTES => Some(linked.clone()),
-                Value::Array(accounts) if accounts.is_empty() => None,
-                Value::Null => None,
+                Value::Array(accounts) if !accounts.is_empty() && accounts.len() <= MAX_LINKED_ACCOUNTS && accounts.iter().all(Value::is_object) && linked.to_string().len() <= MAX_LINKED_BYTES => {
+                    // The pictures they refer to, beside them (linked_summary.rs).
+                    pictures = Some(crate::linked_summary::pictures_for(accounts, &message["attachments"]));
+                    Some(linked.clone())
+                }
+                Value::Array(accounts) if accounts.is_empty() => {
+                    pictures = Some(Vec::new());
+                    None
+                }
+                Value::Null => {
+                    pictures = Some(Vec::new());
+                    None
+                }
                 _ => kept.linked,
             };
         }
@@ -481,14 +501,54 @@ impl Community {
             kept.public_address = address.as_str().filter(|address| address.starts_with("did:webvh:") && address.len() <= 1024).map(str::to_string);
         }
         let after = (kept.description.clone(), kept.banner.clone(), kept.linked.clone(), kept.public_address.clone());
+        // What was found of the accounts (summaries) is found again once they are
+        // checked (server.rs, `prove_accounts`); and the address's statement holds
+        // only for the address it is about, and the member it names.
+        let linked_before = self.store.member_linked(sender)?;
+        let mut linked_after = linked_before.clone();
+        if before.2 != after.2 || before.3 != after.3 {
+            linked_after.summaries = None;
+        }
+        if before.3 != after.3 {
+            linked_after.statement = None;
+        }
+        match profile.get("memberStatement") {
+            Some(Value::Null) => linked_after.statement = None,
+            Some(statement @ Value::Object(_)) if self.statement_fits(sender, kept.public_address.as_deref(), statement)? => linked_after.statement = Some(statement.clone()),
+            _ => {}
+        }
+        if kept.public_address.is_none() {
+            linked_after.statement = None;
+        }
+        if let Some(pictures) = pictures {
+            self.store.set_member_linked_pictures(sender, &pictures)?;
+        }
+        let linked_changed = linked_after != linked_before;
+        if linked_changed {
+            self.store.set_member_linked(sender, &linked_after, now)?;
+        }
         // Being a bot, and its commands (bots.rs).
         let bot_changed = self.take_bot(sender, profile, now)?;
         if before == after {
-            return Ok(bot_changed);
+            return Ok(bot_changed || linked_changed);
         }
         kept.at = now;
         self.store.set_member_profile(sender, &kept)?;
         Ok(true)
+    }
+
+    /// Whether `statement` is about `address` and made for this community and
+    /// `sender`'s member id here, as it says: what the server checks of it here.
+    /// Its proof is checked against the address as it resolves (server.rs) before
+    /// the profile comes here, and by every app that shows it.
+    fn statement_fits(&self, sender: &str, address: Option<&str>, statement: &Value) -> anyhow::Result<bool> {
+        let Some(address) = address else { return Ok(false) };
+        let proof = &statement["proof"];
+        let member = self.store.member_id(sender, crate::gates::now())?;
+        Ok(statement["holder"].as_str() == Some(address)
+            && proof["challenge"].as_str() == Some(member.as_str())
+            && proof["domain"].as_str().is_some_and(|domain| self.own_dids().iter().any(|own| own == domain))
+            && statement.to_string().len() <= MAX_STATEMENT_BYTES)
     }
 
     /// `set-member-profile`: what this community alone shows of the sender.

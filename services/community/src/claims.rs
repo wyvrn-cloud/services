@@ -87,8 +87,18 @@ where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = Option<Value>>,
 {
-    let mut found = Vec::new();
-    for credential in linked.iter().take(10) {
+    verified_linked(linked, address, issuers, now, fetch).await.into_iter().map(|(_, account)| account).collect()
+}
+
+/// As [`verified_accounts`], with where in `linked` each credential that proves
+/// one is: `(index, (service homepage, account))`, an account once.
+pub async fn verified_linked<F, Fut>(linked: &[Value], address: &str, issuers: &[String], now: &str, fetch: F) -> Vec<(usize, (String, String))>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Option<Value>>,
+{
+    let mut found: Vec<(usize, (String, String))> = Vec::new();
+    for (index, credential) in linked.iter().enumerate().take(crate::member_ids::MAX_LINKED_ACCOUNTS) {
         let Some(id) = account_of(credential) else { continue };
         let service = id.0.as_str();
         // Why one isn't taken is logged (never the credential): a member whose
@@ -126,7 +136,7 @@ where
             None => None,
         };
         match wyvrn_hosted_did::linked::check(credential, &document, status.as_ref(), now) {
-            Ok(()) if !found.contains(&id) => found.push(id),
+            Ok(()) if !found.iter().any(|(_, kept)| *kept == id) => found.push((index, id)),
             Ok(()) => {}
             Err(why) => tracing::info!(service, issuer, %why, "a linked account isn't taken: it doesn't check out"),
         }

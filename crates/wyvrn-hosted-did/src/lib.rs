@@ -12,6 +12,9 @@
 //! - [`linkage`]: a domain the DID says is its holder's, against what that
 //!   domain says back.
 //! - [`keys`]: the keys in a document, and a signature against them.
+//! - [`linked`]: linked-account credentials, and the pictures they refer to.
+//! - [`member`]: a member's statement that a public address is theirs in a
+//!   community.
 //!
 //! - [`write`]: the holder's side -- writing a log, and signing what is uploaded.
 //! - [`read`]: all of the reading, one file at a time, for a caller that does its
@@ -27,6 +30,7 @@ pub mod api;
 pub mod keys;
 pub mod linkage;
 pub mod linked;
+pub mod member;
 pub mod presentation;
 pub mod read;
 pub mod resolve;

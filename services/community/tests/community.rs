@@ -5190,3 +5190,83 @@ fn follower_pauses_and_moves(store: Store) {
     publish("p4", 8);
     assert_eq!(queued(), 2);
 }
+
+/// A linked-account credential for the Bluesky account `did:plc:<n>`, about
+/// `address`, referring to the picture `picture` (as wyvrn-verify issues them),
+/// signed by [`ISSUER`].
+async fn bluesky_credential(address: &str, n: usize, picture: &[u8]) -> Value {
+    use affinidi_data_integrity::{DataIntegrityProof, SignOptions};
+    use wyvrn_hosted_did::linked::{digest_name, digest_sri, sha384};
+    let url = format!("https://verify.example/pictures/{}.webp", digest_name(&sha384(picture)));
+    let mut value = json!({
+        "@context": ["https://www.w3.org/ns/credentials/v2", "https://wyvrn.app/ns/linked-account/v1"],
+        "id": format!("urn:uuid:00000000-0000-4000-8000-{n:012}"),
+        "type": ["VerifiableCredential", "LinkedAccountCredential"],
+        "issuer": ISSUER,
+        "validFrom": "2026-01-01T00:00:00Z",
+        "credentialSubject": { "id": address, "account": { "type": "OnlineAccount", "accountServiceHomepage": "https://bsky.app", "accountName": format!("did:plc:{n}"),
+            "wyvrn": { "handle": format!("ann{n}.bsky.social"), "displayName": "Ann", "image": url, "followers": 40 + n } } },
+        "relatedResource": [{ "id": url, "mediaType": "image/webp", "digestSRI": digest_sri(picture) }],
+    });
+    let signer = wyvrn_hosted_did::write::signing_secret(ISSUER_JWK, Some(&format!("{ISSUER}#key-1"))).unwrap();
+    let contexts = value["@context"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_string()).collect();
+    let proof = DataIntegrityProof::sign(&value, &signer, SignOptions::new().with_proof_purpose("assertionMethod").with_context(contexts)).await.unwrap();
+    value["proof"] = serde_json::to_value(proof).unwrap();
+    value
+}
+
+/// The member list carries a summary of each linked account the server checked,
+/// with its picture served here by its digest; the credentials themselves come
+/// only with one member's whole entry. Twelve of the largest fit what is kept.
+#[tokio::test]
+async fn the_member_list_carries_summaries_of_checked_linked_accounts_and_a_card_the_credentials() {
+    use wyvrn_hosted_did::linked::{digest_name, sha384};
+    let (server, admin) = server_with_imported_post().await;
+    let member = Peer::start(&server).await;
+    server.state.community.store.admit(&member.did(), wyvrn_community::store::Role::Member, 1).unwrap();
+    member.community("join", json!({})).await;
+    let address = "did:webvh:abc:ann.example";
+    let webp = |fill: u8| {
+        let mut bytes = b"RIFF\0\0\0\0WEBPVP8 ".to_vec();
+        bytes.extend(std::iter::repeat_n(fill, 2000));
+        bytes
+    };
+    let mut credentials = Vec::new();
+    for n in 0..12 {
+        credentials.push(bluesky_credential(address, n, &webp(n as u8)).await);
+    }
+    // One changed since it was signed: kept with the rest, but no summary.
+    credentials[11]["credentialSubject"]["account"]["wyvrn"]["followers"] = json!(1_000_000);
+    assert!(json!(credentials).to_string().len() <= wyvrn_community::member_ids::MAX_LINKED_BYTES);
+    keep_profile(&server, &member.did(), address, &credentials);
+    // Its picture as the profile brought it (linked_summary.rs), and the second's.
+    server.state.community.store.set_member_linked_pictures(&member.did(), &[(digest_name(&sha384(&webp(0))), "image/webp".into(), webp(0))]).unwrap();
+    wyvrn_community::server::consider_profile(server.state.clone(), member.did(), address.into(), credentials.clone()).await;
+
+    let id = server.id(&member);
+    let whole = admin.community("members-request", json!({})).await;
+    let entry = whole["body"]["members"].as_array().unwrap().iter().find(|m| m["member"] == id.as_str()).unwrap().clone();
+    let summaries = entry["profile"]["linkedAccountSummaries"].as_array().unwrap();
+    assert_eq!(summaries.len(), 11, "the changed one isn't checked: {entry}");
+    assert!(entry["profile"].get("linkedAccounts").is_none(), "no credentials in the list");
+    assert_eq!(summaries[0]["platform"], "bluesky");
+    assert_eq!(summaries[0]["handle"], "ann0.bsky.social");
+    assert_eq!(summaries[0]["displayName"], "Ann");
+    assert_eq!(summaries[0]["followers"], 40);
+    assert_eq!(summaries[0]["credential"], "urn:uuid:00000000-0000-4000-8000-000000000000");
+    assert!(summaries[0]["checkedAt"].as_i64().unwrap() > 1_700_000_000);
+    let picture = summaries[0]["picture"].as_str().unwrap();
+    assert!(picture.ends_with(&format!("/m/{id}/linked/{}", digest_name(&sha384(&webp(0))))), "{picture}");
+    assert!(summaries[1].get("picture").is_none(), "its picture never came");
+    // Served, as the member's other pictures are.
+    let path = picture.split_once("/m/").unwrap().1;
+    let served = reqwest::get(format!("{}m/{path}", server.url)).await.unwrap();
+    assert_eq!(served.headers()["content-type"], "image/webp");
+    assert_eq!(served.bytes().await.unwrap().as_ref(), webp(0).as_slice());
+    // Brief entries have none of it; the card's entry has the credentials too.
+    let brief = admin.community("members-request", json!({ "brief": true, "ids": [id] })).await;
+    assert!(brief["body"]["members"][0]["profile"].get("linkedAccountSummaries").is_none());
+    let card = admin.community("member-request", json!({ "member": id })).await;
+    assert_eq!(card["body"]["member"]["profile"]["linkedAccounts"].as_array().unwrap().len(), 12);
+    assert_eq!(card["body"]["member"]["profile"]["linkedAccountSummaries"].as_array().unwrap().len(), 11);
+}

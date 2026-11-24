@@ -113,6 +113,18 @@ the server can read them. A channel here is not end-to-end encrypted between its
 members; each member's messages are encrypted to the server, and the server's to
 each member.
 
+**Linked accounts** (community/1.0's Profiles): of a member's profile, up to 12
+linked-account credentials (64 KiB), kept only once the profile's public address
+is shown to be theirs, and the pictures they refer to, sent beside them and
+checked against the digests the credentials sign (`linked_summary.rs`). Each
+credential is checked when it comes (from an issuer in `linked_account_issuers`,
+signed, in date, not revoked), and the member list carries a summary of each one
+that checked out, with its picture served at `/m/<member id>/linked/<digest>`;
+the credentials themselves only in one member's whole entry (`member-request`).
+A member's statement, their public address's signature on their member id here
+(`memberStatement`), is kept once it checks out against the address as it
+resolves, and given in their entries for apps to check themselves.
+
 ## On the web
 
 The server shows the community on the web too ([community/1.0's "On the web"](https://wyvrn-cloud.github.io/protocols/protocols/community/1.0/)):

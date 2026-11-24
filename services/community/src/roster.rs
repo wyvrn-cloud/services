@@ -22,9 +22,9 @@ use crate::store::{Channel, Member, RoleDef};
 
 /// The most entries a page holds, brief.
 pub const MOST_BRIEF: usize = 200;
-/// The most entries a page holds that aren't brief: each may carry linked
-/// accounts of up to 128 KiB (MAX_LINKED_BYTES); the byte budget below
-/// (`PAGE_BYTES`) is what bounds a page, whatever its count.
+/// The most entries a page holds that aren't brief: each carries a summary of
+/// each linked account, never the credentials (linked_summary.rs); the byte
+/// budget below (`PAGE_BYTES`) is what bounds a page, whatever its count.
 pub const MOST_FULL: usize = 25;
 /// A page's size where it says no `limit` and only `query`.
 pub const QUERY_PAGE: usize = 20;
@@ -53,6 +53,11 @@ struct HereRow {
 /// Everything the list says of everyone (or of one member), read at once.
 pub struct Roster {
     full: bool,
+    /// Whether an entry carries the linked accounts' credentials themselves, as
+    /// one member's whole entry does (`member-request`), beside their summaries.
+    credentials: bool,
+    /// Each member's linked accounts' summaries and their address's statement.
+    linked: HashMap<String, crate::linked_summary::Kept>,
     roles: Vec<RoleDef>,
     owners: Vec<String>,
     held: HashMap<String, Vec<String>>,
@@ -132,6 +137,16 @@ impl Roster {
             })?
             .into_iter()
             .collect();
+        let linked = if full {
+            let read = |text: Option<String>| text.and_then(|text| serde_json::from_str::<Value>(&text).ok());
+            db.query(&filter("SELECT did, summaries, statement FROM member_linked", "did"), &one, |row| {
+                Ok((row.get::<String>(0)?, crate::linked_summary::Kept { summaries: read(row.get(1)?), statement: read(row.get(2)?) }))
+            })?
+            .into_iter()
+            .collect()
+        } else {
+            HashMap::new()
+        };
         let signatures = if full {
             db.query(&filter("SELECT did, signature FROM member_signatures", "did"), &one, |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)))?.into_iter().collect()
         } else {
@@ -151,7 +166,14 @@ impl Roster {
         let roles = store.roles()?;
         let owners = community.owners()?;
         let online = community.seen_online()?;
-        Ok(Self { full, roles, owners, held, ids, pictures, profiles, here, bots, signatures, timeouts, online })
+        Ok(Self { full, credentials: false, linked, roles, owners, held, ids, pictures, profiles, here, bots, signatures, timeouts, online })
+    }
+
+    /// With the linked accounts' credentials in each entry: one member's whole
+    /// entry, for their profile card.
+    pub fn with_credentials(mut self) -> Self {
+        self.credentials = true;
+        self
     }
 
     /// What `did` may do, from what was read.
@@ -264,8 +286,18 @@ impl Roster {
             if let Some(hash) = &profile.banner {
                 said.insert("banner".into(), json!(Self::picture_url(community, &id, "banner", hash)));
             }
-            if let Some(linked) = profile.linked.as_ref().filter(|_| !brief) {
+            // What the server found of the linked accounts it checked, never the
+            // credentials themselves but in one member's whole entry.
+            if let Some(linked) = profile.linked.as_ref().filter(|_| !brief && self.credentials) {
                 said.insert("linkedAccounts".into(), linked.clone());
+            }
+            if let Some(kept) = self.linked.get(did).filter(|_| !brief) {
+                if let Some(summaries) = &kept.summaries {
+                    said.insert("linkedAccountSummaries".into(), crate::linked_summary::with_addresses(summaries, &community.public_url, &id));
+                }
+                if let Some(statement) = kept.statement.as_ref().filter(|_| profile.public_address.is_some()) {
+                    said.insert("memberStatement".into(), statement.clone());
+                }
             }
             if let Some(address) = profile.public_address.as_ref().filter(|_| !brief) {
                 said.insert("publicAddress".into(), json!(address));
@@ -500,7 +532,7 @@ impl Community {
         let Some(member) = self.store.member(&did)?.filter(|member| !self.own_dids().contains(&member.did)) else {
             return Ok(None);
         };
-        let roster = Roster::load(self, Some(&did), true, self.powers(&asker.did)?.has("timeout_members"))?;
+        let roster = Roster::load(self, Some(&did), true, self.powers(&asker.did)?.has("timeout_members"))?.with_credentials();
         Ok(Some(roster.entry(self, &member, false)?))
     }
 

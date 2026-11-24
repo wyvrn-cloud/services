@@ -136,7 +136,9 @@ async fn hosted(State(state): State<Arc<AppState>>, Path(path): Path<String>, re
             Some(whois) => (whois, "application/vp"),
             None => return StatusCode::NOT_FOUND.into_response(),
         },
-        _ => return StatusCode::NOT_FOUND.into_response(),
+        // A picture the whois refers to, by its digest: the same name is always
+        // the same picture (did-hosting/1.0, "Linked accounts' pictures").
+        file => return whois_picture(&state, &name.as_did_path(), file),
     };
     // A resolver asks again often and the answer seldom changes: the version is
     // the tag, so an unchanged file costs it nothing but the question.
@@ -151,6 +153,27 @@ async fn hosted(State(state): State<Arc<AppState>>, Path(path): Path<String>, re
     if let Ok(tag) = HeaderValue::from_str(&tag) {
         headers.insert(header::ETAG, tag);
     }
+    response
+}
+
+/// `<name>.webp` or `<name>.jpg`, a picture `did_path`'s whois refers to.
+fn whois_picture(state: &AppState, did_path: &str, file: &str) -> Response {
+    let Some((picture, extension)) = file.rsplit_once('.') else { return StatusCode::NOT_FOUND.into_response() };
+    let (media_type, bytes) = match state.host.store.whois_picture(did_path, picture) {
+        Ok(Some(found)) => found,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return internal(error),
+    };
+    if !matches!((extension, media_type.as_str()), ("webp", "image/webp") | ("jpg", "image/jpeg")) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let mut response = bytes.into_response();
+    let headers = response.headers_mut();
+    if let Ok(kind) = HeaderValue::from_str(&media_type) {
+        headers.insert(header::CONTENT_TYPE, kind);
+    }
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=31536000, immutable"));
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     response
 }
 

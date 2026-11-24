@@ -683,6 +683,7 @@ const CACHED_TABLES: &[&str] = &[
     "member_profiles",
     "member_pictures",
     "member_here",
+    "member_linked",
     "roles",
     "member_roles",
     "channel_overrides",
@@ -1458,6 +1459,24 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         at INTEGER NOT NULL,
         banner_hash TEXT
     );
+    -- What the server found of a member's linked accounts when it checked them
+    -- (a summary of each, linked_summary.rs), and the statement their public
+    -- address signed that it is theirs here (community/1.0's Profiles).
+    CREATE TABLE IF NOT EXISTS member_linked (
+        did TEXT PRIMARY KEY,
+        summaries TEXT,
+        statement TEXT,
+        at INTEGER NOT NULL
+    );
+    -- The pictures a member's linked accounts refer to, by their digest
+    -- (linked-accounts/1.0, The picture), served as their other pictures are.
+    CREATE TABLE IF NOT EXISTS member_linked_pictures (
+        did TEXT NOT NULL,
+        picture TEXT NOT NULL,
+        media_type TEXT NOT NULL,
+        data TEXT NOT NULL,
+        PRIMARY KEY (did, picture)
+    );
     -- What a member is in this community alone (set-member-profile).
     CREATE TABLE IF NOT EXISTS member_here (
         did TEXT PRIMARY KEY,
@@ -2151,6 +2170,19 @@ fn schema() -> Schema {
                 at BIGINT NOT NULL,
                 banner_hash VARCHAR(32)
             ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS member_linked (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                summaries MEDIUMTEXT,
+                statement TEXT,
+                at BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS member_linked_pictures (
+                did {MYSQL_DID} NOT NULL,
+                picture VARCHAR(64) NOT NULL,
+                media_type VARCHAR(32) NOT NULL,
+                data TEXT NOT NULL,
+                PRIMARY KEY (did(255), picture)
+            ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS member_here (
                 did {MYSQL_DID} NOT NULL PRIMARY KEY,
                 nickname VARCHAR(255),
@@ -2458,7 +2490,7 @@ impl Store {
             tx.execute("DELETE FROM member_pictures WHERE did = ?1", params![prior])?;
             // The rest of their profile, and what they are here (member_ids.rs):
             // the new DID's, where it has its own already.
-            for table in ["member_profiles", "member_here"] {
+            for table in ["member_profiles", "member_here", "member_linked", "member_linked_pictures"] {
                 tx.execute(&format!("UPDATE OR IGNORE {table} SET did = ?2 WHERE did = ?1"), params![prior, new])?;
                 tx.execute(&format!("DELETE FROM {table} WHERE did = ?1"), params![prior])?;
             }
