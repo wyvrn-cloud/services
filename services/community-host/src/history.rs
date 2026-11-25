@@ -212,3 +212,40 @@ fn refresh(
     }
     Ok(())
 }
+
+/// `picture-sizes`: the pictures of the community `name`'s posts kept before their
+/// sizes were (a Discord history brought in before), opened and measured, each
+/// post that gains them sent as changed (as an edit is). Safe while it runs, and to
+/// run again.
+pub fn picture_sizes(host: &Host, name: &str, dry_run: bool) -> anyhow::Result<()> {
+    let record = host.registry.get(name)?.with_context(|| format!("there is no community called {name}"))?;
+    let stores = host.stores(&record, record.storage)?;
+    let settings = host.settings(&record);
+    let (Some(config), Some(location)) = (&settings.files, &stores.files) else { anyhow::bail!("{name} keeps no files") };
+    let store = wyvrn_community::store::Store::open(&stores.community)?;
+    let files = wyvrn_community::files::Files::open(config, location, &settings.server.public_url)?;
+    println!("The pictures of {name}'s posts without their sizes{}:", if dry_run { " (dry run: nothing is changed)" } else { "" });
+    let mut last_told = 0;
+    let filled = wyvrn_community::picture_sizes::fill(&store, &files, dry_run, |so_far| {
+        if so_far.posts_read >= last_told + 5000 {
+            last_told = so_far.posts_read;
+            println!("    {} posts with files read, {} pictures measured", so_far.posts_read, so_far.pictures);
+        }
+    })?;
+    println!(
+        "  {} posts with files read; {} pictures in {} posts {}; {} pictures kept elsewhere or gone, {} that couldn't be read, left as they are",
+        filled.posts_read,
+        filled.pictures,
+        filled.posts,
+        if dry_run { "to measure" } else { "measured" },
+        filled.not_here,
+        filled.unreadable
+    );
+    if filled.changed_meanwhile > 0 {
+        println!("  {} posts changed while this ran: run it again for them", filled.changed_meanwhile);
+    }
+    if !dry_run && filled.posts > 0 {
+        println!("members' apps take up the changed posts as they do an edit");
+    }
+    Ok(())
+}

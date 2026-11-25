@@ -54,6 +54,13 @@ wyvrn-community-host [--config <path>] import-discord <name> <folder> <channel>.
                                                                   embeds of the posts already imported from
                                                                   those channels, sent as edits are.
                                                                   --dry-run says what it would do.
+wyvrn-community-host [--config <path>] picture-sizes <name> [--dry-run]
+                                                                  the pictures of one's posts kept without
+                                                                  their width and height (a Discord history
+                                                                  brought in before they were measured)
+                                                                  opened and measured, those posts sent as
+                                                                  edits are; once is enough, again changes
+                                                                  nothing. Safe while the host runs.
 wyvrn-community-host [--config <path>] backup <name>              back one up now (backups.key set)
 wyvrn-community-host [--config <path>] open-backup <file> <out.tar.gz>
                                                                   open a backup with the backup key: the
@@ -234,6 +241,15 @@ async fn main() -> anyhow::Result<()> {
             anyhow::ensure!(!asked.channels.is_empty(), "name the channels to import\n\n{USAGE}");
             let host = Host::new(config.clone(), registry(&config)?);
             tokio::task::block_in_place(|| wyvrn_community_host::history::run(&host, name, &asked, now()))
+        }
+        ["picture-sizes", name, rest @ ..] => {
+            let dry_run = match rest {
+                [] => false,
+                ["--dry-run"] => true,
+                _ => anyhow::bail!("{}: unrecognized\n\n{USAGE}", rest.join(" ")),
+            };
+            let host = Host::new(config.clone(), registry(&config)?);
+            tokio::task::block_in_place(|| wyvrn_community_host::history::picture_sizes(&host, name, dry_run))
         }
         ["import-expressions", name, folder, rest @ ..] => {
             let dry_run = rest.contains(&"--dry-run");

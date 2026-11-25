@@ -60,12 +60,19 @@ pub fn open_sealed(ciphertext: &[u8], ciphering: &Value) -> Option<Vec<u8>> {
 }
 
 impl Files {
-    /// How big the `n`th file a post carries is, if it is kept here.
-    pub fn carried_size(&self, extra: &Value, n: usize) -> Option<u64> {
+    /// The `n`th file a post carries: its media item, its attachment, and its id
+    /// here, if it is kept here.
+    fn kept<'a>(&self, extra: &'a Value, n: usize) -> Option<(&'a Value, &'a Value, &'a str)> {
         let item = extra["media"].as_array()?.get(n)?;
         let attachment = extra["attachments"].as_array()?.iter().find(|a| a["id"] == item["attachment"])?;
         let link = attachment["data"]["links"].as_array()?.first()?.as_str()?;
         let file_id = link.strip_prefix(&self.host.download_url("")).filter(|id| !id.is_empty() && !id.contains('/'))?;
+        Some((item, attachment, file_id))
+    }
+
+    /// How big the `n`th file a post carries is, if it is kept here.
+    pub fn carried_size(&self, extra: &Value, n: usize) -> Option<u64> {
+        let (_, _, file_id) = self.kept(extra, n)?;
         Some(self.host.stored(file_id, wyvrn_service::now()).ok()?.byte_count)
     }
 
@@ -73,16 +80,29 @@ impl Files {
     /// `attachments`), opened with the key the post gives, if it is kept here and is
     /// at most `most` bytes. What the web view shows and an announcement sends on.
     pub async fn carried(&self, extra: &Value, n: usize, most: u64) -> Carried {
-        let Some(item) = extra["media"].as_array().and_then(|m| m.get(n)) else { return Carried::NotHere };
-        let Some(attachment) = extra["attachments"].as_array().into_iter().flatten().find(|a| a["id"] == item["attachment"]) else { return Carried::NotHere };
-        let Some(link) = attachment["data"]["links"].as_array().and_then(|l| l.first()).and_then(Value::as_str) else { return Carried::NotHere };
-        let own = self.host.download_url("");
-        let Some(file_id) = link.strip_prefix(&own).filter(|id| !id.is_empty() && !id.contains('/')) else { return Carried::NotHere };
+        let Some((item, attachment, file_id)) = self.kept(extra, n) else { return Carried::NotHere };
         let Ok(stored) = self.host.stored(file_id, wyvrn_service::now()) else { return Carried::NotHere };
         if stored.byte_count > most {
             return Carried::NotHere;
         }
         let Ok(bytes) = tokio::fs::read(self.host.store.path(file_id)).await else { return Carried::NotHere };
+        Self::opened(item, attachment, bytes)
+    }
+
+    /// As [`Files::carried`], read here and now: for work that answers nobody (the
+    /// pictures of posts kept before their sizes were, measured: [`crate::picture_sizes::fill`]).
+    pub fn carried_now(&self, extra: &Value, n: usize, most: u64) -> Carried {
+        let Some((item, attachment, file_id)) = self.kept(extra, n) else { return Carried::NotHere };
+        let Ok(stored) = self.host.stored(file_id, wyvrn_service::now()) else { return Carried::NotHere };
+        if stored.byte_count > most {
+            return Carried::NotHere;
+        }
+        let Ok(bytes) = std::fs::read(self.host.store.path(file_id)) else { return Carried::NotHere };
+        Self::opened(item, attachment, bytes)
+    }
+
+    /// `bytes`, the file of `item` and `attachment`, opened with the key `item` gives.
+    fn opened(item: &Value, attachment: &Value, bytes: Vec<u8>) -> Carried {
         let bytes = match item.get("ciphering").filter(|c| !c.is_null()) {
             Some(ciphering) => match open_sealed(&bytes, ciphering) {
                 Some(plain) => plain,

@@ -957,14 +957,16 @@ pub fn seal(plain: &[u8]) -> (Vec<u8>, Value) {
 }
 
 /// Keeps a file sealed at the community's host: its attachment (chat-message/1.0's,
-/// as a member's app sends one) and its media item.
+/// as a member's app sends one) and its media item: a picture's with its width and
+/// height, where they can be read of it (and without them where they can't).
 fn keep_file(files: &Files, owner: &str, path: &Path, name: &str, now: i64) -> anyhow::Result<(Value, Value)> {
     let plain = std::fs::read(path).with_context(|| format!("{}", path.display()))?;
     let media_type = media_type_of(name);
     let (sealed, ciphering) = seal(&plain);
     let (id, url, hash) = files.keep_any(owner, name, media_type, &sealed, now)?;
     let attachment = json!({ "id": id, "media_type": media_type, "filename": name, "byte_count": sealed.len(), "data": { "links": [url], "hash": hash } });
-    let item = json!({ "attachment": id, "ciphering": ciphering });
+    let mut item = json!({ "attachment": id, "ciphering": ciphering });
+    crate::picture_sizes::put(&mut item, media_type, &plain);
     Ok((attachment, item))
 }
 
@@ -1291,6 +1293,25 @@ mod tests {
         let (sealed, ciphering) = seal(b"a picture");
         assert_ne!(sealed, b"a picture");
         assert_eq!(crate::files::open_sealed(&sealed, &ciphering).as_deref(), Some(&b"a picture"[..]));
+    }
+
+    #[test]
+    fn a_picture_brought_in_carries_its_size_and_nothing_else_does() {
+        let files = Files::scratch(&crate::config::FilesConfig::default(), "https://c.example/").unwrap();
+        let dir = files.host.store.path("");
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(21, 13)).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        std::fs::write(dir.join("in.png"), png.into_inner()).unwrap();
+        std::fs::write(dir.join("in.jpg"), b"not a jpeg at all").unwrap();
+        std::fs::write(dir.join("in.txt"), b"words").unwrap();
+        let (_, item) = keep_file(&files, "import:discord:1", &dir.join("in.png"), "art.png", 1).unwrap();
+        assert_eq!((item["width"].clone(), item["height"].clone()), (json!(21), json!(13)));
+        for (path, name) in [("in.jpg", "broken.jpg"), ("in.txt", "notes.txt")] {
+            let (attachment, item) = keep_file(&files, "import:discord:1", &dir.join(path), name, 1).unwrap();
+            assert!(item.get("width").is_none() && item.get("height").is_none(), "{name}");
+            assert!(attachment["id"].is_string());
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

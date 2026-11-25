@@ -4455,6 +4455,29 @@ impl Store {
         Ok(())
     }
 
+    /// The extras (as kept: JSON) of the posts after `after` by id that carry
+    /// files (`media`), at most `limit` of them: a page of them, for work done to
+    /// every post a page at a time.
+    pub fn post_extras_with_media_after(&self, after: &str, limit: usize) -> Result<Vec<(String, String)>> {
+        self.db.lock().query(
+            "SELECT post, extra FROM post_extra WHERE post > ?1 AND extra LIKE ?2 ORDER BY post LIMIT ?3",
+            params![after, "%\"media\"%", limit as i64],
+            |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)),
+        )
+    }
+
+    /// Puts `extra` in place of a post's extra if it is still `was` (nothing else
+    /// has changed it meanwhile), and marks the post changed, so members' apps take
+    /// it up as they do an edit. Whether it was.
+    pub fn replace_post_extra(&self, id: &str, was: &str, extra: &Value) -> Result<bool> {
+        let mut db = self.db.lock();
+        if db.execute("UPDATE post_extra SET extra = ?3 WHERE post = ?1 AND extra = ?2", params![id, was, extra.to_string()])? == 0 {
+            return Ok(false);
+        }
+        Self::touch(&mut db, id)?;
+        Ok(true)
+    }
+
     /// Records `did`'s whole vote on the poll `post`; none takes it back. The post
     /// takes the next `rev`.
     pub fn vote(&self, post: &str, did: &str, answers: &[String], now: i64) -> Result<()> {

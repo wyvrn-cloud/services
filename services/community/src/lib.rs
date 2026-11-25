@@ -36,6 +36,7 @@ pub mod linked_summary;
 pub mod member_ids;
 pub mod moderation;
 pub mod outgoing;
+pub mod picture_sizes;
 pub mod posting;
 pub mod protection;
 pub mod questions;
