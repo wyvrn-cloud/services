@@ -20,11 +20,11 @@ wyvrn-service = { path = "crates/wyvrn-service" }
 wyvrn-hosted-did = { path = "crates/wyvrn-hosted-did" }
 
 # Tracks didcomm's default branch; pin a tag (tag = "...") once it publishes releases.
-didcomm-agent = { git = "https://github.com/wyvrn-cloud/didcomm", rev = "b926e516a616c3b96675545d284bc03273408f48" }
-didcomm-core = { git = "https://github.com/wyvrn-cloud/didcomm", rev = "b926e516a616c3b96675545d284bc03273408f48" }
-didcomm-crypto-askar = { git = "https://github.com/wyvrn-cloud/didcomm", rev = "b926e516a616c3b96675545d284bc03273408f48" }
-didcomm-quickstart = { git = "https://github.com/wyvrn-cloud/didcomm", rev = "b926e516a616c3b96675545d284bc03273408f48" }
-didcomm-resolver-peer = { git = "https://github.com/wyvrn-cloud/didcomm", rev = "b926e516a616c3b96675545d284bc03273408f48" }
+didcomm-agent = { git = "https://github.com/wyvrn-cloud/didcomm", rev = "d0e7df3c3e882db5750c50c19fe86d994c34ea7d" }
+didcomm-core = { git = "https://github.com/wyvrn-cloud/didcomm", rev = "d0e7df3c3e882db5750c50c19fe86d994c34ea7d" }
+didcomm-crypto-askar = { git = "https://github.com/wyvrn-cloud/didcomm", rev = "d0e7df3c3e882db5750c50c19fe86d994c34ea7d" }
+didcomm-quickstart = { git = "https://github.com/wyvrn-cloud/didcomm", rev = "d0e7df3c3e882db5750c50c19fe86d994c34ea7d" }
+didcomm-resolver-peer = { git = "https://github.com/wyvrn-cloud/didcomm", rev = "d0e7df3c3e882db5750c50c19fe86d994c34ea7d" }
 
 anyhow = "1"
 async-trait = "0.1"
