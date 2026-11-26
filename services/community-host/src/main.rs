@@ -52,7 +52,8 @@ wyvrn-community-host [--config <path>] import-discord <name> <folder> <channel>.
                                                                   what isn't there yet. --refresh-embeds
                                                                   brings nothing in: it writes again the
                                                                   embeds of the posts already imported from
-                                                                  those channels, sent as edits are.
+                                                                  those channels (their pictures' sizes too),
+                                                                  sent as edits are.
                                                                   --dry-run says what it would do.
 wyvrn-community-host [--config <path>] picture-sizes <name> [--dry-run]
                                                                   the pictures of one's posts kept without
