@@ -78,14 +78,34 @@ pub fn url_with(public_url: &str, id: &str, token: &str) -> String {
 /// The URL of a webhook just made or given a new one, for its page to show once.
 static SHOW_ONCE: LazyLock<std::sync::Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
 
+/// A file sent with a webhook's post, for `attachment://` in its embeds: where it is
+/// kept, and a picture's width and height, read of it.
+#[derive(Debug, Clone, Default)]
+pub struct SentFile {
+    pub url: String,
+    pub size: Option<(u32, u32)>,
+}
+
 /// An `http(s)` address, as an embed or avatar may give one; `attachment://name`
 /// is one of the files sent with it, where `files` has it.
-fn link(value: &Value, files: &HashMap<String, String>) -> Option<String> {
+fn link(value: &Value, files: &HashMap<String, SentFile>) -> Option<String> {
+    sent_link(value, files).map(|(url, _)| url)
+}
+
+/// [`link`], and the size of the file it names where it is one sent with it.
+fn sent_link(value: &Value, files: &HashMap<String, SentFile>) -> Option<(String, Option<(u32, u32)>)> {
     let text = value.as_str()?.trim();
     if let Some(name) = text.strip_prefix("attachment://") {
-        return files.get(name).cloned();
+        return files.get(name).map(|file| (file.url.clone(), file.size));
     }
-    (text.len() <= 2048 && (text.starts_with("https://") || text.starts_with("http://")) && !text.chars().any(char::is_whitespace)).then(|| text.to_string())
+    (text.len() <= 2048 && (text.starts_with("https://") || text.starts_with("http://")) && !text.chars().any(char::is_whitespace)).then(|| (text.to_string(), None))
+}
+
+/// An embed picture's width and height as given (Discord's `image` and `thumbnail`
+/// carry them), both whole numbers of pixels, or neither.
+pub fn given_size(picture: &Value) -> Option<(u32, u32)> {
+    let side = |v: &Value| v.as_u64().filter(|n| (1..=100_000).contains(n)).map(|n| n as u32);
+    Some((side(&picture["width"])?, side(&picture["height"])?))
 }
 
 /// Text up to `max` characters, as it is (line breaks kept), or none if empty.
@@ -96,7 +116,7 @@ fn text(value: &Value, max: usize) -> Option<String> {
 
 /// Embeds as Discord's webhooks take them, checked: at most ten, each field to its
 /// limit, 6000 characters in all. `files` are those sent with them, by name.
-pub fn read_embeds(given: &Value, files: &HashMap<String, String>) -> Result<Vec<Value>, String> {
+pub fn read_embeds(given: &Value, files: &HashMap<String, SentFile>) -> Result<Vec<Value>, String> {
     let Some(list) = given.as_array() else { return Ok(Vec::new()) };
     if list.len() > MAX_EMBEDS {
         return Err("A message has at most 10 embeds.".into());
@@ -144,9 +164,16 @@ pub fn read_embeds(given: &Value, files: &HashMap<String, String>) -> Result<Vec
             }
             out.insert("footer".into(), said);
         }
+        // With its width and height where they are known (a file sent with it is
+        // measured; one elsewhere is as the sender says), so an app keeps its room.
         for picture in ["image", "thumbnail"] {
-            if let Some(url) = link(&embed[picture]["url"], files) {
-                out.insert(picture.into(), json!({ "url": url }));
+            if let Some((url, measured)) = sent_link(&embed[picture]["url"], files) {
+                let mut kept = json!({ "url": url });
+                if let Some((width, height)) = measured.or_else(|| given_size(&embed[picture])) {
+                    kept["width"] = width.into();
+                    kept["height"] = height.into();
+                }
+                out.insert(picture.into(), kept);
             }
         }
         let fields = embed["fields"].as_array().map(Vec::as_slice).unwrap_or_default();
@@ -260,7 +287,7 @@ async fn read_sent(state: &Arc<AppState>, request: Request) -> Result<Sent, Resp
 
 /// Keeps what was sent as files; the attachments that name them, and each name's
 /// address (for `attachment://` in embeds).
-fn keep_files(community: &Community, hook: &Webhook, sent: &Sent, now: i64) -> Result<(Vec<Value>, HashMap<String, String>), Response> {
+fn keep_files(community: &Community, hook: &Webhook, sent: &Sent, now: i64) -> Result<(Vec<Value>, HashMap<String, SentFile>), Response> {
     let mut attachments = Vec::new();
     let mut by_name = HashMap::new();
     if sent.files.is_empty() {
@@ -286,7 +313,8 @@ fn keep_files(community: &Community, hook: &Webhook, sent: &Sent, now: i64) -> R
         if let Some(description) = description {
             attachment["description"] = json!(description);
         }
-        by_name.insert(filename, url);
+        let size = media_type.starts_with("image/").then(|| crate::picture_sizes::of(bytes)).flatten();
+        by_name.insert(filename, SentFile { url, size });
         attachments.push(attachment);
     }
     Ok((attachments, by_name))
@@ -1027,7 +1055,7 @@ mod tests {
 
     #[test]
     fn embeds_are_checked_to_discords_limits_and_attachment_links_resolved() {
-        let files = HashMap::from([("chart.png".to_string(), "https://c.example/f/abc".to_string())]);
+        let files = HashMap::from([("chart.png".to_string(), SentFile { url: "https://c.example/f/abc".to_string(), size: Some((800, 400)) })]);
         let embeds = read_embeds(
             &json!([{ "title": "Build #42", "description": "All green", "url": "https://ci.example/42", "color": 3066993, "timestamp": "2026-11-17T10:00:00Z",
                       "author": { "name": "CI", "icon_url": "javascript:alert(1)" }, "footer": { "text": "main" },
@@ -1038,6 +1066,8 @@ mod tests {
         .unwrap();
         assert_eq!(embeds[0]["title"], "Build #42");
         assert_eq!(embeds[0]["image"]["url"], "https://c.example/f/abc");
+        // A file sent with it is as wide and high as it is measured.
+        assert_eq!((embeds[0]["image"]["width"].clone(), embeds[0]["image"]["height"].clone()), (json!(800), json!(400)));
         assert!(embeds[0].get("thumbnail").is_none());
         assert!(embeds[0]["author"].get("icon_url").is_none());
         assert_eq!(embeds[0]["fields"][0]["inline"], true);
@@ -1045,6 +1075,23 @@ mod tests {
         assert!(read_embeds(&json!([{ "description": "x".repeat(4096) }, { "description": "y".repeat(2000) }]), &files).is_err());
         assert!(read_embeds(&json!([{}]), &files).is_err());
         assert!(read_embeds(&json!([{ "fields": [{ "name": "only a name" }] }]), &files).is_err());
+    }
+
+    #[test]
+    fn an_embeds_pictures_keep_the_width_and_height_given_and_nothing_else() {
+        let files = HashMap::new();
+        let embeds = read_embeds(
+            &json!([{ "image": { "url": "https://cdn.example/a.png", "width": 1200, "height": 630 },
+                      "thumbnail": { "url": "https://cdn.example/t.png", "width": 0, "height": 80 } },
+                    { "image": { "url": "https://cdn.example/b.png", "width": "1200", "height": 630 } },
+                    { "image": { "url": "https://cdn.example/c.png", "width": 1200 } }]),
+            &files,
+        )
+        .unwrap();
+        assert_eq!(embeds[0]["image"], json!({ "url": "https://cdn.example/a.png", "width": 1200, "height": 630 }));
+        assert_eq!(embeds[0]["thumbnail"], json!({ "url": "https://cdn.example/t.png" }));
+        assert_eq!(embeds[1]["image"], json!({ "url": "https://cdn.example/b.png" }));
+        assert_eq!(embeds[2]["image"], json!({ "url": "https://cdn.example/c.png" }));
     }
 
     #[test]

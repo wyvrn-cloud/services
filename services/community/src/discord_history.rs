@@ -174,9 +174,24 @@ pub struct Image {
     pub url: String,
     /// Where it was on the web.
     pub canonical_url: Option<String>,
+    /// Its size in pixels, as Discord gave it (an embed's pictures have them).
+    pub width: Option<u64>,
+    pub height: Option<u64>,
 }
 
 impl Image {
+    /// As an embed's picture is sent: its address on the web, with its width and
+    /// height where they are given, so an app keeps its room before it loads.
+    fn card(&self) -> Option<Value> {
+        let mut picture = json!({ "url": self.web()? });
+        let side = |n: Option<u64>| n.filter(|n| (1..=100_000).contains(n));
+        if let (Some(width), Some(height)) = (side(self.width), side(self.height)) {
+            picture["width"] = width.into();
+            picture["height"] = height.into();
+        }
+        Some(picture)
+    }
+
     /// Its address on the web, if it has one.
     fn web(&self) -> Option<&str> {
         [self.canonical_url.as_deref(), Some(self.url.as_str())].into_iter().flatten().find(|u| u.starts_with("https://") || u.starts_with("http://"))
@@ -991,9 +1006,8 @@ fn card(e: &Embed, rewrite: &mut dyn FnMut(&str) -> String) -> Option<Value> {
     put("color", e.color.as_deref().and_then(|c| i64::from_str_radix(c.trim_start_matches('#'), 16).ok()).map(Value::from));
     put("author", e.author.as_ref().and_then(|a| a.name.clone()).map(|name| json!({ "name": name, "url": e.author.as_ref().and_then(|a| a.url.clone()) })));
     put("footer", e.footer.as_ref().and_then(|f| f.text.clone()).map(|text| json!({ "text": text })));
-    let picture = e.image.iter().chain(e.images.iter()).find_map(Image::web).map(|u| json!({ "url": u }));
-    put("image", picture);
-    put("thumbnail", e.thumbnail.as_ref().and_then(Image::web).map(|u| json!({ "url": u })));
+    put("image", e.image.iter().chain(e.images.iter()).find_map(Image::card));
+    put("thumbnail", e.thumbnail.as_ref().and_then(Image::card));
     if !fields.is_empty() {
         put("fields", Some(json!(fields)));
     }
@@ -1434,6 +1448,21 @@ mod tests {
         assert_eq!(embeds[1]["color"], 0x2ecc71);
         // The role they call on is the post's mention, once.
         assert_eq!(post.mentions.iter().map(|m| m.who.as_str()).collect::<Vec<_>>(), ["role:r1"]);
+    }
+
+    #[test]
+    fn an_embeds_pictures_carry_their_width_and_height_from_the_export() {
+        // As DiscordChatExporter writes an embed's pictures: the file beside it, and where it was.
+        let export: Embed = serde_json::from_value(json!({
+            "title": "A post",
+            "image": { "url": "media/a.png", "canonicalUrl": "https://cdn.example/a.png", "width": 1200, "height": 630 },
+            "thumbnail": { "url": "https://cdn.example/t.png", "width": 80, "height": 0 },
+        }))
+        .unwrap();
+        let card = card(&export, &mut |t| t.to_string()).unwrap();
+        assert_eq!(card["image"], json!({ "url": "https://cdn.example/a.png", "width": 1200, "height": 630 }));
+        // A size that isn't one is left out, and the picture kept.
+        assert_eq!(card["thumbnail"], json!({ "url": "https://cdn.example/t.png" }));
     }
 
     #[test]
