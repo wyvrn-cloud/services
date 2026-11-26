@@ -17,6 +17,8 @@ chrono = { workspace = true }
 # Status lists are gzipped (linked accounts).
 flate2 = "1"
 ed25519-dalek = { workspace = true }
+# A passkey's co-signature of a log entry (recovery.rs): ES256.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

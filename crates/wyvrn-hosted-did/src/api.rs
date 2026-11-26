@@ -88,6 +88,37 @@ pub async fn append(did: &str, log: &str, document_json: &str, update_secret_jwk
     write::append(did, log, &document, update_secret_jwk, update_keys.as_deref()).await.map(written)
 }
 
+/// [`write::create_with`]: [`create`], with `options_json` `{witness?, ttl?}`
+/// (`witness` the host's witness `did:key`, from its `reservation`).
+pub async fn create_with(document_json: &str, update_secret_jwk: &str, update_keys_json: &str, options_json: &str) -> Result<String, String> {
+    let document: Value = parse("the document", document_json)?;
+    let update_keys: Vec<String> = parse("the update keys", update_keys_json)?;
+    let options: write::Options = parse("the options", options_json)?;
+    write::create_with(&document, update_secret_jwk, &update_keys, &options).await.map(written)
+}
+
+/// [`write::append_with`]: [`append`], with `options_json` `{witness?, ttl?}`.
+pub async fn append_with(did: &str, log: &str, document_json: &str, update_secret_jwk: &str, update_keys_json: &str, options_json: &str) -> Result<String, String> {
+    let document: Value = parse("the document", document_json)?;
+    let update_keys: Option<Vec<String>> = parse("the update keys", update_keys_json)?;
+    let options: write::Options = parse("the options", options_json)?;
+    write::append_with(did, log, &document, update_secret_jwk, update_keys.as_deref(), &options).await.map(written)
+}
+
+/// [`recovery::sign_address_entry`](crate::recovery::sign_address_entry): a
+/// recovery key's `recovery_proof` for the entry `version_id`, as JSON.
+pub fn address_entry_proof(version_id: &str, recovery_secret_jwk: &str, key: &str) -> Result<String, String> {
+    crate::recovery::sign_address_entry(version_id, recovery_secret_jwk, key).map(|proof| proof.to_string())
+}
+
+/// [`recovery::check_address_entry`](crate::recovery::check_address_entry):
+/// the key's id, or why the proof doesn't hold.
+pub fn check_address_entry_proof(proof_json: &str, document_json: &str, version_id: &str) -> Result<String, String> {
+    let proof: Value = parse("the recovery proof", proof_json)?;
+    let document: Value = parse("the document", document_json)?;
+    crate::recovery::check_address_entry(&proof, &document, version_id)
+}
+
 /// [`write::deactivate`].
 pub async fn deactivate(did: &str, log: &str, update_secret_jwk: &str) -> Result<String, String> {
     write::deactivate(did, log, update_secret_jwk).await.map(written)

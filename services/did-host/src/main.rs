@@ -110,7 +110,13 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     if let Some(mediator) = &config.mediator {
         wyvrn_service::mediator::register(&agent, mediator).await?;
     }
-    let host = host(&config)?;
+    let mut host = host(&config)?;
+    if config.host.witness {
+        // Kept with the host's other keys, sealed as they are.
+        let witness = wyvrn_did_host::witness::Witness::load_or_make(&host.store, &wyvrn_did_host::witness::bound_to(agent.identity()))?;
+        tracing::info!(witness = %witness.did, "witnessing the logs hosted here");
+        host = host.with_witness(witness);
+    }
     tracing::info!(
         did = %agent.did(),
         domain = %config.host.domain,
@@ -121,6 +127,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 
     let state = Arc::new(AppState { agent, host, did_document, admin: Default::default() });
     tokio::spawn(server::run_staleness_checks(state.clone()));
+    tokio::spawn(server::run_pending(state.clone()));
     if let Some(mediator) = &config.mediator {
         let service = Arc::new(server::HostService(state.clone()));
         tokio::spawn(wyvrn_service::mediator::run_pickups(service, mediator.poll_every()));

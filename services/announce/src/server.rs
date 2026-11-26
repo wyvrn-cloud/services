@@ -74,7 +74,9 @@ pub fn build_agent(config: &Config, identity: Identity) -> anyhow::Result<(Agent
         .with_protocol(channel::PIURI, &["channel"])
         .with_protocol(channel::USER_PROFILE, &[])
         // Subscribers react to posts as they would to any message.
-        .with_protocol(channel::MESSAGE_REACTIONS_PIURI, &["observer"]);
+        .with_protocol(channel::MESSAGE_REACTIONS_PIURI, &["observer"])
+        // A subscriber that speaks as its public address is followed there.
+        .with_protocol(wyvrn_service::named::DID_HOSTING, &[wyvrn_service::named::CORRESPONDENT]);
     Ok((agent.with_features(features), document))
 }
 

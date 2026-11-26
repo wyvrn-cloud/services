@@ -84,7 +84,45 @@ impl Service for HostService {
                 Err(refusal) => received.reply(&format!("{}/problem-report", wyvrn_service::admin::PIURI), refusal.body()),
             }));
         }
-        self.0.host.handle(received, kid, now(), &self.0.agent).await
+        let answer = self.0.host.handle(received, kid, now(), &self.0.agent).await;
+        // What the holder is to be told of what was just done, after it has had its answer.
+        send_notices(&self.0, self.0.host.take_notices());
+        answer
+    }
+}
+
+/// Sends `notices` without holding anyone up: each to its hosted DID, or failing
+/// that the `did:peer:4` it names.
+pub fn send_notices(state: &Arc<AppState>, notices: Vec<crate::host::Notice>) {
+    if notices.is_empty() {
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        for notice in notices {
+            for to in &notice.to {
+                match state.agent.send(to, &notice.message).await {
+                    Ok(_) => break,
+                    Err(error) => tracing::debug!(%to, %error, "couldn't tell a holder of a pending entry there"),
+                }
+            }
+        }
+    });
+}
+
+/// How often the host looks for pending entries to publish, or to say are soon.
+const PENDING_CHECK_EVERY: Duration = Duration::from_secs(60);
+
+/// Publishes held-back entries as their day is up, for as long as the host runs:
+/// from what the store keeps, so that one held across a restart is published all
+/// the same.
+pub async fn run_pending(state: Arc<AppState>) {
+    loop {
+        if let Err(error) = state.host.publish_due(now()).await {
+            tracing::warn!(%error, "publishing pending entries failed");
+        }
+        send_notices(&state, state.host.take_notices());
+        tokio::time::sleep(PENDING_CHECK_EVERY).await;
     }
 }
 
@@ -131,6 +169,13 @@ async fn hosted(State(state): State<Arc<AppState>>, Path(path): Path<String>, re
         "did.json" => match record.web_document {
             Some(document) => (document.into_bytes(), "application/did+json"),
             None => return StatusCode::NOT_FOUND.into_response(),
+        },
+        // What the host's witness has signed for: written before the log it
+        // witnesses, and served as freshly.
+        "did-witness.json" => match state.host.store.witness_proofs(&name.as_did_path()) {
+            Ok(Some(proofs)) => (proofs.into_bytes(), "application/json"),
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(error) => return internal(error),
         },
         "whois.vp" => match record.whois {
             Some(whois) => (whois, "application/vp"),

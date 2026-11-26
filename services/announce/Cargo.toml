@@ -28,6 +28,8 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# An admin speaking as a did:webvh at localhost (tests/channel.rs).
+didcomm-resolver-webvh = { workspace = true }
 # A resolver of the tests' own, for a DID that would be fetched from a host.
 async-trait = { workspace = true }
 wyvrn-hosted-did = { workspace = true }

@@ -48,7 +48,17 @@ async fn fetch_text(fetch: &impl Fetch, url: &str) -> Result<String, String> {
 
 async fn resolve_webvh(did: &str, fetch: &impl Fetch) -> Result<Resolved, String> {
     let place = Location::of(did).ok_or_else(|| format!("{did} is not a did:webvh"))?;
-    let verified = verify::log(did, &fetch_text(fetch, &place.log()).await?).await?;
+    let log = fetch_text(fetch, &place.log()).await?;
+    // A log that names witnesses is the DID's only as far as they have signed for
+    // it: their proofs are fetched beside it. None there, and it doesn't verify.
+    let witness_proofs = match verify::needs_witness_proofs(&log) {
+        true => match fetch.get(&place.witness()).await? {
+            Some(bytes) => Some(String::from_utf8(bytes).map_err(|_| format!("{} is not text", place.witness()))?),
+            None => None,
+        },
+        false => None,
+    };
+    let verified = verify::log(did, &log, witness_proofs.as_deref()).await?;
     // Its short name, if it names one in its own place.
     let did_web = verify::also_known_as(&verified.document)
         .into_iter()

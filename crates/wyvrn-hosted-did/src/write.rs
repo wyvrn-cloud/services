@@ -8,7 +8,8 @@ use std::sync::Arc;
 use affinidi_data_integrity::{DataIntegrityProof, SignOptions};
 use affinidi_secrets_resolver::secrets::Secret;
 use base64::Engine;
-use didwebvh_rs::{log_entry::LogEntryMethods, parameters::Parameters, DIDWebVHState, Multibase};
+use didwebvh_rs::witness::{Witness, Witnesses};
+use didwebvh_rs::{log_entry::LogEntryMethods, parameters::Parameters, DIDWebVHError, DIDWebVHState, Multibase};
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
 
@@ -72,10 +73,37 @@ fn written(state: &DIDWebVHState) -> Result<Written, String> {
 /// trusted devices -- and `update_secret_jwk`, which signs this one, has to be the
 /// secret of one of them. The DID is `portable`: it can later move to another host.
 pub async fn create(document: &Value, update_secret_jwk: &str, update_keys: &[String]) -> Result<Written, String> {
+    create_with(document, update_secret_jwk, update_keys, &Options::default()).await
+}
+
+/// What else an entry may say of the log, beside its document and who may update
+/// it next.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct Options {
+    /// The `did:key` of the host's witness, when the host witnesses the logs it
+    /// hosts (did-hosting/1.0, "The host as a witness", its `reservation`'s
+    /// `witness`): the log names it as its only witness, threshold 1. Absent on
+    /// an append, the log's witnessing stays as it is.
+    pub witness: Option<String>,
+    /// `ttl`, in seconds: how long a resolver may use what it read. An address that
+    /// is spoken as SHOULD set 600 (did-hosting/1.0, "Speaking as a hosted DID").
+    pub ttl: Option<u32>,
+}
+
+/// `{ "threshold": 1, "witnesses": [{ "id": witness }] }`.
+pub fn witness_parameter(witness: &str) -> Witnesses {
+    Witnesses::Value { threshold: 1, witnesses: vec![Witness::new(witness)] }
+}
+
+/// [`create`], saying what `options` say from the first entry.
+pub async fn create_with(document: &Value, update_secret_jwk: &str, update_keys: &[String], options: &Options) -> Result<Written, String> {
     let signer = signing_secret(update_secret_jwk, None)?;
     let parameters = Parameters {
         update_keys: Some(Arc::new(update_keys.iter().cloned().map(Multibase::new).collect())),
         portable: Some(true),
+        witness: options.witness.as_deref().map(|witness| Arc::new(witness_parameter(witness))),
+        ttl: options.ttl,
         ..Default::default()
     };
     let mut state = DIDWebVHState::default();
@@ -90,24 +118,69 @@ pub async fn create(document: &Value, update_secret_jwk: &str, update_keys: &[St
 }
 
 /// The log, loaded and verified, ready to be continued.
+///
+/// Verified but for its witness proofs: it is the holder's own, which the holder
+/// wrote, and continuing it needs nothing a witness says. (Those are for whoever
+/// reads it from its host, who has the host's word for it and nothing else.)
 async fn load(did: &str, log: &str) -> Result<DIDWebVHState, String> {
     let mut state = DIDWebVHState::default();
-    state.resolve_log(did, log, None).await.map_err(|e| format!("the log doesn't verify: {e}"))?;
-    Ok(state)
+    let verified = state.resolve_log(did, log, None).await.map(|_| ());
+    // Every entry verified before the witnesses' proofs were looked at.
+    let entries = log.lines().filter(|line| !line.trim().is_empty()).count();
+    match verified {
+        Ok(()) => Ok(state),
+        Err(DIDWebVHError::WitnessProofError(_)) if state.log_entries().len() == entries => Ok(state),
+        Err(e) => Err(format!("the log doesn't verify: {e}")),
+    }
 }
 
 /// Appends an entry giving the DID a new document, signed by one of the keys the
 /// log currently lets update it. `update_keys`, if given, replaces that set from
 /// the next entry on: how a device is added to, or taken out of, those that can.
 pub async fn append(did: &str, log: &str, document: &Value, update_secret_jwk: &str, update_keys: Option<&[String]>) -> Result<Written, String> {
+    append_with(did, log, document, update_secret_jwk, update_keys, &Options::default()).await
+}
+
+/// [`append`], with what `options` say from this entry on: a witness (turning
+/// witnessing on for a log published before its host witnessed), a `ttl`.
+pub async fn append_with(did: &str, log: &str, document: &Value, update_secret_jwk: &str, update_keys: Option<&[String]>, options: &Options) -> Result<Written, String> {
     let signer = signing_secret(update_secret_jwk, None)?;
     let mut state = load(did, log).await?;
     let mut parameters = state.log_entries().last().ok_or("the log is empty")?.validated_parameters.clone();
     if let Some(keys) = update_keys {
         parameters.update_keys = Some(Arc::new(keys.iter().cloned().map(Multibase::new).collect()));
     }
+    if let Some(witness) = &options.witness {
+        parameters.witness = Some(Arc::new(witness_parameter(witness)));
+    }
+    if let Some(ttl) = options.ttl {
+        parameters.ttl = Some(ttl);
+    }
     state.create_log_entry(None, document, &parameters, &signer).await.map_err(|e| e.to_string())?;
     written(&state)
+}
+
+/// The `did:key` a witness signs as, for the key `witness_secret_jwk` (Ed25519):
+/// what a log's `witness` parameter names.
+pub fn witness_did(witness_secret_jwk: &str) -> Result<String, String> {
+    Ok(format!("did:key:{}", public_multikey(witness_secret_jwk)?))
+}
+
+/// A witness's proof that it has seen the entry `version_id` (did:webvh 1.0, "The
+/// Witness Proofs File"): `eddsa-jcs-2022` over `{ "versionId": version_id }`,
+/// `proofPurpose` `assertionMethod`, by `did:key:<key>#<key>`. A proof for an
+/// entry stands for every entry before it too.
+pub async fn witness_proof(version_id: &str, witness_secret_jwk: &str) -> Result<Value, String> {
+    let signer = signing_secret(witness_secret_jwk, None)?;
+    let options = SignOptions::new().with_proof_purpose("assertionMethod");
+    let proof = DataIntegrityProof::sign(&json!({ "versionId": version_id }), &signer, options).await.map_err(|e| e.to_string())?;
+    serde_json::to_value(proof).map_err(|e| e.to_string())
+}
+
+/// `did-witness.json` holding `proofs` (`(versionId, proof)`, oldest first), one
+/// witness's each: `[{ "versionId", "proof": [proof] }]`.
+pub fn witness_file(proofs: &[(String, Value)]) -> String {
+    Value::Array(proofs.iter().map(|(version_id, proof)| json!({ "versionId": version_id, "proof": [proof] })).collect()).to_string()
 }
 
 /// Appends the entry that ends the DID.

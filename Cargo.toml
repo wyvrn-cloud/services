@@ -25,6 +25,7 @@ didcomm-core = { git = "https://github.com/wyvrn-cloud/didcomm", rev = "d0e7df3c
 didcomm-crypto-askar = { git = "https://github.com/wyvrn-cloud/didcomm", rev = "d0e7df3c3e882db5750c50c19fe86d994c34ea7d" }
 didcomm-quickstart = { git = "https://github.com/wyvrn-cloud/didcomm", rev = "d0e7df3c3e882db5750c50c19fe86d994c34ea7d" }
 didcomm-resolver-peer = { git = "https://github.com/wyvrn-cloud/didcomm", rev = "d0e7df3c3e882db5750c50c19fe86d994c34ea7d" }
+didcomm-resolver-webvh = { git = "https://github.com/wyvrn-cloud/didcomm", rev = "d0e7df3c3e882db5750c50c19fe86d994c34ea7d" }
 
 anyhow = "1"
 async-trait = "0.1"

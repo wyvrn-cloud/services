@@ -63,6 +63,16 @@ impl Location {
         }
     }
 
+    /// `did-witness.json`, beside the log: the witnesses' proofs, for a log that
+    /// names witnesses.
+    pub fn witness(&self) -> String {
+        if self.path.is_empty() {
+            format!("https://{}/.well-known/did-witness.json", self.host)
+        } else {
+            format!("{}/did-witness.json", self.base())
+        }
+    }
+
     /// `whois.vp`: beside the log, and never under `.well-known`.
     pub fn whois(&self) -> String {
         format!("{}/whois.vp", self.base())
@@ -84,6 +94,7 @@ mod tests {
         assert_eq!(alice.scid.as_deref(), Some("QmScid"));
         assert_eq!(alice.log(), "https://id.example/alice/did.jsonl");
         assert_eq!(alice.whois(), "https://id.example/alice/whois.vp");
+        assert_eq!(alice.witness(), "https://id.example/alice/did-witness.json");
         let web = Location::of("did:web:id.example:alice").unwrap();
         assert_eq!(web.web_document(), "https://id.example/alice/did.json");
         assert!(web.same_place(&alice));
