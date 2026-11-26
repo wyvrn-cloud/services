@@ -17,6 +17,8 @@
 //!   community.
 //!
 //! - [`write`]: the holder's side -- writing a log, and signing what is uploaded.
+//! - [`recovery`]: a recovery key's or passkey's co-signature of a log entry,
+//!   for a host that holds back what takes something away.
 //! - [`read`]: all of the reading, one file at a time, for a caller that does its
 //!   own fetching.
 //!
@@ -33,6 +35,7 @@ pub mod linked;
 pub mod member;
 pub mod presentation;
 pub mod read;
+pub mod recovery;
 pub mod resolve;
 pub mod urls;
 pub mod verify;

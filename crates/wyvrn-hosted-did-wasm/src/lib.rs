@@ -27,6 +27,33 @@ pub async fn hosted_append(did: String, log: String, document_json: String, upda
     api::append(&did, &log, &document_json, &update_secret_jwk, &update_keys_json).await.map_err(rejected)
 }
 
+/// Writes a DID's first log entry naming the host's witness, and a `ttl`:
+/// `options_json` is `{witness?, ttl?}`.
+#[wasm_bindgen(js_name = hostedCreateWith)]
+pub async fn hosted_create_with(document_json: String, update_secret_jwk: String, update_keys_json: String, options_json: String) -> Result<String, JsValue> {
+    api::create_with(&document_json, &update_secret_jwk, &update_keys_json, &options_json).await.map_err(rejected)
+}
+
+/// Appends a log entry, with `options_json` `{witness?, ttl?}`.
+#[wasm_bindgen(js_name = hostedAppendWith)]
+pub async fn hosted_append_with(did: String, log: String, document_json: String, update_secret_jwk: String, update_keys_json: String, options_json: String) -> Result<String, JsValue> {
+    api::append_with(&did, &log, &document_json, &update_secret_jwk, &update_keys_json, &options_json).await.map_err(rejected)
+}
+
+/// A recovery key's co-signature of a log entry: the `recovery_proof` a
+/// did-hosting `publish` or `cosign` carries.
+#[wasm_bindgen(js_name = hostedAddressEntryProof)]
+pub fn hosted_address_entry_proof(version_id: String, recovery_secret_jwk: String, key: String) -> Result<String, JsValue> {
+    api::address_entry_proof(&version_id, &recovery_secret_jwk, &key).map_err(rejected)
+}
+
+/// The recovery key a `recovery_proof` of the entry `version_id` is by, or why
+/// it doesn't hold against the document.
+#[wasm_bindgen(js_name = hostedCheckAddressEntryProof)]
+pub fn hosted_check_address_entry_proof(proof_json: String, document_json: String, version_id: String) -> Result<String, JsValue> {
+    api::check_address_entry_proof(&proof_json, &document_json, &version_id).map_err(rejected)
+}
+
 /// Appends the entry that ends the DID.
 #[wasm_bindgen(js_name = hostedDeactivate)]
 pub async fn hosted_deactivate(did: String, log: String, update_secret_jwk: String) -> Result<String, JsValue> {

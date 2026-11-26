@@ -16,16 +16,27 @@ pub struct Verified {
 
 /// Verifies `log` as the history of `did`: its SCID against the first entry, each
 /// entry against the one before, every proof against the keys allowed to update at
-/// that point. The error says what is wrong.
-pub async fn log(did: &str, log: &str) -> Result<Verified, String> {
+/// that point, and, where the log names witnesses, `witness_proofs` (its
+/// `did-witness.json`) against them: an entry no witness has signed for is not
+/// the DID's yet (did-hosting/1.0, "The host as a witness"). The error says what
+/// is wrong.
+pub async fn log(did: &str, log: &str, witness_proofs: Option<&str>) -> Result<Verified, String> {
     let mut state = DIDWebVHState::default();
-    let (_, metadata) = state.resolve_log(did, log, None).await.map_err(|e| format!("the log doesn't verify: {e}"))?;
+    let (_, metadata) = state.resolve_log(did, log, witness_proofs).await.map_err(|e| format!("the log doesn't verify: {e}"))?;
     let last = state.log_entries().last().ok_or("the log is empty")?;
     let document = last.get_did_document().map_err(|e| format!("the log gives no document: {e}"))?;
     if document["id"].as_str() != Some(did) {
         return Err(format!("the log is not {did}'s"));
     }
     Ok(Verified { document, version_id: metadata.version_id, deactivated: metadata.deactivated })
+}
+
+/// Whether any entry of `log` names witnesses: then its `did-witness.json` has to
+/// be read beside it, and its proofs verify, for the log to.
+pub fn needs_witness_proofs(log: &str) -> bool {
+    log.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).any(|entry| {
+        entry["parameters"]["witness"]["witnesses"].as_array().is_some_and(|witnesses| !witnesses.is_empty())
+    })
 }
 
 /// The DIDs a document says are also its subject.

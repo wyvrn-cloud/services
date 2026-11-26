@@ -5487,6 +5487,7 @@ dependencies = [
  "didwebvh-rs",
  "ed25519-dalek 2.2.0",
  "flate2",
+ "p256 0.13.2",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
