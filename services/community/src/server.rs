@@ -213,7 +213,10 @@ pub fn build_agent_for(config: &Config, identity: Identity, profile_env: Option<
         // A post is reacted to, changed, taken back and pinned as any message is.
         .with_protocol(community::MESSAGE_REACTIONS, &["observer"])
         .with_protocol(community::MESSAGE_EDITS, &["observer"])
-        .with_protocol(community::MESSAGE_PINS, &["participant"]);
+        .with_protocol(community::MESSAGE_PINS, &["participant"])
+        // A member that speaks as its public address is followed there (community/1.0,
+        // "A member may move to its public address").
+        .with_protocol(wyvrn_service::named::DID_HOSTING, &[wyvrn_service::named::CORRESPONDENT]);
     // Voice channels, where the server has them; and the live connection they
     // need, listed after the address messages are posted to.
     let features = if config.voice.is_some() { features.with_protocol(voice::PIURI, &["server"]) } else { features };
@@ -449,12 +452,17 @@ impl CommunityService {
         // join from a DID that names none, or none that names it back, is refused
         // before anything else is done with it. A ban then follows the address.
         if received.message["type"] == crate::community::JOIN && store.member(&sender)?.is_none() && state.community.requires_address()? {
-            let named: Vec<String> = match state.resolver.resolve(&sender).await {
+            let mut named: Vec<String> = match state.resolver.resolve(&sender).await {
                 // At most five of the names a document gives are looked up (WYV-62):
                 // each is a resolution, and a document can list any number.
                 Ok(document) => document["alsoKnownAs"].as_array().into_iter().flatten().filter_map(Value::as_str).take(5).map(str::to_string).collect(),
                 Err(_) => Vec::new(),
             };
+            // A member that writes as its public address has one by the same rules: the
+            // did:webvh it writes from is the address (community/1.0).
+            if wyvrn_service::named::is_hosted(&sender) {
+                named.insert(0, sender.clone());
+            }
             // Where the community lists hosts, only a verified did:webvh at one of them
             // counts (community/1.0's address_hosts): the resolver verified its log.
             let hosts = state.community.address_hosts()?;

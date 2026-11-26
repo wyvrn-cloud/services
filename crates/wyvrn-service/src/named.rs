@@ -17,6 +17,13 @@ use didcomm_core::resolver::DIDResolver;
 use serde_json::Value;
 use wyvrn_hosted_did::keys::keys_for;
 
+/// did-hosting/1.0, which a service that follows a correspondent to its public
+/// address discloses in the role [`CORRESPONDENT`] (did-hosting/1.0, "Roles"): it
+/// resolves a `did:webvh` sender, follows a `from_prior` onto one, and reads its log
+/// again for a key its copy doesn't list (as the DIDComm library's resolver does).
+pub const DID_HOSTING: &str = "https://wyvrn.app/did-hosting/1.0";
+pub const CORRESPONDENT: &str = "correspondent";
+
 /// Whether a DID is one fetched from a host, whose document can change: a
 /// `did:web` or `did:webvh`. Only those are looked into; any other DID in a
 /// setting is who it says, and matched by name.
@@ -77,12 +84,22 @@ async fn keys_of(resolver: &dyn DIDResolver, did: &str) -> Vec<String> {
 /// The DID among `named` whose holder wrote this message: a hosted one that lists
 /// the key `sender` authenticated with (`kid`). `None` if there is none, or the
 /// message was authenticated by nobody.
+///
+/// A sender that is itself a hosted DID `named` names -- an account speaking as
+/// its public address (multi-device/1.0, "Speaking as a public address") -- is
+/// that DID's holder when the key it wrote with is one its own document lists:
+/// nothing else is looked up for it.
 pub async fn holder_among<'a>(resolver: &dyn DIDResolver, named: &'a [String], sender: &str, kid: Option<&str>) -> Option<&'a str> {
-    let hosted: Vec<&String> = named.iter().filter(|did| is_hosted(did) && did.as_str() != sender).collect();
+    let hosted: Vec<&String> = named.iter().filter(|did| is_hosted(did)).collect();
     if hosted.is_empty() {
         return None;
     }
-    let key = key_written_with(&resolver.resolve(sender).await.ok()?, kid?)?;
+    let sender_document = resolver.resolve(sender).await.ok()?;
+    let key = key_written_with(&sender_document, kid?)?;
+    if let Some(itself) = hosted.iter().find(|did| did.as_str() == sender) {
+        return Some(itself.as_str());
+    }
+    let hosted: Vec<&String> = hosted.into_iter().filter(|did| did.as_str() != sender).collect();
     for did in &hosted {
         if keys_of(resolver, did).await.contains(&key) {
             return Some(did.as_str());
@@ -159,6 +176,20 @@ mod tests {
         async fn resolve_fresh(&self, _did: &str) -> Result<Option<Value>, ResolutionError> {
             Ok(self.fresh.clone())
         }
+    }
+
+    #[tokio::test]
+    async fn a_sender_that_is_the_named_address_is_its_holder_by_a_key_it_lists() {
+        let address = "did:webvh:QmScid:id.example:speaks";
+        let own = document(address, &[("z6LSphone", "z6LSphone")], &[("z6Mksigns", "z6Mksigns")]);
+        // The resolver gives the address's own document for the address, and nothing
+        // newer: nothing more is asked of it.
+        let resolver = Held { sender: Value::Null, held: own.clone(), fresh: None };
+        let named = vec!["did:web:id.example:speaks".to_string(), address.to_string()];
+        assert_eq!(holder_among(&resolver, &named, address, Some(&format!("{address}#z6LSphone"))).await, Some(address));
+        // Not by a key it doesn't list for agreeing keys, nor by nobody.
+        assert_eq!(holder_among(&resolver, &named, address, Some(&format!("{address}#z6Mksigns"))).await, None);
+        assert_eq!(holder_among(&resolver, &named, address, None).await, None);
     }
 
     #[tokio::test]

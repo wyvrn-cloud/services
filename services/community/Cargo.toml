@@ -66,6 +66,8 @@ chrono = { workspace = true }
 aes-gcm = "0.10"
 
 [dev-dependencies]
+# A member speaking as a did:webvh at localhost (tests/community.rs).
+didcomm-resolver-webvh = { workspace = true }
 # Linked-account credentials signed in claims.rs' tests.
 affinidi-data-integrity = { workspace = true }
 mysql = { workspace = true }

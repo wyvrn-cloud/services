@@ -1385,9 +1385,10 @@ impl Community {
     /// Lets in everyone the configuration names, and makes its admins admins. It
     /// never takes anyone out, or lets in a DID a member has since left.
     ///
-    /// Someone named by a public address is not let in here: nobody writes from
-    /// one, so that would be a second member for whoever it names, who is let in
-    /// under the DID they do write from (`wyvrn_service::named`).
+    /// Someone named by a public address is not let in here: they are let in under
+    /// the DID they write from when they write (`wyvrn_service::named`), which is
+    /// the address itself only where they speak as it; let in here, it would be a
+    /// second member for whoever writes from another.
     pub fn admit_configured(&self, now: i64) -> anyhow::Result<()> {
         let written_from = |did: &&String| !wyvrn_service::named::is_hosted(did);
         for did in self.config.admins.iter().chain(&self.config.members).filter(|did| !written_from(did)) {

@@ -445,3 +445,53 @@ async fn a_channel_holding_an_address_is_read_there_and_speaks_as_it_and_subscri
     assert_eq!(answer["body"]["subscribed"], false);
     assert_eq!(answer["from"], address);
 }
+
+/// Someone speaking as their public address: a `did:webvh` at `localhost` of their
+/// keys, its log served from where their messages arrive.
+async fn start_at_address(identity: Identity) -> Peer {
+    didcomm_resolver_webvh::allow_private_hosts();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("http://127.0.0.1:{port}/");
+    let keys: Value = serde_json::from_str(&identity.to_json().unwrap()).unwrap();
+    let jwk = keys["verification_key"].to_string();
+    let mut document = identity.did_document(&format!("did:webvh:{{SCID}}:localhost%3A{port}:ada"), &url);
+    document["alsoKnownAs"] = json!([format!("did:web:localhost%3A{port}:ada")]);
+    let update_key = wyvrn_hosted_did::write::public_multikey(&jwk).unwrap();
+    let written = wyvrn_hosted_did::write::create(&document, &jwk, &[update_key]).await.unwrap();
+    let agent = Arc::new(Agent::with_did(identity, &written.did));
+    let (sent, inbox) = mpsc::unbounded_channel();
+    let log = format!("{}\n", written.log);
+    let app = Router::new()
+        .route(
+            "/",
+            post(|State((agent, sent)): State<(Arc<Agent>, mpsc::UnboundedSender<Value>)>, body: Bytes| async move {
+                let received = agent.receive(&body).await.expect("a message this address can read");
+                let _ = sent.send(received.message);
+            }),
+        )
+        .route("/ada/did.jsonl", axum::routing::get(move || async move { log }))
+        .with_state((agent.clone(), sent));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    Peer { agent, inbox: Mutex::new(inbox) }
+}
+
+#[tokio::test]
+async fn an_admin_named_by_a_public_address_is_one_when_they_write_as_it_and_the_channel_says_it_follows() {
+    let ada = start_at_address(Identity::generate().unwrap()).await;
+    let channel = start_channel(&[ada.did()]).await;
+    let someone = Peer::start().await;
+    someone.send(&channel.did, channel::SUBSCRIBE, json!({})).await;
+    someone.next_of(channel::SUBSCRIPTION).await;
+
+    // The channel says it follows a subscriber to its address.
+    let queries = json!({ "type": "https://didcomm.org/discover-features/2.0/queries", "body": { "queries": [{ "feature-type": "protocol", "match": "https://wyvrn.app/did-hosting/1.0" }] } });
+    let disclosed = someone.agent.request(&channel.did, &queries).await.unwrap().message;
+    assert_eq!(disclosed["body"]["disclosures"][0]["roles"], json!(["correspondent"]), "{disclosed}");
+
+    // Ada writes as the address the configuration names: she is its admin.
+    ada.send(&channel.did, channel::SUBSCRIBE, json!({})).await;
+    assert_eq!(ada.next_of(channel::SUBSCRIPTION).await["body"]["role"], "admin");
+    ada.send(&channel.did, channel::POST, json!({"content": "From the address itself."})).await;
+    assert_eq!(someone.next_of(channel::ANNOUNCEMENT).await["body"]["content"], "From the address itself.");
+}

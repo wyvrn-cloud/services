@@ -5510,3 +5510,115 @@ async fn a_role_members_take_themselves_grants_nothing_that_moderates() {
     assert_eq!(picked["body"]["state"], "channels", "{started} {next} {picked}");
     assert_eq!(store.member_roles(&member.did()).unwrap(), vec![glass.id.clone()]);
 }
+
+/// Someone speaking as their public address: a `did:webvh` at `localhost` of the
+/// keys of `identity`, its log served from where its messages arrive, naming
+/// `peer` (the `did:peer:4` it was) where it was one.
+async fn start_at_address(server: &Running, identity: Identity, peer: Option<&str>) -> Peer {
+    didcomm_resolver_webvh::allow_private_hosts();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("http://127.0.0.1:{port}/");
+    let domain = format!("localhost%3A{port}");
+    let keys: Value = serde_json::from_str(&identity.to_json().unwrap()).unwrap();
+    let jwk = keys["verification_key"].to_string();
+    let mut document = identity.did_document(&format!("did:webvh:{{SCID}}:{domain}:alice"), &url);
+    document["alsoKnownAs"] = json!([format!("did:web:{domain}:alice")].into_iter().chain(peer.map(str::to_string)).collect::<Vec<_>>());
+    let update_key = wyvrn_hosted_did::write::public_multikey(&jwk).unwrap();
+    let written = wyvrn_hosted_did::write::create(&document, &jwk, &[update_key]).await.unwrap();
+    let agent = Arc::new(Agent::with_did(identity, &written.did));
+    let (sent, inbox) = mpsc::unbounded_channel();
+    let log = format!("{}\n", written.log);
+    let app = Router::new()
+        .route(
+            "/",
+            post(|State((agent, sent)): State<(Arc<Agent>, mpsc::UnboundedSender<Value>)>, body: Bytes| async move {
+                let received = agent.receive(&body).await.expect("a message this address can read");
+                let _ = sent.send(received.message);
+            }),
+        )
+        .route("/alice/did.jsonl", axum::routing::get(move || async move { log }))
+        .with_state((agent.clone(), sent));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    Peer { agent, server: server.did.clone(), inbox: Mutex::new(inbox) }
+}
+
+#[tokio::test]
+async fn a_member_speaking_as_its_public_address_joins_posts_and_has_an_address_where_one_is_required() {
+    let server = start_server("admission = \"open\"").await;
+    let owner = Peer::start(&server).await;
+    server.admit(&[&owner]);
+    owner.community("join", json!({})).await;
+    let channel = open_channel(&owner, "general").await;
+
+    // The server says it follows a member to its address (did-hosting/1.0's correspondent).
+    let queries = json!({ "type": "https://didcomm.org/discover-features/2.0/queries", "body": { "queries": [{ "feature-type": "protocol", "match": "https://wyvrn.app/did-hosting/1.0" }] } });
+    let disclosed = owner.agent.request(&server.did, &queries).await.unwrap().message;
+    assert_eq!(disclosed["body"]["disclosures"][0]["roles"], json!(["correspondent"]), "{disclosed}");
+
+    // Only someone with an address is let in: a member writing as theirs has one.
+    owner.community("set-admission", json!({ "requires_address": true })).await;
+    let alice = start_at_address(&server, Identity::generate().unwrap(), None).await;
+    assert!(alice.did().starts_with("did:webvh:"));
+    let joined = alice.community("join", json!({})).await;
+    assert_eq!(kind(&joined), "community", "{joined}");
+    let posted = alice.community("post", json!({ "channel": channel, "id": "p1", "content": "hello from my address" })).await;
+    assert_eq!(kind(&posted), "posted", "{posted}");
+    let id = server.id(&alice);
+    assert_eq!(owner.next_message().await["author"]["member"], id);
+    // What is posted reaches it, at its address.
+    owner.community("post", json!({ "channel": channel, "id": "p2", "content": "welcome" })).await;
+    let sent = loop {
+        let got = alice.next_of(&format!("{C}message")).await;
+        if got["body"]["id"] == "p2" {
+            break got;
+        }
+    };
+    assert_eq!(sent["to"], json!([alice.did()]));
+
+    // An address at a host the community doesn't list doesn't count.
+    owner.community("set-admission", json!({ "address_hosts": ["id.wyvrn.app"] })).await;
+    let bob = start_at_address(&server, Identity::generate().unwrap(), None).await;
+    assert_eq!(bob.community("join", json!({})).await["body"]["code"], "e.p.msg.address-required");
+}
+
+#[tokio::test]
+async fn a_member_moving_from_a_long_did_peer_4_to_its_public_address_keeps_its_roles_and_is_left_only_by_the_address() {
+    use didcomm_crypto_askar::{AskarCryptoService, AskarSigningKey};
+    let server = start_server("").await;
+    let admin = Peer::start(&server).await;
+    let first = Identity::generate().unwrap();
+    let same_keys = || Identity::from_json(&first.to_json().unwrap()).unwrap();
+    let signer = same_keys();
+    // A multi-device account's DID: past what a DID column holds, kept by its short form.
+    let long = Peer::start_long(&server, same_keys(), 5_000).await;
+    server.admit(&[&admin, &long]);
+    let channel = open_channel(&admin, "general").await;
+    admin.community("join", json!({})).await;
+    assert_eq!(kind(&long.community("join", json!({})).await), "community");
+    let id = server.id(&long);
+    let made = admin.community("set-member", json!({ "member": id, "role": "moderator" })).await;
+    assert_eq!(kind(&made), "members", "{made}");
+
+    // It moves to its address, which holds the same keys, as any change of DID.
+    let address = start_at_address(&server, same_keys(), Some(&long.did())).await;
+    let key = AskarSigningKey::new(format!("{}#key-1", long.did()), signer.verification_key().clone());
+    let from_prior = didcomm_core::rotation::build_from_prior(&AskarCryptoService, &long.did(), &address.did(), &key, wyvrn_service::now()).await.unwrap();
+    let message = json!({ "type": format!("{C}post"), "from_prior": from_prior, "body": { "channel": channel, "id": "p1", "content": "at my address now" }, "return_route": "all" });
+    let posted = address.agent.send(&server.did, &message).await.unwrap().unwrap().message;
+    assert_eq!(kind(&posted), "posted", "{posted}");
+    assert_eq!(server.id(&address), id);
+    assert_eq!(server.state.community.powers(&address.did()).unwrap().older_role(), "moderator");
+    assert!(server.state.community.store.member(&long.did()).unwrap().is_none());
+    assert_eq!(server.state.community.store.current_did(&long.did()).unwrap(), address.did());
+
+    // The DID it left can't move it again: whoever still holds its keys is not it.
+    let elsewhere = Peer::start(&server).await;
+    let thief_key = AskarSigningKey::new(format!("{}#key-1", long.did()), signer.verification_key().clone());
+    let away = didcomm_core::rotation::build_from_prior(&AskarCryptoService, &long.did(), &elsewhere.did(), &thief_key, wyvrn_service::now()).await.unwrap();
+    let message = json!({ "type": format!("{C}join"), "from_prior": away, "body": {}, "return_route": "all" });
+    elsewhere.agent.send(&server.did, &message).await.unwrap();
+    assert_eq!(server.state.community.store.current_did(&long.did()).unwrap(), address.did());
+    assert_eq!(server.state.community.powers(&address.did()).unwrap().older_role(), "moderator");
+    assert_ne!(server.state.community.store.member(&elsewhere.did()).unwrap().map(|m| m.role), Some(wyvrn_community::store::Role::Admin));
+}
