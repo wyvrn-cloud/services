@@ -188,7 +188,9 @@ pub fn run(host: &Host, name: &str, asked: &Asked, now: i64) -> anyhow::Result<(
             println!("    not brought over: {failed}");
         }
     }
-    println!("members read it the next time they open those channels and scroll back; nobody is notified");
+    // The channels' imported posts are in what members are told of the community.
+    store.ask_to_tell_members()?;
+    println!("members are told the community as it now stands within a minute; they read the posts the next time they open those channels and scroll back, and nobody is notified");
     Ok(())
 }
 
@@ -241,7 +243,8 @@ fn refresh(
         }
     }
     if !asked.dry_run {
-        println!("members' apps take up the changed posts as they do an edit");
+        store.ask_to_tell_members()?;
+        println!("members are told the community as it now stands within a minute, and their apps take up the changed posts as they do an edit");
     }
     Ok(())
 }
@@ -278,7 +281,8 @@ pub fn picture_sizes(host: &Host, name: &str, dry_run: bool) -> anyhow::Result<(
         println!("  {} posts changed while this ran: run it again for them", filled.changed_meanwhile);
     }
     if !dry_run && filled.posts > 0 {
-        println!("members' apps take up the changed posts as they do an edit");
+        store.ask_to_tell_members()?;
+        println!("members are told the community as it now stands within a minute, and their apps take up the changed posts as they do an edit");
     }
     Ok(())
 }
@@ -294,5 +298,21 @@ pub fn import_discord_roles(host: &Host, name: &str, folder: &Path, dry_run: boo
     let store = wyvrn_community::store::Store::open(&stores.community)?;
     let report = wyvrn_community::discord_roles::import(&store, &members, &roles, &channels, dry_run, now)?;
     println!("{}", report.markdown());
+    if !dry_run {
+        // Roles given to members who claimed their accounts are in what each is told.
+        store.ask_to_tell_members()?;
+    }
+    Ok(())
+}
+
+/// `tell-members`: the community `name`'s running server asked to send every
+/// joined member the community as it now stands, as when its channels change, so
+/// that each app asks for whatever changed since it last did (`changes-request`).
+/// Safe at any time, changed or not: done within a minute, once however often asked.
+pub fn tell_members(host: &Host, name: &str) -> anyhow::Result<()> {
+    let record = host.registry.get(name)?.with_context(|| format!("there is no community called {name}"))?;
+    let stores = host.stores(&record, record.storage)?;
+    wyvrn_community::store::Store::open(&stores.community)?.ask_to_tell_members()?;
+    println!("{name}'s members are told the community as it now stands within a minute (while the host is running)");
     Ok(())
 }

@@ -298,6 +298,9 @@ pub struct Mention {
 pub const COUNT_THREAD: &str = "thread";
 pub const COUNT_FORUM_POSTS: &str = "forum_posts";
 pub const COUNT_SECTION: &str = "section";
+/// The setting that asks the running server to tell members the community as it
+/// stands ([`Store::ask_to_tell_members`]).
+pub const TELL_MEMBERS: &str = "tell_members";
 /// Between a forum's id and a section's in a section count's `subject`.
 const SECTION_MARK: char = '\u{1f}';
 /// A post in a forum that counts towards its author's posts.
@@ -2830,6 +2833,22 @@ impl Store {
         Ok(())
     }
 
+    /// Asks the running server to send every joined member the community as it now
+    /// stands (as when its channels change), whose `latest_rev` has each app ask
+    /// for what changed. For changes made where no member is told of them: the
+    /// host's commands (an import, a refresh), which write to the store from
+    /// another process, or `tell-members` by hand. Taken up within
+    /// [`TELL_MEMBERS_LOOKED_AT_EVERY`](crate::server::TELL_MEMBERS_LOOKED_AT_EVERY).
+    pub fn ask_to_tell_members(&self) -> Result<()> {
+        self.set_setting(TELL_MEMBERS, "1")
+    }
+
+    /// Whether members were asked to be told ([`Self::ask_to_tell_members`]), the
+    /// asking taken away: of two servers looking at once, only one finds it.
+    pub fn take_tell_members(&self) -> Result<bool> {
+        Ok(self.db.lock().execute("DELETE FROM settings WHERE name = ?1", params![TELL_MEMBERS])? > 0)
+    }
+
     // --- Roles --------------------------------------------------------------------
 
     /// Every role, highest first, `everyone` last.
@@ -5126,5 +5145,27 @@ mod long_dids {
         let store = Store::open(&location).unwrap();
         assert_eq!(store.members().unwrap().iter().map(|m| m.did.clone()).collect::<Vec<_>>(), vec![ada.clone(), bea.clone()]);
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod tell_members {
+    use super::*;
+
+    #[test]
+    fn asking_to_tell_members_is_found_once_by_another_opening_of_the_store() {
+        // The host's command and the running server open the same store apart.
+        let path = std::env::temp_dir().join(format!("wyvrn-community-tell-{}.db", uuid::Uuid::new_v4()));
+        let location = Location::Sqlite(path.clone());
+        let (command, server) = (Store::open(&location).unwrap(), Store::open(&location).unwrap());
+        assert!(!server.take_tell_members().unwrap());
+        command.ask_to_tell_members().unwrap();
+        // Asked twice before it is looked at: told once.
+        command.ask_to_tell_members().unwrap();
+        assert!(server.take_tell_members().unwrap());
+        assert!(!server.take_tell_members().unwrap());
+        assert!(!command.take_tell_members().unwrap());
+        drop((command, server));
+        let _ = std::fs::remove_file(path);
     }
 }

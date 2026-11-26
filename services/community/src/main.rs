@@ -8,6 +8,7 @@ wyvrn-community [--config <path>] add <did> [admin]    let someone in, or make t
 wyvrn-community [--config <path>] remove <did>         take someone out
 wyvrn-community [--config <path>] channels             every channel
 wyvrn-community [--config <path>] recount              clear the kept counts and count again
+wyvrn-community [--config <path>] tell-members         every joined member sent the community as it stands, so each app asks what changed
 
 The config path is --config, else $COMMUNITY_CONFIG, else config/default.toml.
 Only someone let in is answered. A DID is the ID their app shows for them.";
@@ -48,6 +49,11 @@ async fn main() -> anyhow::Result<()> {
             for channel in wyvrn_community::serve::open_store(&config)?.channels()? {
                 println!("{}\t{}\t{}\t{}", channel.id, if channel.closed { "closed" } else { "open" }, channel.latest_seq, channel.name);
             }
+            Ok(())
+        }
+        ["tell-members"] => {
+            wyvrn_community::serve::open_store(&config)?.ask_to_tell_members()?;
+            println!("members are told the community as it now stands within a minute (while the server is running)");
             Ok(())
         }
         ["recount"] => {

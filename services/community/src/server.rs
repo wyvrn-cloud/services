@@ -1526,6 +1526,31 @@ pub fn prune_once(state: &AppState) {
     }
 }
 
+/// How often the store is looked at for members to be told the community as it
+/// stands ([`crate::store::Store::ask_to_tell_members`]).
+pub const TELL_MEMBERS_LOOKED_AT_EVERY: Duration = Duration::from_secs(30);
+
+/// Every joined member told the community as it now stands, whenever that was
+/// asked for in the store: by the host's commands, which change posts from another
+/// process (an import, a refresh), by `tell-members`, or by claims made at start.
+/// Its `latest_rev` has each app ask for what changed (`changes-request`); without
+/// it, an app asks only at its daily look, and changes it wasn't sent as they were
+/// made (no one sent them) waited for that (seen 2026-11-26: a refresh of #fanart
+/// and the posts claimed at start showed in no app).
+pub async fn run_member_telling(state: Arc<AppState>) {
+    loop {
+        match state.community.store.take_tell_members() {
+            Ok(true) => {
+                tracing::info!("telling members the community as it now stands, as asked");
+                tell_everyone_later(&state, None);
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(%error, "couldn't look at whether to tell members the community"),
+        }
+        tokio::time::sleep(TELL_MEMBERS_LOOKED_AT_EVERY).await;
+    }
+}
+
 /// How often the people banned are looked at again for accounts they linked since.
 pub const BANS_LOOKED_AT_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 
@@ -1549,12 +1574,25 @@ pub async fn claim_from_kept_profiles(state: Arc<AppState>) {
         Ok(kept) => kept,
         Err(error) => return tracing::warn!(%error, "couldn't read the profiles to look at for claims"),
     };
+    let mut claimed_any = false;
     for (did, address, linked) in kept {
-        let unclaimed = linked.iter().filter_map(crate::claims::discord_account).any(|id| {
-            matches!(state.community.store.claim(id), Ok(None)) && matches!(state.community.store.has_imported_from(id), Ok(true))
-        });
-        if unclaimed {
+        let unclaimed: Vec<String> = linked
+            .iter()
+            .filter_map(crate::claims::discord_account)
+            .filter(|id| matches!(state.community.store.claim(id), Ok(None)) && matches!(state.community.store.has_imported_from(id), Ok(true)))
+            .map(str::to_string)
+            .collect();
+        if !unclaimed.is_empty() {
             consider_profile(Arc::clone(&state), did, address, linked).await;
+            // (One not proven now stays unclaimed, and asks nothing of anyone.)
+            claimed_any |= unclaimed.iter().any(|id| matches!(state.community.store.claim(id), Ok(Some(_))));
+        }
+    }
+    // What was claimed is sent as changed to whoever can be reached now; the rest
+    // are told the community, and ask for it.
+    if claimed_any {
+        if let Err(error) = state.community.store.ask_to_tell_members() {
+            tracing::warn!(%error, "couldn't ask for members to be told of the claims made at start");
         }
     }
 }

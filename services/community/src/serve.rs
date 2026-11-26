@@ -184,6 +184,7 @@ pub async fn serve(config: Config, assistant: Option<Assistant>) -> anyhow::Resu
     tokio::spawn(server::run_voice_sweep(state.clone()));
     tokio::spawn(server::run_ban_watch(state.clone()));
     tokio::spawn(server::claim_from_kept_profiles(state.clone()));
+    tokio::spawn(server::run_member_telling(state.clone()));
     tokio::spawn(server::run_polls(state.clone()));
     if let Some(mediator) = &config.mediator {
         let service = Arc::new(server::CommunityService(state.clone()));

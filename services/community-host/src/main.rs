@@ -71,6 +71,14 @@ wyvrn-community-host [--config <path>] import-discord-roles <name> <folder> [--d
                                                                   roles and overrides; those claimed already
                                                                   are given them now. Again, it updates what
                                                                   is kept. Counts, as Markdown.
+wyvrn-community-host [--config <path>] tell-members <name>
+                                                                  every joined member sent the community as
+                                                                  it now stands, as when its channels change,
+                                                                  so each app asks for what changed since it
+                                                                  last did (it otherwise asks once a day).
+                                                                  The import commands ask for this
+                                                                  themselves; safe at any time. Within a
+                                                                  minute, by the running host.
 wyvrn-community-host [--config <path>] picture-sizes <name> [--dry-run]
                                                                   the pictures of one's posts kept without
                                                                   their width and height (a Discord history
@@ -271,6 +279,10 @@ async fn main() -> anyhow::Result<()> {
             };
             let host = Host::new(config.clone(), registry(&config)?);
             tokio::task::block_in_place(|| wyvrn_community_host::history::import_discord_roles(&host, name, std::path::Path::new(folder), dry_run, now()))
+        }
+        ["tell-members", name] => {
+            let host = Host::new(config.clone(), registry(&config)?);
+            tokio::task::block_in_place(|| wyvrn_community_host::history::tell_members(&host, name))
         }
         ["picture-sizes", name, rest @ ..] => {
             let dry_run = match rest {
