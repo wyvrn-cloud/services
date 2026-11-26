@@ -154,6 +154,11 @@ pub fn category_key(category: &str) -> String {
     format!("category:{category}")
 }
 
+/// Overrides for one member as a set to compare, as [`as_set`].
+fn members_set(overrides: &[crate::discord_roles::MemberOverride]) -> std::collections::BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)> {
+    overrides.iter().filter(|o| !o.allow.is_empty() || !o.deny.is_empty()).map(|o| (o.did.clone(), (o.allow.iter().cloned().collect(), o.deny.iter().cloned().collect()))).collect()
+}
+
 /// Overrides as a set to compare: role -> (allowed, denied), sorted, none empty.
 fn as_set(overrides: &[crate::store::Override]) -> std::collections::BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)> {
     overrides.iter().filter(|o| !o.allow.is_empty() || !o.deny.is_empty()).map(|o| (o.role.clone(), (o.allow.iter().cloned().collect(), o.deny.iter().cloned().collect()))).collect()
@@ -161,10 +166,11 @@ fn as_set(overrides: &[crate::store::Override]) -> std::collections::BTreeMap<St
 
 impl Community {
     /// Whether `channel` has its category's permissions, exactly (Discord's
-    /// "synced"); a channel in no category isn't.
+    /// "synced"), its members' overrides with its roles'; a channel in no category isn't.
     pub fn synced(&self, channel: &Channel) -> anyhow::Result<bool> {
         let Some(category) = &channel.category else { return Ok(false) };
-        Ok(as_set(&self.store.overrides(&category_key(category))?) == as_set(&self.store.overrides(&channel.id)?))
+        let key = category_key(category);
+        Ok(as_set(&self.store.overrides(&key)?) == as_set(&self.store.overrides(&channel.id)?) && members_set(&self.store.member_overrides(&key)?) == members_set(&self.store.member_overrides(&channel.id)?))
     }
 
     /// Gives `channel` its category's permissions, all of them and only them.
@@ -178,6 +184,25 @@ impl Community {
         }
         for o in wanted {
             self.store.set_override(&channel.id, &o.role, &o.allow, &o.deny)?;
+        }
+        let wanted = self.store.member_overrides(&category_key(category))?;
+        for held in self.store.member_overrides(&channel.id)? {
+            if !wanted.iter().any(|o| o.did == held.did) {
+                self.store.set_member_override(&channel.id, &held.did, &[], &[])?;
+            }
+        }
+        for o in wanted {
+            self.store.set_member_override(&channel.id, &o.did, &o.allow, &o.deny)?;
+        }
+        Ok(())
+    }
+
+    /// As [`Self::set_category_override`], for one member.
+    pub fn set_category_member_override(&self, category: &str, did: &str, allow: &[String], deny: &[String]) -> anyhow::Result<()> {
+        let synced: Vec<Channel> = self.store.channels()?.into_iter().filter(|c| c.category.as_deref() == Some(category)).filter(|c| self.synced(c).unwrap_or(false)).collect();
+        self.store.set_member_override(&category_key(category), did, allow, deny)?;
+        for channel in synced {
+            self.sync_with_category(&channel)?;
         }
         Ok(())
     }
@@ -418,6 +443,13 @@ impl Community {
             have.remove(denied);
         }
         have.extend(theirs.iter().flat_map(|o| &o.allow).filter(|p| every.contains(*p)).cloned());
+        // Last, what it says of them alone (discord_roles.rs).
+        if let Some(own) = self.store.member_overrides(&channel.id)?.into_iter().find(|o| o.did == did) {
+            for denied in &own.deny {
+                have.remove(denied);
+            }
+            have.extend(own.allow.iter().filter(|p| every.contains(*p)).cloned());
+        }
         // Whoever opened a channel keeps order in it.
         if channel.created_by == did {
             have.insert("manage_messages".into());
@@ -532,11 +564,13 @@ impl Community {
     /// The roles as `community` lists them: highest first, `everyone` last, without
     /// their permissions.
     pub fn roles_body(&self) -> anyhow::Result<Vec<Value>> {
-        Ok(self
+        let bots = self.bot_role_holders()?;
+        let now = crate::gates::now();
+        self
             .store
             .roles()?
             .iter()
-            .map(|role| {
+            .map(|role| -> anyhow::Result<Value> {
                 let mut listed = json!({
                     "id": role.id,
                     "name": role.name,
@@ -555,9 +589,13 @@ impl Community {
                 if role.permissions.iter().any(|p| p == "administrator") {
                     listed["administrator"] = json!(true);
                 }
-                listed
+                // A bot's own: held by it alone (by its member id).
+                if let Some(bot) = bots.get(&role.id) {
+                    listed["managed"] = json!({ "bot": self.store.member_id(bot, now)? });
+                }
+                Ok(listed)
             })
-            .collect())
+            .collect()
     }
 
     /// Who among the joined holds `permission`.

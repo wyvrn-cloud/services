@@ -144,7 +144,7 @@ pub async fn prefetch(community: &Community, member: &str, message: &mut Value) 
 }
 
 /// A Discord permission set, as its number.
-fn bits(value: &Value) -> u64 {
+pub(crate) fn bits(value: &Value) -> u64 {
     match value {
         Value::String(text) => text.parse().unwrap_or(0),
         Value::Number(n) => n.as_u64().unwrap_or(0),
@@ -153,7 +153,7 @@ fn bits(value: &Value) -> u64 {
 }
 
 /// What `bits` are here, in order.
-fn mapped(bits: u64) -> BTreeSet<String> {
+pub(crate) fn mapped(bits: u64) -> BTreeSet<String> {
     PERMISSIONS.iter().filter(|(bit, _, _)| bits >> bit & 1 == 1).flat_map(|(_, _, ours)| ours.iter()).filter(|p| is_permission(p)).map(|p| p.to_string()).collect()
 }
 
@@ -220,7 +220,7 @@ fn left_out(template: &Value) -> Option<String> {
 
 /// A Discord channel's kind: `text`, `voice`, `forum` or `category`, and what it
 /// is on Discord where that isn't the same (`announcement`, `stage`, `media`).
-fn kind_of(channel: &Value) -> (&'static str, Option<&'static str>) {
+pub(crate) fn kind_of(channel: &Value) -> (&'static str, Option<&'static str>) {
     match channel["type"].as_i64().unwrap_or(0) {
         2 => ("voice", None),
         4 => ("category", None),

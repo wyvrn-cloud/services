@@ -23,6 +23,7 @@ pub mod bots;
 pub mod claims;
 pub mod discord;
 pub mod discord_history;
+pub mod discord_roles;
 pub mod events;
 pub mod filters;
 pub mod forms;

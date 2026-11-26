@@ -5275,3 +5275,113 @@ async fn the_member_list_carries_summaries_of_checked_linked_accounts_and_a_card
     assert_eq!(card["body"]["member"]["profile"]["linkedAccounts"].as_array().unwrap().len(), 12);
     assert_eq!(card["body"]["member"]["profile"]["linkedAccountSummaries"].as_array().unwrap().len(), 11);
 }
+
+#[tokio::test]
+async fn discords_roles_and_overrides_come_with_a_claim_member_overrides_work_out_last_and_a_bot_has_a_role_of_its_own() {
+    use wyvrn_community::discord_history as history;
+    use wyvrn_community::store::RoleDef;
+    let server = start_server("").await;
+    let (owner, moderator, ann, bot) = (Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &moderator, &ann, &bot]);
+    for peer in [&moderator, &ann, &bot] {
+        peer.community("join", json!({})).await;
+    }
+    let channel = open_channel(&owner, "fanart").await;
+    let store = &server.state.community.store;
+    // Artists below Moderator, Elders above it.
+    let role = |id: &str, name: &str| RoleDef { id: id.into(), name: name.into(), color: None, icon: None, position: 1, permissions: Vec::new(), mentionable: false, hoist: false, self_assignable: false };
+    store.save_role(&role("art", "Artists")).unwrap();
+    store.save_role(&role("eld", "Elders")).unwrap();
+    store.rank_roles(&["art".into(), "moderator".into(), "eld".into(), "admin".into()]).unwrap();
+    store.give_role(&moderator.did(), "moderator").unwrap();
+    // Ann's posts on Discord, brought in.
+    let export = history::Export {
+        guild: history::Named { id: "1".into(), name: "G".into() },
+        channel: history::ExportChannel { id: "900".into(), kind: "GuildTextChat".into(), name: "fanart".into(), ..Default::default() },
+        messages: vec![history::Message {
+            id: "10".into(),
+            kind: "Default".into(),
+            timestamp: "2020-01-01T00:00:00+00:00".into(),
+            content: "old art".into(),
+            author: history::User { id: "111".into(), name: "ann".into(), ..Default::default() },
+            ..Default::default()
+        }],
+    };
+    let folder = std::env::temp_dir();
+    let setting = history::Context { folder: &folder, files: None, channel_names: Default::default(), roles: Default::default(), expressions: Default::default(), now: 1 };
+    history::write(store, &export, &store.channel(&channel).unwrap().unwrap(), &setting, |_, _| {}).unwrap();
+    // Discord's member list, roles and channels (synthetic): Ann holds Artists and
+    // Elders there, and #fanart denies her Send Messages.
+    let roles = vec![
+        json!({ "id": "1", "name": "@everyone", "position": 0, "permissions": "0" }),
+        json!({ "id": "71", "name": "Artists", "position": 1, "permissions": "0" }),
+        json!({ "id": "72", "name": "Elders", "position": 2, "permissions": "0" }),
+    ];
+    let channels = vec![json!({ "id": "900", "guild_id": "1", "type": 0, "name": "fanart", "position": 0, "permission_overwrites": [{ "id": "111", "type": 1, "allow": "0", "deny": "2048" }] })];
+    let members = vec![json!({ "user": { "id": "111", "username": "ann" }, "roles": ["71", "72"] })];
+    let report = wyvrn_community::discord_roles::import(store, &members, &roles, &channels, false, 2).unwrap();
+    assert_eq!((report.roles_by_name, report.channels_matched, report.channels_by_history, report.overrides_kept), (2, 1, 1, 1), "{report:?}");
+    // Kept naming the imported author: nothing yet for Ann.
+    let permissions = |told: &Value| told["channels"].as_array().unwrap().iter().find(|c| c["id"] == channel.as_str()).unwrap()["permissions"].clone();
+    let before = ann.community("join", json!({})).await["body"].clone();
+    assert!(permissions(&before).as_array().unwrap().contains(&json!("post")), "{before}");
+
+    // Ann asks; the moderator sees what it would give, and decides.
+    store.set_claim(&wyvrn_community::claims::Claim { discord_id: "111".into(), did: ann.did(), state: "verified".into(), at: 1, decided_by: None }).unwrap();
+    ann.community("claim-imported", json!({})).await;
+    let seen = moderator.community("join", json!({})).await;
+    assert_eq!(seen["body"]["claims"][0]["roles"], json!(["art", "eld"]), "{seen}");
+    let decided = moderator.community("decide-claim", json!({ "member": server.id(&ann), "approve": true })).await;
+    assert_eq!(kind(&decided), "community", "{decided}");
+    let after = ann.community("join", json!({})).await["body"].clone();
+    // Only the role ranked below the moderator's own; the override is hers now and
+    // denies her posting there, over what her roles give.
+    assert_eq!(after["my_roles"], json!(["art"]), "{after}");
+    assert_eq!(after["imported_claim"]["given"], json!({ "roles": ["art"], "overrides": 1 }), "{after}");
+    assert!(!permissions(&after).as_array().unwrap().contains(&json!("post")), "{after}");
+    assert!(store.member_overrides_of("did:wyvrn:tmp:discord:111").unwrap().is_empty());
+    let audit = store.audit_entries(None, 50, None, Some(&ann.did()), Some("member.roles")).unwrap();
+    assert_eq!(audit[0].details.as_ref().unwrap()["claim"], "111");
+
+    // The owner allows her by member id: worked out last, it allows.
+    let started = owner.workflow("start", json!({ "template_id": "channel-permissions", "instance_id": "cp1", "context": { "channel": channel } })).await;
+    assert!(started["body"]["ui"].to_string().contains("denies Post"), "{started}");
+    let editing = advance(&owner, "cp1", "edit", json!({ "member": server.id(&ann) })).await;
+    assert_eq!(editing["body"]["state"], "role", "{editing}");
+    let saved = advance(&owner, "cp1", "save", json!({ "allow-post": true })).await;
+    assert_eq!(saved["body"]["state"], "roles", "{saved}");
+    let allowed = ann.community("join", json!({})).await["body"].clone();
+    assert!(permissions(&allowed).as_array().unwrap().contains(&json!("post")), "{allowed}");
+    let unknown = advance(&owner, "cp1", "edit", json!({ "member": "m-nobody" })).await;
+    assert_eq!(unknown["body"]["code"], "guard_failed", "{unknown}");
+
+    // A bot approved has a role of its own, managed, that nobody gives or deletes.
+    bot.agent.send(&bot.server, &json!({ "type": "https://didcomm.org/user-profile/1.0/profile", "body": { "profile": { "displayName": "Dicebot", "bot": true, "commands": [] } } })).await.unwrap();
+    for _ in 0..50 {
+        if store.bot_asked(&bot.did()).unwrap().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let approved = owner.community("approve-bot", json!({ "member": server.id(&bot), "approved": true })).await;
+    assert_eq!(kind(&approved), "members", "{approved}");
+    let told = owner.community("join", json!({})).await["body"].clone();
+    let own = told["roles"].as_array().unwrap().iter().find(|r| r.get("managed").is_some()).cloned().expect("a managed role");
+    assert_eq!(own["managed"], json!({ "bot": server.id(&bot) }));
+    let own_id = own["id"].as_str().unwrap().to_string();
+    let picking = owner.workflow("start", json!({ "template_id": "member-roles", "instance_id": "mr1", "context": { "member": ann.did() } })).await;
+    assert!(!picking["body"]["ui"].to_string().contains(&format!("role-{own_id}")), "{picking}");
+    owner.workflow("start", json!({ "template_id": "roles", "instance_id": "r1" })).await;
+    advance(&owner, "r1", "edit", json!({ "role": own_id })).await;
+    let refused = advance(&owner, "r1", "delete", json!({})).await;
+    assert_eq!(refused["body"]["code"], "guard_failed", "{refused}");
+    // Named the Discord bot it was, by someone who manages roles.
+    let naming = owner.workflow("start", json!({ "template_id": "member-roles", "instance_id": "mr2", "context": { "member": bot.did() } })).await;
+    assert!(naming["body"]["allowed_events"].to_string().contains("discord_bot"), "{naming}");
+    let named = advance(&owner, "mr2", "discord_bot", json!({ "discord_id": "4242" })).await;
+    assert!(named["body"]["ui"].to_string().contains("It is that Discord bot now"), "{named}");
+    assert_eq!(store.discord_account_of(&bot.did()).unwrap().as_deref(), Some("4242"));
+    // Gone, its role goes with it.
+    store.remove_member(&bot.did()).unwrap();
+    assert!(store.role(&own_id).unwrap().is_none());
+}

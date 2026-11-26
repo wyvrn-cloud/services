@@ -177,6 +177,10 @@ impl Community {
                     return refuse(message, "e.p.msg.unknown-bot", "Their profile doesn't say they are a bot.").map(Some);
                 }
                 self.store.set_bot_approved(&did, approved.then_some(sender), now)?;
+                // Approved: a role of its own (community/1.0's "A bot's own role").
+                if approved {
+                    self.store.settle_bot_role(&did)?;
+                }
                 self.audit(now, sender, if approved { "bot.approve" } else { "bot.unapprove" }, Some(&did), None);
                 return Ok(Some(Outcome::reply(crate::community::reply_to(message, crate::community::MEMBERS, self.members_for(member)?))));
             }
