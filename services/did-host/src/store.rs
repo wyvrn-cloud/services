@@ -59,9 +59,40 @@ pub struct Record {
     pub asked_at: Option<i64>,
 }
 
+/// An entry held back (did-hosting/1.0, "The host as a witness"): checked, and
+/// everything its publication will need, kept until it is witnessed, replaced or
+/// withdrawn. One for a name at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pending {
+    pub name: String,
+    /// The newest entry's `versionId`.
+    pub version_id: String,
+    /// The witnessed entry it follows.
+    pub after: String,
+    /// The entries held back, one per line.
+    pub entries: String,
+    pub did: String,
+    /// The whole log, with them.
+    pub log: String,
+    pub web_document: String,
+    pub holder_keys: Vec<String>,
+    /// Every key any version of the document has had, with them.
+    pub all_keys: Vec<String>,
+    /// The keys the publish showed were the holder's (written and signed with).
+    pub proven: Vec<String>,
+    pub deactivated: bool,
+    pub accepted_at: i64,
+    pub publish_at: i64,
+    /// Whether the holder has been told it is to be published within the hour.
+    pub soon_sent: bool,
+}
+
 pub struct Store {
     db: Db,
 }
+
+const PENDING_COLUMNS: &str =
+    "name, version_id, after_version, entries, did, log, web_document, holder_keys, all_keys, proven, deactivated, accepted_at, publish_at, soon_sent";
 
 const COLUMNS: &str = "name, published, reserved, assigned, hold_keys, hold_expires, did, version_id, log, web_document, holder_keys, whois, heard_at, asked_at";
 
@@ -100,6 +131,35 @@ const SQLITE: &str = r#"CREATE TABLE IF NOT EXISTS names (
         media_type TEXT NOT NULL,
         data BLOB NOT NULL,
         PRIMARY KEY (name, picture)
+    );
+    -- What the host's witness has signed for, by name: the did-witness.json
+    -- served beside the log (did-hosting/1.0, "The host as a witness").
+    CREATE TABLE IF NOT EXISTS witness_proofs (
+        name TEXT PRIMARY KEY,
+        proofs TEXT NOT NULL
+    );
+    -- An entry held back, one for a name at a time (store::Pending).
+    CREATE TABLE IF NOT EXISTS pending_entries (
+        name TEXT PRIMARY KEY,
+        version_id TEXT NOT NULL,
+        after_version TEXT NOT NULL,
+        entries TEXT NOT NULL,
+        did TEXT NOT NULL,
+        log TEXT NOT NULL,
+        web_document TEXT NOT NULL,
+        holder_keys TEXT NOT NULL,
+        all_keys TEXT NOT NULL,
+        proven TEXT NOT NULL,
+        deactivated INTEGER NOT NULL DEFAULT 0,
+        accepted_at INTEGER NOT NULL,
+        publish_at INTEGER NOT NULL,
+        soon_sent INTEGER NOT NULL DEFAULT 0
+    );
+    -- The host's own secrets beside its identity: its witness key, sealed
+    -- where the service seals its keys.
+    CREATE TABLE IF NOT EXISTS host_secrets (
+        name TEXT PRIMARY KEY,
+        secret TEXT NOT NULL
     );"#;
 
 fn schema() -> Schema {
@@ -135,6 +195,31 @@ fn schema() -> Schema {
                 media_type VARCHAR(32) NOT NULL,
                 data BLOB NOT NULL,
                 PRIMARY KEY (name, picture)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS witness_proofs (
+                name VARCHAR(255) NOT NULL PRIMARY KEY,
+                proofs MEDIUMTEXT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS pending_entries (
+                name VARCHAR(255) NOT NULL PRIMARY KEY,
+                version_id VARCHAR(255) NOT NULL,
+                after_version VARCHAR(255) NOT NULL,
+                entries LONGTEXT NOT NULL,
+                did {MYSQL_DID} NOT NULL,
+                log LONGTEXT NOT NULL,
+                web_document LONGTEXT NOT NULL,
+                holder_keys TEXT NOT NULL,
+                all_keys MEDIUMTEXT NOT NULL,
+                proven TEXT NOT NULL,
+                deactivated BIGINT NOT NULL DEFAULT 0,
+                accepted_at BIGINT NOT NULL,
+                publish_at BIGINT NOT NULL,
+                soon_sent BIGINT NOT NULL DEFAULT 0,
+                INDEX pending_by_time (publish_at)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS host_secrets (
+                name VARCHAR(255) NOT NULL PRIMARY KEY,
+                secret TEXT NOT NULL
             ) {MYSQL_TABLE}"#
         )
     });
@@ -214,6 +299,10 @@ impl Store {
 
     /// Puts a checked log under `name`. `keys` is every key any version of its
     /// document has had: they are added to what is remembered, never taken away.
+    /// `witness_proofs`, where the host witnesses it, is its `did-witness.json`
+    /// now: written first (did:webvh 1.0: "The updated did-witness.json file MUST
+    /// be published BEFORE the updated DID Log file"), in the same transaction. An
+    /// entry pending under the name is gone: what it would have followed has moved on.
     #[allow(clippy::too_many_arguments)]
     pub fn publish(
         &self,
@@ -225,10 +314,15 @@ impl Store {
         web_document: &str,
         holder_keys: &[String],
         keys: &[String],
+        witness_proofs: Option<&str>,
         now: i64,
     ) -> anyhow::Result<()> {
         let holder_keys = serde_json::to_string(holder_keys)?;
         self.db.lock().transaction(|tx| {
+            if let Some(proofs) = witness_proofs {
+                tx.execute("INSERT OR REPLACE INTO witness_proofs (name, proofs) VALUES (?1, ?2)", params![name, proofs])?;
+            }
+            tx.execute("DELETE FROM pending_entries WHERE name = ?1", params![name])?;
             tx.execute(Self::ENSURE, params![name])?;
             tx.execute(
                 "UPDATE names SET published = ?2, did = ?3, version_id = ?4, log = ?5, web_document = ?6, holder_keys = ?7,
@@ -275,6 +369,8 @@ impl Store {
         self.db.lock().transaction(|tx| {
             tx.execute(r#"DELETE FROM "keys" WHERE name = ?1"#, params![name])?;
             tx.execute("DELETE FROM whois_pictures WHERE name = ?1", params![name])?;
+            tx.execute("DELETE FROM witness_proofs WHERE name = ?1", params![name])?;
+            tx.execute("DELETE FROM pending_entries WHERE name = ?1", params![name])?;
             tx.execute("DELETE FROM names WHERE name = ?1", params![name])?;
             Ok::<_, anyhow::Error>(())
         })
@@ -296,6 +392,88 @@ impl Store {
 
     pub fn mark_stale(&self, name: &str) -> anyhow::Result<()> {
         self.db.lock().execute("UPDATE names SET published = 'stale' WHERE name = ?1 AND published = 'yes'", params![name])?;
+        Ok(())
+    }
+
+    /// `name`'s `did-witness.json`, if its host has witnessed anything of it.
+    pub fn witness_proofs(&self, name: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.db.lock().query_row("SELECT proofs FROM witness_proofs WHERE name = ?1", params![name], |row| row.get(0))?)
+    }
+
+    fn read_pending(row: &Row) -> wyvrn_service::db::Result<Pending> {
+        let list = |text: String| serde_json::from_str::<Vec<String>>(&text).unwrap_or_default();
+        Ok(Pending {
+            name: row.get(0)?,
+            version_id: row.get(1)?,
+            after: row.get(2)?,
+            entries: row.get(3)?,
+            did: row.get(4)?,
+            log: row.get(5)?,
+            web_document: row.get(6)?,
+            holder_keys: list(row.get(7)?),
+            all_keys: list(row.get(8)?),
+            proven: list(row.get(9)?),
+            deactivated: row.get(10)?,
+            accepted_at: row.get(11)?,
+            publish_at: row.get(12)?,
+            soon_sent: row.get(13)?,
+        })
+    }
+
+    /// Holds `pending` back: in place of any entry pending under its name before.
+    pub fn hold_back(&self, pending: &Pending) -> anyhow::Result<()> {
+        let list = |keys: &[String]| serde_json::to_string(keys);
+        self.db.lock().execute(
+            &format!("INSERT OR REPLACE INTO pending_entries ({PENDING_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"),
+            params![
+                pending.name,
+                pending.version_id,
+                pending.after,
+                pending.entries,
+                pending.did,
+                pending.log,
+                pending.web_document,
+                list(&pending.holder_keys)?,
+                list(&pending.all_keys)?,
+                list(&pending.proven)?,
+                pending.deactivated,
+                pending.accepted_at,
+                pending.publish_at,
+                pending.soon_sent
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The entry pending under `name`, if there is one.
+    pub fn pending(&self, name: &str) -> anyhow::Result<Option<Pending>> {
+        Ok(self.db.lock().query_row(&format!("SELECT {PENDING_COLUMNS} FROM pending_entries WHERE name = ?1"), params![name], Self::read_pending)?)
+    }
+
+    /// Every entry pending, soonest first.
+    pub fn all_pending(&self) -> anyhow::Result<Vec<Pending>> {
+        Ok(self.db.lock().query(&format!("SELECT {PENDING_COLUMNS} FROM pending_entries ORDER BY publish_at"), params![], Self::read_pending)?)
+    }
+
+    /// Drops the entry pending under `name`: replaced, or withdrawn.
+    pub fn drop_pending(&self, name: &str) -> anyhow::Result<()> {
+        self.db.lock().execute("DELETE FROM pending_entries WHERE name = ?1", params![name])?;
+        Ok(())
+    }
+
+    /// The holder of `name` has been told its pending entry is to be published soon.
+    pub fn told_soon(&self, name: &str) -> anyhow::Result<()> {
+        self.db.lock().execute("UPDATE pending_entries SET soon_sent = 1 WHERE name = ?1", params![name])?;
+        Ok(())
+    }
+
+    /// One of the host's own secrets, as it is kept (sealed or not).
+    pub fn secret(&self, name: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.db.lock().query_row("SELECT secret FROM host_secrets WHERE name = ?1", params![name], |row| row.get(0))?)
+    }
+
+    pub fn set_secret(&self, name: &str, kept: &str) -> anyhow::Result<()> {
+        self.db.lock().execute("INSERT OR REPLACE INTO host_secrets (name, secret) VALUES (?1, ?2)", params![name, kept])?;
         Ok(())
     }
 }

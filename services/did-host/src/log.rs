@@ -76,7 +76,11 @@ async fn wait_out_clock_skew(log: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn check(host: &str, name: &Name, log: &str) -> Result<Checked, String> {
+///
+/// `witness_proofs` is the `did-witness.json` to verify the log's witnessed
+/// entries by, where it names witnesses: what this host has witnessed, with a proof
+/// for the newest entry beside it.
+pub async fn check(host: &str, name: &Name, log: &str, witness_proofs: Option<&str>) -> Result<Checked, String> {
     let scid = scid_of(log).ok_or("the log's first entry has no parameters.scid")?;
     let did = format!("did:webvh:{scid}:{host}:{}", name.as_did_path());
     let did_web = did_web_for(host, name);
@@ -86,7 +90,7 @@ pub async fn check(host: &str, name: &Name, log: &str) -> Result<Checked, String
     // The SCID against the first entry, each entry against the one before it,
     // and every proof against the keys allowed to update at that point.
     let mut state = DIDWebVHState::default();
-    let (_, metadata) = state.resolve_log(&did, log, None).await.map_err(|e| format!("the log doesn't verify: {e}"))?;
+    let (_, metadata) = state.resolve_log(&did, log, witness_proofs).await.map_err(|e| format!("the log doesn't verify: {e}"))?;
     let last = state.log_entries().last().ok_or("the log is empty")?;
     let document = last.get_did_document().map_err(|e| format!("the log gives no document: {e}"))?;
 

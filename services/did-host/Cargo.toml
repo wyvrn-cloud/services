@@ -29,6 +29,9 @@ tracing = { workspace = true }
 # The tests make did:peer:4s that list several keys: a holder with several devices,
 # and one made up to list a key that isn't its own.
 didcomm-resolver-peer = { workspace = true }
+# A host at localhost, whose hosted DIDs it resolves itself to tell their holders
+# what is pending (tests/witness.rs).
+didcomm-resolver-webvh = { workspace = true }
 affinidi-data-integrity = { workspace = true }
 ed25519-dalek = { workspace = true }
 # The tests write real did:webvh logs, as a holder would.

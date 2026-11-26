@@ -85,6 +85,11 @@ pub struct HostConfig {
     pub ask_after_days: i64,
     #[serde(default = "default_answer_within_days")]
     pub answer_within_days: i64,
+    /// Whether the host witnesses the logs it hosts (did-hosting/1.0, "The host as
+    /// a witness"): names itself their witness, and holds back for a day an entry
+    /// that takes something away unless a recovery key co-signs it.
+    #[serde(default = "yes")]
+    pub witness: bool,
 }
 
 /// What an agent must disclose (discover-features/2.0) to claim a name in a namespace.

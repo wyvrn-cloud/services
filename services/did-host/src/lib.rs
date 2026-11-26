@@ -7,6 +7,7 @@
 //! - [`store`]: what is kept for each name.
 //! - [`host`]: the protocol -- what each message does.
 //! - [`server`]: the HTTP side: the endpoint messages come to, and serving what is hosted.
+//! - [`witness`]: the host as its logs' witness, and what it holds back.
 
 pub mod admin;
 pub mod config;
@@ -15,3 +16,4 @@ pub mod log;
 pub mod names;
 pub mod server;
 pub mod store;
+pub mod witness;

@@ -9,7 +9,8 @@ use crate::config::HostConfig;
 use wyvrn_hosted_did::{keys, whois};
 use crate::log;
 use crate::names::{Name, Reserved};
-use crate::store::{Published, Record, Store};
+use crate::store::{Pending, Published, Record, Store};
+use crate::witness::{self, Witness};
 
 pub const PIURI: &str = "https://wyvrn.app/did-hosting/1.0";
 
@@ -22,6 +23,9 @@ const STATUS_REQUEST: &str = "https://wyvrn.app/did-hosting/1.0/status-request";
 const STATUS: &str = "https://wyvrn.app/did-hosting/1.0/status";
 const ASSIGN: &str = "https://wyvrn.app/did-hosting/1.0/assign";
 const FREE: &str = "https://wyvrn.app/did-hosting/1.0/free";
+const PENDING: &str = "https://wyvrn.app/did-hosting/1.0/pending";
+const COSIGN: &str = "https://wyvrn.app/did-hosting/1.0/cosign";
+const WITHDRAW: &str = "https://wyvrn.app/did-hosting/1.0/withdraw";
 
 /// How a name stands, as the protocol says it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +96,19 @@ pub struct Host {
     pub config: HostConfig,
     reserved: Reserved,
     resolver: Box<dyn DIDResolver>,
+    /// The host's witness, where it witnesses the logs it hosts.
+    pub witness: Option<Witness>,
+    /// What is to be sent to holders, for the server to send.
+    outbox: std::sync::Mutex<Vec<Notice>>,
+}
+
+/// A message for a holder: `pending`, to the hosted DID it is about.
+#[derive(Debug, Clone)]
+pub struct Notice {
+    /// Whom to send it to, in order: the hosted `did:webvh` (as its witnessed log
+    /// has it), then the `did:peer:4` that log names, should that fail.
+    pub to: Vec<String>,
+    pub message: Value,
 }
 
 /// Who sent a message: the DID it is from, and the one key of that DID's it was
@@ -117,7 +134,40 @@ impl Sender {
 impl Host {
     pub fn new(store: Store, config: HostConfig, resolver: Box<dyn DIDResolver>) -> Self {
         let reserved = Reserved::new(&config.reserved_names, &config.reserved_namespaces);
-        Self { store, config, reserved, resolver }
+        Self { store, config, reserved, resolver, witness: None, outbox: Default::default() }
+    }
+
+    /// The host witnessing every log it hosts, as `witness` (did-hosting/1.0, "The
+    /// host as a witness").
+    pub fn with_witness(mut self, witness: Witness) -> Self {
+        self.witness = Some(witness);
+        self
+    }
+
+    /// What is to be sent to holders now, taken.
+    pub fn take_notices(&self) -> Vec<Notice> {
+        std::mem::take(&mut *self.outbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+    }
+
+    /// Tells `record`'s holder about the entry pending under it: at its hosted DID,
+    /// as the log witnessed so far has it -- so every device it had before the
+    /// change, not only the ones the entry keeps.
+    fn tell(&self, record: &Record, version_id: &str, state: &str, publish_time: Option<i64>, entry: Option<&str>) {
+        let Some(did) = record.did.clone() else { return };
+        let mut to = vec![did];
+        let witnessed = record.log.as_deref().and_then(last_document);
+        if let Some(peer) = witnessed.as_ref().and_then(|document| wyvrn_hosted_did::verify::also_known_as(document).into_iter().find(|aka| aka.starts_with("did:peer:")).map(str::to_string)) {
+            to.push(peer);
+        }
+        let mut body = json!({ "name": record.name, "version_id": version_id, "state": state });
+        if let Some(time) = publish_time {
+            body["publish_time"] = json!(time);
+        }
+        if let Some(entry) = entry {
+            body["entry"] = json!(entry);
+        }
+        let message = json!({ "type": PENDING, "body": body });
+        self.outbox.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(Notice { to, message });
     }
 
     /// A DID's key-agreement keys, or none if it can't be resolved.
@@ -284,6 +334,8 @@ impl Host {
             PUBLISH => self.publish(sender, &received.message, now).await?,
             PUBLISH_WHOIS => self.publish_whois(sender, &received.message, now)?,
             STATUS_REQUEST => self.status(sender, body, now).await?,
+            COSIGN => self.cosign(sender, body, now).await?,
+            WITHDRAW => self.withdraw(sender, &received.message, now)?,
             ASSIGN => self.assign(sender, body, now).await?,
             FREE => self.free(sender, body, now).await?,
             _ => return Ok(None),
@@ -335,15 +387,16 @@ impl Host {
         }
         let expires = now + self.config.hold_seconds;
         self.store.hold(&key, std::slice::from_ref(&sender.key), expires)?;
-        Ok(Ok((
-            RESERVATION,
-            json!({
-                "name": key,
-                "host": self.config.domain,
-                "did_web": log::did_web_for(&self.config.domain, &name),
-                "expires_time": expires,
-            }),
-        )))
+        let mut reservation = json!({
+            "name": key,
+            "host": self.config.domain,
+            "did_web": log::did_web_for(&self.config.domain, &name),
+            "expires_time": expires,
+        });
+        if let Some(witness) = &self.witness {
+            reservation["witness"] = json!(witness.did);
+        }
+        Ok(Ok((RESERVATION, reservation)))
     }
 
     async fn publish(&self, sender: &Sender, message: &Value, now: i64) -> anyhow::Result<Answer> {
@@ -363,9 +416,17 @@ impl Host {
         let record = self.store.get(&key)?;
         let state = self.state_of(&name, record.as_ref(), now);
         let hosted = record.as_ref().filter(|_| matches!(state, State::Published | State::Stale));
+        // An entry held back is not built on: it may yet be undone.
+        let pending = match hosted {
+            Some(_) => self.store.pending(&key)?,
+            None => None,
+        };
         let full_log = match (state, hosted) {
             (State::Published | State::Stale, Some(hosted)) => {
                 let last = hosted.version_id.clone().unwrap_or_default();
+                if let Some(pending) = pending.as_ref().filter(|pending| message["body"]["after"].as_str() == Some(pending.version_id.as_str())) {
+                    return Ok(Err(Refusal::new("e.p.msg.pending", "{1} is held back, and may yet be undone: write after the last witnessed entry, or wait until it is published.").with(&pending.version_id)));
+                }
                 if message["body"]["after"].as_str() != Some(last.as_str()) {
                     return Ok(Err(Refusal::new("e.p.msg.conflict", "The log has moved on: its last entry is {1}.").with(last)));
                 }
@@ -378,9 +439,17 @@ impl Host {
         if full_log.len() > self.config.max_log_bytes {
             return Ok(Err(Refusal::new("e.p.msg.too-large", "The log is over this host's limit of {1} bytes.").with(self.config.max_log_bytes.to_string())));
         }
+        let newest: Value = serde_json::from_str(added.lines().last().unwrap_or_default()).unwrap_or_default();
+        let newest_version = newest["versionId"].as_str().unwrap_or_default().to_string();
 
+        // Witnessed as it would be if published now: what was witnessed before, and a
+        // proof for the newest entry. (Nothing of it is served unless it is.)
+        let proofs = match &self.witness {
+            Some(witness) if !newest_version.is_empty() => Some(witness.proofs_with(self.store.witness_proofs(&key)?.as_deref().filter(|_| hosted.is_some()), &newest_version).await?),
+            _ => None,
+        };
         // 1-4: a valid log, of this name's DID, whose document names its did:web.
-        let checked = match log::check(&self.config.domain, &name, &full_log).await {
+        let checked = match log::check(&self.config.domain, &name, &full_log, proofs.as_deref()).await {
             Ok(checked) => checked,
             Err(why) => return Ok(Err(Refusal::new("e.p.msg.log-invalid", why))),
         };
@@ -391,6 +460,21 @@ impl Host {
             }
         } else if self.config.require_portable && !checked.portable {
             return Ok(Err(Refusal::new("e.p.msg.log-invalid", "This host asks for \"portable\": true in a DID's first entry, so that it can be moved later.")));
+        }
+        // A host that witnesses names itself the only witness of every log it hosts,
+        // from its first entry, or the next entry of one published before it did. A
+        // log already witnessed here changes that only as a change held back: how a
+        // holder moving to another host takes it out.
+        if let Some(witness) = &self.witness {
+            let ours = witness.parameter();
+            let was = hosted.and_then(|hosted| hosted.log.as_deref()).map(witness::in_force).unwrap_or_default();
+            if witness::in_force(&full_log).witness != ours && was.witness != ours {
+                return Ok(Err(Refusal::new(
+                    "e.p.msg.log-invalid",
+                    "This host witnesses the logs it hosts: the log's witness parameter names {1} as its only witness, threshold 1.",
+                )
+                .with(&witness.did)));
+            }
         }
         // 5: the sender is one of the document's own: the key it wrote with is a
         // key-agreement key of it. On an update that may be a device the entry itself
@@ -424,27 +508,182 @@ impl Host {
         }
 
         holder_keys.sort();
-        let published = if checked.deactivated { Published::Deactivated } else { Published::Yes };
-        self.store.publish(
-            &key,
-            published,
-            &checked.did,
-            &checked.version_id,
-            &full_log,
-            &serde_json::to_string(&with_whois_service(checked.web_document.clone(), &self.config.domain, &name))?,
-            &holder_keys,
-            &all_keys,
-            now,
-        )?;
+        let entry = Pending {
+            name: key.clone(),
+            version_id: checked.version_id.clone(),
+            after: hosted.and_then(|hosted| hosted.version_id.clone()).unwrap_or_default(),
+            entries: added.to_string(),
+            did: checked.did.clone(),
+            log: full_log.clone(),
+            web_document: serde_json::to_string(&with_whois_service(checked.web_document.clone(), &self.config.domain, &name))?,
+            holder_keys,
+            all_keys,
+            proven: vec![sender.key.clone(), signed_with],
+            deactivated: checked.deactivated,
+            accepted_at: now,
+            publish_at: now + witness::HOLD_SECONDS,
+            soon_sent: false,
+        };
+
+        // Held back, at a host that witnesses: an entry that takes something away,
+        // unless a recovery key the last witnessed entry lists co-signs it.
+        if let (Some(_), Some(hosted)) = (&self.witness, hosted) {
+            let witnessed = hosted.log.as_deref().unwrap_or_default();
+            let co_signed = match message["body"].get("recovery_proof").filter(|proof| !proof.is_null()) {
+                Some(proof) => match wyvrn_hosted_did::recovery::check_address_entry(proof, &last_document(witnessed).unwrap_or_default(), &entry.version_id) {
+                    Ok(_) => true,
+                    Err(why) => return Ok(Err(Refusal::new("e.p.msg.recovery-invalid", why))),
+                },
+                None => false,
+            };
+            let held_back = witness::held_back_because(witnessed, added).filter(|_| !co_signed);
+            match (held_back, &pending) {
+                // One pending entry a name: this one, too, would have to wait.
+                (Some(_), Some(pending)) => {
+                    return Ok(Err(Refusal::new("e.p.msg.pending", "{1} is held back already: withdraw it, or co-sign this entry with a recovery key.").with(&pending.version_id)));
+                }
+                (Some(why), None) => {
+                    self.store.hold_back(&entry)?;
+                    tracing::info!(name = %key, version = %entry.version_id, why, "held back");
+                    self.tell(hosted, &entry.version_id, "held", Some(entry.publish_at), Some(&entry.entries));
+                    let mut body = self.published_body(&name, hosted);
+                    body["pending"] = json!({ "version_id": entry.version_id, "accepted_time": entry.accepted_at, "publish_time": entry.publish_at });
+                    return Ok(Ok((PUBLISHED, body)));
+                }
+                // Only adding, or co-signed: witnessed at once, and a pending entry it
+                // follows the same witnessed one as is dropped.
+                (None, Some(pending)) => {
+                    tracing::info!(name = %key, dropped = %pending.version_id, by = %entry.version_id, "a pending entry replaced");
+                    self.tell(hosted, &pending.version_id, "dropped", None, None);
+                }
+                (None, None) => {}
+            }
+        }
+
+        let published = self.commit(&entry, proofs.as_deref(), now)?;
+        Ok(Ok((PUBLISHED, self.published_body(&name, &published))))
+    }
+
+    /// Publishes `entry`, witnessed with `proofs` (where the host witnesses):
+    /// `did-witness.json` first, then the log. Returns the name as it now stands.
+    fn commit(&self, entry: &Pending, proofs: Option<&str>, now: i64) -> anyhow::Result<Record> {
+        let published = if entry.deactivated { Published::Deactivated } else { Published::Yes };
+        self.store.publish(&entry.name, published, &entry.did, &entry.version_id, &entry.log, &entry.web_document, &entry.holder_keys, &entry.all_keys, proofs, now)?;
         // The keys this was written with and signed with are now known to be the
         // holder's.
-        self.shown_to_hold(sender, &key)?;
-        self.store.prove(&key, &signed_with)?;
-        tracing::info!(name = %key, did = %checked.did, version = %checked.version_id, "published");
-        Ok(Ok((
-            PUBLISHED,
-            json!({ "name": key, "did": checked.did, "did_web": checked.did_web, "version_id": checked.version_id }),
-        )))
+        for key in &entry.proven {
+            self.store.prove(&entry.name, key)?;
+        }
+        tracing::info!(name = %entry.name, did = %entry.did, version = %entry.version_id, "published");
+        self.store.get(&entry.name)?.ok_or_else(|| anyhow::anyhow!("{} was published and is not there", entry.name))
+    }
+
+    /// `published`'s body for `record` as it stands: its last witnessed entry.
+    fn published_body(&self, name: &Name, record: &Record) -> Value {
+        let mut body = json!({
+            "name": name.as_did_path(),
+            "did": record.did,
+            "did_web": log::did_web_for(&self.config.domain, name),
+            "version_id": record.version_id,
+        });
+        if let Some(witness) = &self.witness {
+            body["witness"] = json!(witness.did);
+        }
+        body
+    }
+
+    /// Witnesses and publishes the pending entry of `name`, now.
+    async fn publish_pending(&self, record: &Record, pending: &Pending, now: i64) -> anyhow::Result<Record> {
+        let proofs = match &self.witness {
+            Some(witness) => Some(witness.proofs_with(self.store.witness_proofs(&pending.name)?.as_deref(), &pending.version_id).await?),
+            None => None,
+        };
+        let published = self.commit(pending, proofs.as_deref(), now)?;
+        self.tell(record, &pending.version_id, "published", Some(now), None);
+        Ok(published)
+    }
+
+    /// Publishes every pending entry whose day is up, and tells the holder of each
+    /// that is to be published within the hour: what the host does once a minute,
+    /// from what it keeps, so that a restart loses nothing.
+    pub async fn publish_due(&self, now: i64) -> anyhow::Result<()> {
+        for pending in self.store.all_pending()? {
+            let Some(record) = self.store.get(&pending.name)? else {
+                self.store.drop_pending(&pending.name)?;
+                continue;
+            };
+            // What it followed has moved on (an admin's doing): it can't be published.
+            if record.version_id.as_deref() != Some(pending.after.as_str()) {
+                self.store.drop_pending(&pending.name)?;
+                continue;
+            }
+            if now >= pending.publish_at {
+                self.publish_pending(&record, &pending, now).await?;
+            } else if now >= pending.publish_at - witness::SOON_SECONDS && !pending.soon_sent {
+                self.store.told_soon(&pending.name)?;
+                self.tell(&record, &pending.version_id, "soon", Some(pending.publish_at), Some(&pending.entries));
+            }
+        }
+        Ok(())
+    }
+
+    /// The pending entry `body` names, under a name `sender` holds (by the last
+    /// witnessed document's keys, or the pending one's).
+    fn pending_named(&self, sender: &Sender, body: &Value) -> anyhow::Result<Result<(Name, Record, Pending), Refusal>> {
+        let name = match self.name(body) {
+            Ok(name) => name,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        let Some(record) = self.store.get(&name.as_did_path())?.filter(|r| matches!(r.published, Published::Yes | Published::Stale)) else {
+            return Ok(Err(Refusal::new("e.p.msg.not-holder", "You don't hold a DID under that name.")));
+        };
+        let pending = self.store.pending(&name.as_did_path())?;
+        if !sender.holds(&record.holder_keys) && !pending.as_ref().is_some_and(|pending| sender.holds(&pending.holder_keys)) {
+            return Ok(Err(Refusal::new("e.p.msg.not-holder", "You don't hold a DID under that name.")));
+        }
+        match pending {
+            Some(pending) if body["version_id"].as_str() == Some(pending.version_id.as_str()) => Ok(Ok((name, record, pending))),
+            Some(pending) => Ok(Err(Refusal::new("e.p.msg.pending", "That entry isn't pending: {1} is.").with(pending.version_id))),
+            None => Ok(Err(Refusal::new("e.p.msg.pending", "No entry is pending under that name."))),
+        }
+    }
+
+    /// `cosign`: a recovery key the last witnessed entry lists co-signs the pending
+    /// entry, which is witnessed and published at once.
+    async fn cosign(&self, sender: &Sender, body: &Value, now: i64) -> anyhow::Result<Answer> {
+        let (name, record, pending) = match self.pending_named(sender, body)? {
+            Ok(found) => found,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        let witnessed = record.log.as_deref().and_then(last_document).unwrap_or_default();
+        if let Err(why) = wyvrn_hosted_did::recovery::check_address_entry(&body["recovery_proof"], &witnessed, &pending.version_id) {
+            return Ok(Err(Refusal::new("e.p.msg.recovery-invalid", why)));
+        }
+        let published = self.publish_pending(&record, &pending, now).await?;
+        Ok(Ok((PUBLISHED, self.published_body(&name, &published))))
+    }
+
+    /// `withdraw`: the holder drops its own pending entry. Authenticated by a key of
+    /// the last witnessed entry's `updateKeys`: an attachment `withdraw` whose bytes
+    /// are the entry's `versionId`, signed (`jws`) by one, as everything uploaded
+    /// here is signed.
+    fn withdraw(&self, sender: &Sender, message: &Value, now: i64) -> anyhow::Result<Answer> {
+        let (name, record, pending) = match self.pending_named(sender, &message["body"])? {
+            Ok(found) => found,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        let update_keys = witness::in_force(record.log.as_deref().unwrap_or_default()).update_keys;
+        let signed = attachment(message, "withdraw")
+            .filter(|(bytes, _)| bytes == pending.version_id.as_bytes())
+            .and_then(|(bytes, jws)| jws.and_then(|jws| keys::signer_among(&bytes, jws, &update_keys)).cloned());
+        if signed.is_none() {
+            return Ok(Err(Refusal::new("e.p.msg.not-holder", "A withdraw carries the entry's versionId as an attachment \"withdraw\", signed (jws) by an update key of the last witnessed entry.")));
+        }
+        self.store.drop_pending(&name.as_did_path())?;
+        tracing::info!(name = %name.as_did_path(), version = %pending.version_id, "a pending entry withdrawn");
+        self.tell(&record, &pending.version_id, "dropped", None, None);
+        let record = self.store.get(&name.as_did_path())?;
+        Ok(Ok((STATUS, self.status_body(&name, record.as_ref(), true, now))))
     }
 
     fn publish_whois(&self, sender: &Sender, message: &Value, now: i64) -> anyhow::Result<Answer> {
@@ -523,6 +762,14 @@ impl Host {
             body["did"] = json!(record.did);
             body["version_id"] = json!(record.version_id);
             body["whois"] = json!(record.whois.is_some());
+            // The entry held back, to its holder alone: so that a device that missed
+            // being told finds it.
+            if let Some(pending) = self.store.pending(&record.name).ok().flatten().filter(|_| yours) {
+                body["pending"] = json!({ "version_id": pending.version_id, "accepted_time": pending.accepted_at, "publish_time": pending.publish_at, "entry": pending.entries });
+            }
+        }
+        if let Some(witness) = &self.witness {
+            body["witness"] = json!(witness.did);
         }
         body
     }
