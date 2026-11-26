@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use mysql::prelude::Queryable;
 
 mod long_forms;
-pub use long_forms::did_key;
+pub use long_forms::{did_key, is_short_form, long_form_seen};
 
 /// Where a store is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +142,39 @@ const UPKEEP_TABLES: [&str; 3] = ["wyvrn_service", "wyvrn_long_forms", "wyvrn_mi
 
 /// The mark of a store whose long-form `did:peer:4`s have been made short.
 const SHORTENED: &str = "did-peer-4-short";
+/// The mark of a store given the long forms another store of the same database
+/// wrote down for it ([`Db::adopt_long_forms`]).
+const ADOPTED: &str = "did-peer-4-long-forms-adopted";
+
+/// A text value read back, as text.
+fn row_text(value: &Value) -> Result<String> {
+    match value {
+        Value::Text(text) => Ok(text.clone()),
+        Value::Blob(bytes) => String::from_utf8(bytes.clone()).map_err(|_| Error::Other("not text".into())),
+        _ => Err(Error::Other("not text".into())),
+    }
+}
+
+/// The tables `sql` (a schema) makes, by the names its statements give them.
+fn schema_tables(sql: &str) -> Vec<String> {
+    let mut tables = Vec::new();
+    let mut words = sql.split(|c: char| c.is_whitespace() || c == '(' || c == ';').filter(|word| !word.is_empty()).peekable();
+    while let Some(word) = words.next() {
+        if word != "TABLE" {
+            continue;
+        }
+        let mut name = words.next();
+        if name == Some("IF") {
+            words.next();
+            words.next();
+            name = words.next();
+        }
+        if let Some(name) = name {
+            tables.push(name.trim_matches(['"', '`']).to_string());
+        }
+    }
+    tables
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -593,7 +626,7 @@ impl Db {
         {
             let mut session = db.lock();
             session.plainly(LONG_FORMS_SQLITE)?;
-            session.keep_long_forms_short()?;
+            session.keep_long_forms_short(None)?;
         }
         Ok(db)
     }
@@ -672,7 +705,14 @@ impl Db {
         for statement in long_forms_mysql() {
             session.plainly(statement)?;
         }
-        session.keep_long_forms_short()?;
+        // A store said to have a database of its own may share it all the same: a
+        // community host's registry sits beside every community's tables, each
+        // under its prefix (`Location::Shared`). Its rows are its schema's tables'
+        // alone: had it made short what is in the others', it would have written
+        // their long forms down in its own table, not theirs, and they would have
+        // had short forms whose long form they never knew.
+        let own = session.naming.is_none().then(|| schema_tables(schema.mysql));
+        session.keep_long_forms_short(own.as_deref())?;
         Ok(())
     }
 
@@ -681,6 +721,46 @@ impl Db {
     /// (whoever it is wrote under both). `(long, short)`, found as the store was
     /// opened the first time since; for the service to bring together as it knows
     /// how, saying both as they are ([`Session::as_they_are`]). Empty once seen.
+    /// Every long form `other` wrote down, written down here too, once for this
+    /// store (marked, as the shortening is): for stores whose short forms another
+    /// store's shortening left without their long form (a community host's
+    /// registry, before it kept to its own tables). Each is one DID's, whichever
+    /// store holds it, so holding more than its rows name is no harm. How many
+    /// were new here.
+    pub fn adopt_long_forms(&self, other: &Db) -> Result<usize> {
+        let mut session = self.lock();
+        if session.query_row("SELECT 1 FROM wyvrn_migrated WHERE name = ?1", &[Value::Text(ADOPTED.into())], |_| Ok(()))?.is_some() {
+            return Ok(0);
+        }
+        let (_, rows) = other.lock().dump("wyvrn_long_forms")?;
+        session.as_they_are(|session| session.transaction(|session| {
+            let mut added = 0;
+            for row in &rows {
+                added += session.execute("INSERT OR IGNORE INTO wyvrn_long_forms (short_form, long_form) VALUES (?1, ?2)", row)?;
+            }
+            session.execute("INSERT OR IGNORE INTO wyvrn_migrated (name) VALUES (?1)", &[Value::Text(ADOPTED.into())])?;
+            Ok::<_, Error>(added)
+        }))
+        .inspect(|_| {
+            for row in &rows {
+                if let (Ok(short), Ok(long)) = (row_text(&row[0]), row_text(&row[1])) {
+                    self.long_forms.forget_unknown(&short);
+                    long_forms::hold(&short, &long);
+                }
+            }
+        })
+    }
+
+    /// Writes `long` (a long-form `did:peer:4`) down here, if it isn't already:
+    /// what any statement naming it does, for a caller that has a DID to learn
+    /// and nothing to say with it.
+    pub fn learn_long_form(&self, long: &str) -> Result<()> {
+        if long_forms::shortened(long).is_some() {
+            self.lock().query("SELECT 1 FROM wyvrn_long_forms WHERE short_form = ?1", &[Value::Text(long.to_string())], |_| Ok(()))?;
+        }
+        Ok(())
+    }
+
     pub fn long_forms_left(&self) -> Vec<(String, String)> {
         std::mem::take(&mut *self.long_forms.left.lock().unwrap_or_else(|p| p.into_inner()))
     }
@@ -1433,7 +1513,7 @@ impl Session<'_> {
     /// that holds text, made its short form, and the long form written down. A row
     /// that can't be (its short form's is there already) is left, and said in
     /// [`Db::long_forms_left`].
-    fn keep_long_forms_short(&mut self) -> Result<()> {
+    fn keep_long_forms_short(&mut self, only: Option<&[String]>) -> Result<()> {
         // In one transaction: written to disk once, and all done or none (tried
         // again the next time the store is opened).
         self.as_they_are(|session| session.transaction(|session| {
@@ -1442,7 +1522,7 @@ impl Session<'_> {
             }
             let mut left: Vec<(String, String)> = Vec::new();
             let mut changed = 0usize;
-            for table in session.tables()? {
+            for table in session.tables()?.into_iter().filter(|table| only.is_none_or(|only| only.contains(table))) {
                 for column in session.text_columns(&table)? {
                     let found: Vec<String> = session.query(&format!("SELECT DISTINCT \"{column}\" FROM \"{table}\" WHERE \"{column}\" LIKE 'did:peer:4zQm%:%'"), &[], |row| row.get(0))?;
                     for value in found {
@@ -2247,5 +2327,85 @@ mod tests {
         let db = Db::shared_with(server.clone(), &database, "c1_", &SCHEMA, "community").unwrap();
         let apart = Db::shared_with(server, &database, "c1_", &SCHEMA, "community").unwrap();
         grouped_on(&db, Some(&apart));
+    }
+
+    #[test]
+    fn a_schema_says_which_tables_it_makes() {
+        let sql = "CREATE TABLE IF NOT EXISTS communities (name TEXT);\n-- a note\nCREATE TABLE create_codes(code TEXT); CREATE INDEX IF NOT EXISTS x ON communities (name)";
+        assert_eq!(schema_tables(sql), ["communities", "create_codes"]);
+    }
+
+    #[test]
+    fn a_store_sharing_its_database_with_prefixed_stores_shortens_its_own_tables_alone() {
+        const HOST: Schema = Schema {
+            sqlite: "CREATE TABLE IF NOT EXISTS communities (owner TEXT NOT NULL PRIMARY KEY)",
+            mysql: "CREATE TABLE IF NOT EXISTS communities (owner VARCHAR(3000) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+        };
+        const MEMBERS: Schema = Schema {
+            sqlite: "CREATE TABLE IF NOT EXISTS members (did TEXT NOT NULL PRIMARY KEY)",
+            mysql: "CREATE TABLE IF NOT EXISTS members (did VARCHAR(3000) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+        };
+        let Some(url) = server() else { return eprintln!("no WYVRN_TEST_DATABASE_URL: skipped") };
+        let url = url.trim_end_matches('/').to_string();
+        let database = format!("wyvrn_test_{}", scratch_name());
+        let member = long_did(1_300, 7);
+        let short = did_key(&member).into_owned();
+        // A community's store from before the shortening: a long form in its rows.
+        {
+            let community = Db::open(&Location::Shared { server: url.clone(), database: database.clone(), prefix: "c3_m_".into() }, &MEMBERS, "community").unwrap();
+            community
+                .lock()
+                .as_they_are(|s| {
+                    s.execute("DELETE FROM wyvrn_migrated", &[])?;
+                    s.execute("INSERT INTO members (did) VALUES (?1)", params![member])
+                })
+                .unwrap();
+        }
+        // The host's own store, in the same database, opened first.
+        let host = Db::open(&Location::MySql(format!("{url}/{database}")), &HOST, "community-host").unwrap();
+        let raw = |db: &Db, sql: &str| db.lock().as_they_are(|s| s.query(sql, &[], |row| row.get::<String>(0))).unwrap();
+        assert!(raw(&host, "SELECT short_form FROM wyvrn_long_forms").is_empty(), "the host's own tables alone");
+        long_forms::held().lock().unwrap().clear();
+        let community = Db::open(&Location::Shared { server: url.clone(), database: database.clone(), prefix: "c3_m_".into() }, &MEMBERS, "community").unwrap();
+        assert_eq!(raw(&community, "SELECT did FROM members"), [short.clone()]);
+        assert_eq!(raw(&community, "SELECT short_form FROM wyvrn_long_forms"), [short.clone()]);
+        long_forms::held().lock().unwrap().clear();
+        assert_eq!(community.lock().query_value::<String>("SELECT did FROM members", &[]).unwrap(), member);
+    }
+
+    #[test]
+    fn a_store_takes_up_the_long_forms_another_wrote_down_for_it_once() {
+        const MEMBERS: Schema = Schema {
+            sqlite: "CREATE TABLE IF NOT EXISTS members (did TEXT NOT NULL PRIMARY KEY)",
+            mysql: "CREATE TABLE IF NOT EXISTS members (did VARCHAR(3000) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+        };
+        let member = long_did(1_100, 8);
+        let short = did_key(&member).into_owned();
+        let (community, registry) = (Db::scratch(&MEMBERS).unwrap(), Db::scratch(&MEMBERS).unwrap());
+        // Kept short here, its long form written down in the other store alone.
+        community.lock().as_they_are(|s| s.execute("INSERT INTO members (did) VALUES (?1)", params![short])).unwrap();
+        registry.lock().execute("INSERT INTO members (did) VALUES (?1)", params![member]).unwrap();
+        long_forms::held().lock().unwrap().clear();
+        assert_eq!(community.lock().query_value::<String>("SELECT did FROM members", &[]).unwrap(), short, "unknown here");
+        assert_eq!(community.adopt_long_forms(&registry).unwrap(), 1);
+        long_forms::held().lock().unwrap().clear();
+        assert_eq!(community.lock().query_value::<String>("SELECT did FROM members", &[]).unwrap(), member);
+        assert_eq!(community.adopt_long_forms(&registry).unwrap(), 0, "once");
+    }
+
+    #[test]
+    fn a_long_form_is_learned_by_a_store_that_had_only_its_short_form() {
+        const MEMBERS: Schema = Schema {
+            sqlite: "CREATE TABLE IF NOT EXISTS members (did TEXT NOT NULL PRIMARY KEY)",
+            mysql: "CREATE TABLE IF NOT EXISTS members (did VARCHAR(3000) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+        };
+        let member = long_did(1_000, 9);
+        let short = did_key(&member).into_owned();
+        let db = Db::scratch(&MEMBERS).unwrap();
+        db.lock().as_they_are(|s| s.execute("INSERT INTO members (did) VALUES (?1)", params![short])).unwrap();
+        assert!(is_short_form(&short) && !is_short_form(&member) && !is_short_form(&format!("{short}#key-1")));
+        db.learn_long_form(&member).unwrap();
+        long_forms::held().lock().unwrap().clear();
+        assert_eq!(db.lock().query_value::<String>("SELECT did FROM members", &[]).unwrap(), member);
     }
 }

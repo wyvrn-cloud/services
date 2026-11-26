@@ -858,7 +858,22 @@ pub struct Context<'a> {
     /// The server's own emoji and stickers as the community's packs
     /// (`import-expressions`' `imported.json`): Discord id -> `(shortcode, url)`.
     pub expressions: HashMap<String, (String, String)>,
+    /// Discord user id -> what they are shown as, for `<@id>` where the message
+    /// doesn't say whom it calls on (in an embed): [`users_in`].
+    pub users: HashMap<String, String>,
     pub now: i64,
+}
+
+/// Everyone `export` says something of (its authors, whom they call on, who
+/// reacted): Discord user id -> what they are shown as.
+pub fn users_in(export: &Export) -> HashMap<String, String> {
+    let mut users = HashMap::new();
+    for m in &export.messages {
+        for user in std::iter::once(&m.author).chain(m.mentions.iter()).chain(m.reactions.iter().flat_map(|r| r.users.iter())) {
+            users.entry(user.id.clone()).or_insert_with(|| user.shown_as().to_string());
+        }
+    }
+    users
 }
 
 /// What was written.
@@ -872,6 +887,27 @@ pub struct Written {
     pub files_failed: Vec<String>,
     pub reactions: usize,
     pub reactions_left_out: usize,
+}
+
+/// Discord role ids matched to the roles here: as the import of the server's roles
+/// mapped them (`import-discord-roles`: `discord_mapped`), else by the name the
+/// role had there, else by the names the export's authors' roles carry
+/// ([`roles_by_name`]). For `<@&id>`, which names a role by its id alone.
+pub fn roles_for(store: &Store, export: &Export) -> anyhow::Result<HashMap<String, (String, String)>> {
+    let roles = store.roles()?;
+    let by_id: HashMap<String, String> = roles.iter().map(|r| (r.id.clone(), r.name.clone())).collect();
+    let by_name: HashMap<String, (String, String)> = roles.into_iter().map(|r| (r.name.to_lowercase(), (r.id, r.name))).collect();
+    let mut found = roles_by_name(store, export)?;
+    for mapped in store.discord_mapped("role")? {
+        let here = match mapped.local.as_ref().and_then(|local| by_id.get(local).map(|name| (local.clone(), name.clone()))) {
+            Some(here) => Some(here),
+            None => by_name.get(&mapped.name.to_lowercase()).cloned(),
+        };
+        if let Some(here) = here {
+            found.insert(mapped.discord_id, here);
+        }
+    }
+    Ok(found)
 }
 
 /// Discord role ids (as the export's authors carry them) matched to the roles here by name.
@@ -909,6 +945,7 @@ static USER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<@!?(\d+)>").expect
 static ROLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<@&(\d+)>").expect("a valid pattern"));
 static CHANNEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<#(\d+)>").expect("a valid pattern"));
 static EMOJI: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<a?:(\w{1,64}):(\d+)>").expect("a valid pattern"));
+static EVERYONE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(^|[^\w`])@(everyone|here)\b").expect("a valid pattern"));
 
 /// A message's text as it reads here: people, roles and channels by name, the
 /// server's own emoji as its packs' (others as `:name:`). And who it calls on, as
@@ -928,10 +965,14 @@ fn rewrite_text(text: &str, m: &Message, ctx: &Context, mentions: &mut Vec<Value
             mentions.push(json!({ "who": who, "name": name }));
         }
     };
-    let text = USER.replace_all(text, |c: &regex::Captures| match m.mentions.iter().find(|u| u.id == c[1]) {
-        Some(user) => {
-            mention(format!("{AUTHOR_PREFIX}{}", user.id), user.shown_as());
-            format!("@{}", user.shown_as())
+    // `@everyone` and `@here` call on everyone who reads it: here, both are everyone.
+    if EVERYONE.is_match(text) {
+        mention(crate::community::EVERYONE.to_string(), "everyone");
+    }
+    let text = USER.replace_all(text, |c: &regex::Captures| match m.mentions.iter().find(|u| u.id == c[1]).map(|u| u.shown_as()).or_else(|| ctx.users.get(&c[1]).map(String::as_str)) {
+        Some(name) => {
+            mention(format!("{AUTHOR_PREFIX}{}", &c[1]), name);
+            format!("@{name}")
         }
         None => "@someone".to_string(),
     });
@@ -976,13 +1017,199 @@ pub fn seal(plain: &[u8]) -> (Vec<u8>, Value) {
 /// height, where they can be read of it (and without them where they can't).
 fn keep_file(files: &Files, owner: &str, path: &Path, name: &str, now: i64) -> anyhow::Result<(Value, Value)> {
     let plain = std::fs::read(path).with_context(|| format!("{}", path.display()))?;
-    let media_type = media_type_of(name);
+    // (By what it is, where it can be told: an embed's picture is kept without its
+    // name's ending.)
+    let media_type = sniffed(&plain).unwrap_or_else(|| media_type_of(name));
     let (sealed, ciphering) = seal(&plain);
     let (id, url, hash) = files.keep_any(owner, name, media_type, &sealed, now)?;
     let attachment = json!({ "id": id, "media_type": media_type, "filename": name, "byte_count": sealed.len(), "data": { "links": [url], "hash": hash } });
     let mut item = json!({ "attachment": id, "ciphering": ciphering });
     crate::picture_sizes::put(&mut item, media_type, &plain);
     Ok((attachment, item))
+}
+
+/// A picture's media type, read from its first bytes.
+fn sniffed(bytes: &[u8]) -> Option<&'static str> {
+    Some(match image::guess_format(bytes).ok()? {
+        image::ImageFormat::Png => "image/png",
+        image::ImageFormat::Jpeg => "image/jpeg",
+        image::ImageFormat::Gif => "image/gif",
+        image::ImageFormat::WebP => "image/webp",
+        image::ImageFormat::Avif => "image/avif",
+        image::ImageFormat::Bmp => "image/bmp",
+        _ => return None,
+    })
+}
+
+/// Whether `url` is Discord's own (its CDN, its media proxy, its proxy of other
+/// sites' pictures): a link that stops working, signed for a while only.
+pub fn expires(url: &str) -> bool {
+    host_of(url).is_some_and(|host| ["discordapp.com", "discordapp.net", "discord.com"].iter().any(|own| host == *own || host.ends_with(&format!(".{own}"))))
+}
+
+/// The file name a link ends in (without its query), percent-decoded.
+fn file_name_of(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let last = parsed.path_segments()?.next_back().filter(|s| !s.is_empty())?;
+    Some(percent_decode(last))
+}
+
+/// `url` as compared: without its query or fragment.
+fn bare(url: &str) -> &str {
+    url.split(['?', '#']).next().unwrap_or(url)
+}
+
+/// A file kept for a post: `(attachment, media item)`, as [`keep_file`] gives them.
+pub type Kept = (Value, Value);
+
+/// What a post brings over of its files, given the files it already has (by
+/// where each came from: `imported.files`, see [`prepare`]); how a file not yet
+/// kept is kept is the caller's (`upload`), as is what to do with none.
+pub struct PostFiles<'a> {
+    pub upload: &'a mut dyn FnMut(&Path, &str) -> anyhow::Result<Kept>,
+}
+
+/// A post of `m` as it is written here: its text, whom it calls on and its
+/// `extra` (`media` and `attachments`, `embeds`, `imported`). `files`, where
+/// files are brought over: each attachment, and each picture of an embed that is
+/// in the export's files and whose link is Discord's (it stops working), kept as
+/// the post's own file (Discord shows a picture's link as the picture; so here:
+/// the link said in the text goes, and a card that was the picture alone with
+/// it). `had`: the files the post has already, by where they came from
+/// (`a:<attachment id>`, `e:<link>`), kept as they are, not again. Without files,
+/// each is said in the text as a note. `written` counts what was kept, or not.
+pub fn prepare(m: &Message, ctx: &Context, mut files: Option<PostFiles<'_>>, had: &HashMap<String, Kept>, written: &mut Written) -> (String, Vec<Value>, serde_json::Map<String, Value>, Vec<String>) {
+    let mut got = Gathered::default();
+    let mut notes = Vec::new();
+    for a in &m.attachments {
+        match local(ctx.folder, &a.url) {
+            Some(path) => {
+                if !got.keep(format!("a:{}", a.id), &path, &a.file_name, &mut files, had, written) {
+                    notes.push(format!("📎 {} (not brought over)", a.file_name));
+                }
+            }
+            None => notes.push(if a.url.starts_with("http") { format!("📎 [{}]({})", a.file_name, a.url) } else { format!("📎 {} (not in the backup)", a.file_name) }),
+        }
+    }
+    let (mut content, mut mentions) = rewrite(m, ctx);
+    // An embed's pictures whose links stop working, kept as the post's files; what
+    // is left of it a card, where anything is.
+    let mut moved: Vec<String> = Vec::new();
+    let mut embeds = m.embeds.clone();
+    for e in embeds.iter_mut() {
+        let link = e.url.clone().filter(|u| expires(u));
+        let mut take = |image: &Image, got: &mut Gathered, files: &mut Option<PostFiles<'_>>, written: &mut Written| -> bool {
+            let web = image.web().map(str::to_string);
+            if web.as_deref().is_some_and(|w| !expires(w)) && link.is_none() {
+                return false;
+            }
+            let Some(path) = local(ctx.folder, &image.url) else { return false };
+            let name = [link.as_deref(), web.as_deref()].into_iter().flatten().find_map(file_name_of).unwrap_or_else(|| "picture".to_string());
+            let source = format!("e:{}", bare(web.as_deref().or(link.as_deref()).unwrap_or(&image.url)));
+            let kept = got.sources.contains(&source) || got.keep(source, &path, &name, files, had, written);
+            if kept {
+                moved.extend(web);
+            }
+            kept
+        };
+        let mut taken = false;
+        for picture in [&mut e.image, &mut e.thumbnail] {
+            if picture.as_ref().is_some_and(|image| take(image, &mut got, &mut files, written)) {
+                *picture = None;
+                taken = true;
+            }
+        }
+        let mut images = std::mem::take(&mut e.images);
+        images.retain(|image| {
+            let kept = take(image, &mut got, &mut files, written);
+            taken |= kept;
+            !kept
+        });
+        e.images = images;
+        if taken {
+            moved.extend(link);
+        }
+    }
+    let cards: Vec<Value> = embeds
+        .iter()
+        .filter(|e| {
+            // A card that was a picture's link and nothing more is the picture now.
+            let words = [&e.title, &e.description].iter().any(|t| t.as_deref().is_some_and(|t| !t.is_empty())) || !e.fields.is_empty() || e.author.is_some() || e.footer.is_some();
+            let pictured = e.image.is_some() || e.thumbnail.is_some() || !e.images.is_empty() || e.video.is_some();
+            words || pictured || !e.url.as_deref().is_some_and(|u| moved.iter().any(|l| bare(l) == bare(u)))
+        })
+        .filter_map(|e| card(e, &mut |text| rewrite_text(text, m, ctx, &mut mentions)))
+        .take(10)
+        .collect();
+    // The links of what is kept now, out of the text.
+    if !moved.is_empty() {
+        let kept: Vec<&str> = moved.iter().map(|l| bare(l)).collect();
+        let names: Vec<&str> = got.attachments.iter().filter_map(|a| a["filename"].as_str()).collect();
+        let without = LINK.replace_all(&content, |c: &regex::Captures| {
+            let link = c[0].trim_end_matches(['.', ',', '!', '?', ')', '>']);
+            if expires(link) && (kept.contains(&bare(link)) || file_name_of(link).is_some_and(|name| names.contains(&name.as_str()))) {
+                c[0][link.len()..].to_string()
+            } else {
+                c[0].to_string()
+            }
+        });
+        content = without.lines().map(str::trim_end).collect::<Vec<_>>().join("\n").trim().to_string();
+    }
+    let mut extra = serde_json::Map::new();
+    if !got.media.is_empty() {
+        extra.insert("media".into(), json!(got.media));
+        extra.insert("attachments".into(), json!(got.attachments));
+    }
+    if !cards.is_empty() {
+        extra.insert("embeds".into(), json!(cards));
+    }
+    for sticker in &m.stickers {
+        let shown = match ctx.expressions.get(&sticker.id) {
+            Some((shortcode, url)) => format!("![:{shortcode}:]({url})"),
+            None => format!("[sticker: {}]", sticker.name),
+        };
+        content = if content.is_empty() { shown } else { format!("{content}\n{shown}") };
+    }
+    for note in notes {
+        content = if content.is_empty() { note } else { format!("{content}\n{note}") };
+    }
+    (content, mentions, extra, got.sources)
+}
+
+/// A post's files as [`prepare`] gathers them: each with where it came from.
+#[derive(Default)]
+struct Gathered {
+    media: Vec<Value>,
+    attachments: Vec<Value>,
+    sources: Vec<String>,
+}
+
+impl Gathered {
+    /// The file at `path` from `source`: the post's already (`had`), or kept now.
+    /// Whether it is the post's.
+    fn keep(&mut self, source: String, path: &Path, name: &str, files: &mut Option<PostFiles<'_>>, had: &HashMap<String, Kept>, written: &mut Written) -> bool {
+        let kept = match had.get(&source) {
+            Some(kept) => kept.clone(),
+            None => {
+                let Some(files) = files.as_mut() else { return false };
+                match (files.upload)(path, name) {
+                    Ok(kept) => {
+                        written.files += 1;
+                        written.file_bytes += kept.0["byte_count"].as_u64().unwrap_or(0);
+                        kept
+                    }
+                    Err(error) => {
+                        written.files_failed.push(format!("{name}: {error:#}"));
+                        return false;
+                    }
+                }
+            }
+        };
+        self.attachments.push(kept.0);
+        self.media.push(kept.1);
+        self.sources.push(source);
+        true
+    }
 }
 
 /// A card as the app draws a webhook's (Discord's embed object): pictures by their
@@ -1060,37 +1287,9 @@ pub fn write(store: &Store, export: &Export, channel: &Channel, ctx: &Context, p
         // and a second run keeps them again (a file nobody's post names is only space).
         let mut prepared = Vec::with_capacity(chunk.len());
         for m in chunk {
-            let mut extra = serde_json::Map::new();
-            let mut media = Vec::new();
-            let mut attachments = Vec::new();
-            let mut notes = Vec::new();
-            for a in &m.attachments {
-                match (ctx.files, local(ctx.folder, &a.url)) {
-                    (Some(files), Some(path)) => match keep_file(files, &owner, &path, &a.file_name, ctx.now) {
-                        Ok((attachment, item)) => {
-                            written.files += 1;
-                            written.file_bytes += attachment["byte_count"].as_u64().unwrap_or(0);
-                            attachments.push(attachment);
-                            media.push(item);
-                        }
-                        Err(error) => {
-                            written.files_failed.push(format!("{}: {error:#}", a.file_name));
-                            notes.push(format!("📎 {} (not brought over)", a.file_name));
-                        }
-                    },
-                    (None, Some(_)) => notes.push(format!("📎 {} (not brought over)", a.file_name)),
-                    (_, None) => notes.push(if a.url.starts_with("http") { format!("📎 [{}]({})", a.file_name, a.url) } else { format!("📎 {} (not in the backup)", a.file_name) }),
-                }
-            }
-            if !media.is_empty() {
-                extra.insert("media".into(), json!(media));
-                extra.insert("attachments".into(), json!(attachments));
-            }
-            let (mut content, mut mentions) = rewrite(m, ctx);
-            let cards = cards(m, ctx, &mut mentions);
-            if !cards.is_empty() {
-                extra.insert("embeds".into(), json!(cards));
-            }
+            let mut upload = |path: &Path, name: &str| keep_file(ctx.files.expect("only asked with files"), &owner, path, name, ctx.now);
+            let files = ctx.files.map(|_| PostFiles { upload: &mut upload });
+            let (content, mentions, mut extra, sources) = prepare(m, ctx, files, &HashMap::new(), &mut written);
             let avatar = match (ctx.files, m.author.avatar_url.as_deref().and_then(|u| local(ctx.folder, u))) {
                 (Some(files), Some(path)) => avatars
                     .entry(m.author.id.clone())
@@ -1110,19 +1309,13 @@ pub fn write(store: &Store, export: &Export, channel: &Channel, ctx: &Context, p
             if let Some(avatar) = avatar {
                 author["avatar"] = avatar;
             }
-            extra.insert("imported".into(), json!({ "from": "discord", "id": m.id, "channel": export.channel.id, "author": author }));
+            let mut imported = json!({ "from": "discord", "id": m.id, "channel": export.channel.id, "author": author, "at": ctx.now });
+            if !sources.is_empty() {
+                imported["files"] = json!(sources);
+            }
+            extra.insert("imported".into(), imported);
             if forum && thread_id.as_deref() == Some(m.id.as_str()) {
                 extra.insert("title".into(), json!(export.channel.name.chars().take(100).collect::<String>()));
-            }
-            for sticker in &m.stickers {
-                let shown = match ctx.expressions.get(&sticker.id) {
-                    Some((shortcode, url)) => format!("![:{shortcode}:]({url})"),
-                    None => format!("[sticker: {}]", sticker.name),
-                };
-                content = if content.is_empty() { shown } else { format!("{content}\n{shown}") };
-            }
-            for note in notes {
-                content = if content.is_empty() { note } else { format!("{content}\n{note}") };
             }
             prepared.push((m, content, mentions, Value::Object(extra)));
         }
@@ -1197,59 +1390,200 @@ pub fn write(store: &Store, export: &Export, channel: &Channel, ctx: &Context, p
     Ok(written)
 }
 
-/// What [`refresh_embeds`] did.
+/// What [`refresh`] did.
 #[derive(Debug, Default)]
 pub struct Refreshed {
-    /// Posts whose embeds were written again.
+    /// Posts written again.
     pub posts: usize,
     /// Posts here already as the export has them.
     pub same: usize,
     /// The export's posts that aren't here (never imported, or taken back).
     pub missing: usize,
+    /// Of `posts`: those whose text or whom they call on changed.
+    pub texts: usize,
+    /// Posts changed here since (edited by whoever claimed them): their text and
+    /// whom they call on are left as they are.
+    pub edited_here: usize,
+    /// Files kept for them now (or, in a dry run, that would be), and their bytes.
+    pub files: usize,
+    pub file_bytes: u64,
+    pub files_failed: Vec<String>,
+}
+
+/// What [`refresh`] writes again of a post already imported.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Refresh {
+    /// Its cards (`embeds`).
+    pub embeds: bool,
+    /// Its files: each attachment and Discord-linked embed picture in the export's
+    /// files kept as its own (`ctx.files`), those it has already kept as they are;
+    /// its text without the links of what is kept now.
+    pub files: bool,
+    /// Its text as it reads now (people, roles and channels by name) and whom it
+    /// calls on (`mentions`: people, roles, everyone).
+    pub mentions: bool,
 }
 
 /// The embeds of `export`'s posts already imported into `channel`, written again
-/// from it as [`write`] would write them now, and each post that changed marked
-/// changed (as an edit is), so members' apps take it up. Nothing else of a post is
-/// touched: what it says, who it calls on, its reactions and files stay as they are.
-/// `dry_run`: only counted.
+/// from it as [`write`] would write them now ([`refresh`] with embeds alone).
 pub fn refresh_embeds(store: &Store, export: &Export, channel: &Channel, ctx: &Context, dry_run: bool) -> anyhow::Result<Refreshed> {
+    refresh(store, export, channel, ctx, Refresh { embeds: true, ..Default::default() }, dry_run)
+}
+
+/// `export`'s posts already imported into `channel`, written again from it as
+/// [`write`] would write them now, in what `what` says, and each post that changed
+/// marked changed (as an edit is), so members' apps take it up. Its reactions,
+/// author and place stay as they are; a post edited here since keeps its text.
+/// Safe to run again: a file kept once is the post's, and isn't kept again.
+/// `dry_run`: only counted (files measured, not kept).
+pub fn refresh(store: &Store, export: &Export, channel: &Channel, ctx: &Context, what: Refresh, dry_run: bool) -> anyhow::Result<Refreshed> {
     let mut refreshed = Refreshed::default();
     let have = imported_here(store, &channel.id)?;
-    store.db.grouped(|| -> anyhow::Result<()> {
-        for m in export.messages.iter().filter(|m| is_said(&m.kind)) {
-            let id = format!("{POST_PREFIX}{}", m.id);
-            let extra: Option<String> = match have.contains(&id) {
-                true => store.db.lock().query_row("SELECT extra FROM post_extra WHERE post = ?1", params![id], |row| row.get(0))?,
-                false => None,
-            };
-            // (A post taken back has no extra left: it stays gone.)
-            let Some(mut extra) = extra.and_then(|text| serde_json::from_str::<Value>(&text).ok()).filter(Value::is_object) else {
-                refreshed.missing += 1;
-                continue;
-            };
-            let cards = cards(m, ctx, &mut Vec::new());
-            let now = if cards.is_empty() { None } else { Some(json!(cards)) };
-            if extra.get("embeds") == now.as_ref() {
-                refreshed.same += 1;
-                continue;
-            }
-            refreshed.posts += 1;
-            if dry_run {
-                continue;
-            }
-            match now {
-                Some(cards) => extra["embeds"] = cards,
-                None => {
-                    extra.as_object_mut().map(|e| e.remove("embeds"));
+    let owner = format!("import:discord:{}", export.guild.id);
+    for m in export.messages.iter().filter(|m| is_said(&m.kind)) {
+        let id = format!("{POST_PREFIX}{}", m.id);
+        let extra: Option<String> = match have.contains(&id) {
+            true => store.db.lock().query_row("SELECT extra FROM post_extra WHERE post = ?1", params![id], |row| row.get(0))?,
+            false => None,
+        };
+        // (A post taken back has no extra left: it stays gone.)
+        let Some(extra) = extra.and_then(|text| serde_json::from_str::<Value>(&text).ok()).filter(Value::is_object) else {
+            refreshed.missing += 1;
+            continue;
+        };
+        let Some((content, kept_mentions, edited_at)) = store.db.lock().query_row(
+            "SELECT posts.content, post_state.mentions, post_state.edited_at FROM posts JOIN post_state ON post_state.post = posts.id WHERE posts.id = ?1",
+            params![id],
+            |row| Ok((row.get::<String>(0)?, row.get::<Option<String>>(1)?, row.get::<Option<i64>>(2)?)),
+        )?
+        else {
+            refreshed.missing += 1;
+            continue;
+        };
+        let had = files_had(m, &extra);
+        let mut written = Written::default();
+        let mut upload = |path: &Path, name: &str| -> anyhow::Result<Kept> {
+            match (dry_run, ctx.files) {
+                (false, Some(files)) => keep_file(files, &owner, path, name, ctx.now),
+                // Counted as it would be kept.
+                _ => {
+                    let bytes = std::fs::metadata(path).with_context(|| format!("{}", path.display()))?.len();
+                    Ok((json!({ "id": format!("dry-run-{name}"), "filename": name, "byte_count": bytes }), json!({ "attachment": format!("dry-run-{name}") })))
                 }
             }
-            store.set_post_extra(&id, &extra)?;
-            store.touch_post(&id)?;
+        };
+        let files = (what.files && ctx.files.is_some()).then(|| PostFiles { upload: &mut upload });
+        let (new_content, new_mentions, prepared, sources) = prepare(m, ctx, files, &had, &mut written);
+        refreshed.files += written.files;
+        refreshed.file_bytes += written.file_bytes;
+        refreshed.files_failed.extend(written.files_failed);
+        let mut new_extra = extra.clone();
+        // When it was brought in, for a post brought in before that was said.
+        if new_extra["imported"].is_object() && new_extra["imported"].get("at").is_none() {
+            let at: Option<i64> = store.db.lock().query_value(
+                "SELECT MIN(imported_ranges.at) FROM imported_ranges JOIN posts ON posts.channel = imported_ranges.channel AND posts.seq BETWEEN imported_ranges.from_seq AND imported_ranges.to_seq WHERE posts.id = ?1",
+                params![id],
+            )?;
+            if let Some(at) = at {
+                new_extra["imported"]["at"] = json!(at);
+            }
         }
-        Ok(())
-    })?;
+        if what.embeds || what.files {
+            match prepared.get("embeds") {
+                Some(cards) => new_extra["embeds"] = cards.clone(),
+                None => {
+                    new_extra.as_object_mut().map(|e| e.remove("embeds"));
+                }
+            }
+        }
+        if what.files && ctx.files.is_some() {
+            for key in ["media", "attachments"] {
+                match prepared.get(key) {
+                    Some(value) => new_extra[key] = value.clone(),
+                    None => {
+                        new_extra.as_object_mut().map(|e| e.remove(key));
+                    }
+                }
+            }
+            if !sources.is_empty() {
+                new_extra["imported"]["files"] = json!(sources);
+            }
+        }
+        // Its text, unless it was edited here since (by whoever claimed it).
+        let edited_here = edited_at != m.timestamp_edited.as_deref().and_then(seconds);
+        let rewrite_text = (what.mentions || (what.files && ctx.files.is_some())) && !edited_here;
+        if (what.mentions || what.files) && edited_here {
+            refreshed.edited_here += 1;
+        }
+        let new_content = if rewrite_text { new_content } else { content.clone() };
+        // Whom it calls on: a Discord account claimed since is its member's.
+        let mut mentions = Vec::new();
+        for mut mention in new_mentions {
+            if let Some(who) = mention["who"].as_str().filter(|who| who.starts_with(AUTHOR_PREFIX)) {
+                mention["who"] = json!(store.current_did(who)?);
+            }
+            mentions.push(mention);
+        }
+        let new_mentions = (!mentions.is_empty()).then(|| Value::from(mentions).to_string());
+        let mentions_changed = what.mentions && !edited_here && new_mentions != kept_mentions;
+        let text_changed = new_content != content;
+        if new_extra == extra && !text_changed && !mentions_changed {
+            refreshed.same += 1;
+            continue;
+        }
+        refreshed.posts += 1;
+        if text_changed || mentions_changed {
+            refreshed.texts += 1;
+        }
+        if dry_run {
+            continue;
+        }
+        store.db.grouped(|| -> anyhow::Result<()> {
+            if new_extra != extra {
+                store.set_post_extra(&id, &new_extra)?;
+            }
+            let mut db = store.db.lock();
+            if text_changed {
+                db.execute("UPDATE posts SET content = ?2 WHERE id = ?1", params![id, new_content])?;
+            }
+            if mentions_changed {
+                db.execute("UPDATE post_state SET mentions = ?2 WHERE post = ?1", params![id, new_mentions])?;
+            }
+            drop(db);
+            store.touch_post(&id)?;
+            Ok(())
+        })?;
+    }
     Ok(refreshed)
+}
+
+/// The files post `m` has kept already, by where each came from ([`prepare`]'s
+/// `had`): as `imported.files` says, or, for a post imported before it said,
+/// each attachment by its file name.
+fn files_had(m: &Message, extra: &Value) -> HashMap<String, Kept> {
+    let attachments = extra["attachments"].as_array().cloned().unwrap_or_default();
+    let media = extra["media"].as_array().cloned().unwrap_or_default();
+    let mut had = HashMap::new();
+    if let Some(sources) = extra["imported"]["files"].as_array() {
+        for (n, source) in sources.iter().enumerate() {
+            if let (Some(source), Some(attachment), Some(item)) = (source.as_str(), attachments.get(n), media.get(n)) {
+                had.insert(source.to_string(), (attachment.clone(), item.clone()));
+            }
+        }
+        return had;
+    }
+    let mut used = vec![false; attachments.len()];
+    for a in &m.attachments {
+        let found = attachments.iter().enumerate().find(|(n, kept)| !used[*n] && kept["filename"] == a.file_name.as_str());
+        if let Some((n, kept)) = found {
+            // (Its media item names it by id.)
+            if let Some(item) = media.iter().find(|item| item["attachment"] == kept["id"]) {
+                used[n] = true;
+                had.insert(format!("a:{}", a.id), (kept.clone(), item.clone()));
+            }
+        }
+    }
+    had
 }
 
 /// Discord channel ids to names, for `<#id>`, from every export's header.
@@ -1279,6 +1613,7 @@ mod tests {
             channel_names: HashMap::from([("900".to_string(), "fanart".to_string())]),
             roles: HashMap::from([("700".to_string(), ("r1".to_string(), "Artists".to_string()))]),
             expressions: HashMap::from([("555".to_string(), ("frostyhi".to_string(), "https://c.example/c/f/s/frosty-emoji/a.png".to_string()))]),
+            users: HashMap::from([("444".to_string(), "Dee".to_string())]),
             now: 2_000_000_000,
         }
     }
@@ -1368,7 +1703,7 @@ mod tests {
         assert!(art.pinned);
         assert_eq!(art.rev, 0);
         assert_eq!(art.author_did, "did:wyvrn:tmp:discord:111");
-        assert_eq!(art.reactions, vec![("❤️".to_string(), vec!["did:wyvrn:tmp:discord:222".to_string(), "did:wyvrn:tmp:discord:333".to_string()])]);
+        assert_eq!(art.reactions, vec![crate::store::Reacted { emoji: "❤️".to_string(), count: 2, by: vec!["did:wyvrn:tmp:discord:222".to_string(), "did:wyvrn:tmp:discord:333".to_string()] }]);
         assert_eq!(art.extra.as_ref().unwrap()["imported"]["id"], "10");
         let answer = store.post_by_id("discord-11").unwrap().unwrap();
         assert_eq!(answer.reply_to.as_deref(), Some("discord-10"));
@@ -1512,6 +1847,188 @@ mod tests {
         assert_eq!((guild.name.as_str(), channel.name.as_str(), channel.category.as_deref()), ("G", "fanart", Some("Art")));
         assert_eq!(read(&path).unwrap().messages.len(), 1);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_role_everyone_and_someone_named_only_in_an_embed_are_called_on() {
+        let dir = std::env::temp_dir();
+        let mut m = message("1", "2020-01-01T00:00:00+00:00", "@everyone read the rules");
+        m.embeds = vec![Embed { description: Some("ask <@&700> or <@444>".into()), ..Default::default() }];
+        let ctx = ctx(&dir);
+        let (text, mut mentions) = rewrite(&m, &ctx);
+        assert_eq!(text, "@everyone read the rules");
+        let cards = cards(&m, &ctx, &mut mentions);
+        assert_eq!(cards[0]["description"], "ask @Artists or @Dee");
+        assert_eq!(
+            mentions,
+            vec![json!({ "who": "everyone", "name": "everyone" }), json!({ "who": "did:wyvrn:tmp:discord:444", "name": "Dee" }), json!({ "who": "role:r1", "name": "Artists" })]
+        );
+        // Not in a word, nor code.
+        assert!(rewrite(&message("2", "2020-01-01T00:00:00+00:00", "mail me@everyone.example"), &ctx).1.is_empty());
+    }
+
+    #[test]
+    fn a_role_is_found_by_the_import_of_the_servers_roles_then_by_its_name_there() {
+        let store = Store::in_memory().unwrap();
+        let role = |id: &str, name: &str| {
+            store.save_role(&crate::store::RoleDef { id: id.into(), name: name.into(), color: None, icon: None, position: 1, permissions: Vec::new(), mentionable: true, hoist: false, self_assignable: false }).unwrap();
+            id.to_string()
+        };
+        let (mods, artists) = (role("m1", "Discord Mods"), role("a1", "Artists"));
+        {
+            let mut db = store.db.lock();
+            db.execute("INSERT INTO discord_mapped (kind, discord_id, local, name) VALUES ('role', '464', ?1, 'Mods (old name)')", params![mods]).unwrap();
+            db.execute("INSERT INTO discord_mapped (kind, discord_id, local, name) VALUES ('role', '465', 'gone', 'Artists')", params![]).unwrap();
+        }
+        let roles = roles_for(&store, &Export::default()).unwrap();
+        assert_eq!(roles.get("464"), Some(&(mods, "Discord Mods".to_string())));
+        assert_eq!(roles.get("465"), Some(&(artists, "Artists".to_string())));
+    }
+
+    /// A PNG of `width` by `height`, its bytes.
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(width, height)).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        png.into_inner()
+    }
+
+    /// A post whose text is a Discord CDN link, carded as Discord cards one (its
+    /// picture in the export's files, without its name's ending), an attachment
+    /// beside it, and a YouTube card (its picture on the web for good).
+    fn post_with_discord_links(folder: &Path) -> Message {
+        std::fs::create_dir_all(folder.join("ch.json_Files")).unwrap();
+        std::fs::write(folder.join("ch.json_Files/Sketch_2-eb27"), png(8, 6)).unwrap();
+        std::fs::write(folder.join("ch.json_Files/art-1.png"), png(4, 4)).unwrap();
+        std::fs::write(folder.join("ch.json_Files/yt-1.jpg"), png(2, 2)).unwrap();
+        let cdn = "https://cdn.discordapp.com/attachments/1/2/Sketch_2.png";
+        let mut m = message("50", "2020-01-01T00:00:00+00:00", &format!("{cdn} (the bigger one)"));
+        m.attachments = vec![Attachment { id: "77".into(), url: "ch.json_Files/art-1.png".into(), file_name: "art.png".into(), file_size_bytes: 10 }];
+        m.embeds = vec![
+            Embed {
+                title: Some(String::new()),
+                url: Some(cdn.into()),
+                thumbnail: Some(Image { url: "ch.json_Files/Sketch_2-eb27".into(), canonical_url: Some(format!("{cdn}?ex=1")), width: Some(8), height: Some(6) }),
+                ..Default::default()
+            },
+            Embed {
+                title: Some("A video".into()),
+                url: Some("https://www.youtube.com/watch?v=x".into()),
+                thumbnail: Some(Image { url: "ch.json_Files/yt-1.jpg".into(), canonical_url: Some("https://i.ytimg.com/vi/x/hq.jpg".into()), width: Some(2), height: Some(2) }),
+                ..Default::default()
+            },
+        ];
+        m
+    }
+
+    #[test]
+    fn a_discord_link_to_a_picture_in_the_backup_is_brought_over_as_the_posts_file() {
+        let files = Files::scratch(&crate::config::FilesConfig::default(), "https://c.example/").unwrap();
+        let folder = files.host.store.path("").join("export");
+        let store = Store::in_memory().unwrap();
+        store.add_channel("fan", "fanart", "", "did:example:owner", 100).unwrap();
+        let channel = store.channel("fan").unwrap().unwrap();
+        let export = Export { messages: vec![post_with_discord_links(&folder)], ..Default::default() };
+        let mut setting = ctx(&folder);
+        setting.files = Some(&files);
+        let written = write(&store, &export, &channel, &setting, |_, _| {}).unwrap();
+        assert_eq!(written.files, 2, "{:?}", written.files_failed);
+        let post = store.post_by_id("discord-50").unwrap().unwrap();
+        assert_eq!(post.content, "(the bigger one)");
+        let extra = post.extra.unwrap();
+        let names: Vec<&str> = extra["attachments"].as_array().unwrap().iter().map(|a| a["filename"].as_str().unwrap()).collect();
+        assert_eq!(names, ["art.png", "Sketch_2.png"]);
+        assert_eq!(extra["attachments"][1]["media_type"], "image/png");
+        assert_eq!((extra["media"][1]["width"].clone(), extra["media"][1]["height"].clone()), (json!(8), json!(6)));
+        // The picture's card is the picture now; the video's stays, its picture on the web.
+        let cards = extra["embeds"].as_array().unwrap();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0]["thumbnail"]["url"], "https://i.ytimg.com/vi/x/hq.jpg");
+        assert_eq!(extra["imported"]["files"], json!(["a:77", "e:https://cdn.discordapp.com/attachments/1/2/Sketch_2.png"]));
+        assert_eq!(extra["imported"]["at"], 2_000_000_000);
+        let _ = std::fs::remove_dir_all(files.host.store.path(""));
+    }
+
+    #[test]
+    fn posts_brought_in_as_text_take_up_their_files_and_mentions_once_and_one_edited_here_keeps_its_text() {
+        let files = Files::scratch(&crate::config::FilesConfig::default(), "https://c.example/").unwrap();
+        let folder = files.host.store.path("").join("export");
+        let store = Store::in_memory().unwrap();
+        store.add_channel("fan", "fanart", "", "did:example:owner", 100).unwrap();
+        let channel = store.channel("fan").unwrap().unwrap();
+        let mut rules = message("51", "2020-01-02T00:00:00+00:00", "ask <@&464>");
+        rules.embeds = vec![Embed { description: Some("@here".into()), ..Default::default() }];
+        let edited = message("52", "2020-01-03T00:00:00+00:00", "ask <@&464> too");
+        let export = Export { messages: vec![post_with_discord_links(&folder), rules, edited], ..Default::default() };
+        // Brought in before: text only, and the role unknown.
+        let mut before = ctx(&folder);
+        before.roles = HashMap::new();
+        write(&store, &export, &channel, &before, |_, _| {}).unwrap();
+        let post = store.post_by_id("discord-50").unwrap().unwrap();
+        assert!(post.content.contains("📎 art.png (not brought over)") && post.content.contains("cdn.discordapp.com"), "{}", post.content);
+        assert_eq!(store.post_by_id("discord-51").unwrap().unwrap().content, "ask @a-role");
+        // As if it were from before `imported.at` and `imported.files` were said.
+        for id in ["discord-50", "discord-51", "discord-52"] {
+            let mut extra = store.post_by_id(id).unwrap().unwrap().extra.unwrap();
+            extra["imported"].as_object_mut().unwrap().remove("at");
+            store.set_post_extra(id, &extra).unwrap();
+        }
+        store.edit_post("discord-52", "my own words", &[], 2_100_000_000).unwrap();
+
+        let mut now = ctx(&folder);
+        now.roles = HashMap::from([("464".to_string(), ("m1".to_string(), "Discord Mods".to_string()))]);
+        now.files = Some(&files);
+        let what = Refresh { embeds: true, files: true, mentions: true };
+        let counted = refresh(&store, &export, &channel, &now, what, true).unwrap();
+        assert_eq!((counted.posts, counted.files), (3, 2), "{counted:?}");
+        assert!(store.post_by_id("discord-50").unwrap().unwrap().extra.unwrap().get("media").is_none(), "a dry run changes nothing");
+        let done = refresh(&store, &export, &channel, &now, what, false).unwrap();
+        assert_eq!((done.posts, done.files, done.edited_here), (3, 2, 1), "{done:?}");
+        let post = store.post_by_id("discord-50").unwrap().unwrap();
+        assert_eq!(post.content, "(the bigger one)");
+        assert_eq!(post.extra.as_ref().unwrap()["media"].as_array().unwrap().len(), 2);
+        assert!(post.rev > 0, "sent as changed");
+        let rules = store.post_by_id("discord-51").unwrap().unwrap();
+        assert_eq!(rules.content, "ask @Discord Mods");
+        let who: Vec<&str> = rules.mentions.iter().map(|m| m.who.as_str()).collect();
+        assert_eq!(who, ["role:m1", "everyone"]);
+        assert_eq!(rules.extra.unwrap()["imported"]["at"], 2_000_000_000);
+        assert_eq!(store.post_by_id("discord-52").unwrap().unwrap().content, "my own words");
+        // Again: nothing more to do, nothing kept twice.
+        let again = refresh(&store, &export, &channel, &now, what, false).unwrap();
+        assert_eq!((again.posts, again.files, again.same), (0, 0, 3), "{again:?}");
+        let _ = std::fs::remove_dir_all(files.host.store.path(""));
+    }
+
+    /// A dry run against a real export, counts only: `WYVRN_DISCORD_EXPORT` names
+    /// one of its files. Brought in as text, then what `--refresh-files
+    /// --refresh-mentions` would do, said. (`cargo test -- --ignored --nocapture`)
+    #[test]
+    #[ignore]
+    fn dry_run_of_a_refresh_against_a_real_export() {
+        let Ok(path) = std::env::var("WYVRN_DISCORD_EXPORT") else { return };
+        let path = PathBuf::from(path);
+        let export = read(&path).unwrap();
+        let folder = path.parent().unwrap();
+        let store = Store::in_memory().unwrap();
+        store.add_channel("c", &export.channel.name, "", "did:example:owner", 100).unwrap();
+        let channel = store.channel("c").unwrap().unwrap();
+        let mut setting = Context { folder, files: None, channel_names: HashMap::new(), roles: HashMap::new(), expressions: HashMap::new(), users: users_in(&export), now: 1 };
+        let written = write(&store, &export, &channel, &setting, |_, _| {}).unwrap();
+        let files = Files::scratch(&crate::config::FilesConfig::default(), "https://c.example/").unwrap();
+        setting.files = Some(&files);
+        let what = Refresh { embeds: true, files: true, mentions: true };
+        let counted = refresh(&store, &export, &channel, &setting, what, true).unwrap();
+        let cdn_in_text = store.db.lock().query_value::<i64>("SELECT COUNT(*) FROM posts WHERE content LIKE '%discordapp.%/attachments/%'", params![]).unwrap();
+        println!(
+            "{} posts brought in as text ({cdn_in_text} with a Discord attachment link in their text); a refresh would write {} again ({} their text or mentions), keeping {} files ({}), {} failed",
+            written.posts,
+            counted.posts,
+            counted.texts,
+            counted.files,
+            bytes(counted.file_bytes),
+            counted.files_failed.len()
+        );
+        let _ = std::fs::remove_dir_all(files.host.store.path(""));
     }
 }
 

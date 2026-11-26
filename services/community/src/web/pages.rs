@@ -581,9 +581,9 @@ fn post_view(state: &AppState, post: &Post, channel: &Channel, root: &str, focus
         reactions: post
             .reactions
             .iter()
-            .map(|(emoji, who)| match custom_emoji(emoji) {
-                Some((name, address)) => ReactionView { raw: emoji.clone(), text: format!(":{name}:"), picture: through_here(&address), count: who.len() },
-                None => ReactionView { raw: emoji.clone(), text: emoji.clone(), picture: None, count: who.len() },
+            .map(|r| match custom_emoji(&r.emoji) {
+                Some((name, address)) => ReactionView { raw: r.emoji.clone(), text: format!(":{name}:"), picture: through_here(&address), count: r.count as usize },
+                None => ReactionView { raw: r.emoji.clone(), text: r.emoji.clone(), picture: None, count: r.count as usize },
             })
             .collect(),
         cards: super::preview::links_in(&post.content)

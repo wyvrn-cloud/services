@@ -138,6 +138,31 @@ async fn what_each_request_costs_in_statements() {
     measure("join (already in: the community)", cost(member.community("join", json!({}))).await);
     measure("changes-request", cost(member.community("changes-request", json!({ "after_rev": 0 }))).await);
     measure("history-request", cost(member.community("history-request", json!({ "channel": channels[0] }))).await);
+    // A role-picker channel brought in from Discord: a few posts, ~1,400 reactions
+    // by 600 authors nobody here has named before.
+    {
+        use wyvrn_community::discord_history as history;
+        let store = &state.community.store;
+        let user = |n: usize| history::User { id: format!("{}", 500_000 + n), name: format!("user{n}"), ..Default::default() };
+        let reaction = |emoji: &str, users: std::ops::Range<usize>| history::Reaction { emoji: history::Emoji { name: emoji.into(), ..Default::default() }, count: users.len() as u64, users: users.map(user).collect() };
+        let messages = (0..4)
+            .map(|n| history::Message {
+                id: format!("{}", 10 + n),
+                kind: "Default".into(),
+                timestamp: format!("2020-11-22T20:0{n}:00+00:00"),
+                author: history::User { id: "111".into(), name: "ann".into(), ..Default::default() },
+                reactions: vec![reaction("🔴", 0..300), reaction("🟢", 150..450), reaction("🔵", 300..600)],
+                ..Default::default()
+            })
+            .collect();
+        let export = history::Export { channel: history::ExportChannel { id: "901".into(), kind: "GuildTextChat".into(), name: "roles".into(), ..Default::default() }, messages, ..Default::default() };
+        let folder = std::env::temp_dir();
+        let setting = history::Context { folder: &folder, files: None, channel_names: Default::default(), roles: Default::default(), expressions: Default::default(), users: Default::default(), now: 1 };
+        history::write(store, &export, &store.channel(&channels[1]).unwrap().unwrap(), &setting, |_, _| {}).unwrap();
+    }
+    let heavy = cost(member.community("history-request", json!({ "channel": channels[1], "limit": 50 }))).await;
+    assert!(heavy.0 < 60, "a history of 3,600 reactions by 600 people: {} statements", heavy.0);
+    measure("history-request (3,600 reactions)", heavy);
     measure(
         "post",
         cost(member.community("post", json!({ "channel": channels[0], "id": uuid::Uuid::new_v4().to_string(), "content": "measured" }))).await,

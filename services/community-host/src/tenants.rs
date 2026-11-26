@@ -382,6 +382,14 @@ impl Host {
         ));
         let opening = Opening { profile_env: None, address: self.address(&record.name)?, voice_tokens: format!("{}.", record.name), assistant: None, owner_pages: Some(owner_pages) };
         let Opened { state, holding } = serve::open(&config, &stores, opening).await?;
+        // The long forms the registry's own shortening wrote down for this
+        // community's members, in its table rather than theirs (until it kept to
+        // its own tables): theirs again, once, so each can be sent to.
+        match state.community.store.adopt_long_forms(&self.registry.db) {
+            Ok(0) => {}
+            Ok(adopted) => tracing::info!(community = %record.name, adopted, "long forms of members' did:peer:4s taken up from the registry"),
+            Err(error) => tracing::warn!(community = %record.name, %error, "couldn't take up the registry's long forms"),
+        }
         // Whether the host is full, as every community here is told (WYV-22).
         let _ = state.community.host_full.set(self.full.clone());
         // What the host says of it stands over what it says of itself.
@@ -391,6 +399,7 @@ impl Host {
             tokio::spawn(server::run_pruning(state.clone())),
             tokio::spawn(server::run_voice_sweep(state.clone())),
             tokio::spawn(server::run_ban_watch(state.clone())),
+            tokio::spawn(server::claim_from_kept_profiles(state.clone())),
             tokio::spawn(server::run_polls(state.clone())),
             tokio::spawn(wyvrn_community::outgoing::run_outgoing(state.clone())),
         ];

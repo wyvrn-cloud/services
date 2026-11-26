@@ -159,7 +159,7 @@ async fn react_form(State(state): State<Arc<AppState>>, Path((id, seq)): Path<(S
     let Some((channel, at)) = readable(&state, &member, &id) else { return page_error(StatusCode::NOT_FOUND, "No such channel", "There's no such channel for you here.") };
     let Some(post) = state.community.store.post_at(&channel.id, seq).ok().flatten() else { return page_error(StatusCode::NOT_FOUND, "No such post", "That post isn't here.") };
     // Their whole set on it, as message-reactions/1.0 says it: this one in or out.
-    let mut theirs: Vec<String> = post.reactions.iter().filter(|(_, by)| by.contains(&member.did)).map(|(emoji, _)| emoji.clone()).collect();
+    let mut theirs: Vec<String> = state.community.store.own_reactions(&member.did, std::slice::from_ref(&post.id)).ok().and_then(|mut own| own.remove(&post.id)).unwrap_or_default();
     match theirs.iter().position(|emoji| *emoji == form.emoji) {
         Some(at) => {
             theirs.remove(at);

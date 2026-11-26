@@ -95,6 +95,18 @@ pub(crate) fn held() -> &'static Mutex<HashMap<String, String>> {
     HELD.get_or_init(Default::default)
 }
 
+/// Whether `did` is a short-form `did:peer:4` (`did:peer:4zQm<hash>`, nothing
+/// after): a DID nobody can resolve without having seen its long form.
+pub fn is_short_form(did: &str) -> bool {
+    short_form(did.as_bytes()).is_some_and(|(_, rest)| rest.is_empty())
+}
+
+/// The long form of short-form `did:peer:4` `short` that some store of this
+/// process has read or written, if any has.
+pub fn long_form_seen(short: &str) -> Option<String> {
+    held_long_form(short)
+}
+
 pub(crate) fn held_long_form(short: &str) -> Option<String> {
     held().lock().unwrap_or_else(|p| p.into_inner()).get(short).cloned()
 }

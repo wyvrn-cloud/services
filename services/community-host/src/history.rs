@@ -27,6 +27,10 @@ pub struct Asked {
     /// Only the embeds of the posts already imported, written again from the export
     /// (`--refresh-embeds`): nothing new is brought in.
     pub refresh_embeds: bool,
+    /// Their files kept as theirs where they aren't yet (`--refresh-files`).
+    pub refresh_files: bool,
+    /// Their text and whom they call on written again (`--refresh-mentions`).
+    pub refresh_mentions: bool,
 }
 
 /// The export files `chosen` names, from `folder`: each a Discord channel's id, or
@@ -98,8 +102,14 @@ pub fn run(host: &Host, name: &str, asked: &Asked, now: i64) -> anyhow::Result<(
         None => HashMap::new(),
     };
     let channel_names = history::channel_names(&history::files_in(&asked.folder)?);
-    if asked.refresh_embeds {
-        return refresh(&store, name, asked, &targets, channel_names, expressions, now);
+    if asked.refresh_embeds || asked.refresh_files || asked.refresh_mentions {
+        // Files kept where the community keeps them, and not as text alone.
+        let files_store = match (&settings.files, &stores.files) {
+            (Some(config), Some(location)) if asked.refresh_files && asked.media => Some(wyvrn_community::files::Files::open(config, location, public_url)?),
+            _ => None,
+        };
+        anyhow::ensure!(!asked.refresh_files || files_store.is_some(), "--refresh-files keeps files: not with --text-only, nor for a community that keeps none");
+        return refresh(&store, name, asked, &targets, files_store.as_ref(), channel_names, expressions, now);
     }
     println!("Into {name}{}:", if asked.media { "" } else { " (text only)" });
     let mut planned_bytes = 0u64;
@@ -152,8 +162,9 @@ pub fn run(host: &Host, name: &str, asked: &Asked, now: i64) -> anyhow::Result<(
             folder: &asked.folder,
             files: files_store.as_ref(),
             channel_names: channel_names.clone(),
-            roles: history::roles_by_name(&store, export)?,
+            roles: history::roles_for(&store, export)?,
             expressions: expressions.clone(),
+            users: history::users_in(export),
             now,
         };
         let written = history::write(&store, export, channel, &setting, |done, total| {
@@ -181,31 +192,53 @@ pub fn run(host: &Host, name: &str, asked: &Asked, now: i64) -> anyhow::Result<(
     Ok(())
 }
 
-/// `--refresh-embeds`: the embeds of the posts of `targets` already here, written
-/// again from the export, each that changed sent as changed (as an edit is).
+/// `--refresh-embeds`, `--refresh-files`, `--refresh-mentions`: the posts of
+/// `targets` already here, written again from the export in what was asked, each
+/// that changed sent as changed (as an edit is).
+#[allow(clippy::too_many_arguments)]
 fn refresh(
     store: &wyvrn_community::store::Store,
     name: &str,
     asked: &Asked,
     targets: &[Target],
+    files: Option<&wyvrn_community::files::Files>,
     channel_names: HashMap<String, String>,
     expressions: HashMap<String, (String, String)>,
     now: i64,
 ) -> anyhow::Result<()> {
-    println!("The embeds of what was imported into {name}{}:", if asked.dry_run { " (dry run: nothing is changed)" } else { "" });
+    let what = history::Refresh { embeds: asked.refresh_embeds, files: asked.refresh_files, mentions: asked.refresh_mentions };
+    let parts: Vec<&str> = [(what.embeds, "embeds"), (what.files, "files"), (what.mentions, "text and mentions")].into_iter().filter(|(on, _)| *on).map(|(_, part)| part).collect();
+    println!("The {} of what was imported into {name}{}:", parts.join(", "), if asked.dry_run { " (dry run: nothing is changed)" } else { "" });
     for target in targets {
         println!("  {}", shown(target));
         let Ok(channel) = &target.channel else { continue };
         let export = history::read(&target.file)?;
-        let setting = Setting { folder: &asked.folder, files: None, channel_names: channel_names.clone(), roles: history::roles_by_name(store, &export)?, expressions: expressions.clone(), now };
-        let refreshed = history::refresh_embeds(store, &export, channel, &setting, asked.dry_run)?;
+        let setting = Setting {
+            folder: &asked.folder,
+            files,
+            channel_names: channel_names.clone(),
+            roles: history::roles_for(store, &export)?,
+            expressions: expressions.clone(),
+            users: history::users_in(&export),
+            now,
+        };
+        let refreshed = history::refresh(store, &export, channel, &setting, what, asked.dry_run)?;
         println!(
-            "    {} posts' embeds {}, {} already as the export has them, {} not here",
+            "    {} posts {} ({} of them their text or mentions; {} files, {}), {} already as the export has them, {} not here",
             refreshed.posts,
             if asked.dry_run { "to write again" } else { "written again" },
+            refreshed.texts,
+            refreshed.files,
+            history::bytes(refreshed.file_bytes),
             refreshed.same,
             refreshed.missing
         );
+        if refreshed.edited_here > 0 {
+            println!("    {} edited here since: their text left as it is", refreshed.edited_here);
+        }
+        for failed in &refreshed.files_failed {
+            println!("    not brought over: {failed}");
+        }
     }
     if !asked.dry_run {
         println!("members' apps take up the changed posts as they do an edit");

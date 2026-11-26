@@ -16,7 +16,9 @@ use wyvrn_service::params;
 use crate::discord_history::AUTHOR_PREFIX;
 use crate::store::Store;
 
-/// The issuer trusted by default: wyvrn-verify.
+/// The issuer trusted by default: wyvrn-verify. It issues as its public address
+/// now (a `did:webvh`), which is trusted as this, its `did:web`, where each names
+/// the other (`alsoKnownAs`, see [`issuer_document`]).
 pub const DEFAULT_ISSUER: &str = "did:web:verify.wyvrn.app";
 /// A Discord account, as linked-accounts/1.0 names its service.
 const DISCORD_HOMES: [&str; 2] = ["https://discord.com", "https://discord.gg"];
@@ -59,6 +61,65 @@ fn origin(url: &str) -> Option<String> {
     (parsed.scheme() == "https").then(|| format!("https://{}", parsed.host_str().unwrap_or_default()))
 }
 
+/// Where a `did:webvh`'s log is kept: `https://<host>` (its log's origin).
+fn did_webvh_origin(did: &str) -> Option<String> {
+    let rest = did.strip_prefix("did:webvh:")?;
+    let host = rest.split(':').nth(1)?.replace("%3A", ":");
+    (!host.is_empty() && !host.contains('/') && !host.contains('@')).then(|| format!("https://{host}"))
+}
+
+/// The DIDs a DID document says are its own as well (`alsoKnownAs`).
+fn also_known_as(document: &Value) -> Vec<&str> {
+    document["alsoKnownAs"].as_array().into_iter().flatten().filter_map(Value::as_str).collect()
+}
+
+/// A linked-account credential's issuer's DID document, if the community trusts
+/// it, with the origins its status lists may be at (nothing is fetched but from
+/// an issuer's own). Trusted: an issuer `issuers` names, or a `did:webvh` whose
+/// document names a `did:web` that `issuers` does as its own (`alsoKnownAs`)
+/// where that `did:web`'s document names the `did:webvh` back: so wyvrn-verify,
+/// trusted as `did:web:verify.wyvrn.app`, is trusted at its public address too,
+/// and nobody else is by saying they are it. A `did:webvh`'s document is resolved
+/// (its log checked): `fetch` is given the DID itself for one.
+async fn issuer_document<F, Fut>(issuer: &str, issuers: &[String], fetch: &F) -> Result<(Value, Vec<String>), &'static str>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Option<Value>>,
+{
+    let listed = issuers.iter().any(|trusted| trusted == issuer);
+    if issuer.starts_with("did:web:") {
+        if !listed {
+            return Err("its issuer isn't one this community trusts");
+        }
+        let url = did_web_url(issuer).ok_or("its issuer's address can't be read")?;
+        let origin = origin(&url).ok_or("its issuer's address can't be read")?;
+        let document = fetch(url).await.ok_or("its issuer's DID document couldn't be fetched")?;
+        return Ok((document, vec![origin]));
+    }
+    if !issuer.starts_with("did:webvh:") {
+        return Err("its issuer is neither a did:web nor a did:webvh");
+    }
+    let document = fetch(issuer.to_string()).await.filter(|document| document["id"].as_str() == Some(issuer)).ok_or("its issuer's DID couldn't be resolved")?;
+    let mut origins: Vec<String> = did_webvh_origin(issuer).into_iter().collect();
+    let mut vouched = false;
+    // Its did:web names (at most three looked at), where they name it back.
+    for alias in also_known_as(&document).into_iter().filter(|alias| alias.starts_with("did:web:")).take(3) {
+        if !listed && !issuers.iter().any(|trusted| trusted == alias) {
+            continue;
+        }
+        let Some(url) = did_web_url(alias) else { continue };
+        let Some(alias_document) = fetch(url.clone()).await else { continue };
+        if alias_document["id"].as_str() == Some(alias) && also_known_as(&alias_document).contains(&issuer) {
+            vouched = true;
+            origins.extend(origin(&url));
+        }
+    }
+    if !listed && !vouched {
+        return Err("its issuer isn't one this community trusts");
+    }
+    Ok((document, origins))
+}
+
 /// The Discord id a member's profile proves (see [`verified_accounts`]).
 pub async fn verified_discord<F, Fut>(linked: &[Value], address: &str, issuers: &[String], now: &str, fetch: F) -> Option<String>
 where
@@ -80,8 +141,10 @@ pub fn account_of(credential: &Value) -> Option<(String, String)> {
 
 /// The accounts a member's profile proves: of its linked-account credentials, those
 /// about `address` (the public address the profile showed to be theirs), from one of
-/// `issuers`, signed, in date and not revoked, each `(service homepage, account)`.
-/// Nothing is fetched but from an issuer's own origin. `fetch` gets a URL's JSON.
+/// `issuers` (or vouched for by one, [`issuer_document`]), signed, in date and not
+/// revoked, each `(service homepage, account)`. Nothing is fetched but from an
+/// issuer's own origin. `fetch` gets a URL's JSON, or given a `did:webvh`, its
+/// document resolved.
 pub async fn verified_accounts<F, Fut>(linked: &[Value], address: &str, issuers: &[String], now: &str, fetch: F) -> Vec<(String, String)>
 where
     F: Fn(String) -> Fut,
@@ -108,21 +171,15 @@ where
             tracing::info!(service, issuer, "a linked account isn't taken: it is about another address than the profile's");
             continue;
         }
-        if !issuers.iter().any(|trusted| trusted == issuer) {
-            tracing::info!(service, issuer, "a linked account isn't taken: its issuer isn't one this community trusts");
-            continue;
-        }
-        let Some(document_url) = did_web_url(issuer) else {
-            tracing::info!(service, issuer, "a linked account isn't taken: its issuer isn't a did:web");
-            continue;
-        };
-        let Some(issuer_origin) = origin(&document_url) else { continue };
-        let Some(document) = fetch(document_url).await else {
-            tracing::info!(service, issuer, "a linked account isn't taken: its issuer's DID document couldn't be fetched");
-            continue;
+        let (document, origins) = match issuer_document(issuer, issuers, &fetch).await {
+            Ok(found) => found,
+            Err(why) => {
+                tracing::info!(service, issuer, "a linked account isn't taken: {why}");
+                continue;
+            }
         };
         let status = match wyvrn_hosted_did::linked::status_of(credential) {
-            Some((url, _)) if origin(&url).as_deref() == Some(issuer_origin.as_str()) => match fetch(url).await {
+            Some((url, _)) if origin(&url).is_some_and(|at| origins.contains(&at)) => match fetch(url).await {
                 Some(list) => Some(list),
                 None => {
                     tracing::info!(service, issuer, "a linked account isn't taken: its status list couldn't be fetched");
@@ -145,6 +202,18 @@ where
 }
 
 impl Store {
+    /// The members whose kept profile has a linked account at `service` among its
+    /// credentials (as they were shown, not yet checked): `(did, public address,
+    /// credentials)`.
+    pub fn profiles_showing(&self, service: &str) -> wyvrn_service::db::Result<Vec<(String, String, Vec<Value>)>> {
+        let rows = self.db.lock().query(
+            "SELECT member_profiles.did, member_profiles.public_address, member_profiles.linked FROM member_profiles JOIN members ON members.did = member_profiles.did WHERE member_profiles.public_address IS NOT NULL AND member_profiles.linked LIKE ?1",
+            params![format!("%{service}%")],
+            |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?, row.get::<String>(2)?)),
+        )?;
+        Ok(rows.into_iter().filter_map(|(did, address, linked)| Some((did, address, serde_json::from_str::<Vec<Value>>(&linked).ok()?))).collect())
+    }
+
     /// Whether anything was imported under the Discord account `discord_id`.
     pub fn has_imported_from(&self, discord_id: &str) -> wyvrn_service::db::Result<bool> {
         Ok(self.db.lock().query_row("SELECT 1 FROM posts WHERE author_did = ?1 LIMIT 1", params![format!("{AUTHOR_PREFIX}{discord_id}")], |_| Ok(()))?.is_some())
@@ -173,18 +242,23 @@ impl Store {
 
     /// As [`Store::claim_imported`], giving back the posts claimed, to be sent as changed.
     pub fn claim_imported_posts(&self, discord_id: &str, did: &str, now: i64) -> anyhow::Result<Vec<String>> {
-        let posts: Vec<String> = self.db.lock().query("SELECT id FROM posts WHERE author_did = ?1", params![format!("{AUTHOR_PREFIX}{discord_id}")], |row| row.get(0))?;
-        self.claim_imported(discord_id, did, now)?;
-        Ok(posts)
+        self.claim_imported(discord_id, did, now)
     }
 
     /// Makes the posts imported under `discord_id` `did`'s: their author, the
     /// reactions and mentions that were the Discord account's, and each post marked
-    /// claimed and changed (so apps take it up). How many posts.
-    pub fn claim_imported(&self, discord_id: &str, did: &str, now: i64) -> anyhow::Result<usize> {
+    /// claimed and changed (so apps take it up); and the posts that call on or answer
+    /// the account changed too, as they name it. The posts changed.
+    pub fn claim_imported(&self, discord_id: &str, did: &str, now: i64) -> anyhow::Result<Vec<String>> {
         let prior = format!("{AUTHOR_PREFIX}{discord_id}");
-        self.db.grouped(|| -> anyhow::Result<usize> {
+        self.db.grouped(|| -> anyhow::Result<Vec<String>> {
             let posts: Vec<String> = self.db.lock().query("SELECT id FROM posts WHERE author_did = ?1", params![prior], |row| row.get(0))?;
+            // And those that call on them or answer them, which name them too.
+            let naming: Vec<String> = self.db.lock().query(
+                "SELECT post FROM post_state WHERE mentions LIKE ?1 OR reply_author = ?2",
+                params![format!("%\"{prior}\"%"), prior],
+                |row| row.get(0),
+            )?;
             self.rotate(&prior, did, now)?;
             {
                 let mut db = self.db.lock();
@@ -203,7 +277,14 @@ impl Store {
                 }
                 self.touch_post(post)?;
             }
-            Ok(posts.len())
+            let mut changed = posts;
+            for post in naming {
+                if !changed.contains(&post) {
+                    self.touch_post(&post)?;
+                    changed.push(post);
+                }
+            }
+            Ok(changed)
         })
     }
 }
@@ -356,6 +437,54 @@ mod tests {
         assert!(!fetched.lock().unwrap().iter().any(|u| u.contains("elsewhere")));
     }
 
+    #[tokio::test]
+    async fn a_did_webvh_issuer_is_trusted_as_the_did_web_that_names_it_back() {
+        use affinidi_data_integrity::{DataIntegrityProof, SignOptions};
+        use wyvrn_hosted_did::write::{public_multikey, signing_secret};
+        const WEB: &str = "did:web:verify.example";
+        const WEBVH: &str = "did:webvh:QmScid:id.example:official:verify";
+        const FORGED: &str = "did:webvh:QmOther:id.example:someone";
+        const JWK: &str = r#"{"kty":"OKP","crv":"Ed25519","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo","d":"nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A"}"#;
+        let document = |id: &str, aka: &[&str]| json!({ "id": id, "alsoKnownAs": aka, "verificationMethod": [{ "id": format!("{id}#key-1"), "type": "Multikey", "controller": id, "publicKeyMultibase": public_multikey(JWK).unwrap() }], "assertionMethod": [format!("{id}#key-1")] });
+        let credential = |issuer: &'static str| async move {
+            let mut value = json!({
+                "@context": ["https://www.w3.org/ns/credentials/v2", "https://wyvrn.app/ns/linked-account/v1"],
+                "type": ["VerifiableCredential", "LinkedAccountCredential"],
+                "issuer": issuer,
+                "validFrom": "2026-01-01T00:00:00Z",
+                "credentialSubject": { "id": "did:webvh:QmAnn:id.example:ann", "account": { "type": "OnlineAccount", "accountServiceHomepage": "https://discord.com", "accountName": "111" } },
+            });
+            let signer = signing_secret(JWK, Some(&format!("{issuer}#key-1"))).unwrap();
+            let contexts = value["@context"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_string()).collect();
+            let proof = DataIntegrityProof::sign(&value, &signer, SignOptions::new().with_proof_purpose("assertionMethod").with_context(contexts)).await.unwrap();
+            value["proof"] = serde_json::to_value(proof).unwrap();
+            value
+        };
+        let fetched = std::sync::Mutex::new(Vec::new());
+        let fetch = |url: String| {
+            fetched.lock().unwrap().push(url.clone());
+            let found = match url.as_str() {
+                WEBVH => Some(document(WEBVH, &[WEB])),
+                // Says it is the trusted one; the trusted one doesn't say it back.
+                FORGED => Some(document(FORGED, &[WEB])),
+                "https://verify.example/.well-known/did.json" => Some(document(WEB, &[WEBVH])),
+                _ => None,
+            };
+            async move { found }
+        };
+        let (trusted, now, ann) = ([WEB.to_string()], "2026-11-22T00:00:00Z", "did:webvh:QmAnn:id.example:ann");
+        assert_eq!(verified_discord(&[credential(WEBVH).await], ann, &trusted, now, &fetch).await.as_deref(), Some("111"));
+        assert_eq!(verified_discord(&[credential(FORGED).await], ann, &trusted, now, &fetch).await, None);
+        // Not vouched for by anything trusted: not trusted.
+        assert_eq!(verified_discord(&[credential(WEBVH).await], ann, &["did:web:other.example".to_string()], now, &fetch).await, None);
+        // Its status list may be at its did:web's host, which named it back.
+        let mut listed = credential(WEBVH).await;
+        listed["credentialStatus"] = json!({ "type": "BitstringStatusListEntry", "statusPurpose": "revocation", "statusListCredential": "https://verify.example/status/1", "statusListIndex": "0" });
+        fetched.lock().unwrap().clear();
+        assert_eq!(verified_discord(&[listed], ann, &trusted, now, &fetch).await, None, "(no list there to read)");
+        assert!(fetched.lock().unwrap().iter().any(|u| u == "https://verify.example/status/1"));
+    }
+
     #[test]
     fn claimed_posts_and_reactions_become_the_members() {
         let store = Store::in_memory().unwrap();
@@ -370,10 +499,10 @@ mod tests {
             db.execute("INSERT INTO reactions (post, did, emoji, at) VALUES ('discord-1', ?1, '❤️', 5)", params![prior]).unwrap();
         }
         assert!(store.has_imported_from("111").unwrap());
-        assert_eq!(store.claim_imported("111", "did:example:ann", 200).unwrap(), 1);
+        assert_eq!(store.claim_imported("111", "did:example:ann", 200).unwrap(), ["discord-1"]);
         let post = store.post_by_id("discord-1").unwrap().unwrap();
         assert_eq!(post.author_did, "did:example:ann");
-        assert_eq!(post.reactions, vec![("❤️".to_string(), vec!["did:example:ann".to_string()])]);
+        assert_eq!(post.reactions, vec![crate::store::Reacted { emoji: "❤️".to_string(), count: 1, by: vec!["did:example:ann".to_string()] }]);
         assert_eq!(post.mentions[0].who, "did:example:ann");
         assert_eq!(post.extra.unwrap()["imported"]["claimed"], true);
         assert!(post.rev > 0);
