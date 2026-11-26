@@ -1050,6 +1050,10 @@ impl Community {
                         }
                     }
                 }
+                // One members take themselves grants nothing that moderates.
+                if role.self_assignable && !crate::roles::may_be_self_assignable(&role.permissions) {
+                    return Err(refused("A role members take themselves can't grant Administrator or a permission that moderates."));
+                }
                 self.store.save_role(&role).map_err(failed)?;
                 self.audit(now, &flow.owner, "role.update", Some(&role.id), Some(json!({ "name": role.name, "permissions": role.permissions, "color": role.color, "mentionable": role.mentionable })));
                 flow.data["note"] = json!(format!("Saved {}.", role.name));
@@ -1612,7 +1616,7 @@ impl Community {
             let kind = if channel.voice.is_some() { "🔊 " } else { "#" };
             fields.push(json!({ "type": "check-box", "form-id": format!("suggest-{}", channel.id), "label": format!("{kind}{}", channel.name), "value": suggested.contains(&channel.id.as_str()) }));
         }
-        let offered: Vec<String> = self.store.roles()?.into_iter().filter(|role| role.self_assignable).map(|role| role.name).collect();
+        let offered: Vec<String> = self.store.roles()?.into_iter().filter(crate::roles::takeable).map(|role| role.name).collect();
         fields.push(json!({ "type": "text", "text": if offered.is_empty() {
             "No roles are offered to pick. A role is, once Roles marks it “Members may take it, or drop it, themselves”.".to_string()
         } else {
@@ -1640,7 +1644,7 @@ impl Community {
             "roles" => {
                 let held = self.store.member_roles(&flow.owner)?;
                 let mut fields = Vec::new();
-                for role in self.store.roles()?.into_iter().filter(|role| role.self_assignable) {
+                for role in self.store.roles()?.into_iter().filter(crate::roles::takeable) {
                     let label = match &role.icon {
                         Some(icon) => format!("{icon} {}", role.name),
                         None => role.name.clone(),
@@ -1792,9 +1796,11 @@ impl Community {
             (ONBOARDING_FLOW, "roles", "pick") => {
                 let held = self.store.member_roles(&flow.owner).map_err(failed)?;
                 let mut changed = false;
+                // (One no longer takeable may still be dropped, never taken.)
                 for role in self.store.roles().map_err(failed)?.into_iter().filter(|role| role.self_assignable) {
                     let wanted = ticked(&input[format!("role-{}", role.id)]);
                     match (wanted, held.contains(&role.id)) {
+                        (true, false) if !crate::roles::takeable(&role) => continue,
                         (true, false) => self.store.give_role(&flow.owner, &role.id).map_err(failed)?,
                         (false, true) => self.store.take_role(&flow.owner, &role.id).map_err(failed)?,
                         _ => continue,

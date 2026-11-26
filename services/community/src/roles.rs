@@ -67,7 +67,7 @@ pub const CHANNEL_PERMISSIONS: &[(&str, &str)] = &[
 ];
 
 /// Holding any of these makes someone a `moderator` in older terms.
-const MODERATING: &[&str] = &["manage_messages", "admit_members", "kick_members", "ban_members", "timeout_members", "manage_reports"];
+pub const MODERATING: &[&str] = &["manage_messages", "admit_members", "kick_members", "ban_members", "timeout_members", "manage_reports"];
 
 const EVERYONE_DEFAULT: &[&str] =
     &["view_channel", "post", "react", "create_threads", "create_private_threads", "send_in_threads", "create_polls", "attach_files", "connect", "speak", "video"];
@@ -76,6 +76,19 @@ const MODERATOR_DEFAULT: &[&str] =
 
 pub fn is_permission(name: &str) -> bool {
     COMMUNITY_PERMISSIONS.iter().chain(CHANNEL_PERMISSIONS).any(|(known, _)| *known == name)
+}
+
+/// Whether a role with `permissions` may be one members take themselves: it
+/// grants neither `administrator` nor anything that moderates.
+pub fn may_be_self_assignable(permissions: &[String]) -> bool {
+    !permissions.iter().any(|p| p == "administrator" || MODERATING.contains(&p.as_str()))
+}
+
+/// Whether a member may take `role` themselves now: marked so, and granting
+/// nothing that moderates (one marked before that was refused, or since given
+/// such a permission, isn't).
+pub fn takeable(role: &RoleDef) -> bool {
+    role.self_assignable && may_be_self_assignable(&role.permissions)
 }
 
 pub fn is_channel_permission(name: &str) -> bool {

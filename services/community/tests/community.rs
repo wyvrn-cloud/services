@@ -5385,3 +5385,43 @@ async fn discords_roles_and_overrides_come_with_a_claim_member_overrides_work_ou
     store.remove_member(&bot.did()).unwrap();
     assert!(store.role(&own_id).unwrap().is_none());
 }
+
+#[tokio::test]
+async fn a_role_members_take_themselves_grants_nothing_that_moderates() {
+    use wyvrn_community::store::RoleDef;
+    let server = start_server("").await;
+    let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member]);
+    member.community("join", json!({})).await;
+    let store = &server.state.community.store;
+    // Ticking it on a role that grants Administrator, or that moderates, is refused.
+    owner.workflow("start", json!({ "template_id": "roles", "instance_id": "r1" })).await;
+    advance(&owner, "r1", "create", json!({ "name": "Glass" })).await;
+    let refused = advance(&owner, "r1", "save", json!({ "name": "Glass", "self_assignable": true, "perm-administrator": true })).await;
+    assert_eq!(refused["body"]["code"], "guard_failed", "{refused}");
+    let refused = advance(&owner, "r1", "save", json!({ "name": "Glass", "self_assignable": true, "perm-ban_members": true })).await;
+    assert_eq!(refused["body"]["code"], "guard_failed", "{refused}");
+    // Taking one on is fine; giving one so marked such a permission is not.
+    let saved = advance(&owner, "r1", "save", json!({ "name": "Glass", "self_assignable": true, "perm-post": true })).await;
+    assert_eq!(saved["body"]["state"], "list", "{saved}");
+    let glass = store.roles().unwrap().into_iter().find(|r| r.name == "Glass").unwrap();
+    assert!(glass.self_assignable);
+    advance(&owner, "r1", "edit", json!({ "role": glass.id })).await;
+    let refused = advance(&owner, "r1", "save", json!({ "name": "Glass", "self_assignable": true, "perm-post": true, "perm-administrator": true })).await;
+    assert_eq!(refused["body"]["code"], "guard_failed", "{refused}");
+    // One marked before the rule (or by hand) is neither offered nor taken.
+    store.save_role(&RoleDef { permissions: vec!["administrator".into()], ..glass.clone() }).unwrap();
+    member.workflow("start", json!({ "template_id": "onboarding", "instance_id": "w1" })).await;
+    let picking = advance(&member, "w1", "next", json!({})).await;
+    assert!(!picking["body"]["ui"].to_string().contains(&format!("role-{}", glass.id)), "{picking}");
+    advance(&member, "w1", "pick", json!({ format!("role-{}", glass.id): true })).await;
+    assert!(store.member_roles(&member.did()).unwrap().is_empty(), "Administrator isn't taken from the picker");
+    // Without what moderates, it is taken.
+    store.save_role(&RoleDef { permissions: vec!["post".into()], ..glass.clone() }).unwrap();
+    advance(&member, "w1", "done", json!({})).await;
+    let started = member.workflow("start", json!({ "template_id": "onboarding", "instance_id": "w2" })).await;
+    let next = advance(&member, "w2", "next", json!({})).await;
+    let picked = advance(&member, "w2", "pick", json!({ format!("role-{}", glass.id): true })).await;
+    assert_eq!(picked["body"]["state"], "channels", "{started} {next} {picked}");
+    assert_eq!(store.member_roles(&member.did()).unwrap(), vec![glass.id.clone()]);
+}

@@ -53,7 +53,7 @@ impl Community {
         let set = self.onboarding()?;
         let welcome = set["welcome"].as_str().is_some_and(|w| !w.trim().is_empty());
         let suggested = set["suggested"].as_array().is_some_and(|s| !s.is_empty());
-        Ok(welcome || suggested || self.store.roles()?.iter().any(|role| role.self_assignable))
+        Ok(welcome || suggested || self.store.roles()?.iter().any(crate::roles::takeable))
     }
 
     fn insights(&self, now: i64) -> anyhow::Result<Value> {
