@@ -617,7 +617,10 @@ impl Host {
                 self.store.drop_pending(&pending.name)?;
                 continue;
             }
-            if now >= pending.publish_at {
+            // Held back by a rule that no longer holds it (0.0.28's first host held a
+            // recovery key back for being named anew): published now.
+            let still_held = witness::held_back_because(record.log.as_deref().unwrap_or_default(), &pending.entries).is_some();
+            if now >= pending.publish_at || !still_held {
                 self.publish_pending(&record, &pending, now).await?;
             } else if now >= pending.publish_at - witness::SOON_SECONDS && !pending.soon_sent {
                 self.store.told_soon(&pending.name)?;

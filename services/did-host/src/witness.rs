@@ -130,9 +130,14 @@ fn messaging(document: &Value) -> Vec<Value> {
     document["service"].as_array().into_iter().flatten().filter(|service| service["type"] == "DIDCommMessaging").cloned().collect()
 }
 
-fn recovery_keys(document: &Value) -> Vec<(String, String)> {
-    let mut listed = recovery::recovery_keys_listed_in(document);
+/// The recovery keys a document lists, by the keys themselves: what they are named
+/// in the document is not what makes them the account's (an app of 0.0.28 names an
+/// address's keys after themselves, where one before numbered them, and the same
+/// recovery key under its new name was held back as changed).
+fn recovery_keys(document: &Value) -> Vec<String> {
+    let mut listed: Vec<String> = recovery::recovery_keys_listed_in(document).into_iter().map(|(_, key)| key).collect();
     listed.sort();
+    listed.dedup();
     listed
 }
 
@@ -236,6 +241,13 @@ mod tests {
         // Taken away in one entry and given back in the next is still taken away.
         let both = format!("{}\n{}", same(None, document(&["z6LSa"], &["z6Mkr"], "did:peer:2.mediator")), same(None, document(&["z6LSa", "z6LSb"], &["z6Mkr"], "did:peer:2.mediator")));
         assert!(held_back_because(&log, &both).is_some());
+
+        // The same keys named again (a device's, and a recovery key): at once.
+        let renamed = |document: Value| {
+            let text = document.to_string().replace("#recovery-z6Mkr", "#key-7").replace("#z6LSb", "#key-3");
+            serde_json::from_str::<Value>(&text).unwrap()
+        };
+        assert_eq!(held_back_because(&log, &same(None, renamed(document(&["z6LSa", "z6LSb"], &["z6Mkr"], "did:peer:2.mediator")))), None);
 
         // Witnessing turned on for a log from before: at once.
         let before = entry(Some(&["z6Mka"]), None, document(&["z6LSa"], &[], "did:peer:2.mediator"));
