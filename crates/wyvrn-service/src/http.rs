@@ -67,18 +67,25 @@ pub async fn receive<S: Service>(service: Arc<S>, body: Bytes) -> Response {
         Ok(None) => return StatusCode::ACCEPTED.into_response(),
         Err(e) => return internal(e),
     };
-    match agent.respond(&received, &reply).await {
-        Ok(Some(packed)) => ([(header::CONTENT_TYPE, "application/didcomm-encrypted+json")], packed).into_response(),
-        Ok(None) => StatusCode::ACCEPTED.into_response(),
-        // The detail is logged, never sent: it carries what the sender's endpoint
-        // answered, and that endpoint can be any address (redirected to one), so
-        // echoing it would read an internal response back to a stranger (security
-        // review WYV-92).
-        Err(e) => {
-            tracing::warn!(error = %e, "couldn't deliver reply");
-            (StatusCode::BAD_GATEWAY, DELIVERY_FAILED).into_response()
-        }
+    // Asked for on this connection, the reply is the response: packed, not sent.
+    if received.wants_reply_on_connection() {
+        return match agent.pack_reply(&received, &reply).await {
+            Ok(packed) => ([(header::CONTENT_TYPE, "application/didcomm-encrypted+json")], packed).into_response(),
+            Err(e) => internal(e),
+        };
     }
+    // Sent to the sender's own address, after they have been told it was taken:
+    // their request isn't held open while the reply crosses to their mediator
+    // (asked 2026-11-26: a post to the updates channel, taken, timed out in the
+    // app while its reply was on the way, up to 30 s behind the channel's own
+    // sending to its subscribers). Whatever the sender's endpoint answers is only
+    // logged, never sent back (security review WYV-92).
+    tokio::spawn(async move {
+        if let Err(e) = service.agent().respond(&received, &reply).await {
+            tracing::warn!(error = %e, "{DELIVERY_FAILED}");
+        }
+    });
+    StatusCode::ACCEPTED.into_response()
 }
 
 /// Serves `router` at `bind` until the process is interrupted (Ctrl-C, or the

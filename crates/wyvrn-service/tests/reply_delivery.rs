@@ -1,5 +1,6 @@
-//! A reply that couldn't be delivered: the sender is told so in fixed words, and
-//! never what its endpoint answered (security review WYV-92).
+//! A reply sent to the sender's own address: their request is answered before it
+//! is sent, so it is never held open by it, and never says what their endpoint
+//! answered (security review WYV-92).
 
 use std::sync::Arc;
 
@@ -30,10 +31,23 @@ async fn listen(router: Router) -> String {
 }
 
 #[tokio::test]
-async fn what_the_senders_endpoint_answered_is_not_sent_back() {
+async fn the_sender_is_answered_before_the_reply_is_sent_and_never_told_what_its_endpoint_said() {
     const MARKER: &str = "internal-secret-7f3a";
-    // The "sender's endpoint": an internal service answering with something private.
-    let endpoint = listen(Router::new().route("/", post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, MARKER) }))).await;
+    // The "sender's endpoint": slow, then refusing with something private.
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let told = reached.clone();
+    let endpoint = listen(Router::new().route(
+        "/",
+        post(move || {
+            let told = told.clone();
+            async move {
+                told.notify_one();
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                (StatusCode::INTERNAL_SERVER_ERROR, MARKER)
+            }
+        }),
+    ))
+    .await;
 
     // The service: answers every message, to the sender's own endpoint.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -44,10 +58,13 @@ async fn what_the_senders_endpoint_answered_is_not_sent_back() {
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 
     let sender = Agent::with_endpoint(Identity::generate().unwrap(), &endpoint).unwrap();
-    // No return_route: the reply goes to the sender's endpoint, which refuses it.
+    // No return_route: the reply goes to the sender's endpoint, after the send is answered.
     let ping = json!({ "type": "https://didcomm.org/trust-ping/2.0/ping", "body": { "response_requested": true } });
-    let error = sender.send(&service_did, &ping).await.expect_err("the service couldn't deliver its reply").to_string();
-    assert!(error.contains("502"), "{error}");
-    assert!(error.contains(http::DELIVERY_FAILED), "{error}");
-    assert!(!error.contains(MARKER), "the endpoint's answer was sent back: {error}");
+    let started = std::time::Instant::now();
+    let answered = sender.send(&service_did, &ping).await;
+    assert!(answered.is_ok(), "{answered:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(3), "the send waited on the reply: {:?}", started.elapsed());
+    assert!(!format!("{answered:?}").contains(MARKER));
+    // And the reply is still sent.
+    tokio::time::timeout(std::time::Duration::from_secs(10), reached.notified()).await.expect("the reply was sent");
 }
