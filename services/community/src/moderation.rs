@@ -177,7 +177,7 @@ impl Community {
                 if message_type == BANS_REQUEST {
                     return Ok(Some(Outcome::reply(reply_to(message, BANS, self.bans_body(now)?))));
                 }
-                let Some(did) = body["did"].as_str().filter(|did| did.starts_with("did:") && did.len() <= 4096) else {
+                let Some(did) = body["did"].as_str().filter(|did| did.starts_with("did:") && did.len() <= wyvrn_service::db::LONGEST_DID) else {
                     return refuse(message, "e.p.msg.invalid-ban", "That isn't a DID.").map(Some);
                 };
                 if message_type == UNBAN {

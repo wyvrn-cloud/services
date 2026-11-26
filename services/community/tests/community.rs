@@ -45,6 +45,29 @@ impl Peer {
         Self { agent, server: server.did.clone(), inbox: Mutex::new(inbox) }
     }
 
+    /// Someone whose `did:peer:4` is at least `length` characters long, as an
+    /// account with many devices has (its document says much more than one key and
+    /// an endpoint: here, an endpoint with a long query).
+    async fn start_long(server: &Running, identity: Identity, length: usize) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/?{}", listener.local_addr().unwrap(), "p".repeat(length * 3 / 4));
+        let did = identity.did(&url).unwrap();
+        assert!(did.len() >= length, "{}", did.len());
+        let agent = Arc::new(Agent::with_did(identity, &did));
+        let (sent, inbox) = mpsc::unbounded_channel();
+        let app = Router::new()
+            .route(
+                "/",
+                post(|State((agent, sent)): State<(Arc<Agent>, mpsc::UnboundedSender<Value>)>, body: Bytes| async move {
+                    let received = agent.receive(&body).await.expect("a message this peer can read");
+                    let _ = sent.send(received.message);
+                }),
+            )
+            .with_state((agent.clone(), sent));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Self { agent, server: server.did.clone(), inbox: Mutex::new(inbox) }
+    }
+
     fn did(&self) -> String {
         self.agent.did()
     }
@@ -5274,4 +5297,66 @@ async fn the_member_list_carries_summaries_of_checked_linked_accounts_and_a_card
     let card = admin.community("member-request", json!({ "member": id })).await;
     assert_eq!(card["body"]["member"]["profile"]["linkedAccounts"].as_array().unwrap().len(), 12);
     assert_eq!(card["body"]["member"]["profile"]["linkedAccountSummaries"].as_array().unwrap().len(), 11);
+}
+
+#[tokio::test]
+async fn a_member_whose_did_peer_4_is_longer_than_any_key_joins_posts_is_given_a_role_moves_and_is_sent_to_by_it() {
+    use didcomm_crypto_askar::{AskarCryptoService, AskarSigningKey};
+    let server = start_server("").await;
+    let admin = Peer::start(&server).await;
+    let first = Identity::generate().unwrap();
+    let signer = Identity::from_json(&first.to_json().unwrap()).unwrap();
+    let long = Peer::start_long(&server, first, 5_000).await;
+    server.admit(&[&admin, &long]);
+    let channel = open_channel(&admin, "general").await;
+    admin.community("join", json!({})).await;
+    let joined = long.community("join", json!({})).await;
+    assert_eq!(kind(&joined), "community", "{joined}");
+    let id = server.id(&long);
+
+    // It posts, and what is posted reaches it, sent to its DID as it is.
+    let posted = long.community("post", json!({ "channel": channel, "id": "p1", "content": "hello" })).await;
+    assert_eq!(kind(&posted), "posted", "{posted}");
+    for peer in [&admin, &long] {
+        assert_eq!(peer.next_message().await["author"]["member"], id);
+    }
+    admin.community("post", json!({ "channel": channel, "id": "p2", "content": "welcome" })).await;
+    let sent = long.next_of(&format!("{C}message")).await;
+    assert_eq!(sent["to"], json!([long.did()]), "{}", &sent.to_string()[..200]);
+
+    // Given a role by member id, and by its DID in a workflow; moderators see the DID whole.
+    let made = admin.community("set-member", json!({ "member": id, "role": "moderator" })).await;
+    assert_eq!(kind(&made), "members", "{made}");
+    assert_eq!(server.state.community.powers(&long.did()).unwrap().older_role(), "moderator");
+    admin.workflow("start", json!({ "template_id": "member-roles", "instance_id": "m1", "context": { "member": long.did() } })).await;
+    let given = advance(&admin, "m1", "save", json!({ "role-admin": true })).await;
+    assert_eq!(kind(&given), "complete", "{given}");
+    let members = admin.community("members-request", json!({})).await;
+    let entry = members["body"]["members"].as_array().unwrap().iter().find(|m| m["member"] == id.as_str()).unwrap().clone();
+    assert_eq!(entry["did"], long.did());
+    assert_eq!(entry["roles"], json!(["admin"]));
+
+    // It moves to another long DID: everything goes with it, under the same member id.
+    let moved = Peer::start_long(&server, Identity::generate().unwrap(), 5_500).await;
+    let key = AskarSigningKey::new(format!("{}#key-1", long.did()), signer.verification_key().clone());
+    let from_prior = didcomm_core::rotation::build_from_prior(&AskarCryptoService, &long.did(), &moved.did(), &key, wyvrn_service::now()).await.unwrap();
+    let message = json!({ "type": format!("{C}join"), "from_prior": from_prior, "body": {}, "return_route": "all" });
+    let told = moved.agent.send(&server.did, &message).await.unwrap().unwrap().message;
+    assert_eq!(kind(&told), "community", "{told}");
+    assert_eq!(told["body"]["my_roles"], json!(["admin"]), "{}", &told.to_string()[..300]);
+    assert_eq!(server.id(&moved), id);
+    assert!(server.state.community.store.member(&long.did()).unwrap().is_none());
+    assert_eq!(server.state.community.store.member(&moved.did()).unwrap().unwrap().did, moved.did());
+    // The DID it left is nobody's now.
+    assert_eq!(long.community("post", json!({ "channel": channel, "content": "still me?" })).await["type"], PROBLEM);
+    // What it posts now, and what it is sent, is under the new DID.
+    assert_eq!(kind(&moved.community("post", json!({ "channel": channel, "id": "p3", "content": "moved" })).await), "posted");
+    admin.community("post", json!({ "channel": channel, "id": "p4", "content": "seen you moved" })).await;
+    let sent = loop {
+        let got = moved.next_of(&format!("{C}message")).await;
+        if got["body"]["id"] == "p4" {
+            break got;
+        }
+    };
+    assert_eq!(sent["to"], json!([moved.did()]));
 }

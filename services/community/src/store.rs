@@ -1,7 +1,7 @@
 //! What the server keeps: who is let in, the channels, and what was said in them.
 
 use serde_json::Value;
-use wyvrn_service::db::{Db, Location, Result, Row, Schema, MYSQL_DID, MYSQL_TABLE};
+use wyvrn_service::db::{Db, Location, Result, Row, Schema, Session, MYSQL_DID, MYSQL_TABLE};
 use wyvrn_service::params;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2228,6 +2228,7 @@ fn schema() -> Schema {
 impl Store {
     pub fn open(location: &Location) -> anyhow::Result<Self> {
         let store = Self::with_cache(Db::open(location, &schema(), "community")?);
+        store.bring_together_long_forms()?;
         store.hash_pictures()?;
         Ok(store)
     }
@@ -2390,7 +2391,8 @@ impl Store {
         // Heard of out of order -- `new` already left for another DID -- the move is
         // to wherever they are now, or the two halves of one person stay apart.
         let new = &self.current_did(new)?;
-        if new == prior {
+        // (A long-form did:peer:4 and its own short form are one DID, kept as one.)
+        if new == prior || wyvrn_service::db::did_key(new) == wyvrn_service::db::did_key(prior) {
             return Ok(false);
         }
         // A DID moves once (security review WYV-27): a second move from it, to
@@ -2404,120 +2406,140 @@ impl Store {
             }
         }
         self.db.lock().transaction(|tx| {
-            let old = tx.query_row(&format!("SELECT {MEMBER_COLUMNS} FROM members WHERE did = ?1"), params![prior], member_from)?;
-            if let Some(old) = &old {
-                let existing = tx.query_row(&format!("SELECT {MEMBER_COLUMNS} FROM members WHERE did = ?1"), params![new], member_from)?;
-                tx.execute("DELETE FROM members WHERE did = ?1", params![prior])?;
-                match existing {
-                    None => {
-                        tx.execute(
-                            "INSERT INTO members (did, role, name, joined, since, delivered) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                            params![new, old.role.as_str(), old.name, old.joined, old.since, old.delivered],
-                        )?;
-                    }
-                    Some(existing) => {
-                        let role = if old.role == Role::Admin { Role::Admin } else { existing.role };
-                        tx.execute(
-                            "UPDATE members SET role = ?2, joined = ?3, name = ?4, since = ?5, delivered = ?6 WHERE did = ?1",
-                            params![
-                                new,
-                                role.as_str(),
-                                old.joined || existing.joined,
-                                existing.name.as_ref().or(old.name.as_ref()),
-                                existing.since.min(old.since),
-                                existing.delivered.max(old.delivered)
-                            ],
-                        )?;
-                    }
-                }
-                // When they left goes with them, unless the new DID is joined.
-                tx.execute("DELETE FROM member_left WHERE did = ?1 AND EXISTS (SELECT 1 FROM members WHERE did = ?2 AND joined = 1)", params![prior, new])?;
-                tx.execute("UPDATE OR IGNORE member_left SET did = ?2 WHERE did = ?1", params![prior, new])?;
-                tx.execute("DELETE FROM member_left WHERE did = ?1", params![prior])?;
-                // What they wrote, and what they were answering, is theirs under the new DID.
-                tx.execute("UPDATE posts SET author_did = ?2 WHERE author_did = ?1", params![prior, new])?;
-                tx.execute("UPDATE posts SET answered_by = ?2 WHERE answered_by = ?1", params![prior, new])?;
-                // (Their counts are worked out again under the new DID.)
-                tx.execute(&format!("DELETE FROM cached_counts WHERE kind = '{COUNT_FORUM_POSTS}' AND subject IN (?1, ?2)"), params![prior, new])?;
-                tx.execute(&format!("DELETE FROM cached_counts WHERE kind = '{COUNT_THREAD}' AND ref_id = ?1"), params![prior])?;
-                tx.execute("UPDATE answering SET owner = ?2 WHERE owner = ?1", params![prior, new])?;
-                // Their voice preferences follow them.
-                tx.execute("UPDATE OR IGNORE voice_prefs SET did = ?2 WHERE did = ?1", params![prior, new])?;
-                tx.execute("DELETE FROM voice_prefs WHERE did = ?1", params![prior])?;
-                // So do what reaches them, and the threads they follow.
-                tx.execute("UPDATE OR IGNORE notify_prefs SET did = ?2 WHERE did = ?1", params![prior, new])?;
-                tx.execute("DELETE FROM notify_prefs WHERE did = ?1", params![prior])?;
-                tx.execute("UPDATE OR IGNORE thread_follows SET did = ?2 WHERE did = ?1", params![prior, new])?;
-                tx.execute("DELETE FROM thread_follows WHERE did = ?1", params![prior])?;
-                // Their roles follow them, and so does owning the community.
-                tx.execute("UPDATE OR IGNORE member_roles SET did = ?2 WHERE did = ?1", params![prior, new])?;
-                tx.execute("DELETE FROM member_roles WHERE did = ?1", params![prior])?;
-                tx.execute("UPDATE settings SET value = ?2 WHERE name = 'owner' AND value = ?1", params![prior, new])?;
-                tx.execute("UPDATE flows SET owner = ?2 WHERE owner = ?1", params![prior, new])?;
-                // Reports they made, or that name them, follow them.
-                tx.execute("UPDATE reports SET by_did = ?2 WHERE by_did = ?1", params![prior, new])?;
-                tx.execute("UPDATE reports SET member = ?2 WHERE member = ?1", params![prior, new])?;
-            }
-            // The rules they accepted, whether or not they were in yet.
-            if let Some(version) = tx.query_row("SELECT version FROM rules_accepted WHERE did = ?1", params![prior], |row| row.get::<i64>(0))? {
-                let kept = tx.query_row("SELECT version FROM rules_accepted WHERE did = ?1", params![new], |row| row.get::<i64>(0))?.unwrap_or(0);
-                tx.execute("INSERT OR REPLACE INTO rules_accepted (did, version) VALUES (?1, ?2)", params![new, version.max(kept)])?;
-                tx.execute("DELETE FROM rules_accepted WHERE did = ?1", params![prior])?;
-            }
-            // A ban or a timeout follows the DID, member or not.
-            tx.execute("UPDATE OR IGNORE bans SET did = ?2 WHERE did = ?1", params![prior, new])?;
-            tx.execute("UPDATE OR IGNORE timeouts SET did = ?2 WHERE did = ?1", params![prior, new])?;
-            tx.execute("UPDATE OR IGNORE join_answers SET did = ?2 WHERE did = ?1", params![prior, new])?;
-            // What they made goes on working for them (WYV-115): the channels they
-            // opened, their webhooks, event receivers and announcement followers
-            // (paused while their maker isn't a member, WYV-20, WYV-99, WYV-125),
-            // the bots they approved; and, for a bot, being one and the commands it
-            // offers.
-            tx.execute("UPDATE channels SET created_by = ?2 WHERE created_by = ?1", params![prior, new])?;
-            tx.execute("UPDATE webhooks SET created_by = ?2 WHERE created_by = ?1", params![prior, new])?;
-            tx.execute("UPDATE event_hooks SET created_by = ?2 WHERE created_by = ?1", params![prior, new])?;
-            tx.execute("UPDATE announce_followers SET created_by = ?2 WHERE created_by = ?1", params![prior, new])?;
-            tx.execute("UPDATE bot_approvals SET by_did = ?2 WHERE by_did = ?1", params![prior, new])?;
-            for table in ["member_bots", "bot_approvals"] {
-                tx.execute(&format!("UPDATE OR IGNORE {table} SET did = ?2 WHERE did = ?1"), params![prior, new])?;
-                tx.execute(&format!("DELETE FROM {table} WHERE did = ?1"), params![prior])?;
-            }
-            // On the web: their lasting key (and with it their sessions, the websites
-            // they let sign them in, and the ids those know them by), and their picture.
-            tx.execute("UPDATE OR IGNORE member_keys SET did = ?2 WHERE did = ?1", params![prior, new])?;
-            tx.execute("DELETE FROM member_keys WHERE did = ?1", params![prior])?;
-            tx.execute("UPDATE OR IGNORE member_pictures SET did = ?2 WHERE did = ?1", params![prior, new])?;
-            tx.execute("DELETE FROM member_pictures WHERE did = ?1", params![prior])?;
-            // The rest of their profile, and what they are here (member_ids.rs):
-            // the new DID's, where it has its own already.
-            for table in ["member_profiles", "member_here", "member_linked", "member_linked_pictures"] {
-                tx.execute(&format!("UPDATE OR IGNORE {table} SET did = ?2 WHERE did = ?1"), params![prior, new])?;
-                tx.execute(&format!("DELETE FROM {table} WHERE did = ?1"), params![prior])?;
-            }
-            tx.execute("UPDATE OR IGNORE message_requests SET from_did = ?2 WHERE from_did = ?1", params![prior, new])?;
-            tx.execute("DELETE FROM message_requests WHERE from_did = ?1", params![prior])?;
-            tx.execute("UPDATE OR IGNORE message_requests SET to_did = ?2 WHERE to_did = ?1", params![prior, new])?;
-            tx.execute("DELETE FROM message_requests WHERE to_did = ?1", params![prior])?;
-            // Their member id: the one they had, unless the new DID was given one
-            // first (it wrote before the server heard of the change), in which case
-            // the older of the two -- and the other still finds them, through the
-            // prior DID's row and superseded.
-            let prior_id = tx.query_row("SELECT member, created FROM member_ids WHERE did = ?1", params![prior], |row| Ok((row.get::<String>(0)?, row.get::<i64>(1)?)))?;
-            let new_id = tx.query_row("SELECT member, created FROM member_ids WHERE did = ?1", params![new], |row| Ok((row.get::<String>(0)?, row.get::<i64>(1)?)))?;
-            match (prior_id, new_id) {
-                (Some(_), None) => {
-                    tx.execute("UPDATE member_ids SET did = ?2 WHERE did = ?1", params![prior, new])?;
-                }
-                (Some((prior_member, prior_created)), Some((new_member, new_created))) if prior_created <= new_created => {
-                    tx.execute("DELETE FROM member_ids WHERE did = ?1 OR did = ?2", params![prior, new])?;
-                    tx.execute("INSERT INTO member_ids (did, member, created) VALUES (?1, ?2, ?3)", params![new, prior_member, prior_created])?;
-                    tx.execute("INSERT INTO member_ids (did, member, created) VALUES (?1, ?2, ?3)", params![prior, new_member, new_created])?;
-                }
-                _ => {}
-            }
+            let was = Self::moved(tx, prior, new)?;
             tx.execute("INSERT OR REPLACE INTO superseded (did, became, at) VALUES (?1, ?2, ?3)", params![prior, new, now])?;
-            Ok(old.is_some())
+            Ok(was)
         })
+    }
+
+    /// What the server holds for `prior` made `new`'s ([`Self::rotate`]), in `tx`.
+    /// Returns whether `prior` was a member.
+    fn moved(tx: &mut Session<'_>, prior: &str, new: &str) -> Result<bool> {
+        let old = tx.query_row(&format!("SELECT {MEMBER_COLUMNS} FROM members WHERE did = ?1"), params![prior], member_from)?;
+        if let Some(old) = &old {
+            let existing = tx.query_row(&format!("SELECT {MEMBER_COLUMNS} FROM members WHERE did = ?1"), params![new], member_from)?;
+            tx.execute("DELETE FROM members WHERE did = ?1", params![prior])?;
+            match existing {
+                None => {
+                    tx.execute(
+                        "INSERT INTO members (did, role, name, joined, since, delivered) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![new, old.role.as_str(), old.name, old.joined, old.since, old.delivered],
+                    )?;
+                }
+                Some(existing) => {
+                    let role = if old.role == Role::Admin { Role::Admin } else { existing.role };
+                    tx.execute(
+                        "UPDATE members SET role = ?2, joined = ?3, name = ?4, since = ?5, delivered = ?6 WHERE did = ?1",
+                        params![
+                            new,
+                            role.as_str(),
+                            old.joined || existing.joined,
+                            existing.name.as_ref().or(old.name.as_ref()),
+                            existing.since.min(old.since),
+                            existing.delivered.max(old.delivered)
+                        ],
+                    )?;
+                }
+            }
+            // When they left goes with them, unless the new DID is joined.
+            tx.execute("DELETE FROM member_left WHERE did = ?1 AND EXISTS (SELECT 1 FROM members WHERE did = ?2 AND joined = 1)", params![prior, new])?;
+            tx.execute("UPDATE OR IGNORE member_left SET did = ?2 WHERE did = ?1", params![prior, new])?;
+            tx.execute("DELETE FROM member_left WHERE did = ?1", params![prior])?;
+            // What they wrote, and what they were answering, is theirs under the new DID.
+            tx.execute("UPDATE posts SET author_did = ?2 WHERE author_did = ?1", params![prior, new])?;
+            tx.execute("UPDATE posts SET answered_by = ?2 WHERE answered_by = ?1", params![prior, new])?;
+            // (Their counts are worked out again under the new DID.)
+            tx.execute(&format!("DELETE FROM cached_counts WHERE kind = '{COUNT_FORUM_POSTS}' AND subject IN (?1, ?2)"), params![prior, new])?;
+            tx.execute(&format!("DELETE FROM cached_counts WHERE kind = '{COUNT_THREAD}' AND ref_id = ?1"), params![prior])?;
+            tx.execute("UPDATE answering SET owner = ?2 WHERE owner = ?1", params![prior, new])?;
+            // Their voice preferences follow them.
+            tx.execute("UPDATE OR IGNORE voice_prefs SET did = ?2 WHERE did = ?1", params![prior, new])?;
+            tx.execute("DELETE FROM voice_prefs WHERE did = ?1", params![prior])?;
+            // So do what reaches them, and the threads they follow.
+            tx.execute("UPDATE OR IGNORE notify_prefs SET did = ?2 WHERE did = ?1", params![prior, new])?;
+            tx.execute("DELETE FROM notify_prefs WHERE did = ?1", params![prior])?;
+            tx.execute("UPDATE OR IGNORE thread_follows SET did = ?2 WHERE did = ?1", params![prior, new])?;
+            tx.execute("DELETE FROM thread_follows WHERE did = ?1", params![prior])?;
+            // Their roles follow them, and so does owning the community.
+            tx.execute("UPDATE OR IGNORE member_roles SET did = ?2 WHERE did = ?1", params![prior, new])?;
+            tx.execute("DELETE FROM member_roles WHERE did = ?1", params![prior])?;
+            tx.execute("UPDATE settings SET value = ?2 WHERE name = 'owner' AND value = ?1", params![prior, new])?;
+            tx.execute("UPDATE flows SET owner = ?2 WHERE owner = ?1", params![prior, new])?;
+            // Reports they made, or that name them, follow them.
+            tx.execute("UPDATE reports SET by_did = ?2 WHERE by_did = ?1", params![prior, new])?;
+            tx.execute("UPDATE reports SET member = ?2 WHERE member = ?1", params![prior, new])?;
+        }
+        // The rules they accepted, whether or not they were in yet.
+        if let Some(version) = tx.query_row("SELECT version FROM rules_accepted WHERE did = ?1", params![prior], |row| row.get::<i64>(0))? {
+            let kept = tx.query_row("SELECT version FROM rules_accepted WHERE did = ?1", params![new], |row| row.get::<i64>(0))?.unwrap_or(0);
+            tx.execute("INSERT OR REPLACE INTO rules_accepted (did, version) VALUES (?1, ?2)", params![new, version.max(kept)])?;
+            tx.execute("DELETE FROM rules_accepted WHERE did = ?1", params![prior])?;
+        }
+        // A ban or a timeout follows the DID, member or not.
+        tx.execute("UPDATE OR IGNORE bans SET did = ?2 WHERE did = ?1", params![prior, new])?;
+        tx.execute("UPDATE OR IGNORE timeouts SET did = ?2 WHERE did = ?1", params![prior, new])?;
+        tx.execute("UPDATE OR IGNORE join_answers SET did = ?2 WHERE did = ?1", params![prior, new])?;
+        // What they made goes on working for them (WYV-115): the channels they
+        // opened, their webhooks, event receivers and announcement followers
+        // (paused while their maker isn't a member, WYV-20, WYV-99, WYV-125),
+        // the bots they approved; and, for a bot, being one and the commands it
+        // offers.
+        tx.execute("UPDATE channels SET created_by = ?2 WHERE created_by = ?1", params![prior, new])?;
+        tx.execute("UPDATE webhooks SET created_by = ?2 WHERE created_by = ?1", params![prior, new])?;
+        tx.execute("UPDATE event_hooks SET created_by = ?2 WHERE created_by = ?1", params![prior, new])?;
+        tx.execute("UPDATE announce_followers SET created_by = ?2 WHERE created_by = ?1", params![prior, new])?;
+        tx.execute("UPDATE bot_approvals SET by_did = ?2 WHERE by_did = ?1", params![prior, new])?;
+        for table in ["member_bots", "bot_approvals"] {
+            tx.execute(&format!("UPDATE OR IGNORE {table} SET did = ?2 WHERE did = ?1"), params![prior, new])?;
+            tx.execute(&format!("DELETE FROM {table} WHERE did = ?1"), params![prior])?;
+        }
+        // On the web: their lasting key (and with it their sessions, the websites
+        // they let sign them in, and the ids those know them by), and their picture.
+        tx.execute("UPDATE OR IGNORE member_keys SET did = ?2 WHERE did = ?1", params![prior, new])?;
+        tx.execute("DELETE FROM member_keys WHERE did = ?1", params![prior])?;
+        tx.execute("UPDATE OR IGNORE member_pictures SET did = ?2 WHERE did = ?1", params![prior, new])?;
+        tx.execute("DELETE FROM member_pictures WHERE did = ?1", params![prior])?;
+        // The rest of their profile, and what they are here (member_ids.rs):
+        // the new DID's, where it has its own already.
+        for table in ["member_profiles", "member_here", "member_linked", "member_linked_pictures"] {
+            tx.execute(&format!("UPDATE OR IGNORE {table} SET did = ?2 WHERE did = ?1"), params![prior, new])?;
+            tx.execute(&format!("DELETE FROM {table} WHERE did = ?1"), params![prior])?;
+        }
+        tx.execute("UPDATE OR IGNORE message_requests SET from_did = ?2 WHERE from_did = ?1", params![prior, new])?;
+        tx.execute("DELETE FROM message_requests WHERE from_did = ?1", params![prior])?;
+        tx.execute("UPDATE OR IGNORE message_requests SET to_did = ?2 WHERE to_did = ?1", params![prior, new])?;
+        tx.execute("DELETE FROM message_requests WHERE to_did = ?1", params![prior])?;
+        // Their member id: the one they had, unless the new DID was given one
+        // first (it wrote before the server heard of the change), in which case
+        // the older of the two -- and the other still finds them, through the
+        // prior DID's row and superseded.
+        let prior_id = tx.query_row("SELECT member, created FROM member_ids WHERE did = ?1", params![prior], |row| Ok((row.get::<String>(0)?, row.get::<i64>(1)?)))?;
+        let new_id = tx.query_row("SELECT member, created FROM member_ids WHERE did = ?1", params![new], |row| Ok((row.get::<String>(0)?, row.get::<i64>(1)?)))?;
+        match (prior_id, new_id) {
+            (Some(_), None) => {
+                tx.execute("UPDATE member_ids SET did = ?2 WHERE did = ?1", params![prior, new])?;
+            }
+            (Some((prior_member, prior_created)), Some((new_member, new_created))) if prior_created <= new_created => {
+                tx.execute("DELETE FROM member_ids WHERE did = ?1 OR did = ?2", params![prior, new])?;
+                tx.execute("INSERT INTO member_ids (did, member, created) VALUES (?1, ?2, ?3)", params![new, prior_member, prior_created])?;
+                tx.execute("INSERT INTO member_ids (did, member, created) VALUES (?1, ?2, ?3)", params![prior, new_member, new_created])?;
+            }
+            _ => {}
+        }
+        Ok(old.is_some())
+    }
+
+    /// Whoever this store held under both forms of one `did:peer:4` (written under
+    /// the long form before it kept them short, and under the short form too) is
+    /// brought together under the short form, as a change of DID would bring them
+    /// ([`Self::moved`]: the higher role of the two, and the rest of what each
+    /// had).
+    fn bring_together_long_forms(&self) -> Result<()> {
+        for (long, short) in self.db.long_forms_left() {
+            tracing::info!(did = %short, "brought together what was kept under both forms of one did:peer:4");
+            self.db.lock().transaction(|tx| tx.as_they_are(|tx| Self::moved(tx, &long, &short)))?;
+        }
+        Ok(())
     }
 
     // --- The waiting list, invites and settings ------------------------------
@@ -4787,5 +4809,62 @@ mod picture_hashes {
         store.set_member_picture("did:example:new", Some(("image/png", "bmV3")), 1).unwrap();
         let hash: Option<String> = store.db.lock().query_row("SELECT hash FROM member_pictures WHERE did = ?1", params!["did:example:new"], |row| row.get(0)).unwrap().flatten();
         assert_eq!(hash.as_deref(), Some(crate::member_ids::picture_hash("bmV3").as_str()));
+    }
+}
+
+#[cfg(test)]
+mod long_dids {
+    use super::*;
+
+    /// A long-form did:peer:4, the longer the larger `length` (some 1.3 characters each).
+    fn long_did(length: usize) -> String {
+        didcomm_agent::Identity::generate().unwrap().did(&format!("https://example.com/?{}", "p".repeat(length * 3 / 4))).unwrap()
+    }
+
+    #[test]
+    fn a_store_from_before_keeps_its_long_dids_short_once_and_brings_together_one_kept_both_ways() {
+        // A file of its own, or tables of its own at the MySQL server `WYVRN_TEST_DATABASE_URL` names.
+        let path = std::env::temp_dir().join(format!("wyvrn-community-long-dids-{}.db", uuid::Uuid::new_v4()));
+        let location = match std::env::var("WYVRN_TEST_DATABASE_URL").ok().filter(|url| !url.is_empty()) {
+            Some(url) => Location::Shared { server: url.trim_end_matches('/').to_string(), database: format!("wyvrn_test_long_{}", uuid::Uuid::new_v4().simple()), prefix: "c1_".into() },
+            None => Location::Sqlite(path.clone()),
+        };
+        let (ada, bea, prior) = (long_did(1_500), long_did(1_000), long_did(900));
+        let short = |did: &str| wyvrn_service::db::did_key(did).into_owned();
+        {
+            // As a store from before kept them: long, as they came; and Bea under both forms.
+            let store = Store::open(&location).unwrap();
+            store
+                .db
+                .lock()
+                .as_they_are(|s| {
+                    s.execute("DELETE FROM wyvrn_migrated", params![])?;
+                    s.execute("INSERT INTO members (did, role, since, delivered) VALUES (?1, 'admin', 1, 0)", params![ada])?;
+                    s.execute("INSERT INTO member_roles (did, role) VALUES (?1, 'admin')", params![ada])?;
+                    s.execute("INSERT INTO settings (name, value) VALUES ('owner', ?1)", params![ada])?;
+                    s.execute("INSERT INTO superseded (did, became, at) VALUES (?1, ?2, 1)", params![prior, ada])?;
+                    s.execute("INSERT INTO members (did, role, since, delivered) VALUES (?1, 'admin', 2, 0)", params![bea])?;
+                    s.execute("INSERT INTO members (did, role, since, delivered) VALUES (?1, 'member', 3, 0)", params![short(&bea)])
+                })
+                .unwrap();
+        }
+        let store = Store::open(&location).unwrap();
+        let kept: Vec<String> = store.db.lock().as_they_are(|s| s.query("SELECT did FROM members ORDER BY since", params![], |row| row.get(0))).unwrap();
+        assert_eq!(kept, vec![short(&ada), short(&bea)]);
+        // Read as they were, found by either form.
+        assert_eq!(store.member(&ada).unwrap().unwrap().did, ada);
+        assert_eq!(store.member(&short(&ada)).unwrap().unwrap().role, Role::Admin);
+        assert_eq!(store.member_roles(&ada).unwrap(), vec!["admin".to_string()]);
+        assert_eq!(store.current_did(&prior).unwrap(), ada);
+        assert!(store.is_superseded(&prior).unwrap());
+        // Bea, kept both ways, is one member: the higher role, the earlier since.
+        let bea_now = store.member(&bea).unwrap().unwrap();
+        assert_eq!((bea_now.did.as_str(), bea_now.role, bea_now.since), (bea.as_str(), Role::Admin, 2));
+        assert_eq!(store.members().unwrap().len(), 2);
+        drop(store);
+        // Opened again, nothing more is done.
+        let store = Store::open(&location).unwrap();
+        assert_eq!(store.members().unwrap().iter().map(|m| m.did.clone()).collect::<Vec<_>>(), vec![ada.clone(), bea.clone()]);
+        let _ = std::fs::remove_file(&path);
     }
 }

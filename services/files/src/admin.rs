@@ -83,7 +83,7 @@ fn read_limits(input: &Value, prefix: &str) -> Result<Limits, String> {
 
 fn did_of(input: &Value) -> Result<String, String> {
     let did = field(input, "did");
-    if did.starts_with("did:") && did.len() <= 2048 && !did.contains(char::is_whitespace) { Ok(did.to_string()) } else { Err("That isn't a DID.".into()) }
+    if did.starts_with("did:") && did.len() <= wyvrn_service::db::LONGEST_DID && !did.contains(char::is_whitespace) { Ok(did.to_string()) } else { Err("That isn't a DID.".into()) }
 }
 
 impl AppState {

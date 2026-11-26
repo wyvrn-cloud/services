@@ -243,6 +243,10 @@ impl Store {
     /// came from), it keeps the higher role of the two and stays subscribed if either
     /// was.
     pub fn rotate(&self, prior: &str, new: &str, now: i64) -> Result<bool> {
+        // A long-form did:peer:4 and its own short form are one DID, kept as one.
+        if wyvrn_service::db::did_key(prior) == wyvrn_service::db::did_key(new) {
+            return Ok(false);
+        }
         self.db.lock().transaction(|tx| {
             let old = tx.query_row(&format!("SELECT {MEMBER_COLUMNS} FROM members WHERE did = ?1"), params![prior], member_from)?;
             if let Some(old) = &old {
@@ -461,6 +465,35 @@ mod tests {
         let merged = store.member("did:new").unwrap().unwrap();
         assert_eq!((merged.role, merged.subscribed), (Role::Admin, true));
         assert_eq!(store.members().unwrap().len(), 1);
+    }
+
+    /// A long-form did:peer:4 of some 5,000 characters, as a phone with many devices has.
+    fn long_did() -> String {
+        let did = didcomm_agent::Identity::generate().unwrap().did(&format!("https://example.com/?{}", "p".repeat(3_750))).unwrap();
+        assert!(did.len() > 5_000, "{}", did.len());
+        did
+    }
+
+    #[test]
+    fn a_did_peer_4_longer_than_any_key_subscribes_posts_reacts_and_moves() {
+        let store = store();
+        let (old, new) = (long_did(), long_did());
+        let author = admin(&store, &old);
+        assert_eq!(author.did, old);
+        store.subscribe(&old, 5).unwrap();
+        let post = store.add_post("p1", "one", &author, 10).unwrap();
+        assert_eq!(post.author_did, old);
+        assert!(store.set_reactions(post.seq, &old, &["👍".to_string()], 11).unwrap());
+        assert_eq!(store.subscribers().unwrap().iter().map(|m| m.did.clone()).collect::<Vec<_>>(), vec![old.clone()]);
+        assert!(store.rotate(&old, &new, 12).unwrap());
+        assert!(store.is_superseded(&old).unwrap() && !store.is_superseded(&new).unwrap());
+        let moved = store.member(&new).unwrap().unwrap();
+        assert_eq!((moved.did.as_str(), moved.role, moved.subscribed), (new.as_str(), Role::Admin, true));
+        assert_eq!(store.reactors(post.seq).unwrap(), vec![("👍".to_string(), vec![new.clone()])]);
+        // A DID and its own short form are one: no move from one to the other.
+        let short = wyvrn_service::db::did_key(&new).into_owned();
+        assert!(!store.rotate(&new, &short, 13).unwrap());
+        assert_eq!(store.member(&short).unwrap().unwrap().did, new);
     }
 
     #[test]

@@ -2712,7 +2712,7 @@ impl Community {
             }
 
             SET_MEMBER => {
-                let Some(did) = body["did"].as_str().filter(|did| did.starts_with("did:") && did.len() <= 4096) else {
+                let Some(did) = body["did"].as_str().filter(|did| did.starts_with("did:") && did.len() <= wyvrn_service::db::LONGEST_DID) else {
                     return refuse(message, "e.p.msg.invalid-member", "That isn't a DID.");
                 };
                 let powers = self.powers(sender)?;

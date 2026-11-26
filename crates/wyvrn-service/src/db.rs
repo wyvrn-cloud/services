@@ -32,6 +32,9 @@ use std::time::{Duration, Instant};
 
 use mysql::prelude::Queryable;
 
+mod long_forms;
+pub use long_forms::did_key;
+
 /// Where a store is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Location {
@@ -107,8 +110,38 @@ pub struct Schema {
 /// 3072 bytes: so one byte a character, and room for most of that.
 pub const MYSQL_DID: &str = "VARCHAR(3000) CHARACTER SET ascii COLLATE ascii_bin";
 
+/// The longest DID a service takes as one, where someone names a DID to it (a
+/// member to let in, to ban): a long-form `did:peer:4` grows with its account's
+/// devices, past any key's length, and is kept by its short form all the same
+/// ([`did_key`]).
+pub const LONGEST_DID: usize = 64 * 1024;
+
 /// What follows a MySQL table's columns.
 pub const MYSQL_TABLE: &str = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin";
+
+/// Every store's: the long form of each `did:peer:4` it keeps by its short form
+/// ([`long_forms`]), and which one-time changes to its rows have been made.
+const LONG_FORMS_SQLITE: &str = "CREATE TABLE IF NOT EXISTS wyvrn_long_forms (short_form TEXT NOT NULL PRIMARY KEY, long_form TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS wyvrn_migrated (name TEXT NOT NULL PRIMARY KEY)";
+
+fn long_forms_mysql() -> [&'static str; 2] {
+    static MYSQL: OnceLock<[String; 2]> = OnceLock::new();
+    let [a, b] = MYSQL.get_or_init(|| {
+        [
+            // A long form is as long as its document: far past a key, and ASCII.
+            format!("CREATE TABLE IF NOT EXISTS wyvrn_long_forms (short_form {MYSQL_DID} NOT NULL PRIMARY KEY, long_form MEDIUMTEXT CHARACTER SET ascii COLLATE ascii_bin NOT NULL) {MYSQL_TABLE}"),
+            format!("CREATE TABLE IF NOT EXISTS wyvrn_migrated (name VARCHAR(64) NOT NULL PRIMARY KEY) {MYSQL_TABLE}"),
+        ]
+    });
+    [a.as_str(), b.as_str()]
+}
+
+/// The store's own tables that aren't the service's: never listed, copied as they are,
+/// or emptied with its tables.
+const UPKEEP_TABLES: [&str; 3] = ["wyvrn_service", "wyvrn_long_forms", "wyvrn_migrated"];
+
+/// The mark of a store whose long-form `did:peer:4`s have been made short.
+const SHORTENED: &str = "did-peer-4-short";
 
 #[derive(Debug)]
 pub enum Error {
@@ -344,6 +377,9 @@ pub struct Db {
     group: Mutex<Option<Group>>,
     /// Held by whoever is grouping, so that only one does at a time.
     grouping: Mutex<()>,
+    /// The long-form `did:peer:4`s written to this store's `wyvrn_long_forms`
+    /// ([`long_forms`]).
+    long_forms: long_forms::Kept,
 }
 
 /// A [`Db::grouped`] going on.
@@ -471,6 +507,10 @@ pub struct Session<'a> {
     in_transaction: bool,
     /// The group going on, if one is ([`Db::grouped`]).
     group: Option<&'a Mutex<Option<Group>>>,
+    long_forms: &'a long_forms::Kept,
+    /// Parameters said as they are, and answers read as they are: no `did:peer:4`
+    /// shortened or made long again ([`long_forms`]). For the store's own upkeep.
+    raw: bool,
 }
 
 impl Drop for Session<'_> {
@@ -549,12 +589,18 @@ impl Db {
             None => connection.execute_batch(schema.sqlite)?,
             Some(naming) => connection.execute_batch(&renamed(schema.sqlite, naming))?,
         }
-        Ok(Self { backend: Mutex::new(Backend::Sqlite(connection)), naming, cache: OnceLock::new(), group: Mutex::new(None), grouping: Mutex::new(()) })
+        let db = Self { backend: Mutex::new(Backend::Sqlite(connection)), naming, cache: OnceLock::new(), group: Mutex::new(None), grouping: Mutex::new(()), long_forms: Default::default() };
+        {
+            let mut session = db.lock();
+            session.plainly(LONG_FORMS_SQLITE)?;
+            session.keep_long_forms_short()?;
+        }
+        Ok(db)
     }
 
     fn mysql(options: mysql::Opts, schema: &Schema, service: &str) -> Result<Self> {
         let connection = mysql_connection(&options)?;
-        let db = Self { backend: Mutex::new(Backend::MySql(Box::new(MySql { connection, options, used: Instant::now() }))), naming: None, cache: OnceLock::new(), group: Mutex::new(None), grouping: Mutex::new(()) };
+        let db = Self { backend: Mutex::new(Backend::MySql(Box::new(MySql { connection, options, used: Instant::now() }))), naming: None, cache: OnceLock::new(), group: Mutex::new(None), grouping: Mutex::new(()), long_forms: Default::default() };
         db.made(schema, service)?;
         Ok(db)
     }
@@ -583,7 +629,7 @@ impl Db {
             }
         }
         let naming = Naming { database: Some(database.to_string()), prefix: prefix.to_string() };
-        let db = Self { backend: Mutex::new(Backend::Pooled(pool)), naming: Some(naming), cache: OnceLock::new(), group: Mutex::new(None), grouping: Mutex::new(()) };
+        let db = Self { backend: Mutex::new(Backend::Pooled(pool)), naming: Some(naming), cache: OnceLock::new(), group: Mutex::new(None), grouping: Mutex::new(()), long_forms: Default::default() };
         db.made(schema, service)?;
         Ok(db)
     }
@@ -623,7 +669,20 @@ impl Db {
                 )))
             }
         }
+        for statement in long_forms_mysql() {
+            session.plainly(statement)?;
+        }
+        session.keep_long_forms_short()?;
         Ok(())
+    }
+
+    /// The long-form `did:peer:4`s this store held before it kept them short, and
+    /// couldn't shorten where they were: a row of the short form was there already
+    /// (whoever it is wrote under both). `(long, short)`, found as the store was
+    /// opened the first time since; for the service to bring together as it knows
+    /// how, saying both as they are ([`Session::as_they_are`]). Empty once seen.
+    pub fn long_forms_left(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut *self.long_forms.left.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
     /// Holds the database: what is said through the session is said with nothing
@@ -638,6 +697,8 @@ impl Db {
             pooled: None,
             in_transaction: grouped,
             group: grouped.then_some(&self.group),
+            long_forms: &self.long_forms,
+            raw: false,
         }
     }
 
@@ -765,7 +826,9 @@ pub fn drop_store(location: &Location, service: &str) -> Result<usize> {
     for table in &tables {
         writing.execute(&format!("DROP TABLE IF EXISTS \"{table}\""), &[])?;
     }
-    writing.execute("DROP TABLE IF EXISTS \"wyvrn_service\"", &[])?;
+    for table in UPKEEP_TABLES {
+        writing.execute(&format!("DROP TABLE IF EXISTS \"{table}\""), &[])?;
+    }
     Ok(tables.len())
 }
 
@@ -792,12 +855,20 @@ fn copy_tables(from: &Location, to: &Location, service: &str, skip: &[&str], onl
                 let names = columns.iter().map(|column| format!("\"{column}\"")).collect::<Vec<_>>().join(", ");
                 let places = (1..=columns.len()).map(|n| format!("?{n}")).collect::<Vec<_>>().join(", ");
                 let insert = format!("INSERT INTO {quoted} ({names}) VALUES ({places})");
-                for row in &rows {
-                    writing.execute(&insert, row)?;
-                }
+                // As they were read: a DID as the store kept it.
+                writing.as_they_are(|writing| rows.iter().try_for_each(|row| writing.execute(&insert, row).map(|_| ())))?;
             }
             copied.push((table.clone(), rows.len()));
         }
+        // The long forms of the DIDs the rows keep short, as they are: added to
+        // whatever is there (each is one DID's whichever store has it).
+        let (_, long_forms) = reading.dump("wyvrn_long_forms")?;
+        writing.as_they_are(|writing| {
+            for row in &long_forms {
+                writing.execute("INSERT OR IGNORE INTO wyvrn_long_forms (short_form, long_form) VALUES (?1, ?2)", row)?;
+            }
+            Ok::<_, Error>(())
+        })?;
         Ok(copied)
     })
 }
@@ -1263,7 +1334,167 @@ impl Session<'_> {
         })
     }
 
+    /// Says `sql`, a long-form `did:peer:4` among `params` said by its short form,
+    /// and what it answers with any short form this store has the long form of
+    /// given back long ([`long_forms`]).
     fn say(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
+        if self.raw {
+            return self.say_kept(sql, params);
+        }
+        let shortened = self.shortened(params)?;
+        let params = shortened.as_deref().unwrap_or(params);
+        #[cfg(debug_assertions)]
+        if let Some(text) = params.iter().find_map(|param| match param {
+            Value::Text(text) if text.starts_with("did:peer:4") && text.len() > 3000 => Some(text),
+            _ => None,
+        }) {
+            // What MySQL's DID columns would refuse, refused in tests on SQLite too.
+            return Err(Error::Other(format!("a did:peer:4 of {} characters that can't be kept short: {}…", text.len(), &text[..80])));
+        }
+        let mut outcome = self.say_kept(sql, params)?;
+        self.lengthened(&mut outcome.rows)?;
+        Ok(outcome)
+    }
+
+    /// `params` with each long-form `did:peer:4` in its short form, and the long
+    /// form written down; `None` where there was none.
+    fn shortened(&mut self, params: &[Value]) -> Result<Option<Vec<Value>>> {
+        let mut shortened: Option<Vec<Value>> = None;
+        for (at, param) in params.iter().enumerate() {
+            let Value::Text(text) = param else { continue };
+            let Some((short, long)) = long_forms::shortened(text) else { continue };
+            let short_did = &short[..long_forms::SHORT_LENGTH];
+            long_forms::hold(short_did, long);
+            if !self.long_forms.is_written(short_did) {
+                self.say_kept("INSERT OR IGNORE INTO wyvrn_long_forms (short_form, long_form) VALUES (?1, ?2)", &[Value::Text(short_did.to_string()), Value::Text(long.to_string())])?;
+                self.long_forms.written(short_did);
+                self.long_forms.forget_unknown(short_did);
+            }
+            shortened.get_or_insert_with(|| params.to_vec())[at] = Value::Text(short);
+        }
+        Ok(shortened)
+    }
+
+    /// `rows` with each short-form `did:peer:4` whose long form this store has
+    /// given back as that.
+    fn lengthened(&mut self, rows: &mut [Row]) -> Result<()> {
+        fn bytes(value: &Value) -> Option<&[u8]> {
+            match value {
+                Value::Text(text) => Some(text.as_bytes()),
+                Value::Blob(bytes) => Some(bytes),
+                _ => None,
+            }
+        }
+        let mut shorts: Vec<String> = Vec::new();
+        for value in rows.iter().flat_map(|row| row.0.iter()) {
+            if let Some((short, _)) = bytes(value).and_then(long_forms::short_form) {
+                if !shorts.iter().any(|seen| seen == short) {
+                    shorts.push(short.to_string());
+                }
+            }
+        }
+        if shorts.is_empty() {
+            return Ok(());
+        }
+        let asked: Vec<String> = shorts.into_iter().filter(|short| long_forms::held_long_form(short).is_none() && !self.long_forms.is_unknown(short)).collect();
+        for some in asked.chunks(200) {
+            let places = (1..=some.len()).map(|n| format!("?{n}")).collect::<Vec<_>>().join(", ");
+            let params: Vec<Value> = some.iter().map(|short| Value::Text(short.clone())).collect();
+            let found = self.say_kept(&format!("SELECT short_form, long_form FROM wyvrn_long_forms WHERE short_form IN ({places})"), &params)?;
+            for row in &found.rows {
+                long_forms::hold(&row.get::<String>(0)?, &row.get::<String>(1)?);
+            }
+            for short in some.iter().filter(|short| long_forms::held_long_form(short).is_none()) {
+                self.long_forms.unknown(short);
+            }
+        }
+        for value in rows.iter_mut().flat_map(|row| row.0.iter_mut()) {
+            let Some((short, rest)) = bytes(value).and_then(long_forms::short_form) else { continue };
+            let Some(long) = long_forms::held_long_form(short).map(|long| format!("{long}{rest}")) else { continue };
+            *value = match value {
+                Value::Blob(_) => Value::Blob(long.into_bytes()),
+                _ => Value::Text(long),
+            };
+        }
+        Ok(())
+    }
+
+    /// Does `work` with what it says said as it is and what it reads read as it is:
+    /// no `did:peer:4` made short or long ([`long_forms`]). For bringing together
+    /// what a store kept under both forms of one DID ([`Db::long_forms_left`]).
+    pub fn as_they_are<T, E>(&mut self, work: impl FnOnce(&mut Self) -> std::result::Result<T, E>) -> std::result::Result<T, E> {
+        let raw = std::mem::replace(&mut self.raw, true);
+        let done = work(self);
+        self.raw = raw;
+        done
+    }
+
+    /// Once for each store: every long-form `did:peer:4` in its rows, in any column
+    /// that holds text, made its short form, and the long form written down. A row
+    /// that can't be (its short form's is there already) is left, and said in
+    /// [`Db::long_forms_left`].
+    fn keep_long_forms_short(&mut self) -> Result<()> {
+        // In one transaction: written to disk once, and all done or none (tried
+        // again the next time the store is opened).
+        self.as_they_are(|session| session.transaction(|session| {
+            if session.query_row("SELECT 1 FROM wyvrn_migrated WHERE name = ?1", &[Value::Text(SHORTENED.into())], |_| Ok(()))?.is_some() {
+                return Ok(());
+            }
+            let mut left: Vec<(String, String)> = Vec::new();
+            let mut changed = 0usize;
+            for table in session.tables()? {
+                for column in session.text_columns(&table)? {
+                    let found: Vec<String> = session.query(&format!("SELECT DISTINCT \"{column}\" FROM \"{table}\" WHERE \"{column}\" LIKE 'did:peer:4zQm%:%'"), &[], |row| row.get(0))?;
+                    for value in found {
+                        let Some((short, long)) = long_forms::shortened(&value) else { continue };
+                        let short_did = &short[..long_forms::SHORT_LENGTH];
+                        session.execute("INSERT OR IGNORE INTO wyvrn_long_forms (short_form, long_form) VALUES (?1, ?2)", &[Value::Text(short_did.to_string()), Value::Text(long.to_string())])?;
+                        changed += session.execute(&format!("UPDATE OR IGNORE \"{table}\" SET \"{column}\" = ?1 WHERE \"{column}\" = ?2"), &[Value::Text(short.clone()), Value::Text(value.clone())])?;
+                        let still: i64 = session.query_value(&format!("SELECT COUNT(*) FROM \"{table}\" WHERE \"{column}\" = ?1"), &[Value::Text(value.clone())])?;
+                        if still > 0 {
+                            tracing::warn!(%table, %column, did = %short, "a long-form did:peer:4 left as it was: its short form is there already");
+                            if !left.iter().any(|(l, _)| l == long) {
+                                left.push((long.to_string(), short_did.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+            session.execute("INSERT OR IGNORE INTO wyvrn_migrated (name) VALUES (?1)", &[Value::Text(SHORTENED.into())])?;
+            if changed > 0 {
+                tracing::info!(changed, "long-form did:peer:4s kept by their short form from now on");
+            }
+            *session.long_forms.left.lock().unwrap_or_else(|p| p.into_inner()) = left;
+            Ok(())
+        }))
+    }
+
+    /// The columns of `table` that can hold text.
+    fn text_columns(&mut self, table: &str) -> Result<Vec<String>> {
+        let naming = self.naming.cloned();
+        let real = format!("{}{table}", naming.as_ref().map(|naming| naming.prefix.as_str()).unwrap_or_default());
+        let columns: Vec<(String, String)> = match &*self.backend {
+            Backend::Sqlite(_) => self.as_written("SELECT name, type FROM pragma_table_info(?1)", &[Value::Text(real)])?,
+            _ => {
+                let database = naming.and_then(|naming| naming.database).map_or(Value::Null, Value::Text);
+                self.as_written("SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = COALESCE(?1, DATABASE()) AND table_name = ?2", &[database, Value::Text(real)])?
+            }
+        }
+        .rows
+        .iter()
+        .map(|row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)))
+        .collect::<Result<_>>()?;
+        Ok(columns
+            .into_iter()
+            .filter(|(_, kind)| {
+                let kind = kind.to_ascii_uppercase();
+                kind.is_empty() || kind.contains("TEXT") || kind.contains("CHAR") || kind.contains("CLOB")
+            })
+            .map(|(name, _)| name)
+            .collect())
+    }
+
+    fn say_kept(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
         let Some(cache) = self.cache else { return self.say_to_database(sql, params) };
         if let Some(table) = table_written(sql) {
             let said = self.say_to_database(sql, params);
@@ -1346,7 +1577,7 @@ impl Session<'_> {
         .map(|row| row.get::<String>(0))
         .collect::<Result<_>>()?;
         let prefix = naming.map(|naming| naming.prefix).unwrap_or_default();
-        Ok(listed.into_iter().filter_map(|name| name.strip_prefix(prefix.as_str()).map(str::to_string)).filter(|name| name != "wyvrn_service").collect())
+        Ok(listed.into_iter().filter_map(|name| name.strip_prefix(prefix.as_str()).map(str::to_string)).filter(|name| !UPKEEP_TABLES.contains(&name.as_str())).collect())
     }
 
     /// How much the store takes up, in bytes: SQLite's pages; MySQL's tables (those
@@ -1456,6 +1687,7 @@ impl Session<'_> {
                 }
                 Err(err) => {
                     let _ = self.plainly(&format!("ROLLBACK TO SAVEPOINT {name}"));
+                    self.long_forms.forget_written();
                     Err(err)
                 }
             };
@@ -1474,6 +1706,7 @@ impl Session<'_> {
             }
             Err(err) => {
                 let _ = self.plainly("ROLLBACK");
+                self.long_forms.forget_written();
                 Err(err)
             }
         }
@@ -1804,6 +2037,85 @@ mod tests {
         assert!(session.execute("INSERT INTO dids (did, n) VALUES (?1, 3)", params![long]).is_err());
         assert_eq!(session.query_value::<i64>("SELECT n FROM dids WHERE did = ?1", params![long]).unwrap(), 1);
         assert_eq!(session.query_value::<i64>("SELECT COUNT(*) FROM dids WHERE did = ?1", params![long.to_uppercase()]).unwrap(), 0);
+    }
+
+    /// A long-form did:peer:4 of at least `length` characters, one of its own (`n`).
+    fn long_did(length: usize, n: usize) -> String {
+        let endpoint = format!("https://example.com/{n}?{}", "p".repeat(length * 3 / 4));
+        let did = didcomm_resolver_peer::peer4::encode(serde_json::json!({ "service": [{ "id": "#didcomm", "type": "DIDCommMessaging", "serviceEndpoint": endpoint }] })).unwrap();
+        assert!(did.len() >= length, "{}", did.len());
+        did
+    }
+
+    #[test]
+    fn a_long_form_did_peer_4_is_kept_by_its_short_form_and_read_back_long() {
+        const DIDS: Schema = Schema {
+            sqlite: "CREATE TABLE IF NOT EXISTS members (did TEXT NOT NULL PRIMARY KEY, role TEXT NOT NULL, became TEXT)",
+            mysql: "CREATE TABLE IF NOT EXISTS members (did VARCHAR(3000) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY, role VARCHAR(16) NOT NULL, became TEXT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+        };
+        let dir = std::env::temp_dir().join(format!("wyvrn-long-forms-test-{}", scratch_name()));
+        let mut places = vec![Location::Sqlite(dir.join("store.sqlite"))];
+        if let Some(url) = server() {
+            places.push(Location::Shared { server: url.trim_end_matches('/').to_string(), database: format!("wyvrn_test_{}", scratch_name()), prefix: "c3_".into() });
+        }
+        for location in places {
+            let (before, both, huge) = (long_did(1_500, 1), long_did(1_200, 2), long_did(5_000, 3));
+            let short = |did: &str| did_key(did).into_owned();
+            let raw_dids = |db: &Db| db.lock().as_they_are(|s| s.query("SELECT did FROM members ORDER BY role", &[], |row| row.get::<String>(0))).unwrap();
+            {
+                // A store from before: long forms as they were, and one DID kept under both forms.
+                let db = Db::open(&location, &DIDS, "test").unwrap();
+                db.lock()
+                    .as_they_are(|s| {
+                        s.execute("DELETE FROM wyvrn_migrated", &[])?;
+                        s.execute("INSERT INTO members (did, role, became) VALUES (?1, 'a', ?2)", params![before, both])?;
+                        s.execute("INSERT INTO members (did, role) VALUES (?1, 'b')", params![both])?;
+                        s.execute("INSERT INTO members (did, role) VALUES (?1, 'c')", params![short(&both)])
+                    })
+                    .unwrap();
+            }
+            let db = Db::open(&location, &DIDS, "test").unwrap();
+            // Made short where it could be; the one already there under its short form left, and said.
+            assert_eq!(raw_dids(&db), vec![short(&before), both.clone(), short(&both)]);
+            assert_eq!(db.lock().as_they_are(|s| s.query_value::<String>("SELECT became FROM members WHERE role = 'a'", &[])).unwrap(), short(&both));
+            assert_eq!(db.long_forms_left(), vec![(both.clone(), short(&both))]);
+            assert!(db.long_forms_left().is_empty());
+            // Found by either form, and read back long.
+            let mut session = db.lock();
+            for did in [&before, &short(&before)] {
+                assert_eq!(session.query_value::<String>("SELECT did FROM members WHERE did = ?1", params![did]).unwrap(), before);
+            }
+            assert_eq!(session.query_value::<String>("SELECT became FROM members WHERE did = ?1", params![before]).unwrap(), both);
+            // Something new, longer than any key, is kept short.
+            session.execute("INSERT INTO members (did, role) VALUES (?1, 'd')", params![huge]).unwrap();
+            assert_eq!(session.execute("UPDATE members SET became = ?2 WHERE did = ?1", params![huge, format!("{huge}#key-1")]).unwrap(), 1);
+            assert_eq!(session.query_row("SELECT did, became FROM members WHERE role = 'd'", &[], |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?))).unwrap(), Some((huge.clone(), format!("{huge}#key-1"))));
+            assert_eq!(session.as_they_are(|s| s.query_value::<String>("SELECT became FROM members WHERE role = 'd'", &[])).unwrap(), format!("{}#key-1", short(&huge)));
+            // What is undone is written again the next time.
+            let undone: Result<()> = session.transaction(|s| {
+                s.execute("INSERT INTO members (did, role) VALUES (?1, 'e')", params![long_did(800, 4)])?;
+                Err(Error::Other("no".into()))
+            });
+            assert!(undone.is_err());
+            session.execute("INSERT INTO members (did, role) VALUES (?1, 'e')", params![long_did(800, 4)]).unwrap();
+            drop(session);
+            drop(db);
+            // Opened again, nothing more is done; read in another process, the long forms are there.
+            let db = Db::open(&location, &DIDS, "test").unwrap();
+            assert!(db.long_forms_left().is_empty());
+            long_forms::held().lock().unwrap().clear();
+            let read = db.lock().query("SELECT did FROM members ORDER BY role", &[], |row| row.get::<String>(0)).unwrap();
+            // (The row left long, and the one under its short form, both read as the long form.)
+            assert_eq!(read, vec![before.clone(), both.clone(), both.clone(), huge.clone(), long_did(800, 4)]);
+            // A copy carries them.
+            let copy = Location::Sqlite(dir.join(format!("copy-{}.sqlite", scratch_name())));
+            Db::open(&copy, &DIDS, "test").unwrap();
+            copy_store(&location, &copy, "test", &[]).unwrap();
+            long_forms::held().lock().unwrap().clear();
+            let copied = Db::open(&copy, &DIDS, "test").unwrap().lock().query("SELECT did FROM members ORDER BY role", &[], |row| row.get::<String>(0)).unwrap();
+            assert_eq!(copied, read);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
