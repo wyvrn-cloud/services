@@ -1482,7 +1482,7 @@ impl Community {
             if existing.author_did != sender {
                 return refuse(message, "e.p.msg.id-taken", "That id has been used.");
             }
-            return Ok(Outcome::reply(reply_to(message, POSTED, json!({ "channel": existing.channel, "seq": existing.seq, "id": existing.id }))));
+            return Ok(Outcome::reply(reply_to(message, POSTED, json!({ "channel": existing.channel, "seq": existing.seq, "id": existing.id, "posted_at": existing.posted_at }))));
         }
         // What it answers, and the thread it is in: both posts of this channel.
         let answered = match body.get("reply_to").filter(|reference| !reference.is_null()) {
@@ -1581,7 +1581,9 @@ impl Community {
         }
         let mut outcome = Outcome {
             reply: Some(reply_to(message, POSTED, {
-                let mut placed = json!({ "channel": post.channel, "seq": post.seq, "id": post.id });
+                // When, by the server's clock: the author's app shows it before its
+                // `message` comes, and places it by this (community/1.0's `posted`).
+                let mut placed = json!({ "channel": post.channel, "seq": post.seq, "id": post.id, "posted_at": post.posted_at });
                 // Censored, its author's app shows it as everyone sees it.
                 if let Some(censored) = &censored {
                     placed["content"] = json!(censored.content);

@@ -342,6 +342,9 @@ async fn a_post_is_answered_reacted_to_changed_pinned_and_taken_back_and_everyon
     admin.next_message().await;
     let got = admin.next_message().await;
     assert_eq!(got["id"], "p2");
+    // Its author is told when it was posted, by the server's clock, as everyone is.
+    assert!(got["posted_at"].is_i64(), "{got}");
+    assert_eq!(answer["body"]["posted_at"], got["posted_at"], "{answer}");
     assert_eq!(got["reply_to"], json!({ "id": "p1", "author": server.id(&admin), "snippet": "Shall we ship?" }));
     // Someone who isn't a member is left out, and only an admin calls on everyone.
     assert_eq!(got["mentions"], json!([{ "who": server.id(&admin), "name": "admin" }]));
