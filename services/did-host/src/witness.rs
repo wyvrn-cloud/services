@@ -249,6 +249,20 @@ mod tests {
         };
         assert_eq!(held_back_because(&log, &same(None, renamed(document(&["z6LSa", "z6LSb"], &["z6Mkr"], "did:peer:2.mediator")))), None);
 
+        // A device's credential key, listed under no relationship by an app from
+        // before 0.0.28 and under assertionMethod since: not a recovery key, at once.
+        let with_credential = |listed: bool| {
+            let mut document = document(&["z6LSa", "z6LSb"], &["z6Mkr"], "did:peer:2.mediator");
+            let id = "did:webvh:Qm:id.example:alice#cred-Qx2kDuhE";
+            document["verificationMethod"].as_array_mut().unwrap().push(json!({ "id": id, "publicKeyMultibase": "zDnaecred" }));
+            if listed {
+                document["assertionMethod"] = json!([id]);
+            }
+            document
+        };
+        let unlisted = entry(Some(&["z6Mka", "z6Mkb"]), Some(witness.clone()), with_credential(false));
+        assert_eq!(held_back_because(&unlisted, &same(None, with_credential(true))), None);
+
         // Witnessing turned on for a log from before: at once.
         let before = entry(Some(&["z6Mka"]), None, document(&["z6LSa"], &[], "did:peer:2.mediator"));
         assert_eq!(held_back_because(&before, &entry(None, Some(witness.clone()), document(&["z6LSa"], &[], "did:peer:2.mediator"))), None);

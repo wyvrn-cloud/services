@@ -31,7 +31,12 @@ fn fragment(id: &str) -> &str {
 
 /// The recovery keys and passkeys a document lists: `(fragment, publicKeyMultibase)`
 /// of each `verificationMethod` entry that no verification relationship names. The
-/// first method of a fragment counts.
+/// first method of a fragment counts. A device's credential key (`#cred-…`, as
+/// did:peer:4 names them: website-sign-in/1.0) is never one: an address's document
+/// from before 0.0.28 listed those under no relationship, having no
+/// `assertionMethod`, and so they were taken for recovery keys -- able to co-sign a
+/// held-back entry, and seen "removed" when the next entry listed them where they
+/// belong (found 2026-11-26).
 pub fn recovery_keys_listed_in(document: &Value) -> Vec<(String, String)> {
     let mut named = std::collections::BTreeSet::new();
     for relationship in RELATIONSHIPS {
@@ -45,7 +50,7 @@ pub fn recovery_keys_listed_in(document: &Value) -> Vec<(String, String)> {
     for method in document["verificationMethod"].as_array().into_iter().flatten() {
         let id = fragment(method["id"].as_str().unwrap_or_default());
         let Some(public_key) = method["publicKeyMultibase"].as_str() else { continue };
-        if id.is_empty() || named.contains(id) || listed.iter().any(|(held, _)| held == id) {
+        if id.is_empty() || id.starts_with("cred-") || named.contains(id) || listed.iter().any(|(held, _)| held == id) {
             continue;
         }
         listed.push((id.to_string(), public_key.to_string()));
