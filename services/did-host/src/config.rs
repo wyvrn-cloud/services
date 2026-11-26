@@ -148,7 +148,8 @@ fn default_reserved_namespaces() -> Vec<String> {
 impl Config {
     /// Reads `path`, then lets the environment override what a deployment most
     /// often needs to: `DID_HOST_BIND`, `DID_HOST_PUBLIC_URL`,
-    /// `DID_HOST_DID_METHOD`, `DID_HOST_DOMAIN`, `DID_HOST_ADMINS` (DIDs
+    /// `DID_HOST_DID_METHOD`, `DID_HOST_DOMAIN`, `DID_HOST_WITNESS` (`true` or
+    /// `false`), `DID_HOST_ADMINS` (DIDs
     /// separated by commas or whitespace) and `DID_HOST_OPEN_NAMESPACES` (labels,
     /// likewise; `*` for any name).
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
@@ -170,6 +171,13 @@ impl Config {
         }
         if let Some(open) = env("DID_HOST_OPEN_NAMESPACES") {
             config.host.open_namespaces = open.split(|c: char| c == ',' || c.is_whitespace()).filter(|label| !label.is_empty() && *label != "*").map(str::to_string).collect();
+        }
+        if let Some(witness) = env("DID_HOST_WITNESS") {
+            config.host.witness = match witness.trim() {
+                "true" | "1" | "yes" => true,
+                "false" | "0" | "no" => false,
+                other => anyhow::bail!("DID_HOST_WITNESS is true or false, not {other:?}"),
+            };
         }
         if let Some(admins) = env("DID_HOST_ADMINS") {
             config.host.admins = admins.split(|c: char| c == ',' || c.is_whitespace()).filter(|did| !did.is_empty()).map(str::to_string).collect();

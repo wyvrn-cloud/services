@@ -67,6 +67,7 @@ docker compose up -d did-host
 |---|---|
 | `/<name>/did.jsonl` | The `did:webvh` log, as its holder wrote it. |
 | `/<name>/did.json` | The parallel `did:web` document, derived from the log as `did:webvh` says to: with its `#files` and `#whois` services, whether or not a whois is published. |
+| `/<name>/did-witness.json` | The host's witness's proofs for the log (below): written before the log, and served, like the log and `did.json`, `no-cache` with an `ETag`. |
 | `/<name>/whois.vp` | The holder's whois, if it has published one. |
 | `/<name>/<digest>.webp`, `.jpg` | A picture a linked account in the whois refers to, published beside it as an attachment of `publish-whois` and checked against the digest the credential signs (did-hosting/1.0, "Linked accounts' pictures"). Kept for good by whoever fetches it (`immutable`); gone with the whois. |
 | `POST /` | `did-hosting/1.0` messages. Only ones their sender authenticated (authcrypt): anything else is answered 403. |
@@ -77,6 +78,28 @@ docker compose up -d did-host
 A name with nothing published under it answers 404 to all three, whether it is
 free, reserved, or being claimed. A name with labels is a path: `official:news`
 is at `/official/news/did.jsonl`.
+
+## The host as a witness
+
+By default (`witness = true` under `[host]`, or `DID_HOST_WITNESS`) the host
+witnesses every log it hosts (did-hosting/1.0, "The host as a witness"). It has a
+witness key of its own, a `did:key`, kept with its other keys (sealed where the
+service seals its keys) and given in `reservation`, `published` and `status`. A
+log names it as its only witness from its first entry, or from the next entry of
+a log published before; the host refuses one that doesn't. Each entry it takes it
+signs for in `did-witness.json` before the log is updated.
+
+An entry that takes something away (a device's key, an update key, a recovery
+key, where mail goes, the witness, or the DID itself) is held back for 24 hours,
+served nowhere meanwhile, and its holder's devices are sent `pending` at the
+hosted DID (again an hour before it is published). A recovery key the last
+witnessed entry lists can co-sign it (`recovery_proof` on `publish`, or `cosign`)
+to have it published at once; the holder can `withdraw` it. Pending entries are
+kept in the store, and published once a minute as they fall due.
+
+Turning witnessing on for a host with names already hosted asks their holders'
+apps to add the witness to their next entry: an app that doesn't know to is
+refused until it does.
 
 ## Names
 
