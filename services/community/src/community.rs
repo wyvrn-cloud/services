@@ -591,6 +591,12 @@ impl Community {
                 tracing::info!(approved, "bots there before approval was asked for are approved");
             }
         }
+        // Bots approved before bots had roles of their own: one each (Endnote 5).
+        match community.give_bots_roles_from_before() {
+            Ok(0) => {}
+            Ok(given) => tracing::info!(given, "bots approved before are given roles of their own"),
+            Err(error) => tracing::warn!(%error, "couldn't give bots roles of their own"),
+        }
         // Tokens from before they were hashed (WYV-63), hashed as it opens.
         match community.store.hash_plain_webhook_tokens() {
             Ok(0) => {}
@@ -792,7 +798,15 @@ impl Community {
                 if !asked.is_empty() {
                     body["claims"] = json!(asked
                         .iter()
-                        .map(|claim| Ok(json!({ "member": claim.did, "discord_id": claim.discord_id, "posts": self.imported_count(&claim.discord_id)?, "at": claim.at })))
+                        .map(|claim| {
+                            let mut listed = json!({ "member": claim.did, "discord_id": claim.discord_id, "posts": self.imported_count(&claim.discord_id)?, "at": claim.at });
+                            // The roles it would give, that the decider sees what they decide.
+                            let roles = self.store.roles_to_give(&claim.discord_id, &claim.did, None)?;
+                            if !roles.is_empty() {
+                                listed["roles"] = json!(roles);
+                            }
+                            Ok(listed)
+                        })
                         .collect::<anyhow::Result<Vec<_>>>()?);
                 }
             }
@@ -802,6 +816,9 @@ impl Community {
                 let posts = if claim.state == "claimed" { 0 } else { self.imported_count(&claim.discord_id)? };
                 if claim.state == "claimed" || posts > 0 {
                     body["imported_claim"] = json!({ "from": "discord", "state": claim.state, "posts": posts });
+                    if claim.state == "claimed" {
+                        body["imported_claim"]["given"] = self.claim_given(&claim.discord_id)?;
+                    }
                 }
             }
             if self.moving()? {
@@ -2287,12 +2304,18 @@ impl Community {
                 let approve = body["approve"].as_bool() == Some(true);
                 let mut outcome = Outcome::default();
                 if approve {
+                    // Its roles (those ranked below the decider's) and overrides first:
+                    // the overrides still name the imported author.
+                    self.give_claimed(&claim.discord_id, who, Some(sender), now)?;
                     outcome.changed = self.store.claim_imported_posts(&claim.discord_id, who, now)?;
                 }
                 claim.state = if approve { "claimed" } else { "refused" }.into();
                 claim.at = now;
                 claim.decided_by = Some(sender.to_string());
                 self.store.set_claim(&claim)?;
+                if approve {
+                    self.store.settle_bot_role(who)?;
+                }
                 self.audit(now, sender, if approve { "claim.approve" } else { "claim.refuse" }, None, Some(json!({ "member": who, "discord_id": claim.discord_id })));
                 outcome.reply = Some(reply_to(message, COMMUNITY, self.community(&member)?));
                 if let Some(claimant) = self.store.member(who)? {

@@ -249,3 +249,17 @@ pub fn picture_sizes(host: &Host, name: &str, dry_run: bool) -> anyhow::Result<(
     }
     Ok(())
 }
+
+/// `import-discord-roles`: a Discord server's roles and member overrides, read
+/// from `folder` (`members.json`, `roles.json`, `channels.json`, as Discord's API
+/// gives them), kept for each account of the community `name`
+/// ([`wyvrn_community::discord_roles::import`]); its report printed, as Markdown.
+pub fn import_discord_roles(host: &Host, name: &str, folder: &Path, dry_run: bool, now: i64) -> anyhow::Result<()> {
+    let record = host.registry.get(name)?.with_context(|| format!("there is no community called {name}"))?;
+    let stores = host.stores(&record, record.storage)?;
+    let (members, roles, channels) = wyvrn_community::discord_roles::read_folder(folder)?;
+    let store = wyvrn_community::store::Store::open(&stores.community)?;
+    let report = wyvrn_community::discord_roles::import(&store, &members, &roles, &channels, dry_run, now)?;
+    println!("{}", report.markdown());
+    Ok(())
+}

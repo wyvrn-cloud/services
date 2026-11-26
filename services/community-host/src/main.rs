@@ -54,6 +54,15 @@ wyvrn-community-host [--config <path>] import-discord <name> <folder> <channel>.
                                                                   embeds of the posts already imported from
                                                                   those channels, sent as edits are.
                                                                   --dry-run says what it would do.
+wyvrn-community-host [--config <path>] import-discord-roles <name> <folder> [--dry-run]
+                                                                  a Discord server's roles and member
+                                                                  overrides kept for each account: <folder>
+                                                                  holds members.json, roles.json and
+                                                                  channels.json as Discord's API (v10) gives
+                                                                  them. A claim of an account gives its
+                                                                  roles and overrides; those claimed already
+                                                                  are given them now. Again, it updates what
+                                                                  is kept. Counts, as Markdown.
 wyvrn-community-host [--config <path>] picture-sizes <name> [--dry-run]
                                                                   the pictures of one's posts kept without
                                                                   their width and height (a Discord history
@@ -241,6 +250,15 @@ async fn main() -> anyhow::Result<()> {
             anyhow::ensure!(!asked.channels.is_empty(), "name the channels to import\n\n{USAGE}");
             let host = Host::new(config.clone(), registry(&config)?);
             tokio::task::block_in_place(|| wyvrn_community_host::history::run(&host, name, &asked, now()))
+        }
+        ["import-discord-roles", name, folder, rest @ ..] => {
+            let dry_run = match rest {
+                [] => false,
+                ["--dry-run"] => true,
+                _ => anyhow::bail!("{}: unrecognized\n\n{USAGE}", rest.join(" ")),
+            };
+            let host = Host::new(config.clone(), registry(&config)?);
+            tokio::task::block_in_place(|| wyvrn_community_host::history::import_discord_roles(&host, name, std::path::Path::new(folder), dry_run, now()))
         }
         ["picture-sizes", name, rest @ ..] => {
             let dry_run = match rest {

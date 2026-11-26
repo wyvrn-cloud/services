@@ -59,7 +59,7 @@ fn templates() -> [(&'static str, &'static str, Value); 13] {
             "A member's roles",
             json!({
                 "states": [{ "name": "pick", "type": "start" }, { "name": "done", "type": "final" }],
-                "transitions": { "save": { "from": "pick", "to": "done" } }
+                "transitions": { "save": { "from": "pick", "to": "done" }, "discord_bot": { "from": "pick", "to": "pick" } }
             }),
         ),
         (
@@ -385,7 +385,7 @@ impl Community {
         let mut events = vec!["edit", "create", "reorder", "done"];
         if chosen.is_some_and(may_edit) {
             events.push("save");
-            if chosen.is_some_and(|r| r.id != EVERYONE_ROLE) {
+            if chosen.is_some_and(|r| r.id != EVERYONE_ROLE && !self.is_bot_role(&r.id).unwrap_or(true)) {
                 events.push("delete");
             }
         }
@@ -478,14 +478,21 @@ impl Community {
 
     fn role_edit_ui(&self, role: &RoleDef, powers: &Powers, save_bar: bool) -> Value {
         let everyone = role.id == EVERYONE_ROLE;
+        let bot = self.bot_role_holders().unwrap_or_default().get(&role.id).cloned();
         let mut fields = Vec::new();
+        if let Some(bot) = &bot {
+            let name = self.override_name(bot).unwrap_or_default();
+            fields.push(json!({ "type": "text", "text": format!("{name}'s own role, as a bot: held by it alone, and gone with it.") }));
+        }
         if !everyone {
             fields.push(json!({ "type": "text-input", "form-id": "name", "label": "Name", "value": role.name, "required": true }));
             fields.push(json!({ "type": "text-input", "form-id": "color", "format": "color", "label": "Colour", "placeholder": "#3498db", "value": role.color.clone().unwrap_or_default() }));
             fields.push(json!({ "type": "text-input", "form-id": "icon", "format": "emoji", "label": "Badge", "placeholder": "⭐", "value": role.icon.clone().unwrap_or_default() }));
             fields.push(json!({ "type": "check-box", "form-id": "mentionable", "label": "Anyone may @mention this role", "value": role.mentionable }));
             fields.push(json!({ "type": "check-box", "form-id": "hoist", "label": "List its members apart", "value": role.hoist }));
-            fields.push(json!({ "type": "check-box", "form-id": "self_assignable", "label": "Members may take it, or drop it, themselves", "value": role.self_assignable }));
+            if bot.is_none() {
+                fields.push(json!({ "type": "check-box", "form-id": "self_assignable", "label": "Members may take it, or drop it, themselves", "value": role.self_assignable }));
+            }
         }
         let mut kept = Vec::new();
         for (heading, permissions) in [("In the community", COMMUNITY_PERMISSIONS), ("In channels (each channel can change these)", CHANNEL_PERMISSIONS)] {
@@ -510,7 +517,7 @@ impl Community {
             form["save-bar"] = json!({ "event": "save" });
         }
         let mut items = vec![json!({ "type": "title", "text": title }), form];
-        if !everyone {
+        if !everyone && bot.is_none() {
             items.push(button("Delete role", "delete", json!({})));
         }
         items.push(button("Back", "back", json!({})));
@@ -523,7 +530,9 @@ impl Community {
         let name = member.name.clone().unwrap_or_else(|| "this member".into());
         let mut fields = Vec::new();
         let mut fixed = Vec::new();
-        for role in self.store.roles().map_err(failed)?.iter().filter(|role| role.id != EVERYONE_ROLE) {
+        // (A bot's own role is neither given nor taken.)
+        let managed = self.bot_role_holders().map_err(failed)?;
+        for role in self.store.roles().map_err(failed)?.iter().filter(|role| role.id != EVERYONE_ROLE && !managed.contains_key(&role.id)) {
             let holds = held.contains(&role.id);
             if powers.above(role.position) {
                 fields.push(json!({ "type": "check-box", "form-id": format!("role-{}", role.id), "label": role.name, "value": holds }));
@@ -539,7 +548,24 @@ impl Community {
         if can_draw(flow, SAVE_BAR) {
             form["save-bar"] = json!({ "event": "save" });
         }
-        Ok(json!([{ "type": "title", "text": format!("Roles for {name}") }, form]))
+        let mut items = vec![json!({ "type": "title", "text": format!("Roles for {name}") }), form];
+        // A bot: which Discord bot it is, as no bot can claim (discord_roles.rs).
+        if self.store.bot_asked(&member.did).map_err(failed)?.is_some() {
+            if let Some(note) = flow.data["note"].as_str() {
+                items.push(json!({ "type": "pass", "text": note }));
+            }
+            let current = self.store.discord_account_of(&member.did).map_err(failed)?;
+            let text = match &current {
+                Some(id) => format!("It is the Discord bot {id}: its posts brought in are its, and its roles there were given it."),
+                None => "Was it a bot on Discord? Its user id there makes the posts brought in under it its own, gives it its roles there (those ranked below yours), and makes the role Discord made for it its own.".into(),
+            };
+            items.push(json!({ "type": "form", "children": [
+                { "type": "text", "text": text },
+                { "type": "text-input", "form-id": "discord_id", "label": "Its Discord user id", "placeholder": "123456789012345678", "value": current.unwrap_or_default(), "required": true },
+                button("This is that Discord bot", "discord_bot", json!({}))
+            ] }));
+        }
+        Ok(Value::Array(items))
     }
 
     fn channel_roles_ui(&self, flow: &Flow, powers: &Powers) -> Result<Value, Refusal> {
@@ -586,15 +612,39 @@ impl Community {
             }
             items.push(json!({ "type": "row", "children": row }));
         }
+        // Then each member it has an override for, worked out last, whatever their
+        // rank (discord_roles.rs); one named by member id is added below.
+        let describe = |list: &[String]| list.iter().map(|p| label_of(p)).collect::<Vec<_>>().join(", ");
+        for o in self.store.member_overrides(&target.key).map_err(failed)? {
+            let name = self.override_name(&o.did).map_err(failed)?;
+            let text = match (o.allow.is_empty(), o.deny.is_empty()) {
+                (false, false) => format!("{name}: allows {}; denies {}", describe(&o.allow), describe(&o.deny)),
+                (false, true) => format!("{name}: allows {}", describe(&o.allow)),
+                _ => format!("{name}: denies {}", describe(&o.deny)),
+            };
+            items.push(json!({ "type": "row", "children": [{ "type": "text", "text": text }, button("Edit", "edit", json!({ "member": o.did }))] }));
+        }
+        items.push(json!({ "type": "form", "children": [
+            { "type": "text-input", "form-id": "member", "format": "member", "label": "Set it for one member: their member id", "placeholder": "m…", "required": true },
+            button("Set for them", "edit", json!({}))
+        ] }));
         items.push(button("Done", "done", json!({})));
         Ok(Value::Array(items))
     }
 
     fn channel_role_ui(&self, flow: &Flow, held: &std::collections::BTreeSet<String>) -> Result<Value, Refusal> {
         let target = self.flow_target(flow)?;
-        let role_id = flow.data["role"].as_str().unwrap_or_default();
-        let role = self.store.role(role_id).map_err(failed)?.ok_or_else(|| refused("That role is gone."))?;
-        let said = self.store.overrides(&target.key).map_err(failed)?.into_iter().find(|o| o.role == role.id);
+        let (name, said) = match flow.data["member"].as_str() {
+            Some(did) => {
+                let said = self.store.member_overrides(&target.key).map_err(failed)?.into_iter().find(|o| o.did == did).map(|o| crate::store::Override { channel: o.channel, role: String::new(), allow: o.allow, deny: o.deny });
+                (self.override_name(did).map_err(failed)?, said)
+            }
+            None => {
+                let role_id = flow.data["role"].as_str().unwrap_or_default();
+                let role = self.store.role(role_id).map_err(failed)?.ok_or_else(|| refused("That role is gone."))?;
+                (role.name, self.store.overrides(&target.key).map_err(failed)?.into_iter().find(|o| o.role == role.id))
+            }
+        };
         let mut fields = Vec::new();
         for (name, label) in CHANNEL_PERMISSIONS {
             let allowed = said.as_ref().is_some_and(|o| o.allow.iter().any(|p| p == name));
@@ -610,9 +660,10 @@ impl Community {
             }
         }
         fields.push(button("Save", "save", json!({})));
+        let neither = if flow.data["member"].is_string() { "Neither ticked: as their roles give it here." } else { "Neither ticked: as the role has it everywhere." };
         Ok(json!([
-            { "type": "title", "text": format!("{} in {}", role.name, target.title) },
-            { "type": "text", "text": "Neither ticked: as the role has it everywhere." },
+            { "type": "title", "text": format!("{name} in {}", target.title) },
+            { "type": "text", "text": neither },
             { "type": "form", "children": fields },
             button("Back", "back", json!({}))
         ]))
@@ -632,12 +683,15 @@ impl Community {
                 (ROLES, "edit") => {
                     let role = self.store.role(flow.data["role"].as_str().unwrap_or_default()).map_err(failed)?.ok_or_else(|| refused("That role is gone."))?;
                     let mut events = vec!["save", "back"];
-                    if role.id != EVERYONE_ROLE {
+                    if role.id != EVERYONE_ROLE && !self.is_bot_role(&role.id).map_err(failed)? {
                         events.push("delete");
                     }
                     (self.role_edit_ui(&role, &powers, can_draw(flow, SAVE_BAR)), events)
                 }
-                (MEMBER_ROLES, _) => (self.member_roles_ui(flow, &powers)?, vec!["save"]),
+                (MEMBER_ROLES, _) => {
+                    let bot = self.store.bot_asked(&self.flow_member(flow)?.did).map_err(failed)?.is_some();
+                    (self.member_roles_ui(flow, &powers)?, if bot { vec!["save", "discord_bot"] } else { vec!["save"] })
+                }
                 (CHANNEL_PERMISSIONS_FLOW, "roles") => (self.channel_roles_ui(flow, &powers)?, vec!["read_only", "unlock", "private", "public", "edit", "sync", "done"]),
                 (AUTOMOD_FLOW, "list") => (self.automod_list_ui(flow).map_err(failed)?, vec!["edit", "create", "preset", "toggle", "done"]),
                 (AUTOMOD_FLOW, "edit") => (self.automod_edit_ui(flow).map_err(failed)?, vec!["save", "delete", "back"]),
@@ -984,7 +1038,8 @@ impl Community {
                     role.icon = (!icon.is_empty()).then_some(icon);
                     role.mentionable = ticked(&input["mentionable"]);
                     role.hoist = ticked(&input["hoist"]);
-                    role.self_assignable = ticked(&input["self_assignable"]);
+                    // (A bot's own is held by it alone.)
+                    role.self_assignable = ticked(&input["self_assignable"]) && !self.is_bot_role(&role.id).map_err(failed)?;
                 }
                 // What the editor holds is theirs to set; anything else stays as it was.
                 for (name, _) in COMMUNITY_PERMISSIONS.iter().chain(CHANNEL_PERMISSIONS) {
@@ -994,6 +1049,10 @@ impl Community {
                             role.permissions.push(name.to_string());
                         }
                     }
+                }
+                // One members take themselves grants nothing that moderates.
+                if role.self_assignable && !crate::roles::may_be_self_assignable(&role.permissions) {
+                    return Err(refused("A role members take themselves can't grant Administrator or a permission that moderates."));
                 }
                 self.store.save_role(&role).map_err(failed)?;
                 self.audit(now, &flow.owner, "role.update", Some(&role.id), Some(json!({ "name": role.name, "permissions": role.permissions, "color": role.color, "mentionable": role.mentionable })));
@@ -1006,6 +1065,9 @@ impl Community {
                 if role.id == EVERYONE_ROLE {
                     return Err(refused("Every member's role can't be deleted."));
                 }
+                if self.is_bot_role(&role.id).map_err(failed)? {
+                    return Err(refused("A bot's own role goes only with the bot."));
+                }
                 self.store.delete_role(&role.id).map_err(failed)?;
                 self.audit(now, &flow.owner, "role.delete", Some(&role.id), Some(json!({ "name": role.name })));
                 flow.data["note"] = json!(format!("Deleted {}.", role.name));
@@ -1013,6 +1075,7 @@ impl Community {
                 true
             }
             (ROLES, "edit", "back") | (CHANNEL_PERMISSIONS_FLOW, "role", "back") => {
+                flow.data.as_object_mut().map(|data| data.remove("member"));
                 flow.state = if flow.template == ROLES { "list" } else { "roles" }.into();
                 false
             }
@@ -1023,7 +1086,8 @@ impl Community {
                 }
                 let held = self.store.member_roles(&member.did).map_err(failed)?;
                 let (mut given, mut taken) = (Vec::new(), Vec::new());
-                for role in self.store.roles().map_err(failed)?.iter().filter(|role| role.id != EVERYONE_ROLE && powers.above(role.position)) {
+                let managed = self.bot_role_holders().map_err(failed)?;
+                for role in self.store.roles().map_err(failed)?.iter().filter(|role| role.id != EVERYONE_ROLE && powers.above(role.position) && !managed.contains_key(&role.id)) {
                     let wanted = ticked(&input[format!("role-{}", role.id)]);
                     match (wanted, held.contains(&role.id)) {
                         (true, false) => {
@@ -1041,6 +1105,15 @@ impl Community {
                     self.audit(now, &flow.owner, "member.roles", Some(&member.did), Some(json!({ "given": given, "taken": taken })));
                 }
                 flow.status = "completed".into();
+                true
+            }
+            (MEMBER_ROLES, "pick", "discord_bot") => {
+                let member = self.flow_member(&flow)?;
+                if member.did != flow.owner && !self.outranks(&powers, &member.did).map_err(failed)? {
+                    return Err(not_allowed("You can only do this for someone ranked below you."));
+                }
+                let said = self.name_discord_bot(&flow.owner, &member.did, input["discord_id"].as_str().unwrap_or_default(), now).map_err(failed)?;
+                flow.data["note"] = json!(said.map_err(refused)?);
                 true
             }
             (CHANNEL_PERMISSIONS_FLOW, "roles", "sync") => {
@@ -1067,7 +1140,22 @@ impl Community {
                 self.audit(now, &flow.owner, "channel.permissions", Some(&target.key), Some(json!({ "role": EVERYONE_ROLE, said: on })));
                 true
             }
+            (CHANNEL_PERMISSIONS_FLOW, "roles", "edit") if input["member"].is_string() => {
+                // One member, by member id (made a DID on the way in); or an imported
+                // Discord author an override names already. No rank rule.
+                let did = input["member"].as_str().unwrap_or_default().trim().to_string();
+                let target = self.flow_target(&flow)?;
+                let named = self.store.member_overrides(&target.key).map_err(failed)?.iter().any(|o| o.did == did);
+                if !did.starts_with("did:") || (!named && self.store.member(&did).map_err(failed)?.is_none()) {
+                    return Err(refused("There is no member with that member id."));
+                }
+                flow.data.as_object_mut().map(|data| data.remove("role"));
+                flow.data["member"] = json!(did);
+                flow.state = "role".into();
+                false
+            }
             (CHANNEL_PERMISSIONS_FLOW, "roles", "edit") => {
+                flow.data.as_object_mut().map(|data| data.remove("member"));
                 let id = input["role"].as_str().unwrap_or_default();
                 let role = self.store.role(id).map_err(failed)?.ok_or_else(|| refused("There is no such role."))?;
                 if role.id != EVERYONE_ROLE && !powers.above(role.position) {
@@ -1080,9 +1168,12 @@ impl Community {
             (CHANNEL_PERMISSIONS_FLOW, "role", "save") => {
                 let target = self.flow_target(&flow)?;
                 let role_id = flow.data["role"].as_str().unwrap_or_default().to_string();
+                let member = flow.data["member"].as_str().map(str::to_string);
                 let held = self.target_held(&flow.owner, &powers, &target)?;
-                let said = self.store.overrides(&target.key).map_err(failed)?.into_iter().find(|o| o.role == role_id);
-                let (mut allow, mut deny) = said.map(|o| (o.allow, o.deny)).unwrap_or_default();
+                let (mut allow, mut deny) = match &member {
+                    Some(did) => self.store.member_overrides(&target.key).map_err(failed)?.into_iter().find(|o| o.did == *did).map(|o| (o.allow, o.deny)).unwrap_or_default(),
+                    None => self.store.overrides(&target.key).map_err(failed)?.into_iter().find(|o| o.role == role_id).map(|o| (o.allow, o.deny)).unwrap_or_default(),
+                };
                 for (name, label) in CHANNEL_PERMISSIONS.iter().filter(|(name, _)| held.contains(*name)) {
                     let (allowing, denying) = (ticked(&input[format!("allow-{name}")]), ticked(&input[format!("deny-{name}")]));
                     if allowing && denying {
@@ -1097,8 +1188,21 @@ impl Community {
                         deny.push(name.to_string());
                     }
                 }
-                self.set_target_override(&target, &role_id, &allow, &deny)?;
-                self.audit(now, &flow.owner, "channel.permissions", Some(&target.key), Some(json!({ "role": role_id, "allow": allow, "deny": deny })));
+                match &member {
+                    Some(did) => {
+                        match (&target.channel, &target.category) {
+                            (None, Some(category)) => self.set_category_member_override(&category.id, did, &allow, &deny).map_err(failed)?,
+                            _ => self.store.set_member_override(&target.key, did, &allow, &deny).map_err(failed)?,
+                        }
+                        let name = self.override_name(did).map_err(failed)?;
+                        self.audit(now, &flow.owner, "channel.permissions", Some(&target.key), Some(json!({ "member": { "did": did, "name": name }, "allow": allow, "deny": deny })));
+                    }
+                    None => {
+                        self.set_target_override(&target, &role_id, &allow, &deny)?;
+                        self.audit(now, &flow.owner, "channel.permissions", Some(&target.key), Some(json!({ "role": role_id, "allow": allow, "deny": deny })));
+                    }
+                }
+                flow.data.as_object_mut().map(|data| data.remove("member"));
                 flow.state = "roles".into();
                 true
             }
@@ -1512,7 +1616,7 @@ impl Community {
             let kind = if channel.voice.is_some() { "🔊 " } else { "#" };
             fields.push(json!({ "type": "check-box", "form-id": format!("suggest-{}", channel.id), "label": format!("{kind}{}", channel.name), "value": suggested.contains(&channel.id.as_str()) }));
         }
-        let offered: Vec<String> = self.store.roles()?.into_iter().filter(|role| role.self_assignable).map(|role| role.name).collect();
+        let offered: Vec<String> = self.store.roles()?.into_iter().filter(crate::roles::takeable).map(|role| role.name).collect();
         fields.push(json!({ "type": "text", "text": if offered.is_empty() {
             "No roles are offered to pick. A role is, once Roles marks it “Members may take it, or drop it, themselves”.".to_string()
         } else {
@@ -1540,7 +1644,7 @@ impl Community {
             "roles" => {
                 let held = self.store.member_roles(&flow.owner)?;
                 let mut fields = Vec::new();
-                for role in self.store.roles()?.into_iter().filter(|role| role.self_assignable) {
+                for role in self.store.roles()?.into_iter().filter(crate::roles::takeable) {
                     let label = match &role.icon {
                         Some(icon) => format!("{icon} {}", role.name),
                         None => role.name.clone(),
@@ -1692,9 +1796,11 @@ impl Community {
             (ONBOARDING_FLOW, "roles", "pick") => {
                 let held = self.store.member_roles(&flow.owner).map_err(failed)?;
                 let mut changed = false;
+                // (One no longer takeable may still be dropped, never taken.)
                 for role in self.store.roles().map_err(failed)?.into_iter().filter(|role| role.self_assignable) {
                     let wanted = ticked(&input[format!("role-{}", role.id)]);
                     match (wanted, held.contains(&role.id)) {
+                        (true, false) if !crate::roles::takeable(&role) => continue,
                         (true, false) => self.store.give_role(&flow.owner, &role.id).map_err(failed)?,
                         (false, true) => self.store.take_role(&flow.owner, &role.id).map_err(failed)?,
                         _ => continue,

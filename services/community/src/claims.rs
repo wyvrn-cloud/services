@@ -260,8 +260,12 @@ impl crate::community::Community {
             return Ok(Proven::Review);
         }
         let had_asked = held.as_ref().is_some_and(|claim| claim.state == "asked");
+        // What was kept of the account's roles and overrides (discord_roles.rs).
+        self.give_claimed(discord_id, did, None, now)?;
         let changed = store.claim_imported_posts(discord_id, did, now)?;
         store.set_claim(&Claim { discord_id: discord_id.to_string(), did: did.to_string(), state: "claimed".into(), at: now, decided_by: None })?;
+        // A bot's own role, now that it is known which Discord account it is.
+        store.settle_bot_role(did)?;
         self.audit(now, did, "claim.proven", None, Some(json!({ "discord_id": discord_id, "posts": changed.len() })));
         Ok(Proven::Claimed { changed, had_asked })
     }

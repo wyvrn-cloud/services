@@ -687,6 +687,8 @@ const CACHED_TABLES: &[&str] = &[
     "roles",
     "member_roles",
     "channel_overrides",
+    "member_overrides",
+    "bot_roles",
     "categories",
     "channel_order",
     "channel_voice",
@@ -1494,6 +1496,61 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         at INTEGER NOT NULL,
         PRIMARY KEY (from_did, to_did)
     );
+    -- Discord's roles and overrides, kept, member overrides and a bot's own role
+    -- (discord_roles.rs). What a channel (or a category, `category:<id>`) allows
+    -- and denies one member, each a JSON list; one naming an imported Discord
+    -- author until a member claims that account.
+    CREATE TABLE IF NOT EXISTS member_overrides (
+        channel TEXT NOT NULL,
+        did TEXT NOT NULL,
+        allow TEXT NOT NULL,
+        deny TEXT NOT NULL,
+        PRIMARY KEY (channel, did)
+    );
+    -- A bot's own role: held by that bot alone, and gone with it.
+    CREATE TABLE IF NOT EXISTS bot_roles (
+        did TEXT PRIMARY KEY,
+        role TEXT NOT NULL
+    );
+    -- Each Discord account a server's member list named: what it is called, whether
+    -- it is a bot, and its roles there as the roles here they matched (JSON).
+    CREATE TABLE IF NOT EXISTS discord_accounts (
+        discord_id TEXT PRIMARY KEY,
+        name TEXT,
+        bot INTEGER NOT NULL DEFAULT 0,
+        roles TEXT NOT NULL,
+        at INTEGER NOT NULL
+    );
+    -- What each Discord channel gave one account alone, as Discord said it, and
+    -- the channel (or category) here it was matched to; none where none was.
+    CREATE TABLE IF NOT EXISTS discord_account_overrides (
+        discord_id TEXT NOT NULL,
+        discord_channel TEXT NOT NULL,
+        channel TEXT,
+        allow TEXT NOT NULL,
+        deny TEXT NOT NULL,
+        PRIMARY KEY (discord_id, discord_channel)
+    );
+    -- Discord's roles and channels, as matched to those here (kind `role` or
+    -- `channel`); `bot`, a role Discord made for a bot, that bot's user id.
+    CREATE TABLE IF NOT EXISTS discord_mapped (
+        kind TEXT NOT NULL,
+        discord_id TEXT NOT NULL,
+        local TEXT,
+        name TEXT NOT NULL,
+        bot TEXT,
+        PRIMARY KEY (kind, discord_id)
+    );
+    -- What a Discord account's roles and overrides gave the member who is it (by a
+    -- claim, or named a bot's by someone who manages roles), once.
+    CREATE TABLE IF NOT EXISTS discord_given (
+        discord_id TEXT PRIMARY KEY,
+        did TEXT NOT NULL,
+        roles TEXT NOT NULL,
+        overrides INTEGER NOT NULL,
+        by_did TEXT,
+        at INTEGER NOT NULL
+    );
     -- What rows are found by, beyond each table's key: kept small on a community
     -- of a few dozen, and what keeps a big one from reading a whole table to
     -- answer (a thread's posts, what changed since, a member's posts, …). Made
@@ -1510,6 +1567,7 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
     CREATE INDEX IF NOT EXISTS answering_by_owner ON answering (owner, post);
     CREATE INDEX IF NOT EXISTS flows_by_owner ON flows (owner);
     CREATE INDEX IF NOT EXISTS message_requests_by_to ON message_requests (to_did);
+    CREATE INDEX IF NOT EXISTS member_overrides_by_did ON member_overrides (did);
     CREATE INDEX IF NOT EXISTS form_answers_by_channel ON form_answers (channel, at);
     CREATE INDEX IF NOT EXISTS wiki_pages_by_channel ON wiki_pages (channel);
     CREATE INDEX IF NOT EXISTS wiki_comments_by_page ON wiki_comments (page, at);
@@ -2198,6 +2256,49 @@ fn schema() -> Schema {
                 at BIGINT NOT NULL,
                 PRIMARY KEY (from_did(255), to_did(255))
             ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS member_overrides (
+                channel VARCHAR(255) NOT NULL,
+                did {MYSQL_DID} NOT NULL,
+                allow TEXT NOT NULL,
+                deny TEXT NOT NULL,
+                PRIMARY KEY (channel, did(255))
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS bot_roles (
+                did {MYSQL_DID} NOT NULL,
+                role VARCHAR(64) NOT NULL,
+                PRIMARY KEY (did(255))
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS discord_accounts (
+                discord_id VARCHAR(64) NOT NULL PRIMARY KEY,
+                name TEXT,
+                bot BIGINT NOT NULL DEFAULT 0,
+                roles TEXT NOT NULL,
+                at BIGINT NOT NULL
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS discord_account_overrides (
+                discord_id VARCHAR(64) NOT NULL,
+                discord_channel VARCHAR(64) NOT NULL,
+                channel VARCHAR(255),
+                allow TEXT NOT NULL,
+                deny TEXT NOT NULL,
+                PRIMARY KEY (discord_id, discord_channel)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS discord_mapped (
+                kind VARCHAR(16) NOT NULL,
+                discord_id VARCHAR(64) NOT NULL,
+                local VARCHAR(255),
+                name TEXT NOT NULL,
+                bot VARCHAR(64),
+                PRIMARY KEY (kind, discord_id)
+            ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS discord_given (
+                discord_id VARCHAR(64) NOT NULL PRIMARY KEY,
+                did {MYSQL_DID} NOT NULL,
+                roles TEXT NOT NULL,
+                overrides BIGINT NOT NULL,
+                by_did {MYSQL_DID},
+                at BIGINT NOT NULL
+            ) {MYSQL_TABLE};
             CREATE INDEX IF NOT EXISTS post_state_by_thread ON post_state (thread);
             CREATE INDEX IF NOT EXISTS post_state_by_rev ON post_state (rev);
             CREATE INDEX IF NOT EXISTS post_state_by_reply ON post_state (reply_to);
@@ -2210,6 +2311,7 @@ fn schema() -> Schema {
             CREATE INDEX IF NOT EXISTS answering_by_owner ON answering (owner(255), post);
             CREATE INDEX IF NOT EXISTS flows_by_owner ON flows (owner(255));
             CREATE INDEX IF NOT EXISTS message_requests_by_to ON message_requests (to_did(255));
+            CREATE INDEX IF NOT EXISTS member_overrides_by_did ON member_overrides (did(255));
             CREATE INDEX IF NOT EXISTS form_answers_by_channel ON form_answers (channel, at);
             CREATE INDEX IF NOT EXISTS wiki_pages_by_channel ON wiki_pages (channel);
             CREATE INDEX IF NOT EXISTS wiki_comments_by_page ON wiki_comments (page, at);
@@ -2337,6 +2439,8 @@ impl Store {
         let mut db = self.db.lock();
         db.execute("DELETE FROM member_left WHERE did = ?1", params![did])?;
         db.execute("DELETE FROM member_roles WHERE did = ?1", params![did])?;
+        // Their overrides for one member, and a bot's own role (discord_roles.rs).
+        crate::discord_roles::forget_member_in(&mut db, did)?;
         // Signed in on the web view: signed out with it (WYV-51).
         db.execute("DELETE FROM web_sessions WHERE mkey IN (SELECT mkey FROM member_keys WHERE did = ?1)", params![did])?;
         let removed = db.execute("DELETE FROM members WHERE did = ?1", params![did])? > 0;
@@ -2493,6 +2597,9 @@ impl Store {
             tx.execute(&format!("UPDATE OR IGNORE {table} SET did = ?2 WHERE did = ?1"), params![prior, new])?;
             tx.execute(&format!("DELETE FROM {table} WHERE did = ?1"), params![prior])?;
         }
+        // Their overrides for one member, a bot's own role, what a Discord
+        // account gave them (discord_roles.rs).
+        crate::discord_roles::rotate_in(tx, prior, new)?;
         // On the web: their lasting key (and with it their sessions, the websites
         // they let sign them in, and the ids those know them by), and their picture.
         tx.execute("UPDATE OR IGNORE member_keys SET did = ?2 WHERE did = ?1", params![prior, new])?;
@@ -2657,6 +2764,7 @@ impl Store {
         self.db.lock().transaction(|tx| {
             tx.execute("DELETE FROM member_roles WHERE role = ?1", params![id])?;
             tx.execute("DELETE FROM channel_overrides WHERE role = ?1", params![id])?;
+            tx.execute("DELETE FROM bot_roles WHERE role = ?1", params![id])?;
             Ok(tx.execute("DELETE FROM roles WHERE id = ?1", params![id])? > 0)
         })
     }
