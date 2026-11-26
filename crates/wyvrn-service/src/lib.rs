@@ -19,6 +19,8 @@
 //!   while it runs.
 //! - [`named`]: someone the settings name by a public address, recognised by the
 //!   key they write with.
+//! - [`delivery`], [`from_prior`]: what a failed delivery says about trying
+//!   again, and who signed a member's move.
 //! - [`admin`]: a service's admin pages, as workflows only its admins are let into.
 //! - [`logging`], [`now`]: the same start-up and the same clock for all of them.
 //!
@@ -29,7 +31,9 @@ pub mod address;
 pub mod admin;
 pub mod client_address;
 pub mod db;
+pub mod delivery;
 pub mod fetch_budget;
+pub mod from_prior;
 pub mod guard;
 pub mod hosted_address;
 pub mod http;

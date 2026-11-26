@@ -116,6 +116,14 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         emoji TEXT NOT NULL,
         at INTEGER NOT NULL,
         PRIMARY KEY (seq, did)
+    );
+    -- Subscribers a post couldn't be delivered to, until it can (delivery.rs).
+    CREATE TABLE IF NOT EXISTS undelivered (
+        did TEXT PRIMARY KEY,
+        since INTEGER NOT NULL,
+        tries INTEGER NOT NULL,
+        gone INTEGER NOT NULL,
+        next_at INTEGER NOT NULL
     );";
 
 fn schema() -> Schema {
@@ -149,7 +157,9 @@ fn schema() -> Schema {
                 emoji TEXT NOT NULL,
                 at BIGINT NOT NULL,
                 PRIMARY KEY (seq, did)
-            ) {MYSQL_TABLE}"
+            ) {MYSQL_TABLE};
+            {}",
+            wyvrn_service::delivery::mysql_table(MYSQL_DID, MYSQL_TABLE)
         )
     });
     Schema { sqlite: SQLITE, mysql }
@@ -203,6 +213,7 @@ impl Store {
         let mut db = self.db.lock();
         db.execute("UPDATE members SET subscribed = 0 WHERE did = ?1 AND role = 'admin'", params![did])?;
         db.execute("DELETE FROM members WHERE did = ?1 AND role <> 'admin'", params![did])?;
+        db.execute("DELETE FROM undelivered WHERE did = ?1", params![did])?;
         Ok(())
     }
 
@@ -231,6 +242,22 @@ impl Store {
     pub fn set_delivered(&self, did: &str, seq: i64) -> Result<()> {
         self.db.lock().execute("UPDATE members SET delivered_seq = ?2 WHERE did = ?1 AND delivered_seq < ?2", params![did, seq])?;
         Ok(())
+    }
+
+    /// Every subscriber a post couldn't be delivered to, and when to try them next.
+    pub fn undelivered(&self) -> Result<std::collections::HashMap<String, wyvrn_service::delivery::Undelivered>> {
+        wyvrn_service::delivery::undelivered(&self.db)
+    }
+
+    /// A post couldn't be delivered to `did` (`gone`: nobody takes their mail).
+    /// Returns when to try them next, and whether they were known to be gone already.
+    pub fn delivery_failed(&self, did: &str, gone: bool, now: i64) -> Result<(wyvrn_service::delivery::Undelivered, bool)> {
+        wyvrn_service::delivery::delivery_failed(&self.db, did, gone, now)
+    }
+
+    /// `did` can be reached again. Returns whether they had been held back.
+    pub fn delivery_resumed(&self, did: &str) -> Result<bool> {
+        wyvrn_service::delivery::delivery_resumed(&self.db, did)
     }
 
     pub fn is_superseded(&self, did: &str) -> Result<bool> {
@@ -281,6 +308,8 @@ impl Store {
             tx.execute("UPDATE OR IGNORE reactions SET did = ?2 WHERE did = ?1", params![prior, new])?;
             tx.execute("DELETE FROM reactions WHERE did = ?1", params![prior])?;
             tx.execute("INSERT OR REPLACE INTO superseded (did, became, at) VALUES (?1, ?2, ?3)", params![prior, new, now])?;
+            // Nothing is sent to the DID left; the new one wrote, so is there.
+            tx.execute("DELETE FROM undelivered WHERE did = ?1 OR did = ?2", params![prior, new])?;
             Ok(old.is_some())
         })
     }

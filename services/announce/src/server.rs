@@ -252,6 +252,12 @@ async fn answer(state: &Arc<AppState>, received: &Received, sender_kid: Option<&
         }
     }
 
+    // Heard from, so there: anything held back for them goes now.
+    if state.channel.store.delivery_resumed(&sender)? {
+        tracing::info!(did = %sender, "heard from a subscriber who couldn't be reached: sending them what they missed");
+        state.deliver.notify_one();
+    }
+
     if let Some(reply) = state.agent.auto_reply(received) {
         return Ok(Some(reply));
     }
@@ -295,13 +301,21 @@ fn send_later(state: &Arc<AppState>, did: String, message: Value) {
 }
 
 /// Sends every subscriber the posts they haven't had, in order. A subscriber who
-/// can't be reached is left where they are, and tried again on the next pass.
+/// can't be reached is left where they are, and tried again after a wait that
+/// doubles each time (`wyvrn_service::delivery`): one whose mediator holds no
+/// mailbox for them, once a day at most, or as soon as they write.
 pub async fn deliver_pending(state: &Arc<AppState>) -> anyhow::Result<()> {
     let store = &state.channel.store;
     let latest = store.latest_seq()?;
+    let undelivered = store.undelivered()?;
+    let now = now();
     let limit = Arc::new(Semaphore::new(DELIVERY_CONCURRENCY));
     let mut sends = tokio::task::JoinSet::new();
     for member in store.subscribers()?.into_iter().filter(|m| m.delivered_seq < latest) {
+        let held = undelivered.get(&member.did).cloned();
+        if held.as_ref().is_some_and(|held| held.held_back(now)) {
+            continue;
+        }
         let state = state.clone();
         let limit = limit.clone();
         sends.spawn(async move {
@@ -310,10 +324,21 @@ pub async fn deliver_pending(state: &Arc<AppState>) -> anyhow::Result<()> {
                 Ok(posts) => posts,
                 Err(error) => return tracing::error!(%error, "couldn't read posts to deliver"),
             };
+            let mut held = held;
             for post in posts {
                 if let Err(error) = state.voice.send(&state.agent, &member.did, &state.channel.announcement(&post)).await {
-                    tracing::warn!(did = %member.did, seq = post.seq, %error, "couldn't deliver a post; will try again");
-                    return;
+                    match wyvrn_service::delivery::failure(&error) {
+                        // This post never will be: the next may.
+                        wyvrn_service::delivery::Failure::TooLarge => {
+                            tracing::warn!(did = %member.did, seq = post.seq, %error, "a post is too large for a subscriber's mediator: passed over");
+                        }
+                        failure => return delivery_failed(&state, &member.did, post.seq, failure, &error),
+                    }
+                } else if held.take().is_some() {
+                    if let Err(error) = state.channel.store.delivery_resumed(&member.did) {
+                        tracing::error!(%error, "couldn't record a delivery");
+                    }
+                    tracing::info!(did = %member.did, "a subscriber who couldn't be reached can be again");
                 }
                 if let Err(error) = state.channel.store.set_delivered(&member.did, post.seq) {
                     return tracing::error!(%error, "couldn't record a delivery");
@@ -323,6 +348,24 @@ pub async fn deliver_pending(state: &Arc<AppState>) -> anyhow::Result<()> {
     }
     while sends.join_next().await.is_some() {}
     Ok(())
+}
+
+/// Notes a failed delivery to `did`, to try them again later, and says so: once
+/// for someone found gone, at each try for anyone else.
+fn delivery_failed(state: &AppState, did: &str, seq: i64, failure: wyvrn_service::delivery::Failure, error: &anyhow::Error) {
+    let gone = failure == wyvrn_service::delivery::Failure::Gone;
+    let (next, was_gone) = match state.channel.store.delivery_failed(did, gone, now()) {
+        Ok(noted) => noted,
+        Err(error) => return tracing::error!(%error, "couldn't record a failed delivery"),
+    };
+    let retry_in = next.next_at - now();
+    if gone && !was_gone {
+        tracing::warn!(%did, seq, %error, "nobody takes a subscriber's mail: posts are held for them until they write, or a try (at most daily) finds them");
+    } else if gone {
+        tracing::debug!(%did, seq, %error, tries = next.tries, retry_in, "a subscriber is still gone");
+    } else {
+        tracing::warn!(%did, seq, %error, tries = next.tries, retry_in, "couldn't deliver a post; will try again");
+    }
 }
 
 /// How long reactions to a post are gathered before subscribers are told. Telling

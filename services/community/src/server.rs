@@ -134,6 +134,13 @@ impl AppState {
         self.live.lock().unwrap_or_else(|p| p.into_inner()).get(&id).map(|(_, out)| out.clone())
     }
 
+    /// Whether `did` is watching over a live connection.
+    fn is_watching(&self, did: &str) -> bool {
+        let live = self.live.lock().unwrap_or_else(|p| p.into_inner());
+        let watching = self.watching.lock().unwrap_or_else(|p| p.into_inner());
+        watching.iter().any(|id| live.get(id).is_some_and(|(holder, _)| holder == did))
+    }
+
     /// Puts `message` on every watching connection of `did`'s. Whether any took it:
     /// one that can't is no longer watching, and the message goes as if it weren't.
     fn to_watching(&self, did: &str, message: &Value) -> bool {
@@ -250,13 +257,40 @@ pub fn socket_url(public_url: &str) -> String {
 async fn rotation(state: &AppState, received: &Received, sender: &str) -> Option<(String, String)> {
     let jwt = received.message["from_prior"].as_str()?;
     match didcomm_core::rotation::verify_from_prior(&AskarCryptoService, state.resolver.as_ref(), jwt).await {
-        Ok((prior, new)) if new == sender && prior != new => Some((prior, new)),
+        Ok((prior, new)) if new == sender && prior != new => Some((moving_from(state, prior, &new, jwt).await, new)),
         Ok(_) => None,
         Err(error) => {
             tracing::warn!(%sender, %error, "ignoring a from_prior that doesn't check out");
             None
         }
     }
+}
+
+/// The DID a verified move to `new` is taken from: `prior`, or, where `prior` has
+/// moved already and its member has moved on since, the DID they are at now --
+/// when the key that signed it is one that DID speaks with too.
+///
+/// An app that changed DID several times since a server last heard from it signs
+/// a move from each DID it has been straight to the one it is at, oldest first
+/// (community/1.0, "A member is a DID"; wyvrn-chat's rotationNotice.ts). A server
+/// that followed some of those changes already holds the oldest as moved to a
+/// later one, which has not moved yet as far as it knows: taken as it stands, the
+/// move would be a second one from that DID, and refused (WYV-27). But whoever
+/// signed it holds a key the member's current DID authenticates with, so could
+/// move that DID itself: it is that DID's first move, not a fork by someone left
+/// holding only the old DID's keys (a device removed along the way is not in the
+/// current DID). A member at its public address moves away from it only by a
+/// `from_prior` from the address itself, so this is for a `did:peer` only.
+async fn moving_from(state: &AppState, prior: String, new: &str, from_prior: &str) -> String {
+    let at = match state.community.store.moved_elsewhere(&prior, new) {
+        Ok(Some(at)) if at.starts_with("did:peer:") => at,
+        _ => return prior,
+    };
+    if !wyvrn_service::from_prior::signed_with_a_key_of(state.resolver.as_ref(), from_prior, &at).await {
+        return prior;
+    }
+    tracing::debug!(%prior, %at, %new, "a move from a DID followed on already, signed by a key of where its member is now: taken from there");
+    at
 }
 
 /// Sends a post as it now stands to everyone joined: over a watching connection,
@@ -423,6 +457,11 @@ impl CommunityService {
                 tracing::info!(%prior, %new, "a member changed DID");
                 send_later(state, new, notice);
             }
+        }
+        // Heard from, so there: anything held back for them goes now.
+        if state.community.store.delivery_resumed(&sender)? {
+            tracing::info!(did = %sender, "heard from a member who couldn't be reached: sending them what they missed");
+            state.deliver.notify_one();
         }
         // A ping's answer, to one the web view sent someone signing in.
         if received.message["type"] == crate::web::sign_in::PING_RESPONSE {
@@ -1319,22 +1358,32 @@ pub async fn run_voice_sweep(state: Arc<AppState>) {
 /// who can't be reached is left where they are, and tried again on the next pass.
 /// Whoever just posted (`AppState::deliver_first`) is sent theirs first, before the
 /// rest are started.
+///
+/// One who couldn't be reached through the mediator is passed over until the wait
+/// `wyvrn_service::delivery` gives them is up (one whose mediator holds no mailbox
+/// for them, a day at most), unless they are watching, or until they write.
 pub async fn deliver_pending(state: &Arc<AppState>) -> anyhow::Result<()> {
     let store = &state.community.store;
     let latest = store.latest_serial()?;
     let first: Vec<String> = std::mem::take(&mut *state.deliver_first.lock().expect("deliver_first lock"));
-    let (posters, rest): (Vec<_>, Vec<_>) = store.joined()?.into_iter().filter(|member| member.delivered < latest).partition(|member| first.contains(&member.did));
+    let undelivered = store.undelivered()?;
+    let now = now();
+    let owed = store.joined()?.into_iter().filter(|member| member.delivered < latest);
+    let due = owed.filter(|member| !undelivered.get(&member.did).is_some_and(|held| held.held_back(now)) || state.is_watching(&member.did));
+    let (posters, rest): (Vec<_>, Vec<_>) = due.partition(|member| first.contains(&member.did));
     for member in posters {
-        deliver_to(state, member).await;
+        let held = undelivered.contains_key(&member.did);
+        deliver_to(state, member, held).await;
     }
     let limit = Arc::new(Semaphore::new(DELIVERY_CONCURRENCY));
     let mut sends = tokio::task::JoinSet::new();
     for member in rest {
         let state = state.clone();
         let limit = limit.clone();
+        let held = undelivered.contains_key(&member.did);
         sends.spawn(async move {
             let _permit = limit.acquire().await;
-            deliver_to(&state, member).await;
+            deliver_to(&state, member, held).await;
         });
     }
     while sends.join_next().await.is_some() {}
@@ -1342,8 +1391,8 @@ pub async fn deliver_pending(state: &Arc<AppState>) -> anyhow::Result<()> {
 }
 
 /// Sends one member the posts they haven't had, in order, as far as they can be
-/// reached.
-async fn deliver_to(state: &Arc<AppState>, member: crate::store::Member) {
+/// reached. `held`: a delivery to them had failed (they are tried again).
+async fn deliver_to(state: &Arc<AppState>, member: crate::store::Member, mut held: bool) {
     let posts = match state.community.store.posts_after(member.delivered, DELIVERY_BATCH) {
         Ok(posts) => posts,
         Err(error) => return tracing::error!(%error, "couldn't read posts to deliver"),
@@ -1382,9 +1431,22 @@ async fn deliver_to(state: &Arc<AppState>, member: crate::store::Member) {
                 Ok(masked) => masked,
                 Err(error) => return tracing::error!(%error, "couldn't name people as they may be named to them"),
             };
-            if let Err(error) = state.voice.send(&state.agent, &member.did, &message).await {
-                tracing::warn!(did = %member.did, serial = post.serial, %error, "couldn't deliver a post; will try again");
-                return;
+            match state.voice.send(&state.agent, &member.did, &message).await {
+                Err(error) => match wyvrn_service::delivery::failure(&error) {
+                    // This post never will be: the next may.
+                    wyvrn_service::delivery::Failure::TooLarge => {
+                        tracing::warn!(did = %member.did, serial = post.serial, %error, "a post is too large for a member's mediator: passed over");
+                    }
+                    failure => return delivery_failed(state, &member.did, post.serial, failure, &error),
+                },
+                Ok(()) if held => {
+                    held = false;
+                    if let Err(error) = state.community.store.delivery_resumed(&member.did) {
+                        tracing::error!(%error, "couldn't record a delivery");
+                    }
+                    tracing::info!(did = %member.did, "a member who couldn't be reached can be again");
+                }
+                Ok(()) => {}
             }
         }
         if let Err(error) = state.community.store.set_delivered(&member.did, post.serial) {
@@ -1393,11 +1455,32 @@ async fn deliver_to(state: &Arc<AppState>, member: crate::store::Member) {
     }
 }
 
+/// Notes a failed delivery to `did`, to try them again later, and says so: once
+/// for someone found gone, at each try for anyone else.
+fn delivery_failed(state: &AppState, did: &str, serial: i64, failure: wyvrn_service::delivery::Failure, error: &anyhow::Error) {
+    let gone = failure == wyvrn_service::delivery::Failure::Gone;
+    let (next, was_gone) = match state.community.store.delivery_failed(did, gone, now()) {
+        Ok(noted) => noted,
+        Err(error) => return tracing::error!(%error, "couldn't record a failed delivery"),
+    };
+    let retry_in = next.next_at - now();
+    if gone && !was_gone {
+        tracing::warn!(%did, serial, %error, "nobody takes a member's mail: posts are held for them until they write or watch, or a try (at most daily) finds them");
+    } else if gone {
+        tracing::debug!(%did, serial, %error, tries = next.tries, retry_in, "a member is still gone");
+    } else {
+        tracing::warn!(%did, serial, %error, tries = next.tries, retry_in, "couldn't deliver a post; will try again");
+    }
+}
+
 /// Whether a member who has joined hasn't been sent everything yet: someone who
-/// couldn't be reached, to be tried again ([`DELIVERY_RETRY`]).
+/// couldn't be reached, to be tried again ([`DELIVERY_RETRY`]). Not someone whose
+/// mediator holds no mailbox for them: they are tried when the community is open
+/// anyway, or when they write, and a host needn't open it for them.
 pub fn deliveries_owed(state: &AppState) -> anyhow::Result<bool> {
     let latest = state.community.store.latest_serial()?;
-    Ok(state.community.store.joined()?.iter().any(|member| member.delivered < latest))
+    let undelivered = state.community.store.undelivered()?;
+    Ok(state.community.store.joined()?.iter().any(|member| member.delivered < latest && !undelivered.get(&member.did).is_some_and(|held| held.gone)))
 }
 
 /// Delivers whenever something is posted, and again a while after anyone

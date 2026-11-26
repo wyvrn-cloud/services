@@ -679,6 +679,7 @@ const CACHED_TABLES: &[&str] = &[
     "members",
     "member_left",
     "superseded",
+    "undelivered",
     "member_ids",
     "member_profiles",
     "member_pictures",
@@ -718,6 +719,14 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         did TEXT PRIMARY KEY,
         became TEXT NOT NULL,
         at INTEGER NOT NULL
+    );
+    -- Members a post couldn't be delivered to, until it can (wyvrn_service::delivery).
+    CREATE TABLE IF NOT EXISTS undelivered (
+        did TEXT PRIMARY KEY,
+        since INTEGER NOT NULL,
+        tries INTEGER NOT NULL,
+        gone INTEGER NOT NULL,
+        next_at INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS channels (
         id TEXT PRIMARY KEY,
@@ -1592,6 +1601,13 @@ fn schema() -> Schema {
                 became {MYSQL_DID} NOT NULL,
                 at BIGINT NOT NULL
             ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS undelivered (
+                did {MYSQL_DID} NOT NULL PRIMARY KEY,
+                since BIGINT NOT NULL,
+                tries BIGINT NOT NULL,
+                gone BIGINT NOT NULL,
+                next_at BIGINT NOT NULL
+            ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS channels (
                 id VARCHAR(255) NOT NULL PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -2327,6 +2343,27 @@ fn schema() -> Schema {
     Schema { sqlite: SQLITE, mysql }
 }
 
+/// Says that a move from `prior` to `new` was not taken: as a warning the first
+/// time this process sees that pair, quietly after (an app that sends it with
+/// every message, or each of a member's devices, would otherwise fill the log).
+fn refused_once(prior: &str, new: &str) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(String, String)>>> = std::sync::Mutex::new(None);
+    let pair = (wyvrn_service::db::did_key(prior).into_owned(), wyvrn_service::db::did_key(new).into_owned());
+    let first = {
+        let mut seen = SEEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let seen = seen.get_or_insert_with(Default::default);
+        if seen.len() >= 10_000 {
+            seen.clear();
+        }
+        seen.insert(pair)
+    };
+    if first {
+        tracing::warn!(%prior, %new, "a second, different move from a DID that has moved already: not taken");
+    } else {
+        tracing::debug!(%prior, %new, "a second, different move from a DID that has moved already: not taken, again");
+    }
+}
+
 impl Store {
     pub fn open(location: &Location) -> anyhow::Result<Self> {
         let store = Self::with_cache(Db::open(location, &schema(), "community")?);
@@ -2443,6 +2480,7 @@ impl Store {
         crate::discord_roles::forget_member_in(&mut db, did)?;
         // Signed in on the web view: signed out with it (WYV-51).
         db.execute("DELETE FROM web_sessions WHERE mkey IN (SELECT mkey FROM member_keys WHERE did = ?1)", params![did])?;
+        db.execute("DELETE FROM undelivered WHERE did = ?1", params![did])?;
         let removed = db.execute("DELETE FROM members WHERE did = ?1", params![did])? > 0;
         if removed {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
@@ -2484,6 +2522,22 @@ impl Store {
         Ok(())
     }
 
+    /// Every member a post couldn't be delivered to, and when to try them next.
+    pub fn undelivered(&self) -> Result<std::collections::HashMap<String, wyvrn_service::delivery::Undelivered>> {
+        wyvrn_service::delivery::undelivered(&self.db)
+    }
+
+    /// A post couldn't be delivered to `did` (`gone`: nobody takes their mail).
+    /// Returns when to try them next, and whether they were known to be gone already.
+    pub fn delivery_failed(&self, did: &str, gone: bool, now: i64) -> Result<(wyvrn_service::delivery::Undelivered, bool)> {
+        wyvrn_service::delivery::delivery_failed(&self.db, did, gone, now)
+    }
+
+    /// `did` can be reached again. Returns whether they had been held back.
+    pub fn delivery_resumed(&self, did: &str) -> Result<bool> {
+        wyvrn_service::delivery::delivery_resumed(&self.db, did)
+    }
+
     pub fn is_superseded(&self, did: &str) -> Result<bool> {
         Ok(self.db.lock().query_row("SELECT 1 FROM superseded WHERE did = ?1", params![did], |_| Ok(()))?.is_some())
     }
@@ -2492,28 +2546,48 @@ impl Store {
     /// and `prior` is never listened to again. Returns whether `prior` was a member.
     /// Where `new` is one already, it keeps the higher role of the two.
     pub fn rotate(&self, prior: &str, new: &str, now: i64) -> Result<bool> {
+        let same = |a: &str, b: &str| a == b || wyvrn_service::db::did_key(a) == wyvrn_service::db::did_key(b);
+        // Back at a DID it had left (wyvrn-chat: "An account can come back to a DID it
+        // left"): `new`'s moves led here, to `prior`, and `prior` -- where the member
+        // is now -- signed the move back. Their own doing, not a fork by whoever else
+        // holds the old DID's keys, so `new` is listened to again.
+        let returning = !same(new, prior) && same(&self.current_did(new)?, prior);
         // Heard of out of order -- `new` already left for another DID -- the move is
         // to wherever they are now, or the two halves of one person stay apart.
-        let new = &self.current_did(new)?;
+        let new = &if returning { new.to_string() } else { self.current_did(new)? };
         // (A long-form did:peer:4 and its own short form are one DID, kept as one.)
-        if new == prior || wyvrn_service::db::did_key(new) == wyvrn_service::db::did_key(prior) {
+        if same(new, prior) {
             return Ok(false);
         }
         // A DID moves once (security review WYV-27): a second move from it, to
         // somewhere its first didn't lead, is whoever else still holds its old keys,
-        // and is not taken.
-        let before: Option<String> = self.db.lock().query_row("SELECT became FROM superseded WHERE did = ?1", params![prior], |row| row.get(0))?;
-        if let Some(became) = before {
-            if &self.current_did(&became)? != new {
-                tracing::warn!(%prior, %new, "a second, different move from a DID that has moved already: not taken");
-                return Ok(false);
-            }
+        // and is not taken. (One signed by a key the member's current DID speaks
+        // with is taken as a move of that DID instead: `Community::rotated_from`.)
+        if self.moved_elsewhere(prior, new)?.is_some() {
+            refused_once(prior, new);
+            return Ok(false);
         }
         self.db.lock().transaction(|tx| {
+            if returning {
+                tx.execute("DELETE FROM superseded WHERE did = ?1", params![new])?;
+            }
             let was = Self::moved(tx, prior, new)?;
             tx.execute("INSERT OR REPLACE INTO superseded (did, became, at) VALUES (?1, ?2, ?3)", params![prior, new, now])?;
+            // Nothing is sent to the DID left; the new one wrote, so is there.
+            tx.execute("DELETE FROM undelivered WHERE did = ?1 OR did = ?2", params![prior, new])?;
             Ok(was)
         })
+    }
+
+    /// Where `prior`'s member is now, if `prior` has moved already and its moves
+    /// didn't lead to `new` (nor to where `new`'s did): a move [`Self::rotate`]
+    /// doesn't take.
+    pub fn moved_elsewhere(&self, prior: &str, new: &str) -> Result<Option<String>> {
+        let before: Option<String> = self.db.lock().query_row("SELECT became FROM superseded WHERE did = ?1", params![prior], |row| row.get(0))?;
+        let Some(became) = before else { return Ok(None) };
+        let (at, new) = (self.current_did(&became)?, self.current_did(new)?);
+        let same = at == new || wyvrn_service::db::did_key(&at) == wyvrn_service::db::did_key(&new);
+        Ok((!same).then_some(at))
     }
 
     /// What the server holds for `prior` made `new`'s ([`Self::rotate`]), in `tx`.

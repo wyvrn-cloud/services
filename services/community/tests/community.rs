@@ -5081,6 +5081,127 @@ fn a_did_moves_once_and_a_second_different_move_from_it_is_not_taken() {
     assert_eq!(store.current_did(old).unwrap(), new);
 }
 
+#[tokio::test]
+async fn a_member_nobody_takes_mail_for_is_passed_over_until_they_write() {
+    let server = start_server("").await;
+    let admin = Peer::start(&server).await;
+    server.admit(&[&admin]);
+    let channel = open_channel(&admin, "general").await;
+    // A member whose mediator holds no mailbox for them (coordinate-mediation 3.1).
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let holds = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let app = Router::new()
+        .route(
+            "/",
+            post(|State((asked, holds)): State<(Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicBool>)>| async move {
+                asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if holds.load(std::sync::atomic::Ordering::SeqCst) {
+                    return (axum::http::StatusCode::ACCEPTED, "");
+                }
+                (axum::http::StatusCode::NOT_FOUND, "This mediator holds no mailbox for the recipient.")
+            }),
+        )
+        .with_state((asked.clone(), holds.clone()));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let gone = Identity::generate().unwrap();
+    let gone_did = gone.did(&url).unwrap();
+    let store = &server.state.community.store;
+    store.set_member(&gone_did, wyvrn_community::store::Role::Member, 1).unwrap();
+    store.set_joined(&gone_did, true).unwrap();
+
+    admin.community("post", json!({ "channel": channel, "id": "p1", "content": "one" })).await;
+    server::deliver_pending(&server.state).await.unwrap();
+    let held = store.undelivered().unwrap()[&gone_did].clone();
+    assert!(held.gone, "{held:?}");
+    // (The server's own pass, woken by the post, may still be on its way.)
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let tried = asked.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(tried >= 1);
+    // Passed over from then on, and no reason for a host to open the community.
+    admin.community("post", json!({ "channel": channel, "id": "p2", "content": "two" })).await;
+    for _ in 0..3 {
+        server::deliver_pending(&server.state).await.unwrap();
+    }
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), tried);
+    assert!(!server::deliveries_owed(&server.state).unwrap());
+
+    // They write, from an app that has its mail somewhere again: they are there,
+    // and sent what they missed.
+    holds.store(true, std::sync::atomic::Ordering::SeqCst);
+    let agent = Agent::with_did(gone, &gone_did);
+    let _ = agent.send(&server.did, &json!({ "type": format!("{C}members-request"), "body": {} })).await;
+    let latest = store.latest_serial().unwrap();
+    for _ in 0..50 {
+        if store.member(&gone_did).unwrap().unwrap().delivered == latest {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(store.member(&gone_did).unwrap().unwrap().delivered, latest);
+    assert!(!store.undelivered().unwrap().contains_key(&gone_did));
+}
+
+#[test]
+fn an_account_back_at_a_did_it_left_is_listened_to_there_again() {
+    let store = Store::in_memory().unwrap();
+    let (first, second) = ("did:peer:2.first", "did:peer:2.second");
+    store.set_member(first, wyvrn_community::store::Role::Member, 1).unwrap();
+    store.rotate(first, second, 2).unwrap();
+    assert!(store.is_superseded(first).unwrap());
+    // The DID it is at signs the move back (wyvrn-chat: "An account can come back to
+    // a DID it left").
+    assert!(store.rotate(second, first, 3).unwrap());
+    assert_eq!(store.current_did(first).unwrap(), first);
+    assert_eq!(store.current_did(second).unwrap(), first);
+    assert!(!store.is_superseded(first).unwrap());
+    assert!(store.is_superseded(second).unwrap());
+    assert!(store.member(first).unwrap().is_some());
+    assert!(store.member(second).unwrap().is_none());
+    // And may leave it again, for somewhere new.
+    store.rotate(first, "did:peer:2.third", 4).unwrap();
+    assert_eq!(store.current_did(second).unwrap(), "did:peer:2.third");
+}
+
+#[tokio::test]
+async fn a_member_whose_did_changed_twice_is_followed_by_moves_signed_straight_to_where_they_are() {
+    use didcomm_crypto_askar::{AskarCryptoService, AskarSigningKey};
+    let server = start_server("admission = \"open\"").await;
+    let admin = Peer::start(&server).await;
+    server.admit(&[&admin]);
+    // One account, three DIDs one after another: the same device key in each.
+    let me = Identity::generate().unwrap();
+    let again = || Identity::from_json(&me.to_json().unwrap()).unwrap();
+    let (a, b, c) = (Peer::start_long(&server, again(), 0).await, Peer::start_long(&server, again(), 0).await, Peer::start_long(&server, again(), 0).await);
+    assert_eq!(kind(&a.community("join", json!({})).await), "community");
+    let id = server.id(&a);
+    let move_from = |prior: String, new: String| {
+        let key = AskarSigningKey::new(format!("{prior}#key-1"), me.verification_key().clone());
+        async move { didcomm_core::rotation::build_from_prior(&AskarCryptoService, &prior, &new, &key, wyvrn_service::now()).await.unwrap() }
+    };
+    let carrying = |from_prior: String| json!({ "type": format!("{C}join"), "from_prior": from_prior, "body": {}, "return_route": "all" });
+    // The server hears of the first change.
+    b.agent.send(&server.did, &carrying(move_from(a.did(), b.did()).await)).await.unwrap();
+    assert_eq!(server.state.community.store.current_did(&a.did()).unwrap(), b.did());
+
+    // After the second, the app signs a move from every DID it has been straight to
+    // the one it is at, oldest first: A → C (the server has A as B, which it has not
+    // heard move yet), then B → C. Both are taken; the first, as B's move.
+    let told = c.agent.send(&server.did, &carrying(move_from(a.did(), c.did()).await)).await.unwrap().unwrap().message;
+    assert_eq!(kind(&told), "community", "{told}");
+    assert_eq!(server.state.community.store.current_did(&a.did()).unwrap(), c.did());
+    assert_eq!(server.state.community.store.current_did(&b.did()).unwrap(), c.did());
+    c.agent.send(&server.did, &carrying(move_from(b.did(), c.did()).await)).await.unwrap();
+    assert_eq!(server.state.community.store.current_did(&b.did()).unwrap(), c.did());
+    assert_eq!(server.id(&c), id);
+    assert!(server.state.community.store.member(&b.did()).unwrap().is_none());
+    assert!(server.state.community.store.member(&c.did()).unwrap().is_some());
+
+    // (Someone holding only an old DID's keys, not the current one's -- a device
+    // removed at the first change -- is not: wyvrn_service::from_prior's tests.)
+}
+
 #[test]
 fn an_event_receiver_pauses_while_its_maker_is_banned_or_gone_and_follows_them_when_they_move() {
     receiver_pauses_and_moves(Store::in_memory().unwrap());

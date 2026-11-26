@@ -305,6 +305,79 @@ async fn a_subscriber_who_cannot_be_reached_is_left_where_they_were_to_be_tried_
     assert_eq!(channel.state.channel.store.member(&away_did).unwrap().unwrap().delivered_seq, 0);
     // The post is logged all the same.
     assert_eq!(channel.state.channel.store.latest_seq().unwrap(), 1);
+    // Tried again in a minute, not at once: the next pass passes them over.
+    let held = channel.state.channel.store.undelivered().unwrap()[&away_did].clone();
+    assert_eq!((held.tries, held.gone), (1, false));
+    assert!(held.next_at >= server::now() + 50, "{held:?}");
+    server::deliver_pending(&channel.state).await.unwrap();
+    assert_eq!(channel.state.channel.store.undelivered().unwrap()[&away_did].tries, 1);
+}
+
+/// An endpoint that answers every message as a mediator does a forward to a DID it
+/// holds no mailbox for (coordinate-mediation 3.1), counting them -- until `holds`
+/// is set, when it takes them.
+async fn mediator_without_a_mailbox() -> (String, Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicBool>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let holds = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let app = Router::new()
+        .route(
+            "/",
+            post(|State((asked, holds)): State<(Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicBool>)>| async move {
+                asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if holds.load(std::sync::atomic::Ordering::SeqCst) {
+                    return (axum::http::StatusCode::ACCEPTED, "");
+                }
+                (axum::http::StatusCode::NOT_FOUND, "This mediator holds no mailbox for the recipient.")
+            }),
+        )
+        .with_state((asked.clone(), holds.clone()));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, asked, holds)
+}
+
+#[tokio::test]
+async fn a_subscriber_nobody_takes_mail_for_is_not_sent_to_again_until_they_write() {
+    let admin = Peer::start().await;
+    let channel = start_channel(&[admin.did()]).await;
+    let (url, asked, holds) = mediator_without_a_mailbox().await;
+    let gone = Identity::generate().unwrap();
+    let gone_did = gone.did(&url).unwrap();
+    channel.state.channel.store.subscribe(&gone_did, server::now()).unwrap();
+
+    admin.send(&channel.did, channel::POST, json!({"content": "one"})).await;
+    admin.next_of(channel::ANNOUNCEMENT).await;
+    server::deliver_pending(&channel.state).await.unwrap();
+    // (The channel's own pass, woken by the post, may still be on its way.)
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let tried = asked.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(tried >= 1);
+    let held = channel.state.channel.store.undelivered().unwrap()[&gone_did].clone();
+    assert!(held.gone, "{held:?}");
+    assert!(held.next_at >= server::now() + 3000, "an hour at least: {held:?}");
+    // Every later pass, and every later post, passes them over.
+    admin.send(&channel.did, channel::POST, json!({"content": "two"})).await;
+    admin.next_of(channel::ANNOUNCEMENT).await;
+    for _ in 0..3 {
+        server::deliver_pending(&channel.state).await.unwrap();
+    }
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), tried);
+    assert_eq!(channel.state.channel.store.member(&gone_did).unwrap().unwrap().delivered_seq, 0);
+
+    // They write, from an app that has its mail somewhere again: they are there,
+    // and sent what they missed, in order.
+    holds.store(true, std::sync::atomic::Ordering::SeqCst);
+    let agent = Agent::with_did(gone, &gone_did);
+    agent.send(&channel.did, &json!({"type": channel::HISTORY_REQUEST, "body": {}})).await.unwrap();
+    for _ in 0..50 {
+        if channel.state.channel.store.member(&gone_did).unwrap().unwrap().delivered_seq == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(channel.state.channel.store.member(&gone_did).unwrap().unwrap().delivered_seq, 2);
+    assert!(!channel.state.channel.store.undelivered().unwrap().contains_key(&gone_did));
 }
 
 /// A `from_prior` saying `prior` is now `new`, signed with `signer`'s key as `prior`'s.
