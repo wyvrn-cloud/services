@@ -136,6 +136,89 @@ impl Store {
         Ok(id)
     }
 
+    /// [`Store::current_did`] of each of `dids`, a statement for each step of moves
+    /// rather than one for each DID.
+    pub fn current_dids(&self, dids: &[String]) -> Result<HashMap<String, String>> {
+        let mut current: HashMap<String, String> = dids.iter().map(|did| (did.clone(), did.clone())).collect();
+        let mut asking: Vec<String> = dids.to_vec();
+        for _ in 0..32 {
+            if asking.is_empty() {
+                break;
+            }
+            let mut moved: HashMap<String, String> = HashMap::new();
+            for some in asking.chunks(500) {
+                let values: Vec<wyvrn_service::db::Value> = some.iter().map(|did| wyvrn_service::db::ToValue::to_value(did)).collect();
+                let places = (1..=values.len()).map(|n| format!("?{n}")).collect::<Vec<_>>().join(", ");
+                for (did, became) in self.db.lock().query(&format!("SELECT did, became FROM superseded WHERE did IN ({places})"), &values, |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)))? {
+                    if did != became {
+                        moved.insert(did, became);
+                    }
+                }
+            }
+            asking = Vec::new();
+            for at in current.values_mut() {
+                if let Some(became) = moved.get(at) {
+                    *at = became.clone();
+                    asking.push(became.clone());
+                }
+            }
+            asking.sort();
+            asking.dedup();
+        }
+        Ok(current)
+    }
+
+    /// [`Store::member_id`] of each of `dids` (made now for any who have none), in a
+    /// few statements whatever their number: a post with hundreds of reactors names
+    /// each of them to whoever reads it.
+    pub fn member_ids(&self, dids: &[String], now: i64) -> Result<HashMap<String, String>> {
+        let current = self.current_dids(dids)?;
+        let mut wanted: Vec<String> = current.values().cloned().collect();
+        wanted.sort();
+        wanted.dedup();
+        let mut ids: HashMap<String, String> = HashMap::new();
+        for some in wanted.chunks(500) {
+            let values: Vec<wyvrn_service::db::Value> = some.iter().map(|did| wyvrn_service::db::ToValue::to_value(did)).collect();
+            let places = (1..=values.len()).map(|n| format!("?{n}")).collect::<Vec<_>>().join(", ");
+            for (did, member) in self.db.lock().query(&format!("SELECT did, member FROM member_ids WHERE did IN ({places})"), &values, |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)))? {
+                ids.insert(did, member);
+            }
+        }
+        // (Read back by the DID given, long or short: keyed as the store keeps it.)
+        let key = |did: &str| wyvrn_service::db::did_key(did).into_owned();
+        let found: HashMap<String, String> = ids.iter().map(|(did, member)| (key(did), member.clone())).collect();
+        let mut made: Vec<(String, String)> = Vec::new();
+        for did in &wanted {
+            if !found.contains_key(&key(did)) && !made.iter().any(|(known, _)| known == did) {
+                made.push((did.clone(), new_member_id()));
+            }
+        }
+        for some in made.chunks(200) {
+            let mut values: Vec<wyvrn_service::db::Value> = Vec::new();
+            let mut rows = Vec::new();
+            for (n, (did, member)) in some.iter().enumerate() {
+                values.push(wyvrn_service::db::ToValue::to_value(did));
+                values.push(wyvrn_service::db::ToValue::to_value(member));
+                values.push(wyvrn_service::db::ToValue::to_value(&now));
+                rows.push(format!("(?{}, ?{}, ?{})", n * 3 + 1, n * 3 + 2, n * 3 + 3));
+            }
+            self.db.lock().execute(&format!("INSERT OR IGNORE INTO member_ids (did, member, created) VALUES {}", rows.join(", ")), &values)?;
+        }
+        if !made.is_empty() {
+            // Whoever another writer gave an id meanwhile keeps theirs.
+            let asked: Vec<String> = made.iter().map(|(did, _)| did.clone()).collect();
+            for some in asked.chunks(500) {
+                let values: Vec<wyvrn_service::db::Value> = some.iter().map(|did| wyvrn_service::db::ToValue::to_value(did)).collect();
+                let places = (1..=values.len()).map(|n| format!("?{n}")).collect::<Vec<_>>().join(", ");
+                for (did, member) in self.db.lock().query(&format!("SELECT did, member FROM member_ids WHERE did IN ({places})"), &values, |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)))? {
+                    ids.insert(did, member);
+                }
+            }
+        }
+        let by_key: HashMap<String, String> = ids.iter().map(|(did, member)| (key(did), member.clone())).collect();
+        Ok(current.into_iter().filter_map(|(asked, at)| by_key.get(&key(&at)).map(|member| (asked, member.clone()))).collect())
+    }
+
     /// Whom a member id names, at the DID they are at now; none for an id nobody
     /// was given.
     pub fn did_of_member(&self, member: &str) -> Result<Option<String>> {
@@ -265,10 +348,60 @@ impl Community {
         let keep_dids = DID_GIVEN.contains(&kind) || (WITH_DIDS.contains(&kind) && self.told_dids(to)?);
         let mut masked = message.clone();
         if let Some(body) = masked.get_mut("body") {
+            self.own_reactions_shown(to, body)?;
             let mut masker = Masker { community: self, own: self.own_dids(), keep_dids, ids: HashMap::new(), now: crate::gates::now() };
+            // Everyone it names, looked up at once: a few statements for them all.
+            let mut named = Vec::new();
+            masker.people_in(body, None, &mut named);
+            masker.look_up(&named)?;
             masker.walk(body, None)?;
         }
         Ok(masked)
+    }
+
+    /// Where a post in `body` is sent with only the first of an emoji's reactors
+    /// (`Store::REACTORS_SHOWN`), `to` among them if they put it there too: so
+    /// their app knows its own reactions however many others there are.
+    fn own_reactions_shown(&self, to: &str, body: &mut Value) -> anyhow::Result<()> {
+        fn cut_short<'v>(value: &'v mut Value, found: &mut Vec<&'v mut Value>) {
+            let short = value["id"].is_string()
+                && value["reactions"].as_array().is_some_and(|all| all.iter().any(|r| r["count"].as_u64().is_some_and(|count| r["by"].as_array().is_some_and(|by| (by.len() as u64) < count))));
+            if short {
+                return found.push(value);
+            }
+            match value {
+                Value::Array(items) => items.iter_mut().for_each(|item| cut_short(item, found)),
+                Value::Object(fields) => fields.values_mut().for_each(|inner| cut_short(inner, found)),
+                _ => {}
+            }
+        }
+        if !to.starts_with("did:") || self.own_dids().iter().any(|own| own == to) {
+            return Ok(());
+        }
+        let mut posts = Vec::new();
+        cut_short(body, &mut posts);
+        if posts.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<String> = posts.iter().filter_map(|post| post["id"].as_str().map(str::to_string)).collect();
+        let own = self.store.own_reactions(to, &ids)?;
+        if own.is_empty() {
+            return Ok(());
+        }
+        // (Named by member id already, where it was masked before.)
+        let id = self.store.member_id(to, crate::gates::now())?;
+        for post in posts {
+            let Some(theirs) = post["id"].as_str().and_then(|id| own.get(id)) else { continue };
+            for reaction in post["reactions"].as_array_mut().into_iter().flatten() {
+                let put = reaction["emoji"].as_str().is_some_and(|emoji| theirs.iter().any(|e| e == emoji));
+                if let (true, Some(by)) = (put, reaction["by"].as_array_mut()) {
+                    if !by.iter().any(|did| did == to || *did == id) {
+                        by.push(json!(to));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `message` from `sender` with every member id it names a person by (in
@@ -328,6 +461,41 @@ struct Masker<'a> {
 }
 
 impl Masker<'_> {
+    /// Every person `value` names where `walk` would name them by member id.
+    fn people_in(&self, value: &Value, key: Option<&str>, named: &mut Vec<String>) {
+        let names_person = key.is_some_and(|key| PERSON_KEYS.contains(&key));
+        match value {
+            Value::String(text) if names_person && self.is_person(text) => named.push(text.clone()),
+            Value::Array(items) => {
+                for item in items {
+                    self.people_in(item, if item.is_string() { key } else { None }, named);
+                }
+            }
+            Value::Object(fields) => {
+                if let Some(did) = fields.get("did").and_then(Value::as_str).filter(|did| self.is_person(did)) {
+                    named.push(did.to_string());
+                }
+                for (field, inner) in fields {
+                    if field == "did" || field == "content" || field == "snippet" || field == "memberStatement" || field == "linkedAccounts" {
+                        continue;
+                    }
+                    self.people_in(inner, Some(field.as_str()), named);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The member ids of `dids`, at once (`Store::member_ids`), kept for `walk`.
+    fn look_up(&mut self, dids: &[String]) -> anyhow::Result<()> {
+        let wanted: Vec<String> = dids.iter().filter(|did| !self.ids.contains_key(*did)).cloned().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+        if wanted.len() < 2 {
+            return Ok(());
+        }
+        self.ids.extend(self.community.store.member_ids(&wanted, self.now)?);
+        Ok(())
+    }
+
     fn id_of(&mut self, did: &str) -> anyhow::Result<String> {
         if let Some(id) = self.ids.get(did) {
             return Ok(id.clone());

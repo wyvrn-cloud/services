@@ -471,7 +471,7 @@ impl Community {
             return Ok(Err("It is another Discord account already."));
         }
         let given = self.give_claimed(discord_id, did, Some(actor), now)?;
-        let posts = self.store.claim_imported(discord_id, did, now)?;
+        let posts = self.store.claim_imported(discord_id, did, now)?.len();
         self.store.set_claim(&crate::claims::Claim { discord_id: discord_id.to_string(), did: did.to_string(), state: "claimed".into(), at: now, decided_by: Some(actor.to_string()) })?;
         // (Its own role, now that it is known which Discord bot it is.)
         self.store.settle_bot_role(did)?;

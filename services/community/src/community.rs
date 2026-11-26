@@ -23,6 +23,9 @@ pub const POSTED: &str = "https://wyvrn.app/community/1.0/posted";
 pub const MESSAGE: &str = "https://wyvrn.app/community/1.0/message";
 pub const HISTORY_REQUEST: &str = "https://wyvrn.app/community/1.0/history-request";
 pub const HISTORY: &str = "https://wyvrn.app/community/1.0/history";
+/// Everyone who reacted to a post, where it is sent with only the first of them.
+pub const REACTIONS_REQUEST: &str = "https://wyvrn.app/community/1.0/reactions-request";
+pub const REACTIONS: &str = "https://wyvrn.app/community/1.0/reactions";
 pub const MEMBERS_REQUEST: &str = "https://wyvrn.app/community/1.0/members-request";
 /// Posts imported under a member's Discord account asked to be made theirs (claims.rs).
 pub const CLAIM_IMPORTED: &str = "https://wyvrn.app/community/1.0/claim-imported";
@@ -1057,7 +1060,9 @@ impl Community {
             body["pinned"] = json!(true);
         }
         if !post.reactions.is_empty() {
-            body["reactions"] = post.reactions.iter().map(|(emoji, by)| json!({ "emoji": emoji, "by": by })).collect();
+            // `by` the first of them (and the reader's own, `own_reactions_shown`) where
+            // `count` is more: `reactions-request` names everyone.
+            body["reactions"] = post.reactions.iter().map(|r| json!({ "emoji": r.emoji, "count": r.count, "by": r.by })).collect();
         }
         if let Some(thread) = &post.grew {
             let mut grew = json!({ "created_by": thread.created_by, "created_at": thread.created_at, "count": thread.count });
@@ -2121,7 +2126,7 @@ impl Community {
                     return refuse(message, "e.p.msg.invalid-reaction", "A reaction is an emoji, and a post takes twenty of them from one member.");
                 }
                 // A post takes so many different ones, whoever they are from.
-                let known: Vec<&String> = post.reactions.iter().map(|(emoji, _)| emoji).collect();
+                let known: Vec<&String> = post.reactions.iter().map(|r| &r.emoji).collect();
                 let new = emoji.iter().filter(|emoji| !known.contains(emoji)).count();
                 if known.len() + new > MAX_REACTIONS && new > 0 {
                     return refuse(message, "e.p.msg.too-many", "That post has as many different reactions as one takes.");
@@ -2251,6 +2256,15 @@ impl Community {
                     history["thread"] = json!(thread);
                 }
                 Ok(Outcome::reply(reply_to(message, HISTORY, history)))
+            }
+
+            REACTIONS_REQUEST => {
+                let Some(post) = self.named_post(body, sender)? else {
+                    return refuse(message, "e.p.msg.unknown-post", "There is no such post.");
+                };
+                let emoji = body["emoji"].as_str().filter(|e| !e.is_empty());
+                let reactions: Vec<Value> = self.store.reactors(&post.id, emoji)?.iter().map(|r| json!({ "emoji": r.emoji, "count": r.count, "by": r.by })).collect();
+                Ok(Outcome::reply(reply_to(message, REACTIONS, json!({ "channel": post.channel, "id": post.id, "reactions": reactions }))))
             }
 
             SET_RAID => {

@@ -354,7 +354,7 @@ async fn a_post_is_answered_reacted_to_changed_pinned_and_taken_back_and_everyon
     // A reaction is all of one member's emoji on a post; everyone is told who put what.
     let reacted = member.ask("https://wyvrn.app/message-reactions/1.0/reactions", json!({ "to": { "id": "p1" }, "emoji": ["👍", "🎉"] })).await;
     assert_eq!(kind(&reacted), "changed", "{reacted}");
-    assert_eq!(reacted["body"]["reactions"], json!([{ "emoji": "🎉", "by": [server.id(&member)] }, { "emoji": "👍", "by": [server.id(&member)] }]));
+    assert_eq!(reacted["body"]["reactions"], json!([{ "emoji": "🎉", "count": 1, "by": [server.id(&member)] }, { "emoji": "👍", "count": 1, "by": [server.id(&member)] }]));
     assert_eq!(admin.next_of(&changed).await["body"]["reactions"].as_array().unwrap().len(), 2);
     member.next_of(&changed).await;
     admin.ask("https://wyvrn.app/message-reactions/1.0/reactions", json!({ "to": { "id": "p1" }, "emoji": ["👍"] })).await;
@@ -4550,7 +4550,7 @@ async fn a_member_asks_for_the_posts_imported_under_their_discord_account_and_a_
         }],
     };
     let folder = std::env::temp_dir();
-    let setting = history::Context { folder: &folder, files: None, channel_names: Default::default(), roles: Default::default(), expressions: Default::default(), now: 1 };
+    let setting = history::Context { folder: &folder, files: None, channel_names: Default::default(), roles: Default::default(), expressions: Default::default(), users: Default::default(), now: 1 };
     history::write(store, &export, &store.channel(&channel).unwrap().unwrap(), &setting, |_, _| {}).unwrap();
 
     // Not checked yet: nothing to claim.
@@ -4616,7 +4616,7 @@ async fn server_with_imported_post() -> (Running, Peer) {
         }],
     };
     let folder = std::env::temp_dir();
-    let setting = history::Context { folder: &folder, files: None, channel_names: Default::default(), roles: Default::default(), expressions: Default::default(), now: 1 };
+    let setting = history::Context { folder: &folder, files: None, channel_names: Default::default(), roles: Default::default(), expressions: Default::default(), users: Default::default(), now: 1 };
     history::write(store, &export, &store.channel(&channel).unwrap().unwrap(), &setting, |_, _| {}).unwrap();
     (server, admin)
 }
@@ -5514,7 +5514,7 @@ async fn discords_roles_and_overrides_come_with_a_claim_member_overrides_work_ou
         }],
     };
     let folder = std::env::temp_dir();
-    let setting = history::Context { folder: &folder, files: None, channel_names: Default::default(), roles: Default::default(), expressions: Default::default(), now: 1 };
+    let setting = history::Context { folder: &folder, files: None, channel_names: Default::default(), roles: Default::default(), expressions: Default::default(), users: Default::default(), now: 1 };
     history::write(store, &export, &store.channel(&channel).unwrap().unwrap(), &setting, |_, _| {}).unwrap();
     // Discord's member list, roles and channels (synthetic): Ann holds Artists and
     // Elders there, and #fanart denies her Send Messages.
@@ -5742,4 +5742,180 @@ async fn a_member_moving_from_a_long_did_peer_4_to_its_public_address_keeps_its_
     assert_eq!(server.state.community.store.current_did(&long.did()).unwrap(), address.did());
     assert_eq!(server.state.community.powers(&address.did()).unwrap().older_role(), "moderator");
     assert_ne!(server.state.community.store.member(&elsewhere.did()).unwrap().map(|m| m.role), Some(wyvrn_community::store::Role::Admin));
+}
+
+/// A channel brought in from Discord whose few posts carry ~1,400 reactions by
+/// ~600 imported authors (as #roles' "react for a role" posts do), some of them
+/// with nothing to say but their reactions.
+fn imported_reaction_heavy_channel(server: &Running, channel: &str) {
+    use wyvrn_community::discord_history as history;
+    let store = &server.state.community.store;
+    let user = |n: usize| history::User { id: format!("{}", 500_000 + n), name: format!("user{n}"), ..Default::default() };
+    let reaction = |emoji: &str, users: std::ops::Range<usize>| history::Reaction {
+        emoji: history::Emoji { name: emoji.into(), ..Default::default() },
+        count: users.len() as u64,
+        users: users.map(user).collect(),
+    };
+    let post = |id: &str, content: &str, reactions: Vec<history::Reaction>| history::Message {
+        id: id.into(),
+        kind: "Default".into(),
+        timestamp: format!("2020-11-22T20:{:02}:00+00:00", id.len()),
+        content: content.into(),
+        author: history::User { id: "111".into(), name: "ann".into(), ..Default::default() },
+        reactions,
+        ..Default::default()
+    };
+    let export = history::Export {
+        guild: history::Named { id: "1".into(), name: "G".into() },
+        channel: history::ExportChannel { id: "901".into(), kind: "GuildTextChat".into(), name: "roles".into(), ..Default::default() },
+        messages: vec![
+            post("1", "react for a role", vec![reaction("👍", 0..26)]),
+            post("22", "", vec![reaction("🎨", 0..100), reaction("🎮", 100..200), reaction("🎵", 150..190)]),
+            post("333", "", vec![reaction("🔴", 0..300), reaction("🟢", 200..400), reaction("🔵", 300..359)]),
+            post("4444", "", vec![reaction("🐱", 300..610), reaction("🐶", 0..150), reaction("🦊", 500..548)]),
+        ],
+    };
+    let folder = std::env::temp_dir();
+    let setting = history::Context { folder: &folder, files: None, channel_names: Default::default(), roles: Default::default(), expressions: Default::default(), users: Default::default(), now: 1 };
+    let written = history::write(store, &export, &store.channel(channel).unwrap().unwrap(), &setting, |_, _| {}).unwrap();
+    assert_eq!(written.posts, 4);
+    assert!(written.reactions > 1_300, "{}", written.reactions);
+}
+
+#[tokio::test]
+async fn an_imported_channel_heavy_with_reactions_is_read_back_whole() {
+    let server = start_server("").await;
+    let (admin, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &member]);
+    member.community("join", json!({})).await;
+    let channel = open_channel(&admin, "roles").await;
+    imported_reaction_heavy_channel(&server, &channel);
+    // The member's own, put late: not among the first anyone is sent.
+    let reacted = member.ask("https://wyvrn.app/message-reactions/1.0/reactions", json!({ "to": { "id": "discord-4444" }, "emoji": ["🐱"] })).await;
+    assert_eq!(kind(&reacted), "changed", "{reacted}");
+    let history = member.community("history-request", json!({ "channel": channel, "limit": 50 })).await;
+    assert_eq!(kind(&history), "history", "{history}");
+    let messages = history["body"]["messages"].as_array().unwrap();
+    // Those with nothing to say but their reactions too.
+    let ids: Vec<&str> = messages.iter().map(|m| m["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["discord-1", "discord-22", "discord-333", "discord-4444"], "{history}");
+    assert!(history.to_string().len() < 20_000, "{} bytes", history.to_string().len());
+    let me = server.id(&member);
+    let cats = messages[3]["reactions"].as_array().unwrap().iter().find(|r| r["emoji"] == "🐱").unwrap().clone();
+    assert_eq!(cats["count"], 311, "{cats}");
+    let by = cats["by"].as_array().unwrap();
+    assert_eq!(by.len(), wyvrn_community::store::REACTORS_SHOWN + 1, "the first, and theirs: {cats}");
+    assert!(by.iter().any(|id| *id == json!(me)), "{cats}");
+    assert!(by.iter().all(|id| !id.as_str().unwrap().starts_with("did:")), "{cats}");
+    // Not cut short: as before.
+    let likes = &messages[0]["reactions"][0];
+    assert_eq!((likes["count"].as_u64(), likes["by"].as_array().map(Vec::len)), (Some(20 + 6), Some(20)), "{likes}");
+    // Everyone, when asked.
+    let all = member.community("reactions-request", json!({ "to": { "id": "discord-4444" }, "emoji": "🐱" })).await;
+    assert_eq!(kind(&all), "reactions", "{all}");
+    let listed = all["body"]["reactions"].as_array().unwrap();
+    assert_eq!(listed.len(), 1);
+    let everyone = listed[0]["by"].as_array().unwrap();
+    assert_eq!((listed[0]["count"].as_u64(), everyone.len()), (Some(311), 311));
+    assert!(everyone.iter().all(|id| !id.as_str().unwrap().starts_with("did:")));
+    let distinct: std::collections::HashSet<&str> = everyone.iter().map(|id| id.as_str().unwrap()).collect();
+    assert_eq!(distinct.len(), 311);
+    let nothing = member.community("reactions-request", json!({ "to": { "id": "no-such-post" } })).await;
+    assert_eq!(nothing["body"]["code"], "e.p.msg.unknown-post", "{nothing}");
+}
+
+#[tokio::test]
+async fn a_member_kept_by_their_short_form_alone_is_passed_over_quietly_until_they_write_and_then_sent_to() {
+    let server = start_server("").await;
+    let admin = Peer::start(&server).await;
+    let member = Peer::start_long(&server, Identity::generate().unwrap(), 1_500).await;
+    server.admit(&[&admin]);
+    admin.community("join", json!({})).await;
+    let channel = open_channel(&admin, "general").await;
+    // Kept by the short form of their did:peer:4, whose long form this store never
+    // saw (as a store another's shortening went through was left).
+    let short = wyvrn_service::db::did_key(&member.did()).into_owned();
+    assert!(wyvrn_service::db::is_short_form(&short));
+    let store = &server.state.community.store;
+    store.set_member(&short, wyvrn_community::store::Role::Member, 1).unwrap();
+    store.set_joined(&short, true).unwrap();
+    assert_eq!(store.member(&short).unwrap().unwrap().did, short, "no long form known");
+    // Nothing reaches them, and nothing breaks.
+    admin.community("post", json!({ "channel": channel, "id": "p1", "content": "anyone?" })).await;
+    member.nothing_more().await;
+    // They write: their message names them by their long form, which the store keeps.
+    let joined = member.community("join", json!({})).await;
+    assert_eq!(kind(&joined), "community", "{joined}");
+    assert_eq!(store.member(&short).unwrap().unwrap().did, member.did());
+    admin.community("post", json!({ "channel": channel, "id": "p2", "content": "there you are" })).await;
+    let sent = loop {
+        let got = member.next_of(&format!("{C}message")).await;
+        if got["body"]["id"] == "p2" {
+            break got;
+        }
+    };
+    assert_eq!(sent["to"], json!([member.did()]));
+}
+
+#[tokio::test]
+async fn a_kept_profile_proving_discord_through_the_issuers_public_address_claims_its_posts_once_the_server_is_up() {
+    use affinidi_data_integrity::{DataIntegrityProof, SignOptions};
+    // The issuer as it issues now: a did:webvh, and the did:web the community trusts
+    // naming it, and it them (alsoKnownAs).
+    const WEBVH: &str = "did:webvh:QmScid:id.example:official:verify";
+    let server = start_server(&format!("linked_account_issuers = [\"{ISSUER}\"]")).await;
+    let key = wyvrn_hosted_did::write::public_multikey(ISSUER_JWK).unwrap();
+    let document = |id: &str, aka: &str| json!({ "id": id, "alsoKnownAs": [aka], "verificationMethod": [{ "id": format!("{id}#key-1"), "type": "Multikey", "controller": id, "publicKeyMultibase": key }], "assertionMethod": [format!("{id}#key-1")] });
+    let (web, webvh) = (document(ISSUER, WEBVH), document(WEBVH, ISSUER));
+    let fetch: wyvrn_community::server::JsonFetch = Arc::new(move |url: String| {
+        let found = match url.as_str() {
+            "https://verify.example/.well-known/did.json" => Some(web.clone()),
+            WEBVH => Some(webvh.clone()),
+            _ => None,
+        };
+        Box::pin(async move { found })
+    });
+    *server.state.fetch_json.write().unwrap() = Some(fetch);
+    let (admin, owner) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &owner]);
+    owner.community("join", json!({})).await;
+    let channel = open_channel(&admin, "fanart").await;
+    {
+        use wyvrn_community::discord_history as history;
+        let store = &server.state.community.store;
+        let export = history::Export {
+            channel: history::ExportChannel { id: "900".into(), kind: "GuildTextChat".into(), name: "fanart".into(), ..Default::default() },
+            messages: vec![history::Message {
+                id: "10".into(),
+                kind: "Default".into(),
+                timestamp: "2020-01-01T00:00:00+00:00".into(),
+                content: "old art".into(),
+                author: history::User { id: "111".into(), name: "ann".into(), ..Default::default() },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let folder = std::env::temp_dir();
+        let setting = history::Context { folder: &folder, files: None, channel_names: Default::default(), roles: Default::default(), expressions: Default::default(), users: Default::default(), now: 1 };
+        history::write(store, &export, &store.channel(&channel).unwrap().unwrap(), &setting, |_, _| {}).unwrap();
+    }
+    let address = "did:webvh:QmAnn:id.example:ann";
+    let mut credential = json!({
+        "@context": ["https://www.w3.org/ns/credentials/v2", "https://wyvrn.app/ns/linked-account/v1"],
+        "type": ["VerifiableCredential", "LinkedAccountCredential"],
+        "issuer": WEBVH,
+        "validFrom": "2026-01-01T00:00:00Z",
+        "credentialSubject": { "id": address, "account": { "type": "OnlineAccount", "accountServiceHomepage": "https://discord.com", "accountName": "111" } },
+    });
+    let signer = wyvrn_hosted_did::write::signing_secret(ISSUER_JWK, Some(&format!("{WEBVH}#key-1"))).unwrap();
+    let contexts = credential["@context"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_string()).collect();
+    let proof = DataIntegrityProof::sign(&credential, &signer, SignOptions::new().with_proof_purpose("assertionMethod").with_context(contexts)).await.unwrap();
+    credential["proof"] = serde_json::to_value(proof).unwrap();
+    // Kept while it wasn't trusted: no claim, and the post the import's.
+    keep_profile(&server, &owner.did(), address, &[credential]);
+    assert!(server.state.community.store.claim("111").unwrap().is_none());
+    assert!(imported_author(&server).starts_with("did:wyvrn:tmp:discord:"));
+    wyvrn_community::server::claim_from_kept_profiles(server.state.clone()).await;
+    assert_eq!(imported_author(&server), owner.did());
+    assert_eq!(server.state.community.store.claim("111").unwrap().unwrap().state, "claimed");
 }

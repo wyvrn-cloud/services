@@ -165,7 +165,7 @@ impl Community {
             said["webhook"] = json!({ "id": hook["id"], "name": hook["name"] });
         }
         if !post.reactions.is_empty() {
-            said["reactions"] = json!(post.reactions.iter().map(|(emoji, by)| json!({ "emoji": emoji, "count": by.len() })).collect::<Vec<_>>());
+            said["reactions"] = json!(post.reactions.iter().map(|r| json!({ "emoji": r.emoji, "count": r.count })).collect::<Vec<_>>());
         }
         json!({ "channel": { "id": channel.id, "name": channel.name }, "post": said })
     }

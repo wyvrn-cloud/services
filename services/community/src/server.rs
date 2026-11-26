@@ -120,6 +120,8 @@ impl AppState {
         let fetch = self.fetch_json.read().unwrap_or_else(|p| p.into_inner()).clone();
         match fetch {
             Some(fetch) => fetch(url).await,
+            // A did:webvh issuer's document: resolved, its log checked.
+            None if url.starts_with("did:webvh:") => self.resolver.resolve(&url).await.inspect_err(|error| tracing::info!(did = %url, %error, "an issuer's did:webvh couldn't be resolved")).ok(),
             None => fetch_small_json(url).await,
         }
     }
@@ -1230,7 +1232,11 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket, client: Option
                 None
             })
         };
-        let reply = reply.and_then(|reply| state.community.masked_for(&sender, &reply).inspect_err(|error| tracing::warn!(%error, "couldn't name people as they may be named to them")).ok());
+        // (`answer` masks what it answers itself: watching's and voice's, here.)
+        let reply = match is_voice || received.message["type"] == WATCH {
+            true => reply.and_then(|reply| state.community.masked_for(&sender, &reply).inspect_err(|error| tracing::warn!(%error, "couldn't name people as they may be named to them")).ok()),
+            false => reply,
+        };
         if let Some(reply) = reply {
             match state.agent.pack_reply(&received, &reply).await {
                 Ok(packed) => {
@@ -1531,6 +1537,25 @@ pub async fn run_ban_watch(state: Arc<AppState>) {
     loop {
         tokio::time::sleep(BANS_LOOKED_AT_EVERY).await;
         look_at_bans_again(&state).await;
+    }
+}
+
+/// Once the server is up: every member whose kept profile shows a Discord account
+/// with posts brought in under it, and no claim on them yet, considered as if
+/// their profile had just come (`consider_profile`). For profiles kept while their
+/// credential's issuer wasn't yet trusted as it is now (wyvrn-verify's did:webvh).
+pub async fn claim_from_kept_profiles(state: Arc<AppState>) {
+    let kept = match state.community.store.profiles_showing("https://discord.com") {
+        Ok(kept) => kept,
+        Err(error) => return tracing::warn!(%error, "couldn't read the profiles to look at for claims"),
+    };
+    for (did, address, linked) in kept {
+        let unclaimed = linked.iter().filter_map(crate::claims::discord_account).any(|id| {
+            matches!(state.community.store.claim(id), Ok(None)) && matches!(state.community.store.has_imported_from(id), Ok(true))
+        });
+        if unclaimed {
+            consider_profile(Arc::clone(&state), did, address, linked).await;
+        }
     }
 }
 

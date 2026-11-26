@@ -212,6 +212,25 @@ pub struct Category {
     pub position: i64,
 }
 
+/// The most reactors of one emoji a post is sent with: past it, how many there are
+/// (`count`), and the reader's own; `reactions-request` names them all.
+pub const REACTORS_SHOWN: usize = 20;
+
+/// One emoji on a post: how many put it there, and the first of them by DID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reacted {
+    pub emoji: String,
+    pub count: i64,
+    pub by: Vec<String>,
+}
+
+impl Reacted {
+    /// Whether `by` names only some of those who put it there.
+    pub fn cut_short(&self) -> bool {
+        (self.by.len() as i64) < self.count
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Post {
     /// Its place among every post in every channel: the order they are sent out in.
@@ -247,8 +266,10 @@ pub struct Post {
     /// Who removed it, when it wasn't its author: an admin, or whoever opened the channel.
     pub removed_by: Option<String>,
     pub pinned: bool,
-    /// Each emoji on it, and who put it there, in the order they were first put.
-    pub reactions: Vec<(String, Vec<String>)>,
+    /// Each emoji on it, in the order they were first put: how many put it there,
+    /// and the first of them (at most [`REACTORS_SHOWN`]; `reactions-request` says
+    /// them all).
+    pub reactions: Vec<Reacted>,
     /// The thread that grew from it, if one did.
     pub grew: Option<Thread>,
     /// The voice channel the post invites people into (community-voice/1.0).
@@ -2365,6 +2386,12 @@ fn refused_once(prior: &str, new: &str) {
 }
 
 impl Store {
+    /// The long forms `other` wrote down, written down here too, once
+    /// ([`Db::adopt_long_forms`]): how many were new.
+    pub fn adopt_long_forms(&self, other: &Db) -> Result<usize> {
+        self.db.adopt_long_forms(other)
+    }
+
     pub fn open(location: &Location) -> anyhow::Result<Self> {
         let store = Self::with_cache(Db::open(location, &schema(), "community")?);
         store.bring_together_long_forms()?;
@@ -3421,17 +3448,76 @@ impl Store {
         self.db.lock().query_value("SELECT COALESCE(MAX(serial), 0) FROM posts", params![])
     }
 
+    /// The reactions on each of `ids` ([`Post::reactions`]): counted, and the first
+    /// [`REACTORS_SHOWN`] of each emoji's, in two statements whatever their number.
+    /// A post of a role-picker channel brought in from Discord carries hundreds,
+    /// each a person to name by member id to whoever reads it.
+    fn reactions_on(db: &mut Session<'_>, ids: &[wyvrn_service::db::Value]) -> Result<std::collections::HashMap<String, Vec<Reacted>>> {
+        let mut on: std::collections::HashMap<String, Vec<Reacted>> = std::collections::HashMap::new();
+        if ids.is_empty() {
+            return Ok(on);
+        }
+        let counted = db.query(
+            &format!("SELECT post, emoji, COUNT(*), MIN(at) FROM reactions WHERE post IN ({}) GROUP BY post, emoji ORDER BY MIN(at), emoji", marks(ids.len())),
+            ids,
+            |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?, row.get::<i64>(2)?)),
+        )?;
+        for (post, emoji, count) in counted {
+            on.entry(post).or_default().push(Reacted { emoji, count, by: Vec::new() });
+        }
+        let first = db.query(
+            &format!(
+                "SELECT post, emoji, did FROM (SELECT post, emoji, did, at, ROW_NUMBER() OVER (PARTITION BY post, emoji ORDER BY at, did) AS place FROM reactions WHERE post IN ({})) ranked WHERE place <= {REACTORS_SHOWN} ORDER BY at, did",
+                marks(ids.len())
+            ),
+            ids,
+            |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?, row.get::<String>(2)?)),
+        )?;
+        for (post, emoji, did) in first {
+            if let Some(reacted) = on.get_mut(&post).and_then(|all| all.iter_mut().find(|r| r.emoji == emoji)) {
+                reacted.by.push(did);
+            }
+        }
+        Ok(on)
+    }
+
+    /// Everyone who put each emoji on post `id` (or `emoji` alone), in the order
+    /// they put it: `reactions-request`'s answer.
+    pub fn reactors(&self, id: &str, emoji: Option<&str>) -> Result<Vec<Reacted>> {
+        let rows = self.db.lock().query("SELECT emoji, did FROM reactions WHERE post = ?1 ORDER BY at, emoji, did", params![id], |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)))?;
+        let mut all: Vec<Reacted> = Vec::new();
+        for (put, did) in rows.into_iter().filter(|(put, _)| emoji.is_none_or(|e| e == put)) {
+            match all.iter_mut().find(|r| r.emoji == put) {
+                Some(reacted) => reacted.by.push(did),
+                None => all.push(Reacted { emoji: put, count: 0, by: vec![did] }),
+            }
+        }
+        for reacted in &mut all {
+            reacted.count = reacted.by.len() as i64;
+        }
+        Ok(all)
+    }
+
+    /// The emoji `did` put on each of `posts` (those they put any on).
+    pub fn own_reactions(&self, did: &str, posts: &[String]) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        let mut own: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        if posts.is_empty() {
+            return Ok(own);
+        }
+        let mut values: Vec<wyvrn_service::db::Value> = vec![wyvrn_service::db::ToValue::to_value(&did)];
+        values.extend(posts.iter().map(|post| wyvrn_service::db::ToValue::to_value(post)));
+        let places = (2..=values.len()).map(|n| format!("?{n}")).collect::<Vec<_>>().join(", ");
+        for (post, emoji) in self.db.lock().query(&format!("SELECT post, emoji FROM reactions WHERE did = ?1 AND post IN ({places})"), &values, |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)))? {
+            own.entry(post).or_default().push(emoji);
+        }
+        Ok(own)
+    }
+
     /// A post just read, with what is read apart from it: its reactions, and the
     /// thread that grew from it.
     fn filled(&self, mut post: Post) -> Result<Post> {
         let mut db = self.db.lock();
-        let put = db.query("SELECT emoji, did FROM reactions WHERE post = ?1 ORDER BY at, emoji, did", params![post.id.clone()], |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)))?;
-        for (emoji, did) in put {
-            match post.reactions.iter_mut().find(|(known, _)| *known == emoji) {
-                Some((_, by)) => by.push(did),
-                None => post.reactions.push((emoji, vec![did])),
-            }
-        }
+        post.reactions = Self::reactions_on(&mut db, &[wyvrn_service::db::ToValue::to_value(&post.id)])?.remove(&post.id).unwrap_or_default();
         if post.extra.as_ref().is_some_and(|extra| extra.get("poll").is_some()) {
             post.votes = db.query("SELECT did, answers FROM votes WHERE post = ?1 ORDER BY at, did", params![post.id.clone()], |row| {
                 Ok((row.get::<String>(0)?, list_from(row.get(1)?)))
@@ -3452,17 +3538,9 @@ impl Store {
         let place: std::collections::HashMap<String, usize> = posts.iter().enumerate().map(|(n, post)| (post.id.clone(), n)).collect();
         let at = |id: &str| place.get(id).copied();
         let mut db = self.db.lock();
-        let reactions = db.query(
-            &format!("SELECT post, emoji, did FROM reactions WHERE post IN ({}) ORDER BY at, emoji, did", marks(ids.len())),
-            &ids,
-            |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?, row.get::<String>(2)?)),
-        )?;
-        for (id, emoji, did) in reactions {
-            let Some(n) = at(&id) else { continue };
-            let post = &mut posts[n];
-            match post.reactions.iter_mut().find(|(known, _)| *known == emoji) {
-                Some((_, by)) => by.push(did),
-                None => post.reactions.push((emoji, vec![did])),
+        for (id, reactions) in Self::reactions_on(&mut db, &ids)? {
+            if let Some(n) = at(&id) {
+                posts[n].reactions = reactions;
             }
         }
         let polls: Vec<wyvrn_service::db::Value> = posts

@@ -72,7 +72,26 @@ impl Voice {
     /// the `from_prior` that moves whoever knew it by its `did:web` there, or as the
     /// agent would (its `did:web`, or its mediated DID) before it holds one. A
     /// mediated service goes on speaking as its mediated DID.
+    ///
+    /// A short-form `did:peer:4` is sent to at its long form, where a store of this
+    /// process has seen it; one nobody here has seen the long form of can't be
+    /// resolved, and is passed over quietly (said once for each, at warn; after,
+    /// at debug) until its member writes again, which teaches the store theirs.
     pub async fn send(&self, agent: &Agent, to: &str, message: &Value) -> anyhow::Result<()> {
+        let long;
+        let to = match crate::db::is_short_form(to) {
+            false => to,
+            true => match crate::db::long_form_seen(to) {
+                Some(found) => {
+                    long = found;
+                    long.as_str()
+                }
+                None => {
+                    passed_over(to);
+                    return Ok(());
+                }
+            },
+        };
         let speaking = self.speaking.read().expect("voice lock poisoned").clone();
         match speaking {
             Some(speaking) if agent.mediation().is_none() => {
@@ -86,6 +105,25 @@ impl Voice {
             }
         }
         Ok(())
+    }
+}
+
+/// Says, once for each DID (at warn; after, at debug), that it is passed over:
+/// a short form whose long form nobody here has seen.
+fn passed_over(did: &str) {
+    static SAID: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+    let first = {
+        let mut said = SAID.lock().unwrap_or_else(|p| p.into_inner());
+        let said = said.get_or_insert_with(Default::default);
+        if said.len() > 10_000 {
+            said.clear();
+        }
+        said.insert(did.to_string())
+    };
+    if first {
+        tracing::warn!(%did, "not sent to: a short-form did:peer:4 whose long form isn't known here (until they write again); said once");
+    } else {
+        tracing::debug!(%did, "not sent to: a short-form did:peer:4 whose long form isn't known here");
     }
 }
 

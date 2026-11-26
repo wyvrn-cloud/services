@@ -43,7 +43,8 @@ wyvrn-community-host [--config <path>] discord-survey <folder> [<channel>...] [-
                                                                   take: messages, attachments, GIF links,
                                                                   disk space. Counts only, as Markdown.
 wyvrn-community-host [--config <path>] import-discord <name> <folder> <channel>... [--map <discord-id>=<channel>]
-                     [--text-only] [--no-threads] [--expressions <folder>] [--refresh-embeds] [--dry-run]
+                     [--text-only] [--no-threads] [--expressions <folder>] [--refresh-embeds] [--refresh-files]
+                     [--refresh-mentions] [--dry-run]
                                                                   a Discord channel's history and its threads
                                                                   (by its id or name; a forum's by name) into the channel
                                                                   here of the same category and name (or as
@@ -53,7 +54,13 @@ wyvrn-community-host [--config <path>] import-discord <name> <folder> <channel>.
                                                                   brings nothing in: it writes again the
                                                                   embeds of the posts already imported from
                                                                   those channels (their pictures' sizes too),
-                                                                  sent as edits are.
+                                                                  sent as edits are. --refresh-files keeps
+                                                                  the files they don't have yet (attachments,
+                                                                  Discord-linked embed pictures) as theirs, the
+                                                                  links in their text gone; --refresh-mentions
+                                                                  writes their text and whom they call on
+                                                                  (people, roles, everyone) again. Any of the
+                                                                  three together; safe to run again.
                                                                   --dry-run says what it would do.
 wyvrn-community-host [--config <path>] import-discord-roles <name> <folder> [--dry-run]
                                                                   a Discord server's roles and member
@@ -227,6 +234,8 @@ async fn main() -> anyhow::Result<()> {
                 dry_run: false,
                 threads: true,
                 refresh_embeds: false,
+                refresh_files: false,
+                refresh_mentions: false,
             };
             let mut args = rest.iter();
             while let Some(arg) = args.next() {
@@ -235,6 +244,8 @@ async fn main() -> anyhow::Result<()> {
                     "--text-only" => asked.media = false,
                     "--no-threads" => asked.threads = false,
                     "--refresh-embeds" => asked.refresh_embeds = true,
+                    "--refresh-files" => asked.refresh_files = true,
+                    "--refresh-mentions" => asked.refresh_mentions = true,
                     "--expressions" => asked.expressions = Some(args.next().context("--expressions needs a folder")?.into()),
                     "--map" => {
                         let given = args.next().context("--map needs <discord-id>=<channel>")?;

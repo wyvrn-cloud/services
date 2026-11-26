@@ -312,7 +312,7 @@ async fn a_member_signed_in_posts_replies_and_reacts_from_the_web_as_from_the_ap
     for expected in [1, 0] {
         let reacted = as_member(reqwest::Method::POST, format!("ch/{general}/m/1/react")).form(&[("csrf", csrf.as_str()), ("emoji", "👍")]).send().await.unwrap();
         assert_eq!(reacted.status(), 303);
-        let on = store.post_at(&general, 1).unwrap().unwrap().reactions.iter().find(|(e, _)| e == "👍").map_or(0, |(_, by)| by.len());
+        let on = store.post_at(&general, 1).unwrap().unwrap().reactions.iter().find(|r| r.emoji == "👍").map_or(0, |r| r.count as usize);
         assert_eq!(on, expected);
     }
 
