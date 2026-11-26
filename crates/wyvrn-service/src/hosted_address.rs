@@ -217,10 +217,13 @@ impl Holding {
         let name = json!({ "name": self.address.name });
         let did = match self.kept.load(&self.address)? {
             None => {
-                self.ask_host("reserve", name.clone(), None).await?;
+                let reservation = self.ask_host("reserve", name.clone(), None).await?;
                 let document = address_document(&self.published.document, &service_did, &self.address.template(), &self.address);
                 let update_keys = [write::public_multikey(signing_jwk).map_err(|why| anyhow!(why))?];
-                let written = write::create(&document, signing_jwk, &update_keys).await.map_err(|why| anyhow!(why))?;
+                // A host that witnesses its logs is named their witness from the first
+                // entry (did-hosting/1.0, "The host as a witness").
+                let options = write::Options { witness: reservation["body"]["witness"].as_str().map(str::to_string), ttl: None };
+                let written = write::create_with(&document, signing_jwk, &update_keys, &options).await.map_err(|why| anyhow!(why))?;
                 self.ask_host("publish", name.clone(), Some(signed("log", "text/jsonl", written.entry.as_bytes(), signing_jwk)?)).await?;
                 self.kept.save(&self.address, &Log { did: written.did.clone(), log: written.log })?;
                 tracing::info!(did = %written.did, address = %self.address.did_web, "this service now holds its public address");
@@ -232,9 +235,21 @@ impl Holding {
                 if last["state"] != document {
                     // (An entry is timed to the second, and has to be later than the last.)
                     tokio::time::sleep(Duration::from_millis(1100)).await;
-                    let written = write::append(&held.did, &held.log, &document, signing_jwk, None).await.map_err(|why| anyhow!(why))?;
+                    // A log published before its host witnessed names the host's witness
+                    // from its next entry: the host takes no other.
+                    let witness = match wyvrn_hosted_did::verify::needs_witness_proofs(&held.log) {
+                        true => None,
+                        false => self.ask_host("status-request", name.clone(), None).await?["body"]["witness"].as_str().map(str::to_string),
+                    };
+                    let options = write::Options { witness, ttl: None };
+                    let written = write::append_with(&held.did, &held.log, &document, signing_jwk, None, &options).await.map_err(|why| anyhow!(why))?;
                     let after = last["versionId"].as_str().unwrap_or_default();
-                    self.ask_host("publish", json!({ "name": self.address.name, "after": after }), Some(signed("log", "text/jsonl", written.entry.as_bytes(), signing_jwk)?)).await?;
+                    let published = self.ask_host("publish", json!({ "name": self.address.name, "after": after }), Some(signed("log", "text/jsonl", written.entry.as_bytes(), signing_jwk)?)).await?;
+                    // What takes something away (where mail goes) waits a day at a host
+                    // that witnesses: the service goes on as it is meanwhile.
+                    if let Some(pending) = published["body"].get("pending") {
+                        tracing::warn!(did = %held.did, publish_time = %pending["publish_time"], "this service's public address's new entry is held back by its host until then");
+                    }
                     self.kept.save(&self.address, &Log { did: held.did.clone(), log: written.log })?;
                     tracing::info!(did = %held.did, "this service's public address says what its document now says");
                 }
