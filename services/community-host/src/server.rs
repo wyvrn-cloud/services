@@ -148,7 +148,10 @@ async fn community(State(state): State<Arc<AppState>>, mut request: Request) -> 
 
 /// moq-relay asks one address whether a token may connect. A token starts with
 /// the name of the community it is of (`<name>.`), whose own answer it is given.
-/// A community that isn't open has nobody in its rooms, and so no token to grant.
+/// A community that isn't open is opened to answer: just opened, it says "not yet"
+/// of a token it gave out before (community-voice's restart grace), and its
+/// members' apps, joining again as their live connections come back, are let
+/// through as before rather than cut off by a host that restarted.
 async fn voice_auth(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let request: Value = serde_json::from_slice(&body).unwrap_or_default();
     if request["event"] == "end" {
@@ -158,7 +161,7 @@ async fn voice_auth(State(state): State<Arc<AppState>>, body: Bytes) -> Response
     let token = query.split('&').find_map(|pair| pair.strip_prefix("jwt=")).unwrap_or_default();
     let forbidden = || (StatusCode::FORBIDDEN, Json(json!({ "reason": "forbidden" }))).into_response();
     let Some((name, _)) = token.split_once('.') else { return forbidden() };
-    let Some(tenant) = state.host.loaded(name) else { return forbidden() };
+    let Ok(Some(tenant)) = state.host.tenant(name).await else { return forbidden() };
     let asked = Request::post("/voice/auth").header(header::CONTENT_TYPE, "application/json").body(Body::from(body));
     match asked {
         Ok(asked) => tenant.serve(asked).await,

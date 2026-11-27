@@ -1257,8 +1257,9 @@ async fn live_connection(state: Arc<AppState>, socket: WebSocket, client: Option
             Err(error) => tracing::warn!(%error, "couldn't say who is online"),
         }
     }
-    let presence = state.rooms.close_live(&state.community, id);
-    voice_send(&state, &VoiceOutcome { live: presence, ..VoiceOutcome::default() });
+    // Out of their rooms only if their device doesn't come back within the grace
+    // (voice::LIVE_GRACE), which the sweep sees to.
+    state.rooms.close_live(id, now());
     packing.abort();
     if limited {
         // Let the close frame go out first.
@@ -1294,8 +1295,12 @@ async fn voice_auth(State(state): State<Arc<AppState>>, Json(request): Json<Valu
     let token = query.split('&').find_map(|pair| pair.strip_prefix("jwt=")).unwrap_or_default();
     let did = state.voice.speaking_as().unwrap_or_else(|| state.agent.did());
     match state.rooms.grant(&state.community, &did, token, now()) {
-        Some(grant) => Json(grant).into_response(),
-        None => (StatusCode::FORBIDDEN, Json(json!({ "reason": "forbidden" }))).into_response(),
+        voice::Grant::May(grant) => Json(grant).into_response(),
+        voice::Grant::Refused => (StatusCode::FORBIDDEN, Json(json!({ "reason": "forbidden" }))).into_response(),
+        // Just started, and its participant not back yet: the relay holds the
+        // session on what it was last granted, and asks again (moq-auth: anything
+        // but 401/403 is "unavailable", not "refused").
+        voice::Grant::NotYet => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "reason": "starting" }))).into_response(),
     }
 }
 

@@ -112,7 +112,13 @@ pub async fn open(config: &Config, stores: &Stores, opening: Opening) -> anyhow:
     community.admit_configured(now())?;
 
     let mut state = AppState::new(agent, Default::default(), community, did_document, didcomm_quickstart::default_resolver());
-    state.rooms = crate::voice::Rooms::with_token_prefix(&opening.voice_tokens);
+    // Participant ids and tokens made from the community's own key: the same after
+    // a restart for a device that joins again naming the participant it was.
+    let rooms = crate::voice::Rooms::with_token_prefix(&opening.voice_tokens);
+    state.rooms = match &signing_seed {
+        Some(seed) => rooms.with_secret(crate::voice::secret_from(seed)),
+        None => rooms,
+    };
     state.owner_pages = opening.owner_pages;
     state.web = web;
     // Read whether or not the web view is on (WYV-98).

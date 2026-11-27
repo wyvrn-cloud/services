@@ -2,11 +2,14 @@
 //! the keys they hand each other, invitations, moderation, and the answers to
 //! the forwarding service's "may this session publish that?".
 //!
-//! Rooms live in memory: a restart empties them, and everyone's app joins again.
-//! Nothing here touches the network; `server.rs` sends what it says to send,
-//! over a member's live connection where there is one.
+//! Rooms live in memory: a restart empties them, and everyone's app joins again,
+//! naming the participant it was (`join`'s `participant`), which it is again: its
+//! id is made from the community's own key ([`Rooms::with_secret`]), so it and its
+//! token are the same, and those watching it, and its session at the forwarding
+//! service, carry on. Nothing here touches the network; `server.rs` sends what it
+//! says to send, over a member's live connection where there is one.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 
 use serde_json::{json, Value};
@@ -42,6 +45,15 @@ pub const REVALIDATE_SECONDS: u64 = 15;
 pub const GRANT_SECONDS: i64 = 60;
 /// How long someone moved to another voice channel has to get there.
 pub const MOVE_GRACE: i64 = 15;
+/// How long a participant whose live connection closed stays in the room for its
+/// device to come back on another (a network that changed, a server restarted
+/// behind a proxy): a `join` from it within this keeps it, as it was.
+pub const LIVE_GRACE: i64 = 20;
+/// For this long after the server starts, a token it may have issued before it
+/// started (well formed, for a participant it hasn't given out since) is answered
+/// "ask again" rather than refused: its app is joining again over its live
+/// connection, and the forwarding service holds its session meanwhile.
+pub const RESTART_GRACE: i64 = 45;
 /// As many as one `invite` asks.
 const MAX_INVITEES: usize = 10;
 /// How long a ring lasts.
@@ -68,8 +80,12 @@ pub struct Participant {
     /// seal their keys to: members aren't told each other's DIDs (community-voice/1.0's
     /// room keys). Empty from an app from before them.
     pub room_key: String,
-    /// The live connection it joined over, if it did: closing that takes it out.
+    /// The live connection it joined over (or its device spoke over since), if it
+    /// did: closing that takes it out, after [`LIVE_GRACE`].
     pub live: Option<u64>,
+    /// When its live connection closed, with no other of its device's open: taken
+    /// out [`LIVE_GRACE`] after, unless its device joins again first.
+    pub orphaned: Option<i64>,
     /// What their app gives the forwarding service.
     pub token: String,
     pub muted: bool,
@@ -140,6 +156,9 @@ impl Room {
 struct Live {
     did: String,
     watching: bool,
+    /// The devices (`join`'s `device`) whose participants joined or spoke over it:
+    /// where a participant whose connection closed is moved, if it is one of them.
+    devices: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -148,15 +167,84 @@ struct Inner {
     live: HashMap<u64, Live>,
     /// When time in voice was last counted (insights).
     counted: i64,
+    /// The participant ids given out since the server started, while
+    /// [`RESTART_GRACE`] lasts: a token of one of them that is in no room now was
+    /// given out here, and is refused at once.
+    issued: HashSet<String>,
 }
 
 /// Every voice room of the community, and who holds a live connection.
-#[derive(Default)]
 pub struct Rooms {
     inner: Mutex<Inner>,
     /// What every participant's token starts with: where one host keeps many
     /// communities, which of them the forwarding service's question is for.
     token_prefix: String,
+    /// What participant ids and tokens are made with: the same across restarts
+    /// where it is the community's own ([`Rooms::with_secret`]), so a device that
+    /// joins again naming the participant it was is that participant again, with
+    /// the same token. Random otherwise (a test), good for one run.
+    secret: [u8; 32],
+    /// When these rooms were made (the server started), for [`RESTART_GRACE`].
+    started: i64,
+}
+
+impl Default for Rooms {
+    fn default() -> Self {
+        let mut secret = [0u8; 32];
+        secret[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        secret[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        Self { inner: Mutex::default(), token_prefix: String::new(), secret, started: crate::gates::now() }
+    }
+}
+
+type Mac = hmac::Hmac<sha2::Sha256>;
+
+impl Rooms {
+    fn mac(&self, parts: &[&str]) -> Vec<u8> {
+        use hmac::Mac as _;
+        let mut mac = Mac::new_from_slice(&self.secret).expect("any key length");
+        for part in parts {
+            mac.update(part.as_bytes());
+            mac.update(&[0]);
+        }
+        mac.finalize().into_bytes().to_vec()
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// A new participant id for `did`'s `device` in `channel`: `p-`, eight random
+    /// hex digits and eight that only this community's key makes for them, so that
+    /// one named back in a later `join` can be told to be theirs.
+    fn new_participant_id(&self, channel: &str, did: &str, device: &str) -> String {
+        let nonce = random_id(4);
+        let check = Self::hex(&self.mac(&["participant", channel, did, device, &nonce])[..4]);
+        format!("p-{nonce}{check}")
+    }
+
+    /// Whether `id` is one this community made for `did`'s `device` in `channel`.
+    fn participant_is_theirs(&self, id: &str, channel: &str, did: &str, device: &str) -> bool {
+        let Some(rest) = id.strip_prefix("p-").filter(|rest| rest.len() == 16 && rest.bytes().all(|b| b.is_ascii_hexdigit())) else { return false };
+        let (nonce, check) = rest.split_at(8);
+        Self::hex(&self.mac(&["participant", channel, did, device, nonce])[..4]) == check.to_ascii_lowercase()
+    }
+
+    /// The token of participant `id` in `channel` (`<prefix><id>.<check>`): the
+    /// same each time it is that participant, across restarts with the community's
+    /// own key. The id is bound to its member and device too
+    /// ([`Rooms::participant_is_theirs`]).
+    fn token_for(&self, id: &str, channel: &str) -> String {
+        format!("{}{id}.{}", self.token_prefix, Self::hex(&self.mac(&["token", channel, id])[..24]))
+    }
+
+    /// Whether `token` is one this community made for a voice channel that can
+    /// still be joined, whoever holds it now.
+    fn token_of_an_open_room(&self, community: &Community, token: &str) -> bool {
+        let Some((id, _)) = token.strip_prefix(self.token_prefix.as_str()).and_then(|rest| rest.split_once('.')) else { return false };
+        let Ok(channels) = community.store.channels() else { return false };
+        channels.iter().filter(|channel| channel.voice.is_some() && !channel.closed && !community.channel_off(channel)).any(|channel| self.token_for(id, &channel.id) == token)
+    }
 }
 
 impl Rooms {
@@ -195,6 +283,40 @@ impl Rooms {
     pub fn with_token_prefix(prefix: &str) -> Self {
         Self { token_prefix: prefix.to_string(), ..Self::default() }
     }
+
+    /// Participant ids and tokens made with `secret`, which outlives a restart (one
+    /// drawn from the community's own key): see [`Rooms::secret`].
+    pub fn with_secret(mut self, secret: [u8; 32]) -> Self {
+        self.secret = secret;
+        self
+    }
+
+    /// As if started at `at` (tests of [`RESTART_GRACE`]).
+    pub fn started_at(mut self, at: i64) -> Self {
+        self.started = at;
+        self
+    }
+}
+
+/// The secret participant ids and tokens are made with, from the community's own
+/// signing key: the same wherever and whenever it runs.
+pub fn secret_from(signing_seed: &[u8; 32]) -> [u8; 32] {
+    use hmac::Mac as _;
+    let mut mac = Mac::new_from_slice(signing_seed).expect("any key length");
+    mac.update(b"community-voice/1.0 participants");
+    mac.finalize().into_bytes().into()
+}
+
+/// What [`Rooms::grant`] answers.
+#[derive(Debug, PartialEq)]
+pub enum Grant {
+    /// What the session may do.
+    May(Value),
+    /// Nothing: refuse it.
+    Refused,
+    /// Not known yet: the server has just started and its participant hasn't
+    /// joined again yet. The forwarding service asks again.
+    NotYet,
 }
 
 /// What handling a message came to.
@@ -268,7 +390,7 @@ impl Rooms {
 
     /// A live connection opened by `did`; returns its number.
     pub fn open_live(&self, id: u64, did: &str) {
-        self.lock().live.insert(id, Live { did: did.to_string(), watching: false });
+        self.lock().live.insert(id, Live { did: did.to_string(), watching: false, devices: HashSet::new() });
     }
 
     /// The live connections `did` holds.
@@ -276,25 +398,35 @@ impl Rooms {
         self.lock().live.iter().filter(|(_, live)| live.did == did).map(|(id, _)| *id).collect()
     }
 
-    /// A live connection closed: whoever joined over it is out of their room, and
-    /// so is a participant of its holder that joined otherwise, if the holder holds
-    /// no other. Returns the presence to send.
-    pub fn close_live(&self, community: &Community, id: u64) -> Vec<(u64, Value)> {
-        let left = {
-            let mut inner = self.lock();
-            let Some(live) = inner.live.remove(&id) else { return Vec::new() };
-            let holds_another = inner.live.values().any(|other| other.did == live.did);
-            let mut left = Vec::new();
-            for (channel, room) in inner.rooms.iter_mut() {
-                let before = room.participants.len();
-                room.participants.retain(|_, p| p.live != Some(id) && (holds_another || p.live.is_some() || p.did != live.did));
-                if room.participants.len() != before {
-                    left.push(channel.clone());
+    /// A live connection closed. Whoever joined over it is moved to another live
+    /// connection their device has spoken over, if one is open; otherwise they stay
+    /// [`LIVE_GRACE`] for it to come back (`join` again), and are taken out by
+    /// [`Rooms::sweep`] after. The same for a participant of its holder that joined
+    /// otherwise, if the holder holds no other. Nobody has left yet: no presence.
+    pub fn close_live(&self, id: u64, now: i64) {
+        let mut inner = self.lock();
+        let Some(live) = inner.live.remove(&id) else { return };
+        let holds_another = inner.live.values().any(|other| other.did == live.did);
+        // Each device's other open connection: its newest, where it has several.
+        let mut others: Vec<(u64, &Live)> = inner.live.iter().filter(|(_, other)| other.did == live.did).map(|(id, other)| (*id, other)).collect();
+        others.sort_by_key(|(id, _)| *id);
+        let moved_to: HashMap<String, u64> = others.iter().flat_map(|(id, other)| other.devices.iter().map(move |device| (device.clone(), *id))).collect();
+        let Inner { rooms, .. } = &mut *inner;
+        for room in rooms.values_mut() {
+            for p in room.participants.values_mut() {
+                let joined_otherwise = p.live.is_none() && p.orphaned.is_none() && p.did == live.did && !holds_another;
+                if p.live != Some(id) && !joined_otherwise {
+                    continue;
+                }
+                match moved_to.get(&p.device) {
+                    Some(other) if p.live == Some(id) => p.live = Some(*other),
+                    _ => {
+                        p.live = None;
+                        p.orphaned = Some(now);
+                    }
                 }
             }
-            left
-        };
-        left.iter().flat_map(|channel| self.presence_for_watchers(community, channel)).collect()
+        }
     }
 
     /// Who is in `channel`, as `presence` says them.
@@ -389,6 +521,10 @@ impl Rooms {
                     if p.moving_to.as_ref().is_some_and(|(_, since)| now - since > MOVE_GRACE) {
                         return false;
                     }
+                    // Its connection closed, and its device hasn't come back on another.
+                    if let Some(since) = p.orphaned {
+                        return now - since <= LIVE_GRACE;
+                    }
                     now - p.seen <= SILENT_FOR
                         || match p.live {
                             Some(live) => live_ids.contains(&live),
@@ -405,8 +541,24 @@ impl Rooms {
     }
 
     /// The forwarding service's question (moq-auth's auth contract): what the
-    /// session holding `token` may do. `None`: nothing, refuse it.
-    pub fn grant(&self, community: &Community, community_did: &str, token: &str, now: i64) -> Option<Value> {
+    /// session holding `token` may do; refused for a token of no one in a room,
+    /// unless the server has only just started and it may be of someone joining
+    /// again ([`RESTART_GRACE`]).
+    pub fn grant(&self, community: &Community, community_did: &str, token: &str, now: i64) -> Grant {
+        if let Some(may) = self.grant_held(community, community_did, token, now) {
+            return Grant::May(may);
+        }
+        let mut inner = self.lock();
+        if now - self.started > RESTART_GRACE {
+            inner.issued = HashSet::new();
+            return Grant::Refused;
+        }
+        let given_out_since = token.strip_prefix(self.token_prefix.as_str()).and_then(|rest| rest.split_once('.')).is_some_and(|(id, _)| inner.issued.contains(id));
+        drop(inner);
+        if !given_out_since && self.token_of_an_open_room(community, token) { Grant::NotYet } else { Grant::Refused }
+    }
+
+    fn grant_held(&self, community: &Community, community_did: &str, token: &str, now: i64) -> Option<Value> {
         let inner = self.lock();
         for (channel, room) in &inner.rooms {
             let Some(p) = room.participants.values().find(|p| p.token == token) else { continue };
@@ -445,12 +597,25 @@ impl Rooms {
         // one member; community-voice/1.0).
         let named = body["participant"].as_str();
         // Anything said from inside a room says they are still there.
+        // Said over a live connection, by the participant it names (or the member's
+        // only one there), it is that device's connection now: where it is moved
+        // if the one it joined over closes, and why it isn't taken out meanwhile.
         if let Some(channel) = body["channel"].as_str() {
             let mut inner = self.lock();
-            if let Some(room) = inner.rooms.get_mut(channel) {
+            let Inner { rooms, live: lives, .. } = &mut *inner;
+            if let Some(room) = rooms.get_mut(channel) {
+                let only_one = room.participants.values().filter(|p| p.did == sender).count() == 1;
                 if let Some(id) = room.of(sender, named) {
                     if let Some(p) = room.participants.get_mut(&id) {
                         p.seen = now;
+                        // (A `join` says which device it is, and sees to its own.)
+                        if let Some(entry) = live.filter(|_| message_type != JOIN).and_then(|live| lives.get_mut(&live)) {
+                            entry.devices.insert(p.device.clone());
+                            if named.is_some() || only_one {
+                                p.live = live;
+                                p.orphaned = None;
+                            }
+                        }
                     }
                 }
             }
@@ -513,9 +678,16 @@ impl Rooms {
                 }
                 let device = body["device"].as_str().unwrap_or_default().to_string();
                 let room_key = body["room_key"].as_str().filter(|key| key.starts_with("did:key:") && key.len() <= 256).unwrap_or_default().to_string();
+                // The participant this device was in this room, to be again (joining
+                // again after its live connection, or the server, went): taken if this
+                // community made it for this device here and nobody else is it now.
+                let again = body["participant"].as_str().filter(|id| self.participant_is_theirs(id, &channel.id, sender, &device)).map(str::to_string);
                 let mut left = Vec::new();
                 let participant = {
                     let mut inner = self.lock();
+                    if let Some(entry) = live.and_then(|live| inner.live.get_mut(&live)) {
+                        entry.devices.insert(device.clone());
+                    }
                     let room = inner.rooms.entry(channel.id.clone()).or_default();
                     // "Move here": the member's other devices are taken out first.
                     if body["replace"] == true {
@@ -524,6 +696,7 @@ impl Rooms {
                     let held = room.participants.values().find(|p| p.did == sender && p.device == device).map(|p| p.id.clone());
                     // (Someone a moderator moved here comes in whatever the limit, as on Discord.)
                     let moved_here = inner_moved_here;
+                    let again = again.filter(|id| !room.participants.contains_key(id));
                     let full = !moved_here && settings["limit"].as_i64().is_some_and(|limit| held.is_none() && room.participants.len() as i64 >= limit);
                     if full {
                         drop(inner);
@@ -535,19 +708,23 @@ impl Rooms {
                             if live.is_some() {
                                 p.live = live;
                             }
+                            // Back before its grace ran out.
+                            p.orphaned = None;
                             if !room_key.is_empty() {
                                 p.room_key = room_key.clone();
                             }
                             p.clone()
                         }
                         None => {
+                            let id = again.unwrap_or_else(|| self.new_participant_id(&channel.id, sender, &device));
                             let p = Participant {
-                                id: format!("p-{}", random_id(6)),
+                                token: self.token_for(&id, &channel.id),
+                                id,
                                 did: sender.to_string(),
                                 device: device.clone(),
                                 room_key: room_key.clone(),
                                 live,
-                                token: format!("{}{}", self.token_prefix, random_id(24)),
+                                orphaned: None,
                                 muted: false,
                                 deafened: false,
                                 server_muted: false,
@@ -562,6 +739,9 @@ impl Rooms {
                             p
                         }
                     };
+                    if now - self.started <= RESTART_GRACE {
+                        inner.issued.insert(participant.id.clone());
+                    }
                     // One room per community, for each device: joining this one leaves any other.
                     for (other_id, other) in inner.rooms.iter_mut() {
                         let before = other.participants.len();
@@ -836,7 +1016,15 @@ impl Rooms {
                 if !found {
                     return refuse(message, "e.p.msg.not-in-room", "They aren't in that voice channel.");
                 }
-                Ok(VoiceOutcome { live: self.presence_for_watchers(community, channel), ..VoiceOutcome::default() })
+                let mut presence = self.presence_for_watchers(community, channel);
+                // Taken out by a moderator, said so: its app tells the person, rather
+                // than take it for a connection that dropped and join again.
+                if body["remove"] == true && move_to.is_none() {
+                    for (_, said) in &mut presence {
+                        said["body"]["channels"][0]["removed"] = json!([participant]);
+                    }
+                }
+                Ok(VoiceOutcome { live: presence, ..VoiceOutcome::default() })
             }
 
             _ => refuse(message, "e.p.msg.unsupported", "This server doesn't know that message."),

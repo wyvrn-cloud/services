@@ -130,11 +130,11 @@ services:
     build:
       context: ..
       dockerfile: wyvrn-services/services/community/Dockerfile
-    ports:
-      - "${COMMUNITY_PORT:-8083}:8080"
-      # community-voice's, which shares this service's network (see there).
-      - "${COMMUNITY_VOICE_PORT:-4443}:4443/udp"
-      - "${COMMUNITY_VOICE_PORT:-4443}:4443/tcp"
+    # In community-net's network, with its voice relay (see there): its ports are
+    # published there.
+    network_mode: "service:community-net"
+    depends_on:
+      - community-net
     environment:
       COMMUNITY_PUBLIC_URL: "${COMMUNITY_PUBLIC_URL:-http://localhost:8083/}"
       COMMUNITY_DID_METHOD: "${COMMUNITY_DID_METHOD:-peer}"
@@ -153,6 +153,21 @@ services:
       COMMUNITY_VOICE_RELAY_FINGERPRINT: "${COMMUNITY_VOICE_RELAY_FINGERPRINT:-}"
     volumes:
       - community-data:/app/data
+    restart: unless-stopped
+
+  # The network the community and its voice relay share, held by a container that
+  # does nothing else, so that either can be recreated (a new image) without
+  # leaving the other in a network nothing reaches: the relay used to be in the
+  # community's own, and a community recreated cut voice off until the relay was
+  # recreated too. Their ports are published here.
+  community-net:
+    image: "alpine:3.20"
+    command: ["sleep", "infinity"]
+    init: true
+    ports:
+      - "${COMMUNITY_PORT:-8083}:8080"
+      - "${COMMUNITY_VOICE_PORT:-4443}:4443/udp"
+      - "${COMMUNITY_VOICE_PORT:-4443}:4443/tcp"
     restart: unless-stopped
 
   # Many communities in one process (services/community-host): each its own DID,
@@ -202,13 +217,14 @@ services:
     image: "moqdev/moq-relay:${MOQ_RELAY_TAG:-0.17.8}"
     profiles: ["voice"]
     command: ["/app/relay.toml"]
-    # In the community's own network, so it asks the community over loopback:
-    # moq-relay (0.17.8 on) takes plain http:// for its auth server only there.
-    # Its port is published by the community service for that reason.
-    network_mode: "service:community"
+    # In the community's network (community-net's), so it asks the community over
+    # loopback: moq-relay (0.17.8 on) takes plain http:// for its auth server only
+    # there. Its port is published by community-net for that reason.
+    network_mode: "service:community-net"
     volumes:
       - ./deploy/voice/moq-relay.toml:/app/relay.toml:ro
     depends_on:
+      - community-net
       - community
     restart: unless-stopped
 

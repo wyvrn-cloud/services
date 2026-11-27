@@ -1429,7 +1429,7 @@ async fn voice_turned_off_ends_the_rooms_saying_why_and_none_is_joined_after() {
     let ended = live.next_of(&carol, "presence").await;
     assert_eq!(ended["body"]["channels"], json!([{ "channel": lounge, "participants": [], "ended": "kind-off" }]), "{ended}");
     // Nothing more for the forwarding service to let through.
-    assert!(server.state.rooms.grant(&server.state.community, &server.did, &token, wyvrn_service::now()).is_none());
+    assert!(server.state.rooms.grant(&server.state.community, &server.did, &token, wyvrn_service::now()) == wyvrn_community::voice::Grant::Refused);
     // A stage is another kind: not ended by voice alone.
     wyvrn_community::server::end_voice_of_kinds(&server.state, &["stage".to_string()]);
 
@@ -1442,6 +1442,182 @@ async fn voice_turned_off_ends_the_rooms_saying_why_and_none_is_joined_after() {
     store.set_channel_voice("old-lounge", &json!({})).unwrap();
     let refused = voice(&dave, "join", json!({ "channel": "old-lounge" })).await;
     assert_eq!((refused["body"]["code"].as_str(), refused["body"]["comment"].as_str()), (Some("e.p.msg.kind-off"), Some("Voice was turned off for this community.")), "{refused}");
+}
+
+/// Waits for the server to have noticed that `n` live connections are open.
+async fn live_open(server: &Running, n: usize) {
+    for _ in 0..200 {
+        if server.state.live.lock().unwrap().len() == n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("{n} live connections open");
+}
+
+fn granted(server: &Running, token: &str, at: i64) -> wyvrn_community::voice::Grant {
+    server.state.rooms.grant(&server.state.community, &server.did, token, at)
+}
+
+fn in_room(server: &Running, token: &str, at: i64) -> bool {
+    matches!(granted(server, token, at), wyvrn_community::voice::Grant::May(_))
+}
+
+#[tokio::test]
+async fn a_participant_whose_live_connection_closes_stays_a_while_for_its_device_to_come_back() {
+    use wyvrn_community::voice::LIVE_GRACE;
+    let server = voice_server().await;
+    let (alice, bob) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&alice, &bob]);
+    let lounge = voice_channel(&alice, "lounge", json!({})).await;
+
+    // Gone with no other connection: still in for the grace, out after it.
+    let mut first = Live::open(&bob, &server).await;
+    first.send(&bob, "join", json!({ "channel": lounge, "device": "b" })).await;
+    let joined = first.next_of(&bob, "joined").await;
+    let token = joined["body"]["transport"]["token"].as_str().unwrap().to_string();
+    let _first_id = joined["body"]["participant"].as_str().unwrap().to_string();
+    live_open(&server, 1).await;
+    drop(first);
+    live_open(&server, 0).await;
+    let now = wyvrn_service::now();
+    server.state.rooms.sweep(&server.state.community, now + 5);
+    assert!(in_room(&server, &token, now), "in the room for the grace");
+    server.state.rooms.sweep(&server.state.community, now + LIVE_GRACE + 5);
+    assert!(!in_room(&server, &token, now), "out after it");
+
+    // Back within it, on a new connection, naming the participant it was: the same
+    // participant, with the same token, and kept.
+    let mut again = Live::open(&bob, &server).await;
+    again.send(&bob, "join", json!({ "channel": lounge, "device": "b" })).await;
+    let fresh = again.next_of(&bob, "joined").await;
+    let (id, token) = (fresh["body"]["participant"].as_str().unwrap().to_string(), fresh["body"]["transport"]["token"].as_str().unwrap().to_string());
+    assert_ne!(id, joined["body"]["participant"].as_str().unwrap(), "a new time in the room, unnamed, is a new participant");
+    live_open(&server, 1).await;
+    drop(again);
+    live_open(&server, 0).await;
+    let mut back = Live::open(&bob, &server).await;
+    back.send(&bob, "join", json!({ "channel": lounge, "device": "b", "participant": id })).await;
+    let rejoined = back.next_of(&bob, "joined").await;
+    assert_eq!(rejoined["body"]["participant"], id.as_str());
+    assert_eq!(rejoined["body"]["transport"]["token"], token.as_str());
+    let now = wyvrn_service::now();
+    server.state.rooms.sweep(&server.state.community, now + LIVE_GRACE + 5);
+    assert!(in_room(&server, &token, now), "the new connection holds it");
+
+    // Gone after the grace, and joining again naming it: the same participant all
+    // the same (a phone that took a minute to find a network).
+    drop(back);
+    live_open(&server, 0).await;
+    let now = wyvrn_service::now();
+    server.state.rooms.sweep(&server.state.community, now + LIVE_GRACE + 5);
+    assert!(!in_room(&server, &token, now));
+    let late = voice(&bob, "join", json!({ "channel": lounge, "device": "b", "participant": id })).await;
+    assert_eq!((late["body"]["participant"].as_str(), late["body"]["transport"]["token"].as_str()), (Some(id.as_str()), Some(token.as_str())));
+    // Someone else, or another device, naming it is given one of its own.
+    let theirs = voice(&alice, "join", json!({ "channel": lounge, "device": "b", "participant": id })).await;
+    assert_ne!(theirs["body"]["participant"], id.as_str());
+    let other_device = voice(&bob, "join", json!({ "channel": lounge, "device": "b2", "participant": id })).await;
+    assert_ne!(other_device["body"]["participant"], id.as_str());
+}
+
+#[tokio::test]
+async fn a_participant_whose_connection_closes_is_moved_to_another_its_device_speaks_over() {
+    use wyvrn_community::voice::LIVE_GRACE;
+    let server = voice_server().await;
+    let (alice, bob) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&alice, &bob]);
+    let lounge = voice_channel(&alice, "lounge", json!({})).await;
+    let mut first = Live::open(&bob, &server).await;
+    first.send(&bob, "join", json!({ "channel": lounge, "device": "b" })).await;
+    let joined = first.next_of(&bob, "joined").await;
+    let token = joined["body"]["transport"]["token"].as_str().unwrap().to_string();
+    let id = joined["body"]["participant"].as_str().unwrap().to_string();
+    // Its device opens another (a network that changed) and speaks over it before
+    // the first is seen to close.
+    let mut second = Live::open(&bob, &server).await;
+    second.send(&bob, "state", json!({ "channel": lounge, "participant": id, "muted": false, "deafened": false, "sharing": {} })).await;
+    second.send(&bob, "watch-presence", json!({})).await;
+    second.next_of(&bob, "presence").await;
+    live_open(&server, 2).await;
+    drop(first);
+    live_open(&server, 1).await;
+    let now = wyvrn_service::now();
+    server.state.rooms.sweep(&server.state.community, now + LIVE_GRACE + 5);
+    assert!(in_room(&server, &token, now), "moved to the connection still open");
+    // That one closing too, with no other: out after the grace.
+    drop(second);
+    live_open(&server, 0).await;
+    let now = wyvrn_service::now();
+    server.state.rooms.sweep(&server.state.community, now + LIVE_GRACE + 5);
+    assert!(!in_room(&server, &token, now));
+
+    // Another device's connection is not its own: not moved there.
+    let mut phone = Live::open(&bob, &server).await;
+    phone.send(&bob, "join", json!({ "channel": lounge, "device": "b" })).await;
+    let token = phone.next_of(&bob, "joined").await["body"]["transport"]["token"].as_str().unwrap().to_string();
+    let mut laptop = Live::open(&bob, &server).await;
+    laptop.send(&bob, "join", json!({ "channel": lounge, "device": "l" })).await;
+    laptop.next_of(&bob, "joined").await;
+    live_open(&server, 2).await;
+    drop(phone);
+    live_open(&server, 1).await;
+    let now = wyvrn_service::now();
+    server.state.rooms.sweep(&server.state.community, now + LIVE_GRACE + 5);
+    assert!(!in_room(&server, &token, now), "the phone's participant is out, though the laptop's connection is open");
+}
+
+#[tokio::test]
+async fn after_a_restart_a_device_joining_again_is_the_participant_it_was_with_the_same_token() {
+    use wyvrn_community::voice::{Grant, Rooms, RESTART_GRACE};
+    let server = voice_server().await;
+    let (alice, bob) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&alice, &bob]);
+    let lounge = voice_channel(&alice, "lounge", json!({})).await;
+    let community = &server.state.community;
+    let member = community.store.member(&bob.did()).unwrap().unwrap();
+    let join = |body: Value| json!({ "id": uuid::Uuid::new_v4().to_string(), "type": format!("{V}join"), "body": body });
+    let now = wyvrn_service::now();
+    let secret = wyvrn_community::voice::secret_from(&[7; 32]);
+
+    let before = Rooms::with_token_prefix("x.").with_secret(secret);
+    let joined = before.handle(community, &server.did, &member, &join(json!({ "channel": lounge, "device": "b" })), None, now).unwrap().reply.unwrap();
+    let id = joined["body"]["participant"].as_str().unwrap().to_string();
+    let token = joined["body"]["transport"]["token"].as_str().unwrap().to_string();
+
+    // Started again with the same key: the token is asked about again before its
+    // app has joined again, and isn't refused, only not yet known.
+    let after = Rooms::with_token_prefix("x.").with_secret(secret);
+    assert_eq!(after.grant(community, &server.did, &token, now), Grant::NotYet);
+    assert_eq!(after.grant(community, &server.did, "x.p-0000000000000000.00", now), Grant::Refused, "not one of its tokens");
+    assert_eq!(Rooms::with_token_prefix("x.").grant(community, &server.did, &token, now), Grant::Refused, "made with another key");
+    let again = after.handle(community, &server.did, &member, &join(json!({ "channel": lounge, "device": "b", "participant": id })), None, now).unwrap().reply.unwrap();
+    assert_eq!((again["body"]["participant"].as_str(), again["body"]["transport"]["token"].as_str()), (Some(id.as_str()), Some(token.as_str())));
+    assert!(matches!(after.grant(community, &server.did, &token, now), Grant::May(_)));
+    // Left since: refused at once, grace or none.
+    after.handle(community, &server.did, &member, &json!({ "type": format!("{V}leave"), "body": { "channel": lounge } }), None, now).unwrap();
+    assert_eq!(after.grant(community, &server.did, &token, now), Grant::Refused);
+    // Long after starting, a token nobody holds is refused.
+    let long_after = Rooms::with_token_prefix("x.").with_secret(secret).started_at(now - RESTART_GRACE - 5);
+    assert_eq!(long_after.grant(community, &server.did, &token, now), Grant::Refused);
+}
+
+#[tokio::test]
+async fn a_moderator_taking_someone_out_says_so_in_presence() {
+    let server = voice_server().await;
+    let (admin, bob) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&admin, &bob]);
+    let lounge = voice_channel(&admin, "lounge", json!({})).await;
+    let mut live = Live::open(&bob, &server).await;
+    live.send(&bob, "watch-presence", json!({})).await;
+    live.next_of(&bob, "presence").await;
+    live.send(&bob, "join", json!({ "channel": lounge, "device": "b" })).await;
+    let id = live.next_of(&bob, "joined").await["body"]["participant"].as_str().unwrap().to_string();
+    live.next_of(&bob, "presence").await;
+    tell(&admin, "moderate", json!({ "channel": lounge, "participant": id, "remove": true })).await;
+    let told = live.next_of(&bob, "presence").await;
+    assert_eq!(told["body"]["channels"][0]["removed"], json!([id]), "{told}");
+    assert_eq!(told["body"]["channels"][0]["participants"], json!([]));
 }
 
 #[tokio::test]

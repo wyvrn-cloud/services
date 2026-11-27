@@ -6,7 +6,7 @@ The images themselves arrive with each run: `wyvrn-did-host`, `wyvrn-stickers`, 
 
 The full compose blocks are in `docker-compose.yml` beside this file in wyvrn-services. Below, each is given as it goes in a compose file of the server's own (images carried over, `image:` and no `build:`).
 
-## Restarting a community: its voice relay too
+## Restarting a community: its voice relay too, until each pair shares a network of its own
 
 `community-voice` and `community-host-voice` run in the network of `community` and `community-host` (`network_mode: service:...`). Recreating either community container (a new image) leaves its relay in the old container's network, where nothing reaches it: voice channels say "Can't reach the voice server" (seen 2026-11-07). Recreate the relay with it:
 
@@ -14,6 +14,30 @@ The full compose blocks are in `docker-compose.yml` beside this file in wyvrn-se
 docker-compose -f compose.yml up -d --no-deps community community-host
 docker-compose -f compose.yml up -d --no-deps --force-recreate community-voice community-host-voice
 ```
+
+**Proposed (2026-11-27), so that neither has to be recreated with the other**: each pair shares the network of a container that does nothing else and publishes their ports, as wyvrn-services' own `docker-compose.yml` now does (`community-net`). Moving to it is one recreation of all four, once:
+
+```yaml
+  community-net:
+    image: "alpine:3.20"
+    command: ["sleep", "infinity"]
+    init: true
+    ports: # what community publishes now, its relay's included
+    restart: unless-stopped
+  community:
+    network_mode: "service:community-net"   # in place of its ports:
+    depends_on: [community-net]
+  community-voice:
+    network_mode: "service:community-net"
+    depends_on: [community-net, community]
+  # and the same for community-host / community-host-voice, with a community-host-net
+```
+
+```sh
+docker-compose -f compose.yml up -d --force-recreate community-net community community-voice community-host-net community-host community-host-voice
+```
+
+After that a new community image is `up -d --no-deps community community-host` alone; the relays carry on. A service restart is then ridden out by the apps (community-voice/1.0's rejoin after a live connection comes back): each joins again as the participant it was, the relay holding its session meanwhile.
 
 ## 1. The community web view (in `wyvrn-community`, no new image)
 

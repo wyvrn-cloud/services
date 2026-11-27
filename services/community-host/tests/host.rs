@@ -177,6 +177,15 @@ async fn a_voice_token_is_answered_by_its_own_community_alone() {
     assert_eq!(running.voice_auth(&format!("beta.{rest}")).await.0, 403);
     assert_eq!(running.voice_auth("nobody.x").await.0, 403);
     assert_eq!(running.voice_auth("no-prefix").await.0, 403);
+
+    // Closed (as a restart closes them all) and asked again: opened to answer, and
+    // "not yet" rather than no, while its app joins again; then the same token.
+    running.host.unload("alpha");
+    assert_eq!(running.voice_auth(&token).await.0, 503);
+    let participant = joined["body"]["participant"].as_str().unwrap();
+    let again = ann.ask(&alpha, &format!("{V}join"), json!({ "channel": lounge, "participant": participant })).await;
+    assert_eq!(again["body"]["transport"]["token"], token.as_str(), "{again}");
+    assert_eq!(running.voice_auth(&token).await.0, 200);
 }
 
 #[tokio::test]
