@@ -104,7 +104,10 @@ once. There is no recovery key yet to end that wait, so a second trusted device
 can: a `cosign` with an attachment `cosign` whose bytes are the entry's
 `versionId`, signed (`jws`) by an update key of the last witnessed entry that
 didn't write the entry. Only for such an entry (anything else it takes away still
-waits, or needs a recovery key); an account with one trusted device waits the day.
+waits, or needs a recovery key). An account with **one** trusted device (the last
+witnessed entry has one update key, and it wrote the entry) isn't held at all:
+whoever holds that device is the account, since a second device can only be added
+with it, and an entry held before this rule is published at the next minute's pass.
 While an entry is pending, a `publish` that would be held back too is refused
 (`e.p.msg.pending`, with when the pending one is published): the app writes it
 again once the pending one is published or dropped.

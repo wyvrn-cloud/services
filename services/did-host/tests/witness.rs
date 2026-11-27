@@ -599,3 +599,26 @@ async fn a_first_recovery_key_waits_a_day_unless_a_second_trusted_device_co_sign
     refused_with(&alice.ask("cosign", cosign(&removal.version_id), Some(json!([by_laptop]))).await, "e.p.msg.cosign-invalid");
     let _ = std::fs::remove_file(&host.store_path);
 }
+
+#[tokio::test]
+async fn a_first_recovery_key_from_an_accounts_one_trusted_device_is_published_at_once() {
+    let host = start_host().await;
+    let mut alice = Holder::start(&host, "frank").await;
+    alice.devices.push(device_key());
+    let first = alice.register().await;
+
+    // One trusted device: whoever holds it is the account, and the key goes in now.
+    alice.recovery.push(("recovery-99cc".to_string(), write::public_multikey(&jwk(51)).unwrap()));
+    let adds = alice.write(true).await;
+    let published = alice.publish(&adds, Some(&first.version_id), None).await;
+    assert_eq!(kind(&published), "published", "{published}");
+    assert_eq!(published["body"]["version_id"], adds.version_id, "{published}");
+    assert!(published["body"].get("pending").is_none(), "{published}");
+    alice.keep(&adds);
+
+    // A second recovery key, or one changed, still waits the day.
+    alice.recovery.push(("recovery-aadd".to_string(), write::public_multikey(&jwk(52)).unwrap()));
+    let another = alice.write(true).await;
+    assert!(alice.publish(&another, Some(&adds.version_id), None).await["body"]["pending"].is_object());
+    let _ = std::fs::remove_file(&host.store_path);
+}

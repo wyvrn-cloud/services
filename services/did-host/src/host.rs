@@ -536,7 +536,8 @@ impl Host {
                 },
                 None => false,
             };
-            let held_back = witness::held_back_because(witnessed, added).filter(|_| !co_signed);
+            // A first recovery key from an account's one trusted device isn't held.
+            let held_back = witness::held_back_because(witnessed, added).filter(|_| !co_signed && !witness::first_recovery_key_of_sole_device(witnessed, added));
             match (held_back, &pending) {
                 // One pending entry a name: this one, too, would have to wait.
                 (Some(_), Some(pending)) => {
@@ -623,8 +624,11 @@ impl Host {
                 continue;
             }
             // Held back by a rule that no longer holds it (0.0.28's first host held a
-            // recovery key back for being named anew): published now.
-            let still_held = witness::held_back_because(record.log.as_deref().unwrap_or_default(), &pending.entries).is_some();
+            // recovery key back for being named anew; a first recovery key from an
+            // account's one trusted device, held before that was let through): published now.
+            let witnessed = record.log.as_deref().unwrap_or_default();
+            let still_held =
+                witness::held_back_because(witnessed, &pending.entries).is_some() && !witness::first_recovery_key_of_sole_device(witnessed, &pending.entries);
             if now >= pending.publish_at || !still_held {
                 self.publish_pending(&record, &pending, now).await?;
             } else if now >= pending.publish_at - witness::SOON_SECONDS && !pending.soon_sent {

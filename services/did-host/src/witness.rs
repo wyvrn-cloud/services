@@ -8,7 +8,8 @@
 //! gives the log its first recovery key is held back too (a thief's own recovery
 //! key would let it co-sign everything after), but has no recovery key to end the
 //! wait: a second trusted device's co-signature ends it instead
-//! ([`only_a_first_recovery_key`], `cosign`).
+//! ([`only_a_first_recovery_key`], `cosign`), and an account with one trusted device
+//! isn't held at all ([`first_recovery_key_of_sole_device`]).
 
 use serde_json::{json, Value};
 use wyvrn_hosted_did::{keys, recovery, write};
@@ -190,6 +191,17 @@ pub fn only_a_first_recovery_key(log: &str, added: &str) -> bool {
     held_back(log, added, false).is_some() && held_back(log, added, true).is_none()
 }
 
+/// Whether `added` is held back only for giving the log its first recovery key, by
+/// an account with one trusted device: the last witnessed entry has one update key,
+/// and that key wrote every entry added. Let through at once: whoever holds that one
+/// device is the account (a second device can only be added with it, and with it
+/// lost the account is lost anyway), so a day's wait protects nobody.
+pub fn first_recovery_key_of_sole_device(log: &str, added: &str) -> bool {
+    let update_keys = in_force(log).update_keys;
+    let [only] = update_keys.as_slice() else { return false };
+    only_a_first_recovery_key(log, added) && entries(added).iter().all(|entry| signers_of(&entry.to_string()) == [only.clone()])
+}
+
 fn held_back(log: &str, added: &str, first_recovery_key: bool) -> Option<&'static str> {
     let mut held = in_force(log);
     let mut document = entries(log).last()?.get("state").cloned().unwrap_or_default();
@@ -340,5 +352,24 @@ mod tests {
         line["proof"] = json!({ "verificationMethod": "did:key:z6Mkb#z6Mkb" });
         assert_eq!(signers_of(&format!("{line}\n{line}")), vec!["z6Mkb".to_string()]);
         assert!(signers_of("{}").is_empty());
+    }
+    #[test]
+    fn a_first_recovery_key_from_a_sole_trusted_device_is_not_held() {
+        let signed = |by: &str, document: Value| {
+            let mut line: Value = serde_json::from_str(&entry(None, None, document)).unwrap();
+            line["proof"] = json!([{ "verificationMethod": format!("did:key:{by}#{by}") }]);
+            line.to_string()
+        };
+        let one = entry(Some(&["z6Mka"]), None, document(&["z6LSa"], &[], "did:peer:2.mediator"));
+        let two = entry(Some(&["z6Mka", "z6Mkb"]), None, document(&["z6LSa", "z6LSb"], &[], "did:peer:2.mediator"));
+        let first = document(&["z6LSa"], &["z6Mkr"], "did:peer:2.mediator");
+        assert!(first_recovery_key_of_sole_device(&one, &signed("z6Mka", first.clone())));
+        // Two trusted devices: a second one co-signs it, or it waits.
+        assert!(!first_recovery_key_of_sole_device(&two, &signed("z6Mka", document(&["z6LSa", "z6LSb"], &["z6Mkr"], "did:peer:2.mediator"))));
+        // Not signed by that one key; or more than a first recovery key.
+        assert!(!first_recovery_key_of_sole_device(&one, &signed("z6Mkx", first)));
+        assert!(!first_recovery_key_of_sole_device(&one, &signed("z6Mka", document(&[], &["z6Mkr"], "did:peer:2.mediator"))));
+        let with = entry(Some(&["z6Mka"]), None, document(&["z6LSa"], &["z6Mkr"], "did:peer:2.mediator"));
+        assert!(!first_recovery_key_of_sole_device(&with, &signed("z6Mka", document(&["z6LSa"], &["z6Mks"], "did:peer:2.mediator"))));
     }
 }
