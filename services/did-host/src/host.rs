@@ -334,7 +334,7 @@ impl Host {
             PUBLISH => self.publish(sender, &received.message, now).await?,
             PUBLISH_WHOIS => self.publish_whois(sender, &received.message, now)?,
             STATUS_REQUEST => self.status(sender, body, now).await?,
-            COSIGN => self.cosign(sender, body, now).await?,
+            COSIGN => self.cosign(sender, &received.message, now).await?,
             WITHDRAW => self.withdraw(sender, &received.message, now)?,
             ASSIGN => self.assign(sender, body, now).await?,
             FREE => self.free(sender, body, now).await?,
@@ -540,7 +540,12 @@ impl Host {
             match (held_back, &pending) {
                 // One pending entry a name: this one, too, would have to wait.
                 (Some(_), Some(pending)) => {
-                    return Ok(Err(Refusal::new("e.p.msg.pending", "{1} is held back already: withdraw it, or co-sign this entry with a recovery key.").with(&pending.version_id)));
+                    return Ok(Err(Refusal::new(
+                        "e.p.msg.pending",
+                        "{1} is held back already, until {2} (seconds since the epoch): write after it once it is published, withdraw it, or co-sign this entry with a recovery key.",
+                    )
+                    .with(&pending.version_id)
+                    .with(pending.publish_at.to_string())));
                 }
                 (Some(why), None) => {
                     self.store.hold_back(&entry)?;
@@ -651,16 +656,44 @@ impl Host {
         }
     }
 
-    /// `cosign`: a recovery key the last witnessed entry lists co-signs the pending
-    /// entry, which is witnessed and published at once.
-    async fn cosign(&self, sender: &Sender, body: &Value, now: i64) -> anyhow::Result<Answer> {
+    /// `cosign`: the pending entry co-signed, and so witnessed and published at once.
+    /// By a recovery key the last witnessed entry lists (`recovery_proof`), for any
+    /// entry; or, for an entry held back only for giving the log its first recovery
+    /// key, by a second trusted device: an attachment `cosign` whose bytes are the
+    /// entry's `versionId`, signed (`jws`) by an update key of the last witnessed
+    /// entry other than the one that wrote it. One device alone can't, or a thief
+    /// holding one could give the address a recovery key of its own at once.
+    async fn cosign(&self, sender: &Sender, message: &Value, now: i64) -> anyhow::Result<Answer> {
+        let body = &message["body"];
         let (name, record, pending) = match self.pending_named(sender, body)? {
             Ok(found) => found,
             Err(refusal) => return Ok(Err(refusal)),
         };
-        let witnessed = record.log.as_deref().and_then(last_document).unwrap_or_default();
-        if let Err(why) = wyvrn_hosted_did::recovery::check_address_entry(&body["recovery_proof"], &witnessed, &pending.version_id) {
-            return Ok(Err(Refusal::new("e.p.msg.recovery-invalid", why)));
+        let witnessed_log = record.log.as_deref().unwrap_or_default();
+        if body.get("recovery_proof").is_some_and(|proof| !proof.is_null()) || attachment(message, "cosign").is_none() {
+            let witnessed = last_document(witnessed_log).unwrap_or_default();
+            if let Err(why) = wyvrn_hosted_did::recovery::check_address_entry(&body["recovery_proof"], &witnessed, &pending.version_id) {
+                return Ok(Err(Refusal::new("e.p.msg.recovery-invalid", why)));
+            }
+        } else {
+            let update_keys = witness::in_force(witnessed_log).update_keys;
+            let Some(by) = attachment(message, "cosign")
+                .filter(|(bytes, _)| bytes == pending.version_id.as_bytes())
+                .and_then(|(bytes, jws)| jws.and_then(|jws| keys::signer_among(&bytes, jws, &update_keys)).cloned())
+            else {
+                return Ok(Err(Refusal::new(
+                    "e.p.msg.cosign-invalid",
+                    "A trusted device co-signs with an attachment \"cosign\" carrying the entry's versionId, signed (jws) by an update key of the last witnessed entry.",
+                )));
+            };
+            if pending.proven.contains(&by) || witness::signers_of(&pending.entries).contains(&by) {
+                return Ok(Err(Refusal::new("e.p.msg.cosign-invalid", "The device that wrote the entry can't co-sign it: another trusted device of the account has to.")));
+            }
+            if !witness::only_a_first_recovery_key(witnessed_log, &pending.entries) {
+                let why = witness::held_back_because(witnessed_log, &pending.entries).unwrap_or("it takes something away");
+                return Ok(Err(Refusal::new("e.p.msg.cosign-invalid", "A trusted device co-signs only an entry that gives the DID its first recovery key, and {1}: co-sign it with a recovery key.").with(why)));
+            }
+            tracing::info!(name = %name.as_did_path(), version = %pending.version_id, by = %by, "a first recovery key co-signed by a second trusted device");
         }
         let published = self.publish_pending(&record, &pending, now).await?;
         Ok(Ok((PUBLISHED, self.published_body(&name, &published))))

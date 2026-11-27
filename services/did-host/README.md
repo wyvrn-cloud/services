@@ -97,6 +97,18 @@ witnessed entry lists can co-sign it (`recovery_proof` on `publish`, or `cosign`
 to have it published at once; the holder can `withdraw` it. Pending entries are
 kept in the store, and published once a minute as they fall due.
 
+An entry that gives the log its **first** recovery key (the last witnessed entry
+lists none) is held back the same way, since a thief holding one trusted device
+would otherwise give the address a recovery key of its own and co-sign the rest at
+once. There is no recovery key yet to end that wait, so a second trusted device
+can: a `cosign` with an attachment `cosign` whose bytes are the entry's
+`versionId`, signed (`jws`) by an update key of the last witnessed entry that
+didn't write the entry. Only for such an entry (anything else it takes away still
+waits, or needs a recovery key); an account with one trusted device waits the day.
+While an entry is pending, a `publish` that would be held back too is refused
+(`e.p.msg.pending`, with when the pending one is published): the app writes it
+again once the pending one is published or dropped.
+
 Turning witnessing on for a host with names already hosted asks their holders'
 apps to add the witness to their next entry: an app that doesn't know to is
 refused until it does.

@@ -112,6 +112,8 @@ struct Holder {
     /// Other devices' key-agreement keys, and recovery keys `(id, multikey)`.
     devices: Vec<String>,
     recovery: Vec<(String, String)>,
+    /// Other trusted devices' signing keys (Ed25519 JWKs): update keys beside this one's.
+    trusted: Vec<String>,
 }
 
 impl Holder {
@@ -157,6 +159,7 @@ impl Holder {
             log: String::new(),
             devices: Vec::new(),
             recovery: Vec::new(),
+            trusted: Vec::new(),
         }
     }
 
@@ -191,15 +194,16 @@ impl Holder {
     }
 
     fn signed(&self, id: &str, media_type: &str, bytes: &[u8]) -> Value {
-        let jws = write::sign_attachment(bytes, &self.jwk).unwrap();
-        json!({ "id": id, "media_type": media_type, "data": { "base64": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes), "jws": jws } })
+        signed_by(&self.jwk, id, media_type, bytes)
     }
 
     /// The next entry, written (not yet sent): the document as it now is.
     async fn write(&mut self, witnessed: bool) -> write::Written {
         if self.did.is_empty() {
             let options = write::Options { witness: witnessed.then(|| self.witness.clone()), ttl: Some(600) };
-            write::create_with(&self.document(), &self.jwk, &[self.auth_key()], &options).await.unwrap()
+            let mut update_keys = vec![self.auth_key()];
+            update_keys.extend(self.trusted.iter().map(|jwk| write::public_multikey(jwk).unwrap()));
+            write::create_with(&self.document(), &self.jwk, &update_keys, &options).await.unwrap()
         } else {
             tokio::time::sleep(Duration::from_millis(1100)).await;
             write::append(&self.did, &self.log, &self.document(), &self.jwk, None).await.unwrap()
@@ -250,6 +254,12 @@ impl Holder {
             }
         }
     }
+}
+
+/// An attachment signed (`jws`) by the Ed25519 key `jwk`.
+fn signed_by(jwk: &str, id: &str, media_type: &str, bytes: &[u8]) -> Value {
+    let jws = write::sign_attachment(bytes, jwk).unwrap();
+    json!({ "id": id, "media_type": media_type, "data": { "base64": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes), "jws": jws } })
 }
 
 /// Fetching what the host serves, as a reader does (over HTTP, at localhost).
@@ -532,4 +542,60 @@ async fn what_witnessing_keeps_is_kept_in_the_store_and_freed_with_the_name() {
     store.hold_back(&pending).unwrap();
     store.free("alice").unwrap();
     assert!(store.pending("alice").unwrap().is_none() && store.witness_proofs("alice").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_first_recovery_key_waits_a_day_unless_a_second_trusted_device_co_signs_it() {
+    let host = start_host().await;
+    let mut alice = Holder::start(&host, "erin").await;
+    let laptop = jwk(41);
+    alice.trusted.push(laptop.clone());
+    let tablet = device_key();
+    alice.devices.push(tablet.clone());
+    let first = alice.register().await;
+
+    // The first recovery key: held back, with nothing in force to co-sign it with.
+    alice.recovery.push(("recovery-77aa".to_string(), write::public_multikey(&jwk(42)).unwrap()));
+    let adds = alice.write(true).await;
+    let held = alice.publish(&adds, Some(&first.version_id), None).await;
+    assert_eq!(held["body"]["pending"]["version_id"], adds.version_id, "{held}");
+    assert_eq!(alice.next_pending().await["state"], "held");
+    let cosign = |version: &str| json!({ "name": "erin", "version_id": version });
+
+    // Meanwhile what would be held back too is refused, saying until when.
+    alice.recovery.push(("recovery-88bb".to_string(), write::public_multikey(&jwk(43)).unwrap()));
+    let more = alice.write(true).await;
+    let refused = alice.publish(&more, Some(&first.version_id), None).await;
+    refused_with(&refused, "e.p.msg.pending");
+    assert_eq!(refused["body"]["args"][1], held["body"]["pending"]["publish_time"].as_i64().unwrap().to_string(), "{refused}");
+    alice.recovery.pop();
+
+    // Not by the device that wrote it, nor by a key the log doesn't list, nor over
+    // another entry; a recovery key it adds can't either.
+    let by_writer = alice.signed("cosign", "text/plain", adds.version_id.as_bytes());
+    refused_with(&alice.ask("cosign", cosign(&adds.version_id), Some(json!([by_writer]))).await, "e.p.msg.cosign-invalid");
+    let by_stranger = signed_by(&jwk(44), "cosign", "text/plain", adds.version_id.as_bytes());
+    refused_with(&alice.ask("cosign", cosign(&adds.version_id), Some(json!([by_stranger]))).await, "e.p.msg.cosign-invalid");
+    let over_another = signed_by(&laptop, "cosign", "text/plain", first.version_id.as_bytes());
+    refused_with(&alice.ask("cosign", cosign(&adds.version_id), Some(json!([over_another]))).await, "e.p.msg.cosign-invalid");
+    let by_new = recovery::sign_address_entry(&adds.version_id, &jwk(42), "recovery-77aa").unwrap();
+    refused_with(&alice.ask("cosign", json!({ "name": "erin", "version_id": adds.version_id, "recovery_proof": by_new }), None).await, "e.p.msg.recovery-invalid");
+
+    // By the other trusted device: published at once.
+    let by_laptop = signed_by(&laptop, "cosign", "text/plain", adds.version_id.as_bytes());
+    let cosigned = alice.ask("cosign", cosign(&adds.version_id), Some(json!([by_laptop]))).await;
+    assert_eq!(kind(&cosigned), "published", "{cosigned}");
+    assert_eq!(cosigned["body"]["version_id"], adds.version_id);
+    assert_eq!(alice.next_pending().await["state"], "published");
+    alice.keep(&adds);
+
+    // With a recovery key in force, a device co-signs nothing: a removal still waits,
+    // or takes the recovery key.
+    alice.devices.clear();
+    let removal = alice.write(true).await;
+    assert!(alice.publish(&removal, Some(&adds.version_id), None).await["body"]["pending"].is_object());
+    assert_eq!(alice.next_pending().await["state"], "held");
+    let by_laptop = signed_by(&laptop, "cosign", "text/plain", removal.version_id.as_bytes());
+    refused_with(&alice.ask("cosign", cosign(&removal.version_id), Some(json!([by_laptop]))).await, "e.p.msg.cosign-invalid");
+    let _ = std::fs::remove_file(&host.store_path);
 }

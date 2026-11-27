@@ -4,7 +4,11 @@
 //! A holder's update keys are its trusted devices' keys, and did:webvh takes an
 //! entry signed by any one of them. So an entry that takes something away is
 //! held back for a day, its holder's devices are told, and a recovery key ends
-//! the wait; everything else is witnessed, and published, at once.
+//! the wait; everything else is witnessed, and published, at once. An entry that
+//! gives the log its first recovery key is held back too (a thief's own recovery
+//! key would let it co-sign everything after), but has no recovery key to end the
+//! wait: a second trusted device's co-signature ends it instead
+//! ([`only_a_first_recovery_key`], `cosign`).
 
 use serde_json::{json, Value};
 use wyvrn_hosted_did::{keys, recovery, write};
@@ -142,8 +146,9 @@ fn recovery_keys(document: &Value) -> Vec<String> {
 }
 
 /// What one entry takes away from the one before it, if anything: what makes it
-/// held back. `None` for an entry that only adds.
-fn taken_away(before: (&InForce, &Value), after: (&InForce, &Value)) -> Option<&'static str> {
+/// held back. `None` for an entry that only adds. `first_recovery_key`: whether a
+/// first recovery key (where the entry before lists none) is let through here.
+fn taken_away(before: (&InForce, &Value), after: (&InForce, &Value), first_recovery_key: bool) -> Option<&'static str> {
     let ((was, old), (now, new)) = (before, after);
     if removes(&was.update_keys, &now.update_keys) {
         return Some("it removes an update key");
@@ -153,8 +158,9 @@ fn taken_away(before: (&InForce, &Value), after: (&InForce, &Value)) -> Option<&
             return Some("it removes a device's key");
         }
     }
-    if recovery_keys(old) != recovery_keys(new) {
-        return Some("it changes a recovery key");
+    let (had, has) = (recovery_keys(old), recovery_keys(new));
+    if had != has && !(first_recovery_key && had.is_empty()) {
+        return Some(if had.is_empty() { "it adds the first recovery key" } else { "it changes a recovery key" });
     }
     // Turning witnessing on is witnessed at once, as did:webvh requires.
     if !was.witness.is_null() && was.witness != now.witness {
@@ -173,17 +179,50 @@ fn taken_away(before: (&InForce, &Value), after: (&InForce, &Value)) -> Option<&
 /// if it is: compared with the last witnessed entry, any of them takes something
 /// away. A first publication takes nothing away.
 pub fn held_back_because(log: &str, added: &str) -> Option<&'static str> {
+    held_back(log, added, false)
+}
+
+/// Whether all that holds `added` back is that it gives the log its first recovery
+/// key, where the last witnessed entry lists none: what a second trusted device's
+/// co-signature lets through at once. Anything else it takes away (a device, or a
+/// recovery key changed after the first) still waits, or needs a recovery key.
+pub fn only_a_first_recovery_key(log: &str, added: &str) -> bool {
+    held_back(log, added, false).is_some() && held_back(log, added, true).is_none()
+}
+
+fn held_back(log: &str, added: &str, first_recovery_key: bool) -> Option<&'static str> {
     let mut held = in_force(log);
     let mut document = entries(log).last()?.get("state").cloned().unwrap_or_default();
     for entry in entries(added) {
         let next = held.then(&entry);
         let state = entry.get("state").cloned().unwrap_or_default();
-        if let Some(why) = taken_away((&held, &document), (&next, &state)) {
+        if let Some(why) = taken_away((&held, &document), (&next, &state), first_recovery_key) {
             return Some(why);
         }
         (held, document) = (next, state);
     }
     None
+}
+
+/// The update keys (multikeys) that signed `entries` (log lines): each entry's
+/// Data Integrity proof names its key as `did:key:<multikey>#<multikey>`.
+pub fn signers_of(entries: &str) -> Vec<String> {
+    let mut signers: Vec<String> = Vec::new();
+    for entry in self::entries(entries) {
+        let proofs = match &entry["proof"] {
+            Value::Array(proofs) => proofs.clone(),
+            proof @ Value::Object(_) => vec![proof.clone()],
+            _ => Vec::new(),
+        };
+        for proof in proofs {
+            let method = proof["verificationMethod"].as_str().unwrap_or_default();
+            let key = method.rsplit_once('#').map_or(method.strip_prefix("did:key:").unwrap_or(method), |(_, fragment)| fragment);
+            if !key.is_empty() && !signers.iter().any(|held| held == key) {
+                signers.push(key.to_string());
+            }
+        }
+    }
+    signers
 }
 
 #[cfg(test)]
@@ -267,5 +306,39 @@ mod tests {
         let before = entry(Some(&["z6Mka"]), None, document(&["z6LSa"], &[], "did:peer:2.mediator"));
         assert_eq!(held_back_because(&before, &entry(None, Some(witness.clone()), document(&["z6LSa"], &[], "did:peer:2.mediator"))), None);
         assert_eq!(in_force(&format!("{before}\n{}", entry(None, Some(witness.clone()), document(&[], &[], "x")))).witness, witness);
+    }
+    #[test]
+    fn a_first_recovery_key_is_held_back_and_only_that_a_device_may_co_sign() {
+        let witness = json!({ "threshold": 1, "witnesses": [{ "id": "did:key:z6Mkhost" }] });
+        let without = entry(Some(&["z6Mka", "z6Mkb"]), Some(witness), document(&["z6LSa", "z6LSb"], &[], "did:peer:2.mediator"));
+        let same = |document: Value| entry(None, None, document);
+
+        // The first recovery key: held, and a device's co-signature is enough.
+        let first = same(document(&["z6LSa", "z6LSb"], &["z6Mkr"], "did:peer:2.mediator"));
+        assert_eq!(held_back_because(&without, &first), Some("it adds the first recovery key"));
+        assert!(only_a_first_recovery_key(&without, &first));
+        // ...not with a device taken out beside it,
+        let and_removed = same(document(&["z6LSa"], &["z6Mkr"], "did:peer:2.mediator"));
+        assert!(held_back_because(&without, &and_removed).is_some());
+        assert!(!only_a_first_recovery_key(&without, &and_removed));
+        // ...nor for a second entry that changes the key just added,
+        let then_changed = format!("{first}\n{}", same(document(&["z6LSa", "z6LSb"], &["z6Mks"], "did:peer:2.mediator")));
+        assert!(!only_a_first_recovery_key(&without, &then_changed));
+        // ...nor for one after a recovery key is already in force,
+        let with = entry(Some(&["z6Mka", "z6Mkb"]), None, document(&["z6LSa", "z6LSb"], &["z6Mkr"], "did:peer:2.mediator"));
+        let another = same(document(&["z6LSa", "z6LSb"], &["z6Mkr", "z6Mks"], "did:peer:2.mediator"));
+        assert_eq!(held_back_because(&with, &another), Some("it changes a recovery key"));
+        assert!(!only_a_first_recovery_key(&with, &another));
+        // ...and nothing for an entry that isn't held at all.
+        assert!(!only_a_first_recovery_key(&without, &same(document(&["z6LSa", "z6LSb", "z6LSc"], &[], "did:peer:2.mediator"))));
+    }
+
+    #[test]
+    fn an_entrys_signers_are_read_from_its_proofs() {
+        let mut line = json!({ "versionId": "2-Qm", "proof": [{ "verificationMethod": "did:key:z6Mka#z6Mka" }] });
+        assert_eq!(signers_of(&line.to_string()), vec!["z6Mka".to_string()]);
+        line["proof"] = json!({ "verificationMethod": "did:key:z6Mkb#z6Mkb" });
+        assert_eq!(signers_of(&format!("{line}\n{line}")), vec!["z6Mkb".to_string()]);
+        assert!(signers_of("{}").is_empty());
     }
 }
