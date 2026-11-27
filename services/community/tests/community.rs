@@ -476,7 +476,10 @@ async fn a_post_reaches_everyone_who_joined_its_author_included_and_can_be_read_
 
     let posted = member.community("post", json!({ "channel": channel, "id": "p1", "content": "  hello everyone  " })).await;
     assert_eq!(kind(&posted), "posted", "{posted}");
-    assert_eq!(posted["body"], json!({ "channel": channel, "seq": 1, "id": "p1" }));
+    // Placed, and when by the server's clock (posted_at).
+    let mut placed = posted["body"].clone();
+    assert!(placed.as_object_mut().unwrap().remove("posted_at").is_some_and(|at| at.is_i64()), "{posted}");
+    assert_eq!(placed, json!({ "channel": channel, "seq": 1, "id": "p1" }));
     for peer in [&admin, &member] {
         let got = peer.next_message().await;
         assert_eq!(got["content"], "hello everyone");
