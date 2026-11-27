@@ -724,6 +724,8 @@ const CACHED_TABLES: &[&str] = &[
     "timeouts",
     "rules_accepted",
     "presence",
+    // Read for every post (automod.rs), changed only from the admin pages.
+    "automod_rules",
 ];
 
 /// How long an answer read from [`CACHED_TABLES`] is kept.
@@ -2552,6 +2554,20 @@ impl Store {
         Ok(())
     }
 
+    /// [`Self::set_delivered`] for many members who have had the same posts: a
+    /// statement for them all (each is a round trip to a database that may be far
+    /// away), not one each.
+    pub fn set_all_delivered(&self, dids: &[String], serial: i64) -> Result<()> {
+        let mut db = self.db.lock();
+        for chunk in dids.chunks(200) {
+            let mut values = vec![wyvrn_service::db::ToValue::to_value(&serial)];
+            values.extend(chunk.iter().map(wyvrn_service::db::ToValue::to_value));
+            let marks: Vec<String> = (2..=chunk.len() + 1).map(|n| format!("?{n}")).collect();
+            db.execute(&format!("UPDATE members SET delivered = ?1 WHERE delivered < ?1 AND did IN ({})", marks.join(", ")), &values)?;
+        }
+        Ok(())
+    }
+
     /// Every member a post couldn't be delivered to, and when to try them next.
     pub fn undelivered(&self) -> Result<std::collections::HashMap<String, wyvrn_service::delivery::Undelivered>> {
         wyvrn_service::delivery::undelivered(&self.db)
@@ -3649,16 +3665,26 @@ impl Store {
     /// `reply` is the post answered, its author, and the answerer's quotation of it.
     pub fn set_written_with(&self, id: &str, reply: Option<(&str, &str, Option<&str>)>, thread: Option<&str>, mentions: &[Mention]) -> Result<()> {
         let mut db = self.db.lock();
-        Self::touch(&mut db, id)?;
         let mentions = (!mentions.is_empty()).then(|| serde_json::to_string(mentions).unwrap_or_default());
         let (reply_to, author, snippet) = match reply {
             Some((id, author, snippet)) => (Some(id), Some(author), snippet),
             None => (None, None, None),
         };
-        db.execute(
-            "UPDATE post_state SET reply_to = ?2, thread = ?3, mentions = ?4, reply_author = ?5, reply_snippet = ?6 WHERE post = ?1",
-            params![id, reply_to, thread, mentions, author, snippet],
+        // A post just added has no record yet: made whole in one statement, not
+        // made, numbered and filled in three (each a round trip to a database that
+        // may be far away). One that has one is numbered and filled in as before.
+        let rev: i64 = db.query_value("SELECT COALESCE(MAX(rev), 0) + 1 FROM post_state", params![])?;
+        let made = db.execute(
+            "INSERT OR IGNORE INTO post_state (post, rev, reply_to, thread, mentions, reply_author, reply_snippet) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, rev, reply_to, thread, mentions, author, snippet],
         )?;
+        if made == 0 {
+            Self::touch(&mut db, id)?;
+            db.execute(
+                "UPDATE post_state SET reply_to = ?2, thread = ?3, mentions = ?4, reply_author = ?5, reply_snippet = ?6 WHERE post = ?1",
+                params![id, reply_to, thread, mentions, author, snippet],
+            )?;
+        }
         if let Some(thread) = thread {
             Self::forget_thread(&mut db, thread)?;
         }

@@ -1065,11 +1065,22 @@ fn scratch_name() -> String {
     format!("{}_{}_{}", std::process::id(), nanos, NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
+/// Prepared statements kept per MySQL connection ([`mysql_options`]).
+const STATEMENT_CACHE: usize = 128;
+
 fn mysql_options(url: &str) -> Result<mysql::Opts> {
     let options = mysql::Opts::from_url(url).map_err(|err| Error::Other(format!("the database URL can't be read: {err}")))?;
     // An UPDATE says how many rows it found, not how many it changed: as SQLite's
     // does, and as the stores read it ("was there one?").
-    Ok(mysql::OptsBuilder::from_opts(options).additional_capabilities(mysql::consts::CapabilityFlags::CLIENT_FOUND_ROWS).into())
+    //
+    // A statement not among a connection's prepared ones is prepared first: a round
+    // trip more, 23 ms from the production host (2026-11-26). The driver keeps 32,
+    // and a host's communities each name their own tables, so the same statement is
+    // a different one in each: 128, unless WYVRN_MYSQL_STATEMENT_CACHE says. The
+    // server holds at most `max_prepared_stmt_count` (16,382 by default) across
+    // every connection: 32 connections at 128 is 4,096.
+    let cached = std::env::var("WYVRN_MYSQL_STATEMENT_CACHE").ok().and_then(|n| n.parse().ok()).unwrap_or(STATEMENT_CACHE);
+    Ok(mysql::OptsBuilder::from_opts(options).additional_capabilities(mysql::consts::CapabilityFlags::CLIENT_FOUND_ROWS).stmt_cache_size(cached).into())
 }
 
 fn mysql_connection(options: &mysql::Opts) -> Result<mysql::Conn> {

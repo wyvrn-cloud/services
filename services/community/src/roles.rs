@@ -538,11 +538,16 @@ impl Community {
 
     /// The channels `did` may see, by id.
     pub fn seen_by(&self, did: &str) -> anyhow::Result<std::collections::HashSet<String>> {
+        self.seen_among(did, &self.store.channels()?)
+    }
+
+    /// [`Self::seen_by`] among `channels`, read once for many members.
+    pub fn seen_among(&self, did: &str, channels: &[crate::store::Channel]) -> anyhow::Result<std::collections::HashSet<String>> {
         let powers = self.powers(did)?;
         let mut seen = std::collections::HashSet::new();
-        for channel in self.store.channels()? {
-            if self.sees(did, &powers, &channel)? {
-                seen.insert(channel.id);
+        for channel in channels {
+            if self.sees(did, &powers, channel)? {
+                seen.insert(channel.id.clone());
             }
         }
         Ok(seen)

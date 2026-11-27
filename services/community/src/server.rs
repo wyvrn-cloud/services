@@ -1377,9 +1377,26 @@ pub async fn deliver_pending(state: &Arc<AppState>) -> anyhow::Result<()> {
     let owed = store.joined()?.into_iter().filter(|member| member.delivered < latest);
     let due = owed.filter(|member| !undelivered.get(&member.did).is_some_and(|held| held.held_back(now)) || state.is_watching(&member.did));
     let (posters, rest): (Vec<_>, Vec<_>) = due.partition(|member| first.contains(&member.did));
+    // What is sent is read once for everyone owed it, not once a member: the
+    // database may be far away (23 ms a statement from the host, 2026-11-26), and
+    // each member cost six statements a post, held ahead of every request.
+    let channels = Arc::new(store.channels()?);
+    let mut owed_posts: HashMap<i64, Arc<Vec<crate::store::Post>>> = HashMap::new();
+    for member in posters.iter().chain(&rest) {
+        if let std::collections::hash_map::Entry::Vacant(owed) = owed_posts.entry(member.delivered) {
+            owed.insert(Arc::new(store.posts_after(member.delivered, DELIVERY_BATCH)?));
+        }
+    }
+    // How far each has had them, written together at the end: a statement for
+    // all who got as far, not one a member.
+    let mut had: HashMap<i64, Vec<String>> = HashMap::new();
     for member in posters {
         let held = undelivered.contains_key(&member.did);
-        deliver_to(state, member, held).await;
+        let posts = owed_posts[&member.delivered].clone();
+        let did = member.did.clone();
+        if let Some(serial) = deliver_to(state, member, held, posts, &channels).await {
+            had.entry(serial).or_default().push(did);
+        }
     }
     let limit = Arc::new(Semaphore::new(DELIVERY_CONCURRENCY));
     let mut sends = tokio::task::JoinSet::new();
@@ -1387,41 +1404,56 @@ pub async fn deliver_pending(state: &Arc<AppState>) -> anyhow::Result<()> {
         let state = state.clone();
         let limit = limit.clone();
         let held = undelivered.contains_key(&member.did);
+        let (posts, channels) = (owed_posts[&member.delivered].clone(), channels.clone());
         sends.spawn(async move {
             let _permit = limit.acquire().await;
-            deliver_to(&state, member, held).await;
+            let did = member.did.clone();
+            deliver_to(&state, member, held, posts, &channels).await.map(|serial| (serial, did))
         });
     }
-    while sends.join_next().await.is_some() {}
+    while let Some(done) = sends.join_next().await {
+        if let Ok(Some((serial, did))) = done {
+            had.entry(serial).or_default().push(did);
+        }
+    }
+    for (serial, dids) in had {
+        if let Err(error) = store.set_all_delivered(&dids, serial) {
+            tracing::error!(%error, "couldn't record a delivery");
+        }
+    }
     Ok(())
 }
 
-/// Sends one member the posts they haven't had, in order, as far as they can be
-/// reached. `held`: a delivery to them had failed (they are tried again).
-async fn deliver_to(state: &Arc<AppState>, member: crate::store::Member, mut held: bool) {
-    let posts = match state.community.store.posts_after(member.delivered, DELIVERY_BATCH) {
-        Ok(posts) => posts,
-        Err(error) => return tracing::error!(%error, "couldn't read posts to deliver"),
-    };
-    let seen = match state.community.seen_by(&member.did) {
+/// Sends one member `posts`, the ones they haven't had, in order, as far as they
+/// can be reached; `channels` are the community's. `held`: a delivery to them had
+/// failed (they are tried again). Gives back the last post they have had (or were
+/// passed over), for the caller to write down with everyone else's.
+async fn deliver_to(state: &Arc<AppState>, member: crate::store::Member, held: bool, posts: Arc<Vec<crate::store::Post>>, channels: &[crate::store::Channel]) -> Option<i64> {
+    let mut had = None;
+    deliver_these(state, member, held, &posts, channels, &mut had).await;
+    had
+}
+
+/// [`deliver_to`]'s sending: `had` is the last post they have had (or were
+/// passed over), so far.
+async fn deliver_these(state: &Arc<AppState>, member: crate::store::Member, mut held: bool, posts: &[crate::store::Post], channels: &[crate::store::Channel], had: &mut Option<i64>) {
+    let seen = match state.community.seen_among(&member.did, channels) {
         Ok(seen) => seen,
         Err(error) => return tracing::error!(%error, "couldn't tell which channels a member sees"),
     };
     for post in posts {
         // A post in a channel they may not see is passed over, for good: seeing it
         // later, they read back in it.
-        let unread_thread = post.thread.is_some() && !matches!(state.community.reads_post_id(&member.did, &post), Ok(true));
+        let unread_thread = post.thread.is_some() && !matches!(state.community.reads_post_id(&member.did, post), Ok(true));
         if !seen.contains(&post.channel) || unread_thread {
-            if let Err(error) = state.community.store.set_delivered(&member.did, post.serial) {
-                return tracing::error!(%error, "couldn't record a delivery");
-            }
+            *had = Some(post.serial);
             continue;
         }
         // Watching: everything, there. Through the mediator, what concerns them
         // always, and the rest as they chose while nobody is watching; what isn't
         // sent they catch up on.
-        let message = state.community.message(&post);
-        let reaches = match state.community.reaches(&member, &post) {
+        let message = state.community.message(post);
+        let reaches = match state.community.reaches(&member, post) {
             Ok(reaches) => reaches,
             Err(error) => return tracing::error!(%error, "couldn't tell whether a post concerns a member"),
         };
@@ -1455,9 +1487,7 @@ async fn deliver_to(state: &Arc<AppState>, member: crate::store::Member, mut hel
                 Ok(()) => {}
             }
         }
-        if let Err(error) = state.community.store.set_delivered(&member.did, post.serial) {
-            return tracing::error!(%error, "couldn't record a delivery");
-        }
+        *had = Some(post.serial);
     }
 }
 

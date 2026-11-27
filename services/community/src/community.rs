@@ -1450,8 +1450,11 @@ impl Community {
         if body.get("poll").is_some_and(|p| !p.is_null()) && !self.may_in(sender, &channel, "create_polls")? {
             return refuse(message, "e.p.trust.not-authorized", "You can't make polls in this channel.");
         }
+        // Sent twice (a retry), it is the same post: its id, looked up once.
+        let given_id = body["id"].as_str().filter(|id| !id.is_empty() && id.len() <= 64);
+        let existing = given_id.map(|id| self.store.post_by_id(id)).transpose()?.flatten();
         // A post sent again after a lost answer isn't held to slow mode.
-        let again = body["id"].as_str().map(|id| self.store.post_by_id(id)).transpose()?.flatten().is_some_and(|post| post.author_did == sender);
+        let again = existing.as_ref().is_some_and(|post| post.author_did == sender);
         if !again && checked {
             if let Some(refused) = self.posting_refused(member, &channel, now)? {
                 return refused.answer(message);
@@ -1477,8 +1480,8 @@ impl Community {
             return refuse(message, "e.p.msg.too-long", "That is longer than a post can be here.");
         }
         // Sent twice (a retry), it is the same post: answered as it was.
-        let id = body["id"].as_str().filter(|id| !id.is_empty() && id.len() <= 64).map(str::to_string).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        if let Some(existing) = self.store.post_by_id(&id)? {
+        let id = given_id.map(str::to_string).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        if let Some(existing) = existing {
             if existing.author_did != sender {
                 return refuse(message, "e.p.msg.id-taken", "That id has been used.");
             }
