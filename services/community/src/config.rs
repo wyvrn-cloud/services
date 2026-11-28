@@ -81,11 +81,20 @@ pub struct FilesConfig {
     pub quota_bytes: u64,
     /// The most kept of everyone's; 0 for no limit but the disk.
     pub total_bytes: u64,
+    /// An S3-compatible bucket stored files are kept in rather than `dir`
+    /// (wyvrn-files' bucket.rs): uploads still land in `dir` and are moved there
+    /// once stored. Its key and secret only ever from the environment
+    /// (`COMMUNITY_FILES_BUCKET_KEY` and `_SECRET`, or the variables it names);
+    /// the whole of it may be given there instead (`COMMUNITY_FILES_BUCKET_ENDPOINT`, `_NAME`, ...).
+    pub bucket: Option<wyvrn_files::bucket::BucketConfig>,
+    /// Buckets files were kept in before, read from until moved
+    /// (`wyvrn-community move-files-to-bucket`).
+    pub former_buckets: Vec<wyvrn_files::bucket::BucketConfig>,
 }
 
 impl Default for FilesConfig {
     fn default() -> Self {
-        Self { dir: "files".into(), max_file_bytes: 25 * 1024 * 1024, quota_bytes: 1024 * 1024 * 1024, total_bytes: 0 }
+        Self { dir: "files".into(), max_file_bytes: 25 * 1024 * 1024, quota_bytes: 1024 * 1024 * 1024, total_bytes: 0, bucket: None, former_buckets: Vec::new() }
     }
 }
 
@@ -330,6 +339,16 @@ impl Config {
         }
         if let (Some(files), Some(most)) = (config.files.as_mut(), env("COMMUNITY_FILES_MAX_BYTES")) {
             files.max_file_bytes = most.trim().parse().map_err(|e| anyhow::anyhow!("COMMUNITY_FILES_MAX_BYTES is {most:?}: {e}"))?;
+        }
+        if let Some(files) = config.files.as_mut() {
+            files.bucket = wyvrn_files::bucket::BucketConfig::from_env("COMMUNITY_FILES", files.bucket.take())?;
+            files.former_buckets = std::mem::take(&mut files.former_buckets)
+                .into_iter()
+                .map(|former| {
+                    let name = former.name.to_uppercase();
+                    former.with_secrets(&format!("COMMUNITY_FILES_FORMER_BUCKET_{name}_KEY"), &format!("COMMUNITY_FILES_FORMER_BUCKET_{name}_SECRET"))
+                })
+                .collect::<anyhow::Result<_>>()?;
         }
         // The community's own packs, likewise.
         if let Some(path) = env("COMMUNITY_STICKERS_PATH") {

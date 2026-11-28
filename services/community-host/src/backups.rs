@@ -264,7 +264,9 @@ impl Host {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700))?;
             }
-            self.snapshot(name, &staging.join("data"))?;
+            // Files in a bucket stay there: the bucket keeps them, and the
+            // backup's records still name it.
+            self.snapshot(name, &staging.join("data"), false)?;
             // Packed and sealed in one go: no unsealed archive is ever written.
             let sealed = folder.join(format!("{name}-{now}{SUFFIX}"));
             let partial = folder.join(format!(".{name}-{now}{SUFFIX}.part"));

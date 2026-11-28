@@ -105,6 +105,9 @@ by the old one, and they stay who they were: nobody needs letting in again.
 
 ## What it keeps
 
+**The files members attach** (with `[files]` or `COMMUNITY_FILES_DIR` set) are kept under that folder, or in an S3-compatible bucket: `[files.bucket]`, or `COMMUNITY_FILES_BUCKET_ENDPOINT`, `_NAME`, `_REGION`, `_PREFIX`, `_DOWNLOADS`, with the key and secret only ever in `COMMUNITY_FILES_BUCKET_KEY` and `COMMUNITY_FILES_BUCKET_SECRET`. How it works is in [wyvrn-files' README, "In a bucket"](../files/README.md#in-a-bucket). `wyvrn-community files-places`, `bucket-check` and `move-files-to-bucket` say where they are, check the bucket, and move files from before into it.
+
+
 The `community-data` volume holds the server's own keys, the list of members,
 every channel and everything said in them (with `COMMUNITY_DATABASE_URL` set, all
 of it is in that MySQL database instead:

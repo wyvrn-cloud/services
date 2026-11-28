@@ -5503,6 +5503,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "didcomm-agent",
  "didcomm-core",
  "didcomm-quickstart",

@@ -151,6 +151,22 @@ pub struct StorageConfig {
     /// anywhere either. 1 GiB unless set; 0 not to look.
     #[serde(default = "default_min_free")]
     pub min_free_bytes: u64,
+    /// An S3-compatible bucket every community's attached files are kept in, each
+    /// community under its own folder (`<prefix>/c<id>/`), rather than in its
+    /// folder here (wyvrn-files' bucket.rs). Uploads still land on disk and are
+    /// moved there once stored. Its key and secret only ever from the environment
+    /// (`COMMUNITY_HOST_BUCKET_KEY` and `_SECRET`, or the variables it names); the
+    /// whole of it may be given there instead (`COMMUNITY_HOST_BUCKET_ENDPOINT`, `_NAME`, ...).
+    #[serde(default)]
+    pub bucket: Option<wyvrn_files::bucket::BucketConfig>,
+    /// Whether a community's owner may have its files kept in a bucket of their
+    /// own (their community's owner pages, buckets.rs). On unless turned off.
+    #[serde(default = "default_own_buckets")]
+    pub own_buckets: bool,
+}
+
+fn default_own_buckets() -> bool {
+    true
 }
 
 fn default_min_free() -> u64 {
@@ -159,7 +175,17 @@ fn default_min_free() -> u64 {
 
 impl Default for StorageConfig {
     fn default() -> Self {
-        Self { default: "sqlite".into(), dir: "communities".into(), mysql: String::new(), database_prefix: "wyvrn_c".into(), shared_database: "wyvrn_communities".into(), budget_bytes: 0, min_free_bytes: default_min_free() }
+        Self {
+            default: "sqlite".into(),
+            dir: "communities".into(),
+            mysql: String::new(),
+            database_prefix: "wyvrn_c".into(),
+            shared_database: "wyvrn_communities".into(),
+            budget_bytes: 0,
+            min_free_bytes: default_min_free(),
+            bucket: None,
+            own_buckets: default_own_buckets(),
+        }
     }
 }
 
@@ -272,6 +298,7 @@ impl Config {
         if let Some(dir) = env("COMMUNITY_HOST_DIR") {
             config.storage.dir = dir.into();
         }
+        config.storage.bucket = wyvrn_files::bucket::BucketConfig::from_env("COMMUNITY_HOST", config.storage.bucket.take())?;
         if let Some(mysql) = env("COMMUNITY_HOST_MYSQL_URL") {
             config.storage.mysql = mysql;
         }

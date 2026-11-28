@@ -8,10 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
 use axum::extract::{Path, Request, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
-use tower_http::services::ServeFile;
 use wyvrn_files::host::{Fetch, Host, Put, PIURI};
 use wyvrn_files::policy::{Limits, Policy};
 
@@ -85,7 +84,7 @@ impl Files {
         if stored.byte_count > most {
             return Carried::NotHere;
         }
-        let Ok(bytes) = tokio::fs::read(self.host.store.path(file_id)).await else { return Carried::NotHere };
+        let Ok(bytes) = self.host.store.read(&stored).await else { return Carried::NotHere };
         Self::opened(item, attachment, bytes)
     }
 
@@ -97,7 +96,7 @@ impl Files {
         if stored.byte_count > most {
             return Carried::NotHere;
         }
-        let Ok(bytes) = std::fs::read(self.host.store.path(file_id)) else { return Carried::NotHere };
+        let Ok(bytes) = self.host.store.read_now(&stored) else { return Carried::NotHere };
         Self::opened(item, attachment, bytes)
     }
 
@@ -117,7 +116,9 @@ impl Files {
 
     /// Files whose records are at `location` and bytes in `config.dir`.
     pub fn open(config: &FilesConfig, location: &wyvrn_service::db::Location, public_url: &str) -> anyhow::Result<Self> {
-        let store = wyvrn_files::store::Store::open(location, &config.dir)?;
+        let bucket = config.bucket.as_ref().map(wyvrn_files::bucket::Bucket::new).transpose()?;
+        let former = config.former_buckets.iter().map(wyvrn_files::bucket::Bucket::new).collect::<anyhow::Result<Vec<_>>>()?;
+        let store = wyvrn_files::store::Store::open(location, &config.dir)?.with_buckets(bucket, former);
         let service = wyvrn_files::config::ServiceConfig {
             max_file_bytes: config.max_file_bytes,
             quota_bytes: config.quota_bytes,
@@ -262,35 +263,63 @@ pub async fn put_chunk(State(state): State<Arc<AppState>>, Path(id): Path<String
     }
 }
 
-/// `GET`/`HEAD /f/<id>`: a stored file, whole or by `Range`.
+/// `GET`/`HEAD /f/<id>`: a stored file, whole or by `Range`, from disk or its
+/// bucket (wyvrn-files' serve.rs).
 pub async fn fetch(State(state): State<Arc<AppState>>, Path(id): Path<String>, request: Request) -> Response {
     let Some(files) = &state.community.files else { return StatusCode::NOT_FOUND.into_response() };
     let file = match files.host.stored(&id, wyvrn_service::now()) {
         Ok(file) => file,
         Err(error) => return fetch_response(error),
     };
-    let tag = format!("\"{}\"", file.hash);
-    if request.headers().get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(tag.as_str()) {
-        return StatusCode::NOT_MODIFIED.into_response();
+    wyvrn_files::serve::stored_file(&files.host.store, &file, request, wyvrn_files::serve::Answering { sandbox: false }).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A post's `extra` carrying `link` as its first file, unsealed.
+    fn post_with(link: &str) -> Value {
+        json!({
+            "media": [{ "attachment": "a1" }],
+            "attachments": [{ "id": "a1", "media_type": "text/plain", "filename": "note.txt", "data": { "links": [link] } }],
+        })
     }
-    let mut response = match ServeFile::new(files.host.store.path(&id)).try_call(request).await {
-        Ok(response) => response.into_response(),
-        Err(error) => {
-            tracing::error!(%error, "a file couldn't be served");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    let headers = response.headers_mut();
-    if let Ok(value) = HeaderValue::from_str(&file.media_type) {
-        headers.insert(header::CONTENT_TYPE, value);
+
+    /// Kept in a real bucket (WYVRN_TEST_BUCKET, as wyvrn-files' tests/bucket.rs):
+    /// a file kept here goes to it, and is read from it for the web view and
+    /// for Discord, now and later alike.
+    #[tokio::test]
+    async fn a_file_kept_here_goes_to_the_bucket_and_is_still_carried() {
+        let Ok(endpoint) = std::env::var("WYVRN_TEST_BUCKET") else {
+            eprintln!("skipped: set WYVRN_TEST_BUCKET (and _KEY, _SECRET) to a bucket service to run this");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("wyvrn-community-files-{}", uuid::Uuid::new_v4()));
+        let bucket = wyvrn_files::bucket::BucketConfig {
+            endpoint,
+            name: "wyvrn-files-test".into(),
+            region: "us-east-1".into(),
+            prefix: format!("community-test-{}", uuid::Uuid::new_v4()),
+            path_style: true,
+            downloads: Default::default(),
+            link_seconds: 120,
+            key: std::env::var("WYVRN_TEST_BUCKET_KEY").unwrap(),
+            secret: std::env::var("WYVRN_TEST_BUCKET_SECRET").unwrap(),
+            key_env: None,
+            secret_env: None,
+        };
+        let config = FilesConfig { dir: dir.clone(), bucket: Some(bucket), ..Default::default() };
+        let files = Files::open(&config, &wyvrn_service::db::Location::Sqlite(dir.join("files.sqlite")), "https://community.example/").unwrap();
+        let (id, url, _) = files.keep_bytes("did:example:webhook", "note.txt", "text/plain", b"kept in a bucket", 1).unwrap();
+        assert_eq!(files.host.store.file(&id).unwrap().unwrap().place, "spool");
+        wyvrn_files::serve::tend(&files.host.store).await;
+        assert!(files.host.store.file(&id).unwrap().unwrap().place.starts_with("bucket:"));
+        assert!(!files.host.store.path(&id).exists());
+        let post = post_with(&url);
+        assert!(matches!(files.carried(&post, 0, 1000).await, Carried::Opened { bytes, .. } if bytes == b"kept in a bucket"));
+        assert!(matches!(files.carried_now(&post, 0, 1000), Carried::Opened { bytes, .. } if bytes == b"kept in a bucket"));
+        files.host.store.bucket().unwrap().delete_all().await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
-    if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{}\"", file.name.replace(['"', '\\'], "_"))) {
-        headers.insert(header::CONTENT_DISPOSITION, value);
-    }
-    if let Ok(value) = HeaderValue::from_str(&tag) {
-        headers.insert(header::ETAG, value);
-    }
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=3600"));
-    headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    response
 }

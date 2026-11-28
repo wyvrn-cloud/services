@@ -84,44 +84,15 @@ fn files(config: &Config) -> anyhow::Result<()> {
 }
 
 fn places(config: &Config) -> anyhow::Result<()> {
-    let store = open_store(config)?;
-    for (place, count, bytes) in store.places()? {
-        println!("{place}\t{count} files\t{bytes} bytes");
-    }
-    if let Some(bucket) = store.bucket() {
-        println!("new files go to bucket:{} ({bucket:?})", bucket.tag());
-    }
-    Ok(())
+    wyvrn_files::commands::places(&open_store(config)?)
 }
 
 async fn bucket_check(config: &Config, origin: &str) -> anyhow::Result<()> {
-    let store = open_store(config)?;
-    let Some(bucket) = store.bucket() else { anyhow::bail!("no bucket is configured ([bucket], or FILES_BUCKET_ENDPOINT and FILES_BUCKET_NAME)") };
-    let checked = bucket.check(origin).await?;
-    println!("the bucket takes, gives back and removes a file");
-    if checked.cors {
-        println!("a page at {origin} may fetch from it");
-    } else {
-        println!(
-            "a page at {origin} may NOT fetch from it (CORS): apps following a download link to it will fail.\n\
-             Allow GET and HEAD from any origin, the Range header, and expose Content-Range, Content-Length and ETag,\n\
-             or set downloads = \"proxy\"."
-        );
-    }
-    Ok(())
+    wyvrn_files::commands::bucket_check(&open_store(config)?, origin).await
 }
 
 async fn move_to_bucket(config: &Config) -> anyhow::Result<()> {
-    let store = open_store(config)?;
-    let moved = store.move_to_bucket(|file| println!("{}\t{}\t{} bytes", file.id, file.place, file.byte_count)).await?;
-    println!("{} moved, {} bytes", moved.moved, moved.bytes);
-    for id in &moved.mismatched {
-        println!("{id}: not what its record says; left where it is");
-    }
-    for id in &moved.unreadable {
-        println!("{id}: couldn't be read; left where it is");
-    }
-    Ok(())
+    wyvrn_files::commands::move_to_bucket(&open_store(config)?).await
 }
 
 fn remove(config: &Config, id: &str) -> anyhow::Result<()> {

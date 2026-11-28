@@ -9,6 +9,11 @@ wyvrn-community [--config <path>] remove <did>         take someone out
 wyvrn-community [--config <path>] channels             every channel
 wyvrn-community [--config <path>] recount              clear the kept counts and count again
 wyvrn-community [--config <path>] tell-members         every joined member sent the community as it stands, so each app asks what changed
+wyvrn-community [--config <path>] files-places         how many attached files, and bytes, are on disk and in buckets
+wyvrn-community [--config <path>] bucket-check [<origin>]
+                                                       write, read back and remove a test file in the files' bucket, and say
+                                                       whether a page at <origin> (http://tauri.localhost unless given) may fetch from it
+wyvrn-community [--config <path>] move-files-to-bucket move every attached file not in the bucket there, hashes checked before and after
 
 The config path is --config, else $COMMUNITY_CONFIG, else config/default.toml.
 Only someone let in is answered. A DID is the ID their app shows for them.";
@@ -61,6 +66,10 @@ async fn main() -> anyhow::Result<()> {
             println!("counted {threads} threads, {members} members' forum posts and {sections} forum sections");
             Ok(())
         }
+        ["files-places"] => wyvrn_files::commands::places(&files_of(&config)?.host.store),
+        ["bucket-check"] => wyvrn_files::commands::bucket_check(&files_of(&config)?.host.store, "http://tauri.localhost").await,
+        ["bucket-check", origin] => wyvrn_files::commands::bucket_check(&files_of(&config)?.host.store, origin).await,
+        ["move-files-to-bucket"] => wyvrn_files::commands::move_to_bucket(&files_of(&config)?.host.store).await,
         ["help" | "--help" | "-h"] => {
             println!("{USAGE}");
             Ok(())
@@ -84,4 +93,9 @@ fn add(config: &Config, did: &str, role: Role) -> anyhow::Result<()> {
 
 async fn serve(config: Config) -> anyhow::Result<()> {
     wyvrn_community::serve::serve(config, None).await
+}
+
+/// The files members attach, or why there are none.
+fn files_of(config: &Config) -> anyhow::Result<wyvrn_community::files::Files> {
+    wyvrn_community::serve::open_files(config)?.ok_or_else(|| anyhow::anyhow!("this community keeps no files ([files], or COMMUNITY_FILES_DIR)"))
 }

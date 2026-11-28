@@ -14,7 +14,29 @@ Chosen per community when it is made:
 | `mysql-db` | A database of its own on the MySQL server, `<database_prefix><id>`: its own tables starting `m_`, its packs' `s_`, its files' records' `f_` |
 | `mysql-shared` | Tables of its own in `shared_database`, starting `c<id>_m_` (`c<id>_s_`, `c<id>_f_`) |
 
-The files members attach are kept in `<storage.dir>/<name>/files` whatever the kind. All MySQL communities share the server's connections (`WYVRN_MYSQL_CONNECTIONS`, 64 by default).
+The files members attach are kept in `<storage.dir>/<name>/files` whatever the kind, unless there is a bucket (below). All MySQL communities share the server's connections (`WYVRN_MYSQL_CONNECTIONS`, 64 by default).
+
+### Files in a bucket
+
+With `[storage.bucket]` set (an S3-compatible bucket: Linode Object Storage, MinIO, AWS S3), every community's attached files are kept there instead, each community in a folder of its own, `<prefix>/c<id>/`:
+
+```toml
+[storage.bucket]
+endpoint = "https://us-east-1.linodeobjects.com"
+name = "wyvrn-communities"
+region = "us-east-1"
+prefix = "files"
+downloads = "redirect"   # or "proxy"
+```
+
+The key and secret only ever come from the environment: `COMMUNITY_HOST_BUCKET_KEY` and `COMMUNITY_HOST_BUCKET_SECRET` (the whole bucket may be set there too: `COMMUNITY_HOST_BUCKET_ENDPOINT`, `_NAME`, `_REGION`, `_PREFIX`, `_DOWNLOADS`). How it works, why downloads are redirects, and the CORS the bucket must allow, are in [wyvrn-files' README, "In a bucket"](../files/README.md#in-a-bucket): uploads land on disk as ever and are moved to the bucket once stored; files from before stay where they were, read there, until moved.
+
+- **A community's owner may bring a bucket of their own**: its owner page "Where files are kept" (in the app's community settings) takes the endpoint, bucket, folder, key and secret. The host writes, reads back and removes a test file first, and says whether apps may fetch from it (CORS). What they give is kept sealed in the registry (`own_buckets`) with a key in `<storage.dir>/.bucket-secrets.key`, which only this service's user can read; it is never logged nor shown again. "Move files there" moves the files from before; "Stop using it" sends new files back to the host's storage (its files still read there until moved back), then "Forget my bucket". `storage.own_buckets = false` turns the page off.
+- **Moving files from before**: `wyvrn-community-host move-files-to-bucket <name>` (or `--all`), each file checked against its hash before it goes and read back after, the old copy removed only then. `files-places <name>` says where a community's files are; `bucket-check <name>` checks its bucket. Safe while the host runs.
+- **An export** (moving out) brings a community's files down from the bucket into it, since its own server won't have the bucket. **A backup** leaves them in the bucket (which keeps them): its records still name it.
+- **A community brought in** (import) has its files moved to the bucket as new ones are.
+- **Purged**: its folder in the host's bucket is emptied, and from its owner's own bucket exactly the files its records name are removed, nothing else there.
+- **Don't change the host's bucket or prefix** once files are in it: each file's record names the bucket and folder it is in.
 
 A host admin can move a community to another kind from its admin page (Move … to). It is closed, every table and its keys are copied, and it opens from the new place at the next request; requests that come meanwhile wait. What it was kept in is left for an admin to remove, and SQLite files it left before are renamed aside if it comes back to them. A MySQL database or tables that already hold something are refused. Its DID, members and posts stay as they were.
 

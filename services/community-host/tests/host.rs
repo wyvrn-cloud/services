@@ -808,3 +808,129 @@ async fn every_community_trusts_the_linked_account_issuers_the_host_names_or_wyv
     let record = named.host.registry.create("beta", "Beta", Storage::Sqlite, "did:example:bea", "test", 1).unwrap();
     assert_eq!(named.host.settings(&record).community.linked_account_issuers, ["did:web:verify.example", "did:web:other.example"]);
 }
+
+/// The bucket service the tests may use (wyvrn-files' tests/bucket.rs), as the
+/// host's `[storage.bucket]`, in a folder of its own, or `None` to skip.
+fn test_bucket(prefix: &str) -> Option<String> {
+    let endpoint = std::env::var("WYVRN_TEST_BUCKET").ok()?;
+    let (key, secret) = (std::env::var("WYVRN_TEST_BUCKET_KEY").ok()?, std::env::var("WYVRN_TEST_BUCKET_SECRET").ok()?);
+    Some(format!(
+        "[storage.bucket]\nendpoint = \"{endpoint}\"\nname = \"wyvrn-files-test\"\nprefix = \"{prefix}\"\nkey = \"{key}\"\nsecret = \"{secret}\"\n"
+    ))
+}
+
+/// What a community's files store says of each place: `(place, files)`.
+fn places_of(host: &Host, name: &str) -> Vec<(String, u64)> {
+    wyvrn_community_host::buckets::files_of(host, name).unwrap().host.store.places().unwrap().into_iter().map(|(place, count, _)| (place, count)).collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_communitys_files_go_to_the_hosts_bucket_or_its_owners_and_come_down_into_its_export() {
+    let prefix = format!("host-test-{}", unique());
+    let Some(bucket) = test_bucket(&prefix) else {
+        eprintln!("skipped: set WYVRN_TEST_BUCKET (and _KEY, _SECRET) to a bucket service to run this");
+        return;
+    };
+    let running = start_host_with_extra(600, "", &bucket).await;
+    let host = running.host.clone();
+    host.registry.create("kept", "Kept", Storage::Sqlite, "did:example:owner", "test", 1).unwrap();
+    let record = host.registry.get("kept").unwrap().unwrap();
+    let tenant = host.tenant("kept").await.unwrap().unwrap();
+    let files = tenant.state.community.files.as_ref().unwrap();
+    let (first, _, _) = files.keep_bytes("did:example:owner", "a.txt", "text/plain", b"in the host's bucket", 1).unwrap();
+    wyvrn_files::serve::tend(&files.host.store).await;
+    // In the host's bucket, in the community's own folder.
+    let host_bucket = files.host.store.bucket().unwrap().clone();
+    assert_eq!(host_bucket.key(&first), format!("{prefix}/c{}/{first}", record.id));
+    assert_eq!(host_bucket.size(&host_bucket.key(&first)).await.unwrap(), Some(20));
+    assert!(!host.folder("kept").join("files").join(&first).exists());
+
+    // Exported: brought down into the export, its record saying it is on disk;
+    // the bucket keeps its copy.
+    let out = running._dir.join("export");
+    let exporting = host.clone();
+    let to = out.clone();
+    tokio::task::spawn_blocking(move || exporting.snapshot("kept", &to, true)).await.unwrap().unwrap();
+    assert_eq!(std::fs::read(out.join("files").join(&first)).unwrap(), b"in the host's bucket");
+    let exported = wyvrn_files::store::Store::open(&wyvrn_service::db::Location::Sqlite(out.join("files/files.sqlite")), &out.join("files")).unwrap();
+    assert_eq!(exported.file(&first).unwrap().unwrap().place, "disk");
+    assert!(host_bucket.size(&host_bucket.key(&first)).await.unwrap().is_some());
+
+    // The owner's own bucket, set on their page: checked, sealed, and used from then on.
+    use wyvrn_service::admin::Pages;
+    let page = wyvrn_community_host::buckets::OwnBucketPage { host: Arc::downgrade(&host), community: "kept".into() };
+    let theirs = format!("{prefix}-theirs");
+    let input = json!({
+        "endpoint": std::env::var("WYVRN_TEST_BUCKET").unwrap(), "name": "wyvrn-files-test", "region": "us-east-1", "prefix": theirs,
+        "key": std::env::var("WYVRN_TEST_BUCKET_KEY").unwrap(), "secret": std::env::var("WYVRN_TEST_BUCKET_SECRET").unwrap(),
+    });
+    let mut bad = input.clone();
+    bad["secret"] = json!("not it");
+    assert!(page.act(wyvrn_community_host::buckets::OWN_BUCKET, "save", &bad, "did:example:owner", 2).unwrap_err().starts_with("The bucket couldn't be used"));
+    assert!(host.registry.own_bucket("kept").unwrap().is_none());
+    let said = page.act(wyvrn_community_host::buckets::OWN_BUCKET, "save", &input, "did:example:owner", 2).unwrap().unwrap();
+    assert!(said.starts_with("Files go to your bucket"), "{said}");
+    let kept = host.registry.own_bucket("kept").unwrap().unwrap();
+    assert!(kept.active && kept.cors);
+    assert!(!kept.sealed.contains(&std::env::var("WYVRN_TEST_BUCKET_SECRET").unwrap()));
+
+    let tenant = host.tenant("kept").await.unwrap().unwrap();
+    let files = tenant.state.community.files.as_ref().unwrap();
+    let own_tag = files.host.store.bucket().unwrap().tag().to_string();
+    assert_ne!(own_tag, host_bucket.tag());
+    let (second, _, _) = files.keep_bytes("did:example:owner", "b.txt", "text/plain", b"in the owner's bucket", 3).unwrap();
+    wyvrn_files::serve::tend(&files.host.store).await;
+    assert_eq!(files.host.store.file(&second).unwrap().unwrap().place, format!("bucket:{own_tag}"));
+    // The one from before is still read from the host's.
+    assert_eq!(files.host.store.read(&files.host.store.file(&first).unwrap().unwrap()).await.unwrap(), b"in the host's bucket");
+    let mut shown = Vec::new();
+    page_text(&json!(page.view(wyvrn_community_host::buckets::OWN_BUCKET, "did:example:owner", 3).unwrap()), &mut shown);
+    assert!(shown.iter().any(|text| text.contains("1 files from before")), "{shown:?}");
+    assert!(!shown.iter().any(|text| text.contains(&std::env::var("WYVRN_TEST_BUCKET_SECRET").unwrap())));
+
+    // Moved over, on the page's word.
+    page.act(wyvrn_community_host::buckets::OWN_BUCKET, "move", &json!({}), "did:example:owner", 4).unwrap();
+    for _ in 0..100 {
+        if places_of(&host, "kept") == vec![(format!("bucket:{own_tag}"), 2)] {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(places_of(&host, "kept"), vec![(format!("bucket:{own_tag}"), 2)]);
+    assert_eq!(host_bucket.size(&host_bucket.key(&first)).await.unwrap(), None);
+
+    // Stopped using it: new files go to the host's again, and its own can't be
+    // forgotten while files are in it.
+    page.act(wyvrn_community_host::buckets::OWN_BUCKET, "stop", &json!({}), "did:example:owner", 5).unwrap();
+    assert!(page.act(wyvrn_community_host::buckets::OWN_BUCKET, "forget", &json!({}), "did:example:owner", 5).is_err());
+    let tenant = host.tenant("kept").await.unwrap().unwrap();
+    let files = tenant.state.community.files.as_ref().unwrap();
+    assert_eq!(files.host.store.bucket().unwrap().tag(), host_bucket.tag());
+    assert_eq!(files.host.store.read(&files.host.store.file(&second).unwrap().unwrap()).await.unwrap(), b"in the owner's bucket");
+
+    // Deleted for good: its folder in the host's bucket emptied, and its files
+    // taken out of the owner's, one by one.
+    let own = wyvrn_files::bucket::Bucket::new(&wyvrn_files::bucket::BucketConfig {
+        endpoint: std::env::var("WYVRN_TEST_BUCKET").unwrap(),
+        name: "wyvrn-files-test".into(),
+        region: "us-east-1".into(),
+        prefix: theirs.clone(),
+        path_style: true,
+        downloads: Default::default(),
+        link_seconds: 60,
+        key: std::env::var("WYVRN_TEST_BUCKET_KEY").unwrap(),
+        secret: std::env::var("WYVRN_TEST_BUCKET_SECRET").unwrap(),
+        key_env: None,
+        secret_env: None,
+    })
+    .unwrap();
+    // Something of the owner's own in their bucket, which isn't the community's.
+    own.put_bytes(&own.key("theirs.txt"), b"mine".to_vec()).await.unwrap();
+    assert_eq!(own.list("").await.unwrap().len(), 3);
+    host.registry.set_state("kept", Standing::Deleted, Some(10)).unwrap();
+    host.housekeeping(10).await;
+    assert!(host.registry.get("kept").unwrap().is_none());
+    assert!(host_bucket.list("").await.unwrap().is_empty());
+    assert_eq!(own.list("").await.unwrap().into_iter().map(|(key, _)| key).collect::<Vec<_>>(), vec![own.key("theirs.txt")]);
+    own.delete_all().await.unwrap();
+}

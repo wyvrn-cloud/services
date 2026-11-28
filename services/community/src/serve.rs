@@ -42,6 +42,16 @@ impl Stores {
     }
 }
 
+/// The files members attach, if the community keeps them: what the bucket
+/// commands work on.
+pub fn open_files(config: &Config) -> anyhow::Result<Option<crate::files::Files>> {
+    let stores = Stores::from_env(config)?;
+    match (&config.files, &stores.files) {
+        (Some(files), Some(location)) => Ok(Some(crate::files::Files::open(files, location, &config.server.public_url)?)),
+        _ => Ok(None),
+    }
+}
+
 pub fn open_store(config: &Config) -> anyhow::Result<Store> {
     // In the file the configuration names, unless the environment names a
     // database (COMMUNITY_DATABASE_URL or DATABASE_URL: mysql://user:password@host/database).

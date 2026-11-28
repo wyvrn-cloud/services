@@ -90,6 +90,13 @@ impl Host {
                 copied.extend(wyvrn_service::db::copy_store_held(&records, to, "files", &[])?);
             }
             copy_files(dir, &folder.join("files"))?;
+            // On a host with a bucket, what came in goes to it as new files do.
+            let record = self.registry.get(name)?.ok_or_else(|| anyhow::anyhow!("{name} went while it was brought in"))?;
+            let (bucket, _) = self.files_buckets(&record);
+            if let Some(bucket) = bucket {
+                let spooled = wyvrn_files::store::Store::open(to, &folder.join("files"))?.with_buckets(Some(wyvrn_files::bucket::Bucket::new(&bucket)?), Vec::new()).spool_disk_files()?;
+                tracing::info!(community = %name, spooled, "files brought in to go to the bucket");
+            }
         }
         let rows: usize = copied.iter().map(|(_, rows)| rows).sum();
         tracing::info!(community = %name, tables = copied.len(), rows, "brought a community in");

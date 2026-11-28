@@ -31,6 +31,8 @@ tower = { version = "0.5", features = ["util"] }
 tar = "0.4"
 # Sealing backups (backups.rs): the version the community server uses.
 aes-gcm = "0.10"
+# A community's own bucket, sealed for the registry (buckets.rs).
+base64 = { workspace = true }
 flate2 = "1"
 uuid = { workspace = true }
 sha2 = { workspace = true }

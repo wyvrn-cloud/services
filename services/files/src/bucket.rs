@@ -28,10 +28,10 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
 use rusty_s3::{Bucket as S3Bucket, Credentials, S3Action, UrlStyle};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// How a file in the bucket is given to whoever asks for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Downloads {
     /// A `302` to a link signed for `link_seconds`: the bytes skip the service.
@@ -44,7 +44,7 @@ pub enum Downloads {
 /// A bucket, as configured (`[bucket]`, or a community's own). The key and secret
 /// are never in a config file that is checked in: they come from the
 /// environment, or a file beside the service's data (`key_file`).
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BucketConfig {
     /// `https://us-east-1.linodeobjects.com`, `http://127.0.0.1:9000`, ...
@@ -82,7 +82,26 @@ pub struct BucketConfig {
     pub secret_env: Option<String>,
 }
 
+impl std::fmt::Debug for BucketConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the key or secret.
+        f.debug_struct("BucketConfig")
+            .field("endpoint", &self.endpoint)
+            .field("name", &self.name)
+            .field("region", &self.region)
+            .field("prefix", &self.prefix)
+            .field("downloads", &self.downloads)
+            .finish_non_exhaustive()
+    }
+}
+
 impl BucketConfig {
+    /// The same bucket, its files under `more` within its folder.
+    pub fn within(&self, more: &str) -> Self {
+        let prefix = [self.prefix.trim_matches('/'), more.trim_matches('/')].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("/");
+        Self { prefix, ..self.clone() }
+    }
+
     /// The key and secret filled in from the environment: `key_env`/`secret_env`
     /// if set, else `key_var`/`secret_var`. What is already set stays.
     pub fn with_secrets(mut self, key_var: &str, secret_var: &str) -> anyhow::Result<Self> {

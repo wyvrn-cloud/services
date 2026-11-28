@@ -4,6 +4,7 @@
 
 pub mod admin;
 pub mod bucket;
+pub mod commands;
 pub mod config;
 pub mod hash;
 pub mod host;

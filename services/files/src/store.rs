@@ -501,6 +501,36 @@ impl Store {
         }
     }
 
+    /// Every stored file that is in a bucket brought down to disk, its record
+    /// then saying so: a copy of a store that goes where the bucket isn't (a
+    /// community's export, to run on a server of its own). How many came down.
+    /// The bucket's copies stay.
+    pub async fn bring_to_disk(&self) -> anyhow::Result<usize> {
+        let mut brought = 0;
+        for file in self.every_file()? {
+            if !file.place.starts_with("bucket:") {
+                continue;
+            }
+            let bytes = self.read(&file).await?;
+            if crate::hash::of_bytes(&bytes) != file.hash {
+                anyhow::bail!("{} came back from the bucket changed", file.id);
+            }
+            tokio::fs::write(self.path(&file.id), bytes).await?;
+            self.db.lock().execute("UPDATE files SET place = 'disk' WHERE id = ?1", params![file.id])?;
+            brought += 1;
+        }
+        Ok(brought)
+    }
+
+    /// Stored files on disk to be moved to the bucket in the background, as new
+    /// ones are: what a store copied in from elsewhere brought. How many.
+    pub fn spool_disk_files(&self) -> anyhow::Result<usize> {
+        if self.bucket.is_none() {
+            return Ok(0);
+        }
+        Ok(self.db.lock().execute("UPDATE files SET place = 'spool' WHERE place = 'disk' AND state = 'stored'", params![])?)
+    }
+
     /// How many stored files, and bytes, are in each place.
     pub fn places(&self) -> anyhow::Result<Vec<(String, u64, u64)>> {
         Ok(self.db.lock().query(

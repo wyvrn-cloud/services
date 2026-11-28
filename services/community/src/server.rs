@@ -1659,11 +1659,23 @@ pub async fn look_at_bans_again(state: &Arc<AppState>) {
 
 /// Pruned every hour.
 pub async fn run_pruning(state: Arc<AppState>) {
+    let mut pruned_at: Option<tokio::time::Instant> = None;
     loop {
-        prune_once(&state);
-        tokio::time::sleep(PRUNE_EVERY).await;
+        if pruned_at.is_none_or(|at| at.elapsed() >= PRUNE_EVERY) {
+            prune_once(&state);
+            pruned_at = Some(tokio::time::Instant::now());
+        }
+        // With a bucket: files waiting on disk moved to it, and what was
+        // deleted removed from it (wyvrn-files' serve.rs).
+        if let Some(files) = &state.community.files {
+            wyvrn_files::serve::tend(&files.host.store).await;
+        }
+        tokio::time::sleep(TEND_EVERY.min(PRUNE_EVERY)).await;
     }
 }
+
+/// How often files waiting for the bucket are seen to.
+const TEND_EVERY: Duration = Duration::from_secs(15);
 
 /// DIDComm messages one address may send a minute (WYV-62): a flood of joins from
 /// fresh DIDs, or of anything, comes from somewhere. Behind the trusted proxies,

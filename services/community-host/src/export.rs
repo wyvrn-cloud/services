@@ -234,7 +234,7 @@ impl Host {
         let token = token();
         let staging = exports.join(&token);
         let data = staging.join("data");
-        self.snapshot(name, &data)?;
+        self.snapshot(name, &data, true)?;
         // Not moving any more, where it arrives.
         let exported = wyvrn_community::store::Store::open(&Location::Sqlite(data.join("community.sqlite")))?;
         exported.set_setting(wyvrn_community::community::MOVING_SETTING, "0")?;
@@ -271,7 +271,11 @@ impl Host {
     /// Everything `name` keeps, into `data` as the single `wyvrn-community` keeps
     /// a community in SQLite: its keys, its store, its packs, its files. What an
     /// export (here) and a backup (backups.rs) are made of. Blocks.
-    pub fn snapshot(&self, name: &str, data: &Path) -> anyhow::Result<()> {
+    ///
+    /// Files kept in a bucket (buckets.rs) are brought down into it when
+    /// `from_buckets` (an export: its own server won't have the bucket); a backup
+    /// leaves them there, its records still naming the bucket, which keeps them.
+    pub fn snapshot(&self, name: &str, data: &Path, from_buckets: bool) -> anyhow::Result<()> {
         let record = self.registry.get(name)?.ok_or_else(|| anyhow::anyhow!("there is no community called {name}"))?;
         let from = self.stores(&record, record.storage)?;
         std::fs::create_dir_all(data.join("files"))?;
@@ -298,6 +302,17 @@ impl Host {
             wyvrn_files::store::Store::open(&to, &data.join("files"))?;
             copy_store(files, &to, "files", &[])?;
             copy_dir(&self.folder(name).join("files"), &data.join("files"))?;
+            if from_buckets {
+                let (bucket, former) = self.files_buckets(&record);
+                let buckets = bucket.iter().chain(former.iter()).map(wyvrn_files::bucket::Bucket::new).collect::<anyhow::Result<Vec<_>>>()?;
+                let copy = wyvrn_files::store::Store::open(&to, &data.join("files"))?.with_buckets(None, buckets);
+                let brought = std::thread::scope(|scope| {
+                    scope.spawn(|| tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(copy.bring_to_disk())).join().map_err(|_| anyhow::anyhow!("bringing files down panicked"))?
+                })?;
+                if brought > 0 {
+                    tracing::info!(community = %name, brought, "files brought down from its bucket into its export");
+                }
+            }
         }
         Ok(())
     }

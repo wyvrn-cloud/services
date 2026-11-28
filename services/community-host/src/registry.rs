@@ -52,7 +52,17 @@ CREATE TABLE IF NOT EXISTS domain_pending (
     token TEXT NOT NULL,
     claimed_at INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS domain_pending_by_domain ON domain_pending (domain);";
+CREATE INDEX IF NOT EXISTS domain_pending_by_domain ON domain_pending (domain);
+-- A community's own bucket for its files (buckets.rs): what its owner gave,
+-- sealed with the host's key, never readable here; whether it is the one in
+-- use (or one moved away from, files still in it); whether it answered CORS.
+CREATE TABLE IF NOT EXISTS own_buckets (
+    name TEXT PRIMARY KEY,
+    sealed TEXT NOT NULL,
+    active INTEGER NOT NULL,
+    cors INTEGER NOT NULL,
+    set_at INTEGER NOT NULL
+);";
 
 fn schema() -> Schema {
     static MYSQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -82,11 +92,29 @@ fn schema() -> Schema {
                 created_at BIGINT NOT NULL,
                 created_by {MYSQL_DID} NOT NULL
             ) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS own_buckets (
+                name VARCHAR(64) NOT NULL PRIMARY KEY,
+                sealed TEXT NOT NULL,
+                active INT NOT NULL,
+                cors INT NOT NULL,
+                set_at BIGINT NOT NULL
+            ) {MYSQL_TABLE};
             {}",
             crate::domains::mysql()
         )
     });
     Schema { sqlite: SQLITE, mysql }
+}
+
+/// A community's own bucket, sealed as the registry keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnBucket {
+    pub sealed: String,
+    /// Its files go there now; otherwise it is one moved away from, still read
+    /// until its files are moved out.
+    pub active: bool,
+    pub cors: bool,
+    pub set_at: i64,
 }
 
 /// How a community stands.
@@ -324,8 +352,32 @@ impl Registry {
     /// Forgets a community altogether (its stores are the caller's to remove).
     /// Gone for good: its place, and the domain it had, which is free again for
     /// whoever proves it next (security review WYV-75).
+    /// A community's own bucket, as kept: sealed (buckets.rs opens it), whether
+    /// it is the one in use, and whether it answered CORS.
+    pub fn own_bucket(&self, name: &str) -> anyhow::Result<Option<OwnBucket>> {
+        Ok(self.db.lock().query_row("SELECT sealed, active, cors, set_at FROM own_buckets WHERE name = ?1", params![name], |row| {
+            Ok(OwnBucket { sealed: row.get(0)?, active: row.get::<i64>(1)? != 0, cors: row.get::<i64>(2)? != 0, set_at: row.get(3)? })
+        })?)
+    }
+
+    pub fn set_own_bucket(&self, name: &str, bucket: &OwnBucket) -> anyhow::Result<()> {
+        self.db.lock().transaction(|db| -> anyhow::Result<()> {
+            db.execute("DELETE FROM own_buckets WHERE name = ?1", params![name])?;
+            db.execute(
+                "INSERT INTO own_buckets (name, sealed, active, cors, set_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![name, bucket.sealed.clone(), bucket.active as i64, bucket.cors as i64, bucket.set_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn forget_own_bucket(&self, name: &str) -> anyhow::Result<bool> {
+        Ok(self.db.lock().execute("DELETE FROM own_buckets WHERE name = ?1", params![name])? > 0)
+    }
+
     pub fn forget(&self, name: &str) -> anyhow::Result<bool> {
         self.drop_domain(name)?;
+        self.forget_own_bucket(name)?;
         Ok(self.db.lock().execute("DELETE FROM communities WHERE name = ?1", params![name])? > 0)
     }
 }

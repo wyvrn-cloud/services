@@ -86,6 +86,18 @@ wyvrn-community-host [--config <path>] picture-sizes <name> [--dry-run]
                                                                   opened and measured, those posts sent as
                                                                   edits are; once is enough, again changes
                                                                   nothing. Safe while the host runs.
+wyvrn-community-host [--config <path>] files-places <name>        how many of one's attached files, and bytes,
+                                                                  are on disk and in each bucket
+wyvrn-community-host [--config <path>] bucket-check <name> [<origin>]
+                                                                  write, read back and remove a test file in
+                                                                  the bucket its files go to, and say whether
+                                                                  a page at <origin> (http://tauri.localhost
+                                                                  unless given) may fetch from it (CORS)
+wyvrn-community-host [--config <path>] move-files-to-bucket <name>|--all
+                                                                  move every attached file not in the bucket
+                                                                  its files go to there, hashes checked before
+                                                                  and after, then the old copy removed. Safe
+                                                                  while the host runs.
 wyvrn-community-host [--config <path>] backup <name>              back one up now (backups.key set)
 wyvrn-community-host [--config <path>] open-backup <file> <out.tar.gz>
                                                                   open a backup with the backup key: the
@@ -283,6 +295,39 @@ async fn main() -> anyhow::Result<()> {
         ["tell-members", name] => {
             let host = Host::new(config.clone(), registry(&config)?);
             tokio::task::block_in_place(|| wyvrn_community_host::history::tell_members(&host, name))
+        }
+        ["files-places", name] => {
+            let host = Host::new(config.clone(), registry(&config)?);
+            wyvrn_files::commands::places(&wyvrn_community_host::buckets::files_of(&host, name)?.host.store)
+        }
+        ["bucket-check", name, rest @ ..] => {
+            let origin = match rest {
+                [] => "http://tauri.localhost",
+                [origin] => origin,
+                _ => anyhow::bail!("{}: unrecognized\n\n{USAGE}", rest.join(" ")),
+            };
+            let host = Host::new(config.clone(), registry(&config)?);
+            wyvrn_files::commands::bucket_check(&wyvrn_community_host::buckets::files_of(&host, name)?.host.store, origin).await
+        }
+        ["move-files-to-bucket", which] => {
+            let host = Host::new(config.clone(), registry(&config)?);
+            let names: Vec<String> = if *which == "--all" { host.registry.all()?.into_iter().map(|record| record.name).collect() } else { vec![which.to_string()] };
+            for name in names {
+                let files = match wyvrn_community_host::buckets::files_of(&host, &name) {
+                    Ok(files) if files.host.store.bucket().is_some() => files,
+                    Ok(_) => {
+                        println!("{name}: no bucket for its files");
+                        continue;
+                    }
+                    Err(error) => {
+                        println!("{name}: {error}");
+                        continue;
+                    }
+                };
+                println!("{name}:");
+                wyvrn_files::commands::move_to_bucket(&files.host.store).await?;
+            }
+            Ok(())
         }
         ["picture-sizes", name, rest @ ..] => {
             let dry_run = match rest {

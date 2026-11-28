@@ -204,12 +204,49 @@ impl Host {
         }
     }
 
+    /// `record`'s files removed from the buckets they are in: the host's folder
+    /// for it emptied whole, and in its owner's own bucket the files its records
+    /// name, one by one. Blocks.
+    fn empty_buckets(&self, record: &Record, stores: &Stores) -> anyhow::Result<()> {
+        let host = self.host_bucket_for(record);
+        let own = self.own_bucket_for(record).map(|(config, _)| config);
+        if host.is_none() && own.is_none() {
+            return Ok(());
+        }
+        let files = match &stores.files {
+            Some(location) => Some(wyvrn_files::store::Store::open(location, &self.folder(&record.name).join("files"))?.with_buckets(None, own.iter().map(wyvrn_files::bucket::Bucket::new).collect::<anyhow::Result<Vec<_>>>()?)),
+            None => None,
+        };
+        let work = async {
+            if let Some(config) = &host {
+                let gone = wyvrn_files::bucket::Bucket::new(config)?.delete_all().await?;
+                tracing::info!(community = %record.name, gone, "its folder in the host's bucket emptied");
+            }
+            if let Some(files) = &files {
+                let mut gone = 0;
+                for file in files.every_file()? {
+                    if let wyvrn_files::store::Kept::Bucket(bucket, key) = files.kept(&file) {
+                        bucket.delete(&key).await?;
+                        gone += 1;
+                    }
+                }
+                files.drain_doomed().await?;
+                tracing::info!(community = %record.name, gone, "its files removed from its owner's bucket");
+            }
+            anyhow::Ok(())
+        };
+        std::thread::scope(|scope| scope.spawn(|| tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(work)).join().map_err(|_| anyhow::anyhow!("emptying a bucket panicked"))?)
+    }
+
     /// Everything of `record` gone for good (security review WYV-48): its tables,
     /// wherever it is kept, its folder, and its place in the registry. For a
     /// community deleted or moved whose time to be kept has run out.
     pub fn purge(&self, record: &Record) -> anyhow::Result<()> {
         self.unload(&record.name);
         let stores = self.stores(record, record.storage)?;
+        if let Err(error) = self.empty_buckets(record, &stores) {
+            tracing::error!(community = %record.name, %error, "its files couldn't all be removed from its buckets");
+        }
         if record.storage != Storage::Sqlite {
             wyvrn_service::db::drop_store(&stores.community, "community")?;
             if let Some(stickers) = &stores.stickers {
@@ -308,7 +345,11 @@ impl Host {
             profile: Default::default(),
             voice: self.config.voice.clone(),
             stickers: Some(StickersConfig { path: folder.join("stickers.sqlite") }),
-            files: Some(FilesConfig { dir: folder.join("files"), max_file_bytes: limits.file_bytes, quota_bytes: limits.files_quota, total_bytes: limits.files_total }),
+            files: Some({
+                // The host's bucket (its own folder in it), or the owner's own (buckets.rs).
+                let (bucket, former_buckets) = self.files_buckets(record);
+                FilesConfig { dir: folder.join("files"), max_file_bytes: limits.file_bytes, quota_bytes: limits.files_quota, total_bytes: limits.files_total, bucket, former_buckets }
+            }),
             assistant: None,
             // Each community's web view is at its own address, under the host's, or
             // at its own domain once proved (domains.rs).
@@ -377,8 +418,11 @@ impl Host {
         let config = self.settings(record);
         let stores = self.stores(record, record.storage)?;
         let owner_pages: Arc<dyn wyvrn_service::admin::Pages> = Arc::new(crate::domains::Both(
-            Arc::new(crate::export::MoveOut { host: self.me.clone(), community: record.name.clone() }),
-            Arc::new(crate::domains::OwnDomain { host: self.me.clone(), community: record.name.clone() }),
+            Arc::new(crate::domains::Both(
+                Arc::new(crate::export::MoveOut { host: self.me.clone(), community: record.name.clone() }),
+                Arc::new(crate::domains::OwnDomain { host: self.me.clone(), community: record.name.clone() }),
+            )),
+            Arc::new(crate::buckets::OwnBucketPage { host: self.me.clone(), community: record.name.clone() }),
         ));
         let opening = Opening { profile_env: None, address: self.address(&record.name)?, voice_tokens: format!("{}.", record.name), assistant: None, owner_pages: Some(owner_pages) };
         let Opened { state, holding } = serve::open(&config, &stores, opening).await?;
