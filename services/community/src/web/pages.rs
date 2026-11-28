@@ -1138,7 +1138,21 @@ async fn post_page(State(state): State<Arc<AppState>>, Path((id, seq)): Path<(St
         return page_error(StatusCode::GONE, "Taken back", "This post was taken back, or removed.");
     }
     let root = "../../../";
-    let (around, any_older, any_newer) = match store.channel_posts_around(&channel.id, post.thread.as_deref(), post.posted_at, AROUND) {
+    // A channel's own post: those around it by number, as its pages go (by time,
+    // posts made in the same second could leave it out); a thread's, by time.
+    let found = match post.thread.as_deref() {
+        None => store.channel_posts_before(&channel.id, None, Some(seq + 1), AROUND + 1).and_then(|mut before| {
+            let mut after = store.channel_posts_after(&channel.id, None, seq, AROUND + 1)?;
+            let (older, newer) = (before.len() > AROUND, after.len() > AROUND);
+            before.truncate(AROUND);
+            after.truncate(AROUND);
+            before.reverse();
+            before.extend(after);
+            Ok((before, older, newer))
+        }),
+        Some(thread) => store.channel_posts_around(&channel.id, Some(thread), post.posted_at, AROUND),
+    };
+    let (around, any_older, any_newer) = match found {
         Ok(found) => found,
         Err(error) => return internal(error.into()),
     };
