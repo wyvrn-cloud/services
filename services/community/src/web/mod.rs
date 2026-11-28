@@ -54,6 +54,9 @@ pub const VOICE: &str = "web.voice";
 pub const PUBLIC: &str = "web.public";
 pub const PUBLIC_CHOICES: [&str; 2] = ["everyone", "chosen"];
 pub const THEME: &str = "web.theme";
+/// Whether public posts' pictures from other sites are shown, through the server
+/// (`set-web`'s `outside_pictures`): `1`, or off.
+pub const OUTSIDE: &str = "web.outside_pictures";
 pub const CSS: &str = "web.css";
 pub const DYNAMIC: &str = "oidc.dynamic";
 pub const INDIEAUTH: &str = "oidc.indieauth";
@@ -203,6 +206,10 @@ pub fn page_on(store: &Store) -> bool {
     store.setting(PAGE).ok().flatten().as_deref() == Some("1")
 }
 
+pub fn outside_pictures(store: &Store) -> bool {
+    store.setting(OUTSIDE).ok().flatten().as_deref() == Some("1")
+}
+
 pub fn voice_choice(store: &Store) -> String {
     store.setting(VOICE).ok().flatten().filter(|v| VOICE_CHOICES.contains(&v.as_str())).unwrap_or_else(|| DEFAULT_VOICE.to_string())
 }
@@ -237,7 +244,7 @@ pub fn settle_secret(store: &Store, sealing: &crate::sealing::Sealing) -> anyhow
 
 /// `community`'s `web`, for a server with a web view.
 pub fn community_body(web_url: &str, store: &Store) -> serde_json::Value {
-    let mut body = serde_json::json!({ "url": web_url, "page": page_on(store), "voice": voice_choice(store), "public_channels": public_choice(store) });
+    let mut body = serde_json::json!({ "url": web_url, "page": page_on(store), "voice": voice_choice(store), "outside_pictures": outside_pictures(store), "public_channels": public_choice(store) });
     if page_on(store) {
         body["sign_in"] = serde_json::json!(web_url.trim_end_matches('/'));
     }

@@ -4161,6 +4161,25 @@ impl Store {
         self.all_filled(posts)
     }
 
+    /// A channel's posts after `after`, oldest first: as `channel_posts_before`,
+    /// the other way.
+    pub fn channel_posts_after(&self, channel: &str, thread: Option<&str>, after: i64, limit: usize) -> Result<Vec<Post>> {
+        const IN_THREAD: &str = "(SELECT thread FROM post_state WHERE post_state.post = posts.id)";
+        let posts = match thread {
+            Some(thread) => self.db.lock().query(
+                &format!("SELECT {POST_COLUMNS} FROM posts WHERE channel = ?1 AND seq > ?2 AND {IN_THREAD} = ?4 ORDER BY seq LIMIT ?3"),
+                params![channel, after, limit as i64, thread],
+                post_from,
+            )?,
+            None => self.db.lock().query(
+                &format!("SELECT {POST_COLUMNS} FROM posts WHERE channel = ?1 AND seq > ?2 AND {IN_THREAD} IS NULL ORDER BY seq LIMIT ?3"),
+                params![channel, after, limit as i64],
+                post_from,
+            )?,
+        };
+        self.all_filled(posts)
+    }
+
     /// A channel's posts by time (then number, for posts at the same second):
     /// those before `before`, `(posted_at, seq)`, or its newest with none given,
     /// newest first. As history is read where posts were brought in from elsewhere,

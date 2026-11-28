@@ -20,7 +20,7 @@
 {% endfor %}
 </ul>
 {% else %}
-<ol class="posts">
+<ol class="posts"{% if let Some(newest) = newest %} data-newest="{{ newest }}"{% endif %}{% if let Some(search) = search_in %} data-search="{{ search }}"{% endif %}>
 {% for post in posts %}
   <li class="post{% if post.focus %} focus{% endif %}{% if post.continued %} continued{% endif %}" id="{{ post.anchor }}">
     {% if post.continued %}<a class="run-time" href="{{ post.href }}"><time datetime="{{ post.iso }}" title="{{ post.when }}">{{ post.clock }}</time></a>

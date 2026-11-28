@@ -101,6 +101,58 @@ pub fn links_in(text: &str) -> Vec<String> {
     found
 }
 
+/// GIF hosts other than KLIPY's whose files are pictures whatever they are named.
+const PICTURE_HOSTS: [&str; 8] = ["media.tenor.com", "c.tenor.com", "media.giphy.com", "i.giphy.com", "media0.giphy.com", "media1.giphy.com", "media2.giphy.com", "media3.giphy.com"];
+
+/// Whether `address` is a picture's own address at another site: a PNG, JPEG, GIF
+/// or WebP by its name, or a file at a GIF host. Not KLIPY's (shown from KLIPY) nor
+/// a pack's file (shown through `x/`).
+pub fn is_picture_address(address: &str) -> bool {
+    let Ok(url) = url::Url::parse(address) else { return false };
+    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else { return false };
+    if !matches!(url.scheme(), "https" | "http") || outside::GIF_HOSTS.contains(&host.as_str()) {
+        return false;
+    }
+    let file = url.path_segments().and_then(|mut s| s.next_back()).unwrap_or_default().to_ascii_lowercase();
+    if outside::pack_file(&file).is_some() {
+        return false;
+    }
+    let named = [".png", ".jpg", ".jpeg", ".gif", ".webp"].iter().any(|ext| file.ends_with(ext));
+    named || (PICTURE_HOSTS.contains(&host.as_str()) && !file.is_empty())
+}
+
+/// The pictures from other sites a post names (written bare, as a link, or as a
+/// Markdown picture), in order, each once, at most four; none in code.
+pub fn pictures_in(text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut add = |address: &str| {
+        let address = address.trim();
+        if is_picture_address(address) && !found.iter().any(|known| known == address) && found.len() < 4 {
+            found.push(address.to_string());
+        }
+    };
+    let (mut in_code, mut in_link) = (0usize, 0usize);
+    for event in Parser::new(text) {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => in_code += 1,
+            Event::End(TagEnd::CodeBlock) => in_code = in_code.saturating_sub(1),
+            Event::Start(Tag::Image { dest_url, .. }) if in_code == 0 => add(&dest_url),
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                in_link += 1;
+                add(&dest_url);
+            }
+            Event::End(TagEnd::Link) => in_link = in_link.saturating_sub(1),
+            Event::Text(said) if in_code == 0 && in_link == 0 => {
+                for (start, end) in super::render::bare_links(&said) {
+                    add(&said[start..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
 /// The YouTube video `address` is a link to: a watch page, a short, a `youtu.be`
 /// link, a live or an embed (as the app's youTube.ts).
 pub fn youtube_id(address: &str) -> Option<String> {
@@ -388,6 +440,21 @@ pub fn parse_page(html: &str, page: &url::Url) -> Option<Preview> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pictures_own_address_is_one_by_its_name_or_its_gif_host() {
+        assert!(is_picture_address("https://pictures.example/a/cat.PNG"));
+        assert!(is_picture_address("https://media.tenor.com/abcd/dance"));
+        assert!(is_picture_address("https://media2.giphy.com/media/x/giphy.gif"));
+        assert!(!is_picture_address("https://pictures.example/page"));
+        assert!(!is_picture_address("https://static.klipy.com/ii/a/x.webp"), "KLIPY's are shown from KLIPY");
+        assert!(!is_picture_address("https://stickers.example/955b9a2099ec16abd916638c1309866e.webp"), "a pack's file goes through x/");
+        assert!(!is_picture_address("ftp://pictures.example/cat.png"));
+        assert_eq!(
+            pictures_in("![a](https://p.example/1.jpg) [b](https://p.example/2.gif) https://p.example/3.webp `https://p.example/4.png` https://p.example/1.jpg https://p.example/x"),
+            vec!["https://p.example/1.jpg", "https://p.example/2.gif", "https://p.example/3.webp"]
+        );
+    }
+
     use super::*;
 
     #[test]

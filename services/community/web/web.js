@@ -1,8 +1,10 @@
 // The web view's one script. Every page works without it; it adds the switch
 // between light and dark (remembered in this browser), folds the channel list
-// away on a narrow screen, keeps each channel's place for the visit (starting
-// at its newest posts), runs signing in with the Digital Credentials API, and
-// shows each time in a post in the reader's own zone and way of writing dates.
+// away on a narrow screen, reads a channel a few screens at a time from where it
+// should open (its newest posts, a linked post, or the place kept for the visit)
+// with "Jump to newest" and its own find (Ctrl+F), runs signing in with the
+// Digital Credentials API, and shows each time in a post in the reader's own
+// zone and way of writing dates.
 (function () {
   'use strict'
   var KEY = 'wyvrn-web-theme'
@@ -13,6 +15,10 @@
   // Before the page is drawn, so it doesn't flash the other way.
   var chosen = saved()
   if (chosen === 'light' || chosen === 'dark') root.setAttribute('data-theme', chosen)
+  // A list of posts isn't shown until it is where it should be (postList), so it
+  // isn't seen to jump; in case anything fails, shown anyway after a moment.
+  root.classList.add('placing')
+  setTimeout(function () { root.classList.remove('placing') }, 2500)
 
   function dark() {
     var set = root.getAttribute('data-theme')
@@ -51,9 +57,9 @@
     setInterval(function () { showTimes(document, true) }, 30000)
 
     var posts = document.querySelector('ol.posts')
-    if (posts) keepPlace(posts)
+    var list = posts ? postList(posts) : null
     var live = document.querySelector('[data-live]')
-    if (posts && live && window.EventSource) followLive(live.getAttribute('data-live'), posts)
+    if (list && live && window.EventSource) followLive(live.getAttribute('data-live'), list)
   })
 
   // A time in a post (render.rs's `<time class="timestamp">`, from `<t:…>`), as
@@ -88,11 +94,11 @@
     }
   }
 
-  // A channel's newest page, kept up to date as it is read: told when the channel
-  // moves on (posting.rs's server-sent events), the page is fetched again and its
-  // posts put in place of these, the reader kept at the bottom if they were there.
-  // What is being written in the form below is left alone.
-  function followLive(url, posts) {
+  // A channel's page, kept up to date as it is read: told when the channel moves
+  // on (posting.rs's server-sent events), the list fetches its newest posts again
+  // where it reaches them (postList's `refresh`). What is being written in the
+  // form below is left alone.
+  function followLive(url, list) {
     var heard = null
     var heardVoice = null
     var source = new EventSource(url)
@@ -108,13 +114,7 @@
       if (heard === null) { heard = event.data; return }
       if (event.data === heard) return
       heard = event.data
-      var atBottom = document.documentElement.scrollHeight - window.innerHeight - window.scrollY < 48
-      fetchAgain(function (fresh) {
-        var list = fresh.querySelector('ol.posts')
-        if (!list) return
-        posts.innerHTML = list.innerHTML
-        if (atBottom) window.scrollTo(0, document.documentElement.scrollHeight)
-      })
+      list.refresh()
     })
     // Who is in voice changed: the side's list of channels again.
     source.addEventListener('voice', function (event) {
@@ -130,153 +130,547 @@
     })
   }
 
-  // Where a list of posts was left, for this visit (sessionStorage), by page: the
-  // post at the top of the screen and how far into it, or "at the bottom". Kept by
-  // post rather than by distance so that new posts don't move it. A page seen for
-  // the first time starts at the bottom, with the newest posts; a link to a post
-  // goes to that post.
+  // A list of posts read a screenful at a time. Every post the page has had is
+  // kept (`entries`, oldest first), but only a run of them is in the page: about
+  // two screens at first, never so many that the page is over four screens long
+  // (the scrollbar's handle never under a quarter). As the reader nears either
+  // end, more are put in, from what is kept or from the server's next page (the
+  // "Older posts" and "Newer posts" links, which stay in the page for search
+  // engines and for anyone without this script); those far off screen the other
+  // way are taken out, and kept.
   //
-  // Older (and, on an older page, newer) posts are loaded as the reader comes to
-  // the end of what is there, from the same pages the "Older posts" and "Newer
-  // posts" links lead to -- which stay in the page for search engines and for
-  // anyone without this script. How far back was loaded is kept with the place, so
-  // that reloading brings back the post the reader was at.
-  function keepPlace(posts) {
+  // A page opens where it should without being seen to move: at the newest posts,
+  // at the post a link names (centred), or, coming back in this visit, where the
+  // reader was (sessionStorage) -- placed before it is shown. "Jump to newest" is
+  // there whenever the newest posts aren't on screen, and Ctrl+F (Cmd+F) is the
+  // page's own find, over every post kept and then the server's search of the
+  // channel.
+  var SCREENS = 4
+  var FIRST = 2
+  function postList(posts) {
+    var html = document.documentElement
+    html.classList.add('post-list')
     var key = 'wyvrn-web-place:' + location.pathname + location.search
-    var top = function () { var bar = document.querySelector('.top'); return bar ? bar.offsetHeight : 0 }
-    var bottom = function () { return Math.max(0, document.documentElement.scrollHeight - window.innerHeight) }
-    var atBottom = function () { return bottom() - window.scrollY < 48 }
-    var olderLink = document.querySelector('.paging a[rel="prev"]')
-    var newerLink = document.querySelector('.paging a[rel="next"]')
-    // The furthest page of older posts loaded into this one, if any.
-    var loadedBack = null
+    var screen = function () { return window.innerHeight || 600 }
+    var topBar = function () { var bar = document.querySelector('.top'); return bar ? bar.offsetHeight : 0 }
+    var bottom = function () { return Math.max(0, html.scrollHeight - window.innerHeight) }
+    var nearBottom = function () { return bottom() - window.scrollY < 48 }
+    var seqOf = function (node) { var m = /^m(\d+)$/.exec(node.id || ''); return m ? +m[1] : null }
+    var textOf = function (node) { var body = node.querySelector('.body') || node; return (body.textContent || '').replace(/\s+/g, ' ').trim() }
+    var entry = function (node) { var text = textOf(node); return { id: node.id, seq: seqOf(node), node: node, text: text, lower: text.toLowerCase() } }
+
+    var entries = Array.prototype.map.call(posts.querySelectorAll(':scope > li.post'), entry)
+    var lo = 0
+    var hi = entries.length
+    var link = function (rel) { var a = document.querySelector('.paging a[rel="' + rel + '"]'); return a && a.getAttribute('href') ? a.href : null }
+    // What lies beyond what is kept, each way: a page to fetch, or nothing.
+    var olderHref = link('prev')
+    var newerHref = link('next')
+    var newestHref = posts.getAttribute('data-newest') ? new URL(posts.getAttribute('data-newest'), location.href).href : null
+    var searchHref = posts.getAttribute('data-search') ? new URL(posts.getAttribute('data-search'), location.href).href : null
+    // (Without IntersectionObserver the links stay, to be followed.)
+    if (window.IntersectionObserver) Array.prototype.forEach.call(document.querySelectorAll('.paging'), function (p) { p.hidden = true })
+    var edge = function (which) {
+      var div = document.createElement('div')
+      div.className = 'posts-edge ' + which
+      div.setAttribute('aria-live', 'polite')
+      return div
+    }
+    var topEdge = edge('older')
+    var bottomEdge = edge('newer')
+    posts.parentNode.insertBefore(topEdge, posts)
+    posts.parentNode.insertBefore(bottomEdge, posts.nextSibling)
+    var atNewest = function () { return hi === entries.length && !newerHref }
+
+    // Where the reader is: the first post under the top bar, and how far it is
+    // from it. Kept as they scroll, so that the page can be put back as it was
+    // when posts come and go, or pictures grow, above it.
+    var anchor = null
+    function noteAnchor() {
+      for (var i = lo; i < hi; i++) {
+        var box = entries[i].node.getBoundingClientRect()
+        if (box.bottom > topBar()) { anchor = { node: entries[i].node, top: box.top }; return }
+      }
+      anchor = null
+    }
+    function keepAnchor() {
+      if (anchor && anchor.node.isConnected) window.scrollBy(0, anchor.node.getBoundingClientRect().top - anchor.top)
+      noteAnchor()
+    }
+    // `change` done with what is on screen kept where it is.
+    function anchored(change) {
+      noteAnchor()
+      change()
+      keepAnchor()
+    }
+    var changing = false
+
+    // Posts far off screen taken out, from the top or the bottom, while the page
+    // is near its four screens; never one within a quarter of a screen of what is seen.
+    function trim(fromTop) {
+      anchored(function () {
+        // (A little under four, for the pages' own head and foot and what comes next.)
+        while (html.scrollHeight > (SCREENS - 0.5) * screen() && hi - lo > 1) {
+          var node = (fromTop ? entries[lo] : entries[hi - 1]).node
+          var box = node.getBoundingClientRect()
+          if (fromTop ? box.bottom > -screen() / 4 : box.top < 1.25 * screen()) break
+          node.remove()
+          if (fromTop) lo++
+          else hi--
+        }
+      })
+    }
+
+    // A page of posts (a paging link's), its posts made this page's own: their
+    // addresses made whole, since it may be at another depth (a post's page loads
+    // the channel's pages).
+    function adopt(li, base) {
+      var node = document.importNode(li, true)
+      var all = [node].concat(Array.prototype.slice.call(node.querySelectorAll('[href],[src],[action],[poster]')))
+      all.forEach(function (el) {
+        ;['href', 'src', 'action', 'poster'].forEach(function (name) {
+          var value = el.getAttribute(name)
+          if (value === null || value.charAt(0) === '#') return
+          try { el.setAttribute(name, new URL(value, base).href) } catch (e) { /* left as it was */ }
+        })
+      })
+      return node
+    }
+    function fetchPage(address, where, cache) {
+      if (where) where.textContent = where === topEdge ? 'Loading older posts…' : 'Loading newer posts…'
+      return fetch(address, { credentials: 'same-origin', cache: cache || 'default' })
+        .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text() })
+        .then(function (text) {
+          var page = new DOMParser().parseFromString(text, 'text/html')
+          var rel = function (name) { var a = page.querySelector('.paging a[rel="' + name + '"]'); return a && a.getAttribute('href') ? new URL(a.getAttribute('href'), address).href : null }
+          if (where) where.textContent = ''
+          return {
+            items: Array.prototype.map.call(page.querySelectorAll('ol.posts > li.post'), function (li) { return entry(adopt(li, address)) }),
+            prev: rel('prev'),
+            next: rel('next'),
+          }
+        })
+        .catch(function () {
+          if (where) where.textContent = 'Couldn’t load more posts. They’re tried again as you scroll.'
+          return null
+        })
+    }
+    var held = function (id) { for (var i = 0; i < entries.length; i++) if (entries[i].id === id) return i; return -1 }
+
+    // About a screen more, older or newer: from what is kept, or the server.
+    var loading = false
+    function more(older) {
+      if (loading) return Promise.resolve(false)
+      if (older ? lo > 0 : hi < entries.length) {
+        changing = true
+        anchored(function () {
+          var added = 0
+          while ((older ? lo > 0 : hi < entries.length) && added < 0.75 * screen()) {
+            var e = older ? entries[--lo] : entries[hi++]
+            if (older) posts.insertBefore(e.node, posts.firstChild)
+            else posts.appendChild(e.node)
+            added += e.node.offsetHeight
+          }
+        })
+        trim(!older)
+        changing = false
+        return Promise.resolve(true)
+      }
+      var address = older ? olderHref : newerHref
+      if (!address) return Promise.resolve(false)
+      loading = true
+      return fetchPage(address, older ? topEdge : bottomEdge).then(function (got) {
+        loading = false
+        if (!got) return false
+        var fresh = got.items.filter(function (e) { return held(e.id) < 0 })
+        if (older) {
+          olderHref = got.prev && got.prev !== address ? got.prev : null
+          entries = fresh.concat(entries)
+          lo += fresh.length
+          hi += fresh.length
+        } else {
+          newerHref = got.next && got.next !== address ? got.next : null
+          entries = entries.concat(fresh)
+        }
+        // (A page of nothing new goes on to the next one.)
+        return more(older)
+      })
+    }
+
+    // Only what is around `index` in the page, it shown as `how` says: centred,
+    // at the bottom, or at a kept place (`{ into }`).
+    function windowTo(index, how) {
+      changing = true
+      for (var i = lo; i < hi; i++) entries[i].node.remove()
+      lo = index
+      hi = index + 1
+      posts.appendChild(entries[index].node)
+      var height = function () { return posts.offsetHeight }
+      var turn = how === 'bottom'
+      while (height() < FIRST * screen() && (lo > 0 || hi < entries.length)) {
+        if ((turn || hi >= entries.length) && lo > 0) posts.insertBefore(entries[--lo].node, posts.firstChild)
+        else if (hi < entries.length) posts.appendChild(entries[hi++].node)
+        turn = !turn
+      }
+      var node = entries[index].node
+      if (how === 'bottom') window.scrollTo(0, bottom())
+      else if (how && typeof how.into === 'number') window.scrollTo(0, window.scrollY + node.getBoundingClientRect().top - topBar() + how.into)
+      else window.scrollTo(0, window.scrollY + node.getBoundingClientRect().top - (window.innerHeight - node.offsetHeight) / 2)
+      noteAnchor()
+      changing = false
+    }
+
+    // The ends: nearing one, more comes.
+    var watching = window.IntersectionObserver
+      ? new IntersectionObserver(function (seen) {
+          seen.forEach(function (entry) {
+            if (!entry.isIntersecting || placing) return
+            var older = entry.target === topEdge
+            more(older).then(function (any) {
+              // Still in sight (a short page): on again, once it has settled.
+              if (any) { watching.unobserve(entry.target); setTimeout(function () { watching.observe(entry.target) }, 120) }
+              showJump()
+            })
+          })
+        }, { rootMargin: '100% 0px' })
+      : null
+
+    // Jump to newest.
+    var jump = document.createElement('button')
+    jump.type = 'button'
+    jump.className = 'button jump-newest'
+    jump.textContent = 'Jump to newest ↓'
+    jump.hidden = true
+    document.body.appendChild(jump)
+    function showJump() {
+      jump.hidden = atNewest() && bottom() - window.scrollY < screen()
+    }
+    jump.addEventListener('click', function () {
+      if (!newerHref) {
+        windowTo(entries.length - 1, 'bottom')
+        pinned = true
+        showJump()
+      } else if (newestHref) {
+        var there = new URL(newestHref)
+        try { sessionStorage.setItem('wyvrn-web-place:' + there.pathname + there.search, JSON.stringify({ bottom: true })) } catch (e) { /* fine */ }
+        location.assign(there.href)
+      }
+    })
+
+    // Kept for this visit: the post at the top and how far into it, or the bottom.
     function read() {
       try { return JSON.parse(sessionStorage.getItem(key) || 'null') } catch (e) { return null }
     }
     function save() {
       var place = { bottom: true }
-      if (!atBottom()) {
-        var items = posts.querySelectorAll('li.post')
-        for (var i = 0; i < items.length; i++) {
-          var box = items[i].getBoundingClientRect()
-          if (box.bottom > top()) { place = { post: items[i].id, into: top() - box.top }; break }
-        }
+      if (!(atNewest() && nearBottom())) {
+        noteAnchor()
+        if (anchor) place = { post: anchor.node.id, seq: seqOf(anchor.node), into: topBar() - anchor.top }
       }
-      if (loadedBack) place.back = loadedBack
       try { sessionStorage.setItem(key, JSON.stringify(place)) } catch (e) { /* not kept: fine */ }
     }
-    // Where to be, worked out again as pictures load and move things.
-    function go() {
-      var focus = posts.querySelector('li.post.focus')
-      if (focus) return focus.scrollIntoView({ block: 'center' })
-      var place = read()
-      var post = place && place.post && document.getElementById(place.post)
-      if (post) window.scrollTo(0, window.scrollY + post.getBoundingClientRect().top - top() + (place.into || 0))
-      else window.scrollTo(0, bottom())
-    }
 
-    // The posts of the page a paging link leads to, put before (older) or after
-    // (newer) these, with the place on screen kept; and that page's own link on in
-    // the same direction, or none at its end.
-    var loading = false
-    function load(link, older) {
-      if (loading || !link || !link.getAttribute('href')) return Promise.resolve(false)
-      loading = true
-      var status = link.parentNode.querySelector('.paging-status')
-      if (status) status.textContent = older ? 'Loading older posts…' : 'Loading newer posts…'
-      var address = link.href
-      return fetch(address, { credentials: 'same-origin' })
-        .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text() })
-        .then(function (html) {
-          var page = new DOMParser().parseFromString(html, 'text/html')
-          var came = Array.prototype.filter.call(page.querySelectorAll('ol.posts > li.post'), function (li) { return !document.getElementById(li.id) })
-          var onward = page.querySelector('.paging a[rel="' + (older ? 'prev' : 'next') + '"]')
-          var anchor = older ? posts.querySelector('li.post') : null
-          var before = anchor ? anchor.getBoundingClientRect().top : 0
-          came.forEach(function (li) {
-            var node = document.importNode(li, true)
-            if (older) posts.insertBefore(node, anchor)
-            else posts.appendChild(node)
-          })
-          // What was on screen stays where it was.
-          if (anchor) window.scrollBy(0, anchor.getBoundingClientRect().top - before)
-          if (older) loadedBack = address
-          if (onward && onward.getAttribute('href')) link.setAttribute('href', onward.getAttribute('href'))
-          else link.parentNode.remove()
-          return came.length > 0
-        })
-        .catch(function () { return false })
-        .then(function (more) {
-          loading = false
-          if (status && status.isConnected) status.textContent = ''
-          return more
-        })
-    }
-    // The links give way to loading as the reader nears them.
-    function automatic(link, older) {
-      if (!link || !window.IntersectionObserver) return
-      link.hidden = true
-      var status = document.createElement('span')
-      status.className = 'paging-status'
-      status.setAttribute('aria-live', 'polite')
-      link.parentNode.appendChild(status)
-      var watching = new IntersectionObserver(function (seen) {
-        if (!seen.some(function (entry) { return entry.isIntersecting })) return
-        load(link, older).then(function () {
-          // Still in sight (a short page): on again, once the page has settled.
-          if (link.isConnected) { watching.unobserve(link.parentNode); setTimeout(function () { if (link.isConnected) watching.observe(link.parentNode) }, 300) }
-        })
-      }, { rootMargin: '800px 0px' })
-      watching.observe(link.parentNode)
-    }
-
-    // A link to somewhere on the page is the browser's to follow.
-    if (location.hash) { automatic(olderLink, true); automatic(newerLink, false); return listen() }
-    if ('scrollRestoration' in history) history.scrollRestoration = 'manual'
-
-    // Back where the reader was: older pages loaded again, as far as they had
-    // gone, until the post they were at is here.
-    var saved = read()
-    var bringBack = function (tries) {
-      if (!saved || !saved.post || document.getElementById(saved.post) || !saved.back || !olderLink || tries <= 0) return Promise.resolve()
-      return load(olderLink, true).then(function (more) {
-        if (!more || !olderLink.isConnected) return
-        if (loadedBack === saved.back) return
-        return bringBack(tries - 1)
-      })
-    }
+    // Placing the page, unseen.
+    var placing = true
     var pinned = false
     var moved = false
-    bringBack(20).then(function () {
-      go()
-      pinned = atBottom()
-      automatic(olderLink, true)
-      automatic(newerLink, false)
-    })
-    // Pictures arriving (a pack's file fetched for the first time can take a few
-    // seconds) grow the posts. At the bottom, the page stays at the bottom, as a chat
-    // does, for as long as it is open; at a place come back to, it stays on that post
-    // until the reader moves.
+    function shown() {
+      placing = false
+      html.classList.remove('placing')
+      pinned = atNewest() && nearBottom()
+      if (watching) { watching.observe(topEdge); watching.observe(bottomEdge) }
+      showJump()
+    }
+    function place() {
+      if (!entries.length) return Promise.resolve()
+      var focus = posts.querySelector('li.post.focus')
+      var hashed = location.hash && location.hash.length > 1 ? document.getElementById(decodeURIComponent(location.hash.slice(1))) : null
+      if (focus || (hashed && hashed.matches('li.post'))) { windowTo(held((focus || hashed).id), 'center'); return Promise.resolve() }
+      if (hashed) { windowTo(entries.length - 1, 'bottom'); hashed.scrollIntoView(); return Promise.resolve() }
+      var saved = read()
+      if (saved && saved.post && held(saved.post) >= 0) { windowTo(held(saved.post), { into: saved.into || 0 }); return Promise.resolve() }
+      // Further back than this page: the posts around it fetched in its place.
+      if (saved && saved.seq && newestHref && !newerHref && entries[0] && saved.seq < entries[0].seq) {
+        var address = new URL(newestHref)
+        address.searchParams.set('after', String(Math.max(0, saved.seq - 12)))
+        return fetchPage(address.href, null).then(function (got) {
+          var at = got ? got.items.map(function (e) { return e.id }).indexOf(saved.post) : -1
+          if (at < 0) return windowTo(entries.length - 1, 'bottom')
+          for (var i = lo; i < hi; i++) entries[i].node.remove()
+          entries = got.items
+          lo = hi = 0
+          olderHref = got.prev
+          newerHref = got.next
+          windowTo(at, { into: saved.into || 0 })
+        })
+      }
+      windowTo(entries.length - 1, 'bottom')
+      return Promise.resolve()
+    }
+    if ('scrollRestoration' in history) history.scrollRestoration = 'manual'
+    place().then(function () { requestAnimationFrame(shown) })
+
+    // As pictures arrive and grow the posts: at the newest, kept at the bottom, as
+    // a chat is; anywhere else, the post read kept where it is.
     ;['wheel', 'touchstart', 'keydown', 'mousedown'].forEach(function (name) {
       window.addEventListener(name, function () { moved = true }, { passive: true })
     })
-    window.addEventListener('scroll', function () { if (moved) pinned = atBottom() }, { passive: true })
+    var pending = null
+    window.addEventListener('scroll', function () {
+      if (changing || placing) return
+      if (moved) pinned = atNewest() && nearBottom()
+      noteAnchor()
+      showJump()
+      if (pending) return
+      pending = setTimeout(function () { pending = null; save() }, 200)
+    }, { passive: true })
+    window.addEventListener('pagehide', save)
     function hold() {
-      if (loading) return
+      // (Not while posts are being put in or out: that keeps its own place. A page
+      // being fetched changes nothing until it is here.)
+      if (changing) return
       if (pinned) window.scrollTo(0, bottom())
-      else if (!moved) go()
+      else keepAnchor()
     }
     if (window.ResizeObserver) new ResizeObserver(hold).observe(posts)
     window.addEventListener('load', hold)
-    listen()
 
-    function listen() {
-      var pending = null
-      window.addEventListener('scroll', function () {
-        if (pending) return
-        pending = setTimeout(function () { pending = null; save() }, 200)
-      }, { passive: true })
-      window.addEventListener('pagehide', save)
+    // The channel moved on (posting.rs's live events): where what is kept reaches
+    // the newest, its newest page again, its posts put in place of those kept (an
+    // edit, a reaction), new ones after them, and those gone taken out.
+    function refresh() {
+      if (newerHref || !newestHref) return
+      fetchPage(newestHref, null, 'no-store').then(function (got) {
+        if (!got || !got.items.length) return
+        var first = got.items[0].seq
+        var wasPinned = pinned
+        changing = true
+        anchored(function () {
+          var ids = {}
+          got.items.forEach(function (fresh) {
+            ids[fresh.id] = true
+            var at = held(fresh.id)
+            if (at >= 0) {
+              if (at >= lo && at < hi) entries[at].node.replaceWith(fresh.node)
+              entries[at] = fresh
+            } else if (!entries.length || fresh.seq > entries[entries.length - 1].seq) {
+              var showing = hi === entries.length
+              entries.push(fresh)
+              if (showing) { posts.appendChild(fresh.node); hi++ }
+            }
+          })
+          for (var i = entries.length - 1; i >= 0; i--) {
+            var e = entries[i]
+            if (e.seq === null || e.seq < first || ids[e.id]) continue
+            if (i >= lo && i < hi) { e.node.remove(); hi-- }
+            else if (i < lo) { lo--; hi-- }
+            entries.splice(i, 1)
+          }
+        })
+        changing = false
+        if (wasPinned) window.scrollTo(0, bottom())
+        trim(true)
+        if (finding) finding.again()
+        showJump()
+      })
+    }
+
+    // The page's own find.
+    var finding = setUpFind({
+      entries: function () { return entries },
+      shown: function (i) { return i >= lo && i < hi },
+      showAt: function (i) {
+        if (i >= lo && i < hi) {
+          var node = entries[i].node
+          window.scrollTo(0, window.scrollY + node.getBoundingClientRect().top - (window.innerHeight - node.offsetHeight) / 2)
+          noteAnchor()
+        } else windowTo(i, 'center')
+        pinned = false
+        showJump()
+      },
+      search: searchHref,
+      held: held,
+    })
+
+    return { refresh: refresh }
+  }
+
+  // Ctrl+F (Cmd+F): a find bar over the posts the page has had, kept or shown, and
+  // then the server's search of this channel. Pressed again in the bar, the
+  // browser's own find; Escape closes it.
+  function setUpFind(list) {
+    var bar = document.createElement('div')
+    bar.className = 'find'
+    bar.setAttribute('role', 'search')
+    bar.hidden = true
+    bar.innerHTML =
+      '<div class="find-row">' +
+      '<input type="search" class="find-input" aria-label="Find in these posts" placeholder="Find in these posts">' +
+      '<span class="find-count" aria-live="polite"></span>' +
+      '<button type="button" class="button quiet icon find-step" data-step="-1" aria-label="Previous" title="Previous (Shift+Enter)">↑</button>' +
+      '<button type="button" class="button quiet icon find-step" data-step="1" aria-label="Next" title="Next (Enter)">↓</button>' +
+      '<button type="button" class="button quiet icon find-close" aria-label="Close" title="Close (Escape)">✕</button>' +
+      (list.search ? '<button type="button" class="button quiet find-server">Search the whole channel</button>' : '') +
+      '</div>' +
+      '<ol class="find-results" hidden></ol>'
+    document.body.appendChild(bar)
+    var input = bar.querySelector('.find-input')
+    var count = bar.querySelector('.find-count')
+    var results = bar.querySelector('.find-results')
+    var serverButton = bar.querySelector('.find-server')
+    var matches = []
+    var current = -1
+    var asked = null
+    var highlights = window.CSS && CSS.highlights && window.Highlight
+    var words = function () { return input.value.toLowerCase().split(/\s+/).filter(Boolean) }
+
+    function paint() {
+      Array.prototype.forEach.call(document.querySelectorAll('li.post.found'), function (li) { li.classList.remove('found') })
+      if (highlights) { CSS.highlights.delete('wyvrn-find'); CSS.highlights.delete('wyvrn-find-current') }
+      var all = list.entries()
+      var wanted = words()
+      if (!wanted.length) return
+      var ranges = []
+      var currentRanges = []
+      matches.forEach(function (index, n) {
+        if (!list.shown(index)) return
+        var e = all[index]
+        if (n === current) e.node.classList.add('found')
+        if (!highlights) return
+        var walker = document.createTreeWalker(e.node.querySelector('.body') || e.node, NodeFilter.SHOW_TEXT)
+        for (var text = walker.nextNode(); text; text = walker.nextNode()) {
+          var lower = text.data.toLowerCase()
+          wanted.forEach(function (word) {
+            for (var at = lower.indexOf(word); at >= 0; at = lower.indexOf(word, at + word.length)) {
+              var range = new Range()
+              range.setStart(text, at)
+              range.setEnd(text, at + word.length)
+              ;(n === current ? currentRanges : ranges).push(range)
+            }
+          })
+        }
+      })
+      CSS.highlights.set('wyvrn-find', new Highlight(...ranges))
+      CSS.highlights.set('wyvrn-find-current', new Highlight(...currentRanges))
+    }
+    function say() {
+      if (!words().length) count.textContent = ''
+      else if (!matches.length) count.textContent = 'None here'
+      else count.textContent = (current + 1) + ' of ' + matches.length
+    }
+    function find(keep) {
+      var wanted = words()
+      var all = list.entries()
+      var was = current >= 0 ? matches[current] : null
+      matches = []
+      if (wanted.length) all.forEach(function (e, i) { if (wanted.every(function (w) { return e.lower.indexOf(w) >= 0 })) matches.push(i) })
+      current = -1
+      if (matches.length) {
+        if (keep && was !== null && matches.indexOf(was) >= 0) current = matches.indexOf(was)
+        else {
+          // The newest match at or above what is on screen, as a chat's find starts.
+          current = matches.length - 1
+          for (var n = matches.length - 1; n >= 0; n--) {
+            if (list.shown(matches[n]) && all[matches[n]].node.getBoundingClientRect().top < window.innerHeight) { current = n; break }
+          }
+        }
+      }
+      say()
+      if (!keep && current >= 0) list.showAt(matches[current])
+      paint()
+      results.hidden = true
+      if (!keep && wanted.join(' ').length >= 2 && !matches.length && list.search) askSoon()
+    }
+    function step(by) {
+      if (!matches.length) return
+      current = (current + by + matches.length) % matches.length
+      list.showAt(matches[current])
+      say()
+      paint()
+    }
+    var timer = null
+    function askSoon() {
+      clearTimeout(timer)
+      timer = setTimeout(askServer, 400)
+    }
+    function askServer() {
+      var query = input.value.trim()
+      if (!list.search || query.length < 2) return
+      asked = query
+      var address = new URL(list.search)
+      address.searchParams.set('q', query)
+      results.hidden = false
+      results.innerHTML = '<li class="quiet">Searching the channel…</li>'
+      fetch(address.href, { credentials: 'same-origin' })
+        .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text() })
+        .then(function (text) {
+          if (asked !== query) return
+          var page = new DOMParser().parseFromString(text, 'text/html')
+          var found = page.querySelectorAll('ol.posts > li.post')
+          results.innerHTML = ''
+          if (!found.length) { results.innerHTML = '<li class="quiet">Nothing in the channel says that.</li>'; return }
+          Array.prototype.forEach.call(found, function (li) {
+            var time = li.querySelector('a.time')
+            var href = time ? new URL(time.getAttribute('href'), address.href).href : null
+            var item = document.createElement('li')
+            var go = document.createElement('a')
+            go.className = 'find-result'
+            if (href) go.href = href
+            var who = document.createElement('span')
+            who.className = 'author'
+            who.textContent = (li.querySelector('.author') || {}).textContent || ''
+            var when = document.createElement('span')
+            when.className = 'quiet'
+            when.textContent = ' ' + ((li.querySelector('time') || {}).textContent || '')
+            var said = document.createElement('span')
+            said.className = 'find-result-text'
+            said.textContent = ((li.querySelector('.content') || li).textContent || '').replace(/\s+/g, ' ').trim().slice(0, 160)
+            go.appendChild(who)
+            go.appendChild(when)
+            go.appendChild(said)
+            // One this page has: gone to here, not loaded again.
+            var at = list.held(li.id)
+            if (at >= 0) go.addEventListener('click', function (event) { event.preventDefault(); list.showAt(at) })
+            item.appendChild(go)
+            results.appendChild(item)
+          })
+        })
+        .catch(function () { if (asked === query) results.innerHTML = '<li class="quiet">The search didn’t answer. Try again.</li>' })
+    }
+    function open() {
+      bar.hidden = false
+      input.focus()
+      input.select()
+    }
+    function close() {
+      bar.hidden = true
+      results.hidden = true
+      matches = []
+      current = -1
+      paint()
+    }
+    input.addEventListener('input', function () { find(false) })
+    input.addEventListener('keydown', function (event) {
+      if (event.key === 'Enter') { event.preventDefault(); if (matches.length) step(event.shiftKey ? -1 : 1); else askServer() }
+      else if (event.key === 'Escape') { event.preventDefault(); close() }
+    })
+    Array.prototype.forEach.call(bar.querySelectorAll('.find-step'), function (button) {
+      button.addEventListener('click', function () { step(+button.getAttribute('data-step')) })
+    })
+    if (serverButton) serverButton.addEventListener('click', askServer)
+    bar.querySelector('.find-close').addEventListener('click', close)
+    document.addEventListener('keydown', function (event) {
+      var f = (event.key === 'f' || event.key === 'F') && (event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey
+      if (f) {
+        // Again, in the bar: the browser's own find.
+        if (!bar.hidden && document.activeElement === input) return
+        event.preventDefault()
+        open()
+      } else if (event.key === 'Escape' && !bar.hidden) close()
+    })
+    return {
+      // What is kept changed: the matches again, staying on the one shown.
+      again: function () { if (!bar.hidden && words().length) find(true) },
     }
   }
 

@@ -23,7 +23,9 @@ use crate::server::AppState;
 use crate::store::{Channel, Member, Post};
 
 /// How many posts a channel's page shows at once, and how many around a post.
-const PAGE_POSTS: usize = 50;
+/// Few: the page's script loads more as the reader goes (web.js), and keeps
+/// only about four screens of them in the page.
+const PAGE_POSTS: usize = 25;
 const AROUND: usize = 10;
 /// How far back the pages go, in pages of posts.
 const MAX_BEFORE_PAGES: i64 = 400;
@@ -313,6 +315,10 @@ struct ChannelPage {
     live: Option<String>,
     /// A gallery: its posts as a grid of their first picture or video.
     gallery: bool,
+    /// The channel's newest posts (its page with no paging), for "Jump to newest".
+    newest: Option<String>,
+    /// Searching this channel alone, for the page's find (`&q=` added).
+    search_in: Option<String>,
 }
 
 /// The form a member signed in posts with.
@@ -521,7 +527,19 @@ fn post_view(state: &AppState, post: &Post, channel: &Channel, root: &str, focus
                 height: item["height"].as_i64(),
             })
         })
-        .collect();
+        .collect::<Vec<Media>>();
+    // Pictures linked from other sites, where an admin has them shown: through
+    // this server (`i/`), so the visitor's browser still contacts no one else.
+    let mut media = media;
+    if super::outside_pictures(&state.community.store) {
+        if let Some(secret) = secret.as_deref() {
+            for address in super::preview::pictures_in(&post.content) {
+                if let Some(href) = super::outside::picture_href(secret, root, &address) {
+                    media.push(Media { kind: "image", href, name: "Picture from elsewhere".into(), size: String::new(), width: None, height: None });
+                }
+            }
+        }
+    }
     // (A private thread isn't linked, nor named, on the web.)
     let thread = post.grew.as_ref().filter(|t| !t.private);
     PostView {
@@ -765,6 +783,8 @@ async fn channel_bare(State(state): State<Arc<AppState>>, headers: HeaderMap, Pa
 #[derive(Deserialize)]
 struct Before {
     before: Option<i64>,
+    /// The posts after this one, oldest first (`?after=<seq>`): where "Newer posts" leads.
+    after: Option<i64>,
     /// The post a member signed in is answering (`?reply=<seq>`).
     reply: Option<i64>,
     /// In a wiki: the page shown (`?page=<id>`).
@@ -982,23 +1002,47 @@ async fn channel(State(state): State<Arc<AppState>>, Path((id, name)): Path<(Str
     let root = "../../";
     let store = &state.community.store;
     let before = paging.before.filter(|b| *b > 0);
-    if before.is_some_and(|b| b < channel.latest_seq - PAGE_POSTS as i64 * MAX_BEFORE_PAGES) {
+    let after = paging.after.filter(|a| *a >= 0 && before.is_none());
+    let floor = channel.latest_seq - PAGE_POSTS as i64 * MAX_BEFORE_PAGES;
+    if before.is_some_and(|b| b < floor) || after.is_some_and(|a| a < floor) {
         return page_error(StatusCode::NOT_FOUND, "Too far back", "The web shows a channel's more recent posts. Open it in Wyvrn to read further back.");
     }
-    let mut posts = match store.channel_posts_before(&channel.id, None, before, PAGE_POSTS + 1) {
-        Ok(posts) => posts,
-        Err(error) => return internal(error.into()),
+    let (posts, older, newer) = match after {
+        // Newer than a post, oldest first.
+        Some(after) => {
+            let mut posts = match store.channel_posts_after(&channel.id, None, after, PAGE_POSTS + 1) {
+                Ok(posts) => posts,
+                Err(error) => return internal(error.into()),
+            };
+            let more = posts.len() > PAGE_POSTS;
+            posts.truncate(PAGE_POSTS);
+            let last = posts.last().map_or(after, |p| p.seq);
+            let first = posts.first().map_or(after + 1, |p| p.seq);
+            posts.retain(|p| shows(p, since));
+            let older = shows_any_before(&state, &channel, first, since).then(|| format!("?before={first}"));
+            (posts, older, more.then(|| format!("?after={last}")))
+        }
+        None => {
+            let mut posts = match store.channel_posts_before(&channel.id, None, before, PAGE_POSTS + 1) {
+                Ok(posts) => posts,
+                Err(error) => return internal(error.into()),
+            };
+            let more = posts.len() > PAGE_POSTS;
+            posts.truncate(PAGE_POSTS);
+            let newest = posts.first().map(|p| p.seq);
+            let oldest = posts.last().map(|p| p.seq);
+            posts.retain(|p| shows(p, since));
+            let older = oldest.filter(|seq| more && shows_any_before(&state, &channel, *seq, since)).map(|seq| format!("?before={seq}"));
+            let newer = before.filter(|b| *b <= channel.latest_seq).map(|b| format!("?after={}", newest.unwrap_or(b - 1)));
+            posts.reverse();
+            (posts, older, newer)
+        }
     };
-    let more = posts.len() > PAGE_POSTS;
-    posts.truncate(PAGE_POSTS);
-    posts.retain(|p| shows(p, since));
-    let older = (more && posts.last().is_some_and(|p| shows_any_before(&state, &channel, p.seq, since))).then(|| format!("?before={}", posts.last().map_or(0, |p| p.seq)));
-    let newer = before.map(|b| format!("?before={}", b + PAGE_POSTS as i64)).filter(|_| before.is_some_and(|b| b <= channel.latest_seq));
-    posts.reverse();
     let shown: Vec<&Post> = posts.iter().filter(|p| !p.deleted).collect();
-    let canonical = web.absolute(&match before {
-        Some(b) => format!("{}?before={b}", channel_path(&channel.id, &channel.name)),
-        None => channel_path(&channel.id, &channel.name),
+    let canonical = web.absolute(&match (before, after) {
+        (Some(b), _) => format!("{}?before={b}", channel_path(&channel.id, &channel.name)),
+        (_, Some(a)) => format!("{}?after={a}", channel_path(&channel.id, &channel.name)),
+        _ => channel_path(&channel.id, &channel.name),
     });
     let previews = super::preview::prepare(&state, &shown).await;
     let mut views: Vec<PostView> = shown.iter().map(|p| post_view(&state, p, &channel, root, None, &previews)).collect();
@@ -1034,9 +1078,11 @@ async fn channel(State(state): State<Arc<AppState>>, Path((id, name)): Path<(Str
             compose: compose_for(&state, &viewer, &channel, root, reply),
             react_base: react_base(&viewer, &channel, root),
             quick: super::posting::QUICK_REACTIONS,
-            // The newest page only: an older one doesn't change at its foot.
-            live: before.is_none().then(|| format!("{root}ch/{}/live", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>())),
+            // Every page: the script follows it only while the newest posts are in it.
+            live: Some(format!("{root}ch/{}/live", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>())),
             gallery: channel.gallery,
+            newest: Some(format!("{root}{}", channel_path(&channel.id, &channel.name))),
+            search_in: Some(format!("{root}search?channel={}", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>())),
         }
         .render(),
         private || viewer.signed_in(),
@@ -1092,10 +1138,30 @@ async fn post_page(State(state): State<Arc<AppState>>, Path((id, seq)): Path<(St
         return page_error(StatusCode::GONE, "Taken back", "This post was taken back, or removed.");
     }
     let root = "../../../";
-    let (around, _, _) = match store.channel_posts_around(&channel.id, post.thread.as_deref(), post.posted_at, AROUND) {
+    // A channel's own post: those around it by number, as its pages go (by time,
+    // posts made in the same second could leave it out); a thread's, by time.
+    let found = match post.thread.as_deref() {
+        None => store.channel_posts_before(&channel.id, None, Some(seq + 1), AROUND + 1).and_then(|mut before| {
+            let mut after = store.channel_posts_after(&channel.id, None, seq, AROUND + 1)?;
+            let (older, newer) = (before.len() > AROUND, after.len() > AROUND);
+            before.truncate(AROUND);
+            after.truncate(AROUND);
+            before.reverse();
+            before.extend(after);
+            Ok((before, older, newer))
+        }),
+        Some(thread) => store.channel_posts_around(&channel.id, Some(thread), post.posted_at, AROUND),
+    };
+    let (around, any_older, any_newer) = match found {
         Ok(found) => found,
         Err(error) => return internal(error.into()),
     };
+    // A channel's own post goes on into the channel's pages, both ways (a thread's
+    // whole is its thread's page).
+    let at = format!("{root}{}", channel_path(&channel.id, &channel.name));
+    let (first, last) = (around.iter().map(|p| p.seq).min().unwrap_or(seq), around.iter().map(|p| p.seq).max().unwrap_or(seq));
+    let older = (post.thread.is_none() && any_older && shows_any_before(&state, &channel, first, since)).then(|| format!("{at}?before={first}"));
+    let newer = (post.thread.is_none() && any_newer).then(|| format!("{at}?after={last}"));
     let listed: Vec<&Post> = around.iter().filter(|p| !p.deleted && shows(p, since)).collect();
     let previews = super::preview::prepare(&state, &listed).await;
     let mut views: Vec<PostView> = listed.iter().map(|p| post_view(&state, p, &channel, root, Some(seq), &previews)).collect();
@@ -1124,8 +1190,8 @@ async fn post_page(State(state): State<Arc<AppState>>, Path((id, seq)): Path<(St
             channel_name: channel.name.clone(),
             topic: String::new(),
             posts: views,
-            older: None,
-            newer: None,
+            older,
+            newer,
             title,
             description: if excerpt.is_empty() { format!("A post in #{}", channel.name) } else { excerpt },
             json_ld: render::json_ld(&ld),
@@ -1136,8 +1202,10 @@ async fn post_page(State(state): State<Arc<AppState>>, Path((id, seq)): Path<(St
             compose: None,
             react_base: react_base(&viewer, &channel, root),
             quick: super::posting::QUICK_REACTIONS,
-            live: None,
+            live: post.thread.is_none().then(|| format!("{root}ch/{}/live", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>())),
             gallery: false,
+            newest: post.thread.is_none().then(|| at.clone()),
+            search_in: Some(format!("{root}search?channel={}", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>())),
         }
         .render(),
         private || viewer.signed_in(),
@@ -1201,6 +1269,8 @@ async fn thread_page(State(state): State<Arc<AppState>>, Path((id, thread)): Pat
             quick: super::posting::QUICK_REACTIONS,
             live: None,
             gallery: false,
+            newest: None,
+            search_in: None,
         }
         .render(),
         private || viewer.signed_in(),
@@ -1492,6 +1562,8 @@ async fn feed(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Res
 #[derive(Deserialize, Default)]
 pub struct Searched {
     q: Option<String>,
+    /// One channel alone (`&channel=<id>`), of those the viewer may read.
+    channel: Option<String>,
 }
 
 /// `/search?q=`: the posts that say it, in what the viewer may read here.
@@ -1507,7 +1579,7 @@ async fn search(State(state): State<Arc<AppState>>, Query(asked): Query<Searched
         Ok(readable) => readable,
         Err(error) => return internal(error),
     };
-    let within: Vec<String> = readable.keys().cloned().collect();
+    let within: Vec<String> = readable.keys().filter(|id| asked.channel.as_ref().is_none_or(|only| only == *id)).cloned().collect();
     let found = if query.trim().chars().count() >= 2 && !within.is_empty() {
         match state.community.store.search(&words, None, None, Some(&within), None, 30) {
             Ok(found) => found,
@@ -1549,6 +1621,8 @@ async fn search(State(state): State<Arc<AppState>>, Query(asked): Query<Searched
             quick: super::posting::QUICK_REACTIONS,
             live: None,
             gallery: false,
+            newest: None,
+            search_in: None,
         }
         .render(),
         true,

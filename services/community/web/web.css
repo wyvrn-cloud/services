@@ -84,6 +84,28 @@ main { min-width: 0; }
 .back { font-size: .9rem; }
 .paging { text-align: center; margin: 1rem 0; min-height: 1.5rem; }
 .paging-status { font-size: .85rem; color: var(--muted); }
+.placing ol.posts { visibility: hidden; }
+/* The script keeps the reader's place itself (web.js's postList), as posts come and go. */
+html.post-list { overflow-anchor: none; }
+.posts-edge { min-height: 1px; text-align: center; font-size: .85rem; color: var(--muted); }
+.posts-edge:not(:empty) { padding: .75rem 0; }
+.jump-newest { position: fixed; right: 1.25rem; bottom: 1.25rem; z-index: 6; background: var(--accent); border-color: var(--accent); color: var(--on-accent); box-shadow: 0 4px 16px rgb(0 0 0 / 22%); }
+.jump-newest[hidden] { display: none; }
+.find { position: fixed; top: 4.25rem; right: 1rem; z-index: 7; width: min(32rem, calc(100vw - 2rem)); padding: .5rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); box-shadow: 0 6px 24px rgb(0 0 0 / 20%); }
+.find[hidden] { display: none; }
+.find-row { display: flex; align-items: center; gap: .35rem; flex-wrap: wrap; }
+.find-input { flex: 1 1 8rem; min-width: 0; font: inherit; padding: .4rem .7rem; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--text); }
+.find-count { font-size: .85rem; color: var(--muted); min-width: 3.5rem; text-align: right; }
+.find-server { flex: 1 0 100%; justify-content: center; }
+.find-results { list-style: none; margin: .5rem 0 0; padding: 0; max-height: 50vh; overflow: auto; border-top: 1px solid var(--border); }
+.find-results li { padding: .45rem .25rem; border-bottom: 1px solid var(--border); font-size: .9rem; }
+.find-result { display: block; color: var(--text); }
+.find-result:hover { text-decoration: none; background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.find-result-text { display: block; color: var(--muted); overflow-wrap: anywhere; }
+.post.found { box-shadow: inset 3px 0 0 var(--accent); }
+::highlight(wyvrn-find) { background-color: color-mix(in srgb, #ffd60a 45%, transparent); color: inherit; }
+::highlight(wyvrn-find-current) { background-color: #ff9f0a; color: #111114; }
+@media (max-width: 820px) { .find { top: 3.75rem; right: .5rem; width: calc(100vw - 1rem); } .jump-newest { right: 1rem; bottom: 1rem; } }
 .posts { list-style: none; margin: 0; padding: 0; }
 .post { display: grid; grid-template-columns: 40px minmax(0, 1fr); gap: .85rem; padding: .85rem .6rem; border-radius: var(--radius); scroll-margin-top: 5rem; }
 .post:hover { background: color-mix(in srgb, var(--surface) 60%, transparent); }
