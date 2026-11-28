@@ -3,9 +3,11 @@
 //! attachment by reference. It keeps bytes; it doesn't look at them.
 
 pub mod admin;
+pub mod bucket;
 pub mod config;
 pub mod hash;
 pub mod host;
 pub mod policy;
+pub mod serve;
 pub mod server;
 pub mod store;

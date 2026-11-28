@@ -54,7 +54,9 @@ that passes the domain to it ([`deploy/services`](../../deploy/services)).
 | `FILES_QUOTA_BYTES` | How much each uploader may keep in all. 10 GiB. |
 | `FILES_MAX_FILE_BYTES` | The largest file. 4 GiB. |
 | `FILES_DIR` | Where the bytes are. `data/files`. |
-| `FILES_DATABASE_URL` | Its records (and its keys) in MySQL or MariaDB instead of SQLite: `mysql://user:password@host/database`, a database of its own ([the root README](../../README.md)). The bytes are on disk either way. |
+| `FILES_DATABASE_URL` | Its records (and its keys) in MySQL or MariaDB instead of SQLite: `mysql://user:password@host/database`, a database of its own ([the root README](../../README.md)). The bytes are on disk, or in a bucket (below), either way. |
+| `FILES_BUCKET_ENDPOINT`, `_NAME`, `_REGION`, `_PREFIX`, `_DOWNLOADS` | An S3-compatible bucket for stored files instead of `FILES_DIR` (or `[bucket]` in the config file). See "In a bucket". |
+| `FILES_BUCKET_KEY`, `FILES_BUCKET_SECRET` | Its access key and secret. Only ever from the environment (or the variables `[bucket]`'s `key_env` and `secret_env` name). |
 | `FILES_PUBLIC_ADDRESS` | An address for it at the DID host (`did:web:id.example:official:files`), to be known by. The name is set aside for it first: `wyvrn-did-host assign official:files did:web:files.example`. |
 | `FILES_PROFILE_NAME`, `_DESCRIPTION`, `_PICTURE` | Who it says it is to someone looking its DID up. |
 
@@ -76,9 +78,12 @@ going (16) are in `config/default.toml`'s `[service]`.
 On the same store, with the service running or not:
 
 ```sh
-wyvrn-files files           # every file: id, state, name, bytes held/promised, expiry, owner
+wyvrn-files files           # every file: id, state, where it is, name, bytes held/promised, expiry, owner
 wyvrn-files remove <id>     # take one away
 wyvrn-files prune           # remove what is past its time now (the service does this every 10 minutes)
+wyvrn-files places          # how many files, and bytes, are on disk and in each bucket
+wyvrn-files bucket-check [<origin>]   # write, read back and remove a test file; and whether apps may fetch from it
+wyvrn-files move-to-bucket  # move every file not in the bucket there, hashes checked before and after
 ```
 
 ## What it keeps
@@ -96,11 +101,52 @@ by DID. An uploader that wants the host unable to read a file encrypts it
 before upload and sends the key in the message that shares it
 (`chat-message/1.0`'s `ciphering`); nothing here changes for that.
 
+## In a bucket
+
+With a bucket configured (Linode Object Storage, MinIO, AWS S3, anything that
+speaks S3), stored files are kept there instead of on disk:
+
+```toml
+[bucket]
+endpoint = "https://us-east-1.linodeobjects.com"
+name = "wyvrn-files"
+region = "us-east-1"
+prefix = "files"          # a folder of the bucket for this service
+downloads = "redirect"    # or "proxy"
+link_seconds = 300
+```
+
+- **Uploads still land on disk**, a chunk at a time as ever, and are checked
+  there. Once stored, a file is moved to the bucket in the background (every 15
+  seconds) and removed from disk. Apps don't change, old ones included.
+- **Downloads** (`/f/<id>`) are a `302` to a link signed for `link_seconds`, so
+  the bytes come straight from the bucket and never pass through this machine.
+  That matters for the bill: object storage charges for what leaves it to a
+  server too (on Linode, within the same data centre as well), so passing files
+  on would pay for every byte twice. `downloads = "proxy"` passes them on
+  instead, Range and all, if the bucket must not be seen.
+- **The bucket must allow CORS** for redirects: the apps follow a download link
+  with the page's own `fetch`, from another origin. Allow `GET` and `HEAD` from
+  any origin with the `Range` header, exposing `Content-Range`, `Content-Length`
+  and `ETag` (Linode's Cloud Manager, or `s3cmd setcors`). `wyvrn-files
+  bucket-check` says whether it does. MinIO allows every origin by itself.
+- **Files from before** stay where they were and are still served from there.
+  `wyvrn-files move-to-bucket` moves them, each checked against its hash before it
+  goes and read back from the bucket after, and only then removed from disk; one
+  that doesn't match is left as it is and named. Moving to another bucket is the
+  same: name the old one under `[[former_buckets]]` (with `key_env` and
+  `secret_env`), set the new one as `[bucket]`, and move.
+- A file deleted (or expired) goes at once here and is removed from the bucket
+  in the background.
+
 ## Tests
 
 ```sh
 cargo test -p wyvrn-files
 WYVRN_TEST_DATABASE_URL=mysql://root:test@127.0.0.1:13306/mysql cargo test -p wyvrn-files   # against MySQL
+# Against a bucket (tests/bucket.rs; skipped without one):
+docker run -d --rm --name wyvrn-minio-test -p 127.0.0.1:19000:9000 -e MINIO_ROOT_USER=wyvrntest -e MINIO_ROOT_PASSWORD=wyvrntest-secret minio/minio server /data
+WYVRN_TEST_BUCKET=http://127.0.0.1:19000 WYVRN_TEST_BUCKET_KEY=wyvrntest WYVRN_TEST_BUCKET_SECRET=wyvrntest-secret cargo test -p wyvrn-files --test bucket
 ```
 
 `tests/files.rs` runs the service in the process with an uploader over

@@ -14,6 +14,13 @@ wyvrn-files [--config <path>] [serve]         run the service
 wyvrn-files [--config <path>] files           every file it holds
 wyvrn-files [--config <path>] remove <id>     remove a file
 wyvrn-files [--config <path>] prune           remove what is past its time now
+wyvrn-files [--config <path>] places          how many files, and bytes, are on disk and in buckets
+wyvrn-files [--config <path>] bucket-check [<origin>]
+                                              write, read back and remove a test file in the bucket, and
+                                              say whether a page at <origin> (http://tauri.localhost unless
+                                              given) may fetch from it (CORS)
+wyvrn-files [--config <path>] move-to-bucket  move every stored file that isn't in the bucket there,
+                                              checking each hash before and after, then remove the old copy
 
 The config path is --config, else $FILES_CONFIG, else config/default.toml.";
 
@@ -36,6 +43,10 @@ async fn main() -> anyhow::Result<()> {
         ["files"] => files(&config),
         ["remove", id] => remove(&config, id),
         ["prune"] => prune(&config),
+        ["places"] => places(&config),
+        ["bucket-check"] => bucket_check(&config, "http://tauri.localhost").await,
+        ["bucket-check", origin] => bucket_check(&config, origin).await,
+        ["move-to-bucket"] => move_to_bucket(&config).await,
         ["help" | "--help" | "-h"] => {
             println!("{USAGE}");
             Ok(())
@@ -48,25 +59,67 @@ fn open_store(config: &Config) -> anyhow::Result<Store> {
     // In the file the configuration names, unless the environment names a
     // database (FILES_DATABASE_URL or DATABASE_URL: mysql://user:password@host/database).
     let location = wyvrn_service::db::Location::from_env("FILES", &config.store.path)?;
-    Store::open(&location, &config.store.dir).with_context(|| format!("store {location}"))
+    let store = Store::open(&location, &config.store.dir).with_context(|| format!("store {location}"))?;
+    let bucket = config.bucket.as_ref().map(wyvrn_files::bucket::Bucket::new).transpose()?;
+    let former = config.former_buckets.iter().map(wyvrn_files::bucket::Bucket::new).collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(store.with_buckets(bucket, former))
 }
 
 fn files(config: &Config) -> anyhow::Result<()> {
     let store = open_store(config)?;
-    let host = Host::new(store, config.service.clone(), &config.server.public_url);
-    // Every owner's files: the store lists by owner, so ask it for each.
-    let mut owners: Vec<String> = Vec::new();
-    for id in std::fs::read_dir(&config.store.dir)?.flatten().filter_map(|entry| entry.file_name().into_string().ok()) {
-        if let Some(file) = host.store.file(&id)? {
-            if !owners.contains(&file.owner) {
-                owners.push(file.owner);
-            }
-        }
+    for file in store.every_file()? {
+        println!(
+            "{}\t{}\t{}\t{}\t{}/{}\t{}\t{}",
+            file.id,
+            file.state.as_str(),
+            file.place,
+            file.name,
+            if file.state == wyvrn_files::store::State::Uploading { store.received(&file.id) } else { file.byte_count },
+            file.byte_count,
+            file.expires,
+            file.owner
+        );
     }
-    for owner in owners {
-        for file in host.store.files_of(&owner)? {
-            println!("{}\t{}\t{}\t{}/{}\t{}\t{}", file.id, file.state.as_str(), file.name, host.store.received(&file.id), file.byte_count, file.expires, file.owner);
-        }
+    Ok(())
+}
+
+fn places(config: &Config) -> anyhow::Result<()> {
+    let store = open_store(config)?;
+    for (place, count, bytes) in store.places()? {
+        println!("{place}\t{count} files\t{bytes} bytes");
+    }
+    if let Some(bucket) = store.bucket() {
+        println!("new files go to bucket:{} ({bucket:?})", bucket.tag());
+    }
+    Ok(())
+}
+
+async fn bucket_check(config: &Config, origin: &str) -> anyhow::Result<()> {
+    let store = open_store(config)?;
+    let Some(bucket) = store.bucket() else { anyhow::bail!("no bucket is configured ([bucket], or FILES_BUCKET_ENDPOINT and FILES_BUCKET_NAME)") };
+    let checked = bucket.check(origin).await?;
+    println!("the bucket takes, gives back and removes a file");
+    if checked.cors {
+        println!("a page at {origin} may fetch from it");
+    } else {
+        println!(
+            "a page at {origin} may NOT fetch from it (CORS): apps following a download link to it will fail.\n\
+             Allow GET and HEAD from any origin, the Range header, and expose Content-Range, Content-Length and ETag,\n\
+             or set downloads = \"proxy\"."
+        );
+    }
+    Ok(())
+}
+
+async fn move_to_bucket(config: &Config) -> anyhow::Result<()> {
+    let store = open_store(config)?;
+    let moved = store.move_to_bucket(|file| println!("{}\t{}\t{} bytes", file.id, file.place, file.byte_count)).await?;
+    println!("{} moved, {} bytes", moved.moved, moved.bytes);
+    for id in &moved.mismatched {
+        println!("{id}: not what its record says; left where it is");
+    }
+    for id in &moved.unreadable {
+        println!("{id}: couldn't be read; left where it is");
     }
     Ok(())
 }
@@ -120,6 +173,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         tokio::spawn(wyvrn_service::hosted_address::Holding::new(address, kept, document, ask)?.when_held(held).run());
     }
     tokio::spawn(server::run_pruning(state.clone()));
+    tokio::spawn(server::run_tending(state.clone()));
     if let Some(mediator) = &config.mediator {
         let service = Arc::new(server::FilesService(state.clone()));
         tokio::spawn(wyvrn_service::mediator::run_pickups(service, mediator.poll_every()));

@@ -18,7 +18,6 @@ use didcomm_core::resolver::DIDResolver;
 use didcomm_crypto_askar::AskarCryptoService;
 use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
-use tower_http::services::ServeFile;
 use wyvrn_service::{
     address,
     http::{internal, receive},
@@ -34,6 +33,8 @@ const REQUEST_PROFILE: &str = "https://didcomm.org/user-profile/1.0/request-prof
 
 /// How often what is past its time is removed.
 const PRUNE_EVERY: Duration = Duration::from_secs(10 * 60);
+/// How often what waits for the bucket is seen to.
+const TEND_EVERY: Duration = Duration::from_secs(15);
 
 pub struct AppState {
     pub agent: Agent,
@@ -301,37 +302,14 @@ async fn put_chunk(State(state): State<Arc<AppState>>, Path(id): Path<String>, h
     }
 }
 
-/// `GET`/`HEAD /f/<id>`: a stored file, whole or by `Range`.
+/// `GET`/`HEAD /f/<id>`: a stored file, whole or by `Range`, from disk or its
+/// bucket (serve.rs).
 async fn fetch(State(state): State<Arc<AppState>>, Path(id): Path<String>, request: Request) -> Response {
     let file = match state.host.stored(&id, now()) {
         Ok(file) => file,
         Err(error) => return fetch_response(error),
     };
-    // What a fetcher holds, if it holds the file: no need to send it twice.
-    let tag = format!("\"{}\"", file.hash);
-    if request.headers().get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(tag.as_str()) {
-        return StatusCode::NOT_MODIFIED.into_response();
-    }
-    let mut response = match ServeFile::new(state.host.store.path(&id)).try_call(request).await {
-        Ok(response) => response.into_response(),
-        Err(error) => return internal(error),
-    };
-    let headers = response.headers_mut();
-    if let Ok(value) = HeaderValue::from_str(&file.media_type) {
-        headers.insert(header::CONTENT_TYPE, value);
-    }
-    if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{}\"", file.name.replace(['"', '\\'], "_"))) {
-        headers.insert(header::CONTENT_DISPOSITION, value);
-    }
-    if let Ok(value) = HeaderValue::from_str(&tag) {
-        headers.insert(header::ETAG, value);
-    }
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=3600"));
-    // Bytes are bytes, whatever a browser might make of them: never run as a page
-    // of this host's, even opened in a tab (WYV-52).
-    headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox; default-src 'none'; frame-ancestors 'none'"));
-    response
+    crate::serve::stored_file(&state.host.store, &file, request, crate::serve::Answering { sandbox: true }).await
 }
 
 /// Removes what is past its time, now and then.
@@ -343,5 +321,14 @@ pub async fn run_pruning(state: Arc<AppState>) {
             Err(error) => tracing::warn!(%error, "pruning failed"),
         }
         tokio::time::sleep(PRUNE_EVERY).await;
+    }
+}
+
+/// With a bucket: moves what waits on disk to it, and has it remove what was
+/// deleted, every `TEND_EVERY`.
+pub async fn run_tending(state: Arc<AppState>) {
+    loop {
+        crate::serve::tend(&state.host.store).await;
+        tokio::time::sleep(TEND_EVERY).await;
     }
 }

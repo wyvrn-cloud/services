@@ -20,6 +20,16 @@ pub struct Config {
     /// Who the service says it is, to someone looking its DID up.
     #[serde(default)]
     pub profile: wyvrn_service::address::ProfileConfig,
+    /// An S3-compatible bucket stored files are kept in, rather than on disk
+    /// (bucket.rs). Its key and secret come from `FILES_BUCKET_KEY` and
+    /// `FILES_BUCKET_SECRET` (or the variables it names); the whole of it may be
+    /// given by the environment instead (`FILES_BUCKET_ENDPOINT`, `_NAME`, ...).
+    #[serde(default)]
+    pub bucket: Option<crate::bucket::BucketConfig>,
+    /// Buckets files were kept in before, still read from until moved
+    /// (`wyvrn-files move-to-bucket`). Each names its key's and secret's variables.
+    #[serde(default)]
+    pub former_buckets: Vec<crate::bucket::BucketConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -136,6 +146,14 @@ impl Config {
                 *setting = value.trim().parse().map_err(|e| anyhow::anyhow!("{name} is {value:?}: {e}"))?;
             }
         }
+        self.bucket = crate::bucket::BucketConfig::from_env("FILES", self.bucket.take())?;
+        self.former_buckets = std::mem::take(&mut self.former_buckets)
+            .into_iter()
+            .map(|former| {
+                let name = former.name.clone();
+                former.with_secrets(&format!("FILES_FORMER_BUCKET_{}_KEY", name.to_uppercase()), &format!("FILES_FORMER_BUCKET_{}_SECRET", name.to_uppercase()))
+            })
+            .collect::<anyhow::Result<_>>()?;
         if !self.server.public_url.ends_with('/') {
             self.server.public_url.push('/');
         }

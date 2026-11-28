@@ -1,11 +1,25 @@
 //! What the service keeps: a record per file (whose it is, what it is, how much
-//! of it is there, when it goes), and the bytes, one file on disk per record.
+//! of it is there, when it goes), and the bytes, one file on disk per record --
+//! or, once stored, in a bucket (bucket.rs), as the record's `place` says:
+//!
+//! - `disk`: in the directory, as every file always was.
+//! - `spool`: stored, on disk, waiting to be moved to the store's bucket
+//!   ([`Store::settle`] moves it, and then removes it from disk).
+//! - `bucket:<tag>`: in the bucket that tag names ([`Bucket::tag`]), at its key
+//!   for the file's id.
+//!
+//! An upload in progress is always on disk. A file in a bucket that is deleted
+//! has its key kept in `doomed` until the bucket has been told
+//! ([`Store::drain_doomed`]), so that nothing here waits on the network.
 //!
 //! How much of an upload is there is read from the disk, not the record: a
 //! chunk written just before a crash is on the disk and the record may not say
 //! so, and the disk is what the next chunk is appended to.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::bucket::Bucket;
 
 use wyvrn_service::db::{self, Db, Location, Row, Schema, MYSQL_DID, MYSQL_TABLE};
 use wyvrn_service::params;
@@ -46,6 +60,8 @@ pub struct FileRecord {
     pub upload_expires: i64,
     /// A stored file goes then.
     pub expires: i64,
+    /// Where its bytes are: `disk`, `spool` or `bucket:<tag>` (see the module).
+    pub place: String,
 }
 
 impl FileRecord {
@@ -71,13 +87,14 @@ pub struct NewFile<'a> {
     pub expires: i64,
 }
 
-const COLUMNS: &str = "id, owner, name, media_type, byte_count, hash, state, created, upload_expires, expires";
+const COLUMNS: &str = "id, owner, name, media_type, byte_count, hash, state, created, upload_expires, expires, place";
 
 const SQLITE: &str = r#"CREATE TABLE IF NOT EXISTS files (
         id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL, media_type TEXT NOT NULL,
         byte_count INTEGER NOT NULL, hash TEXT NOT NULL, state TEXT NOT NULL, created INTEGER NOT NULL,
-        upload_expires INTEGER NOT NULL, expires INTEGER NOT NULL);
+        upload_expires INTEGER NOT NULL, expires INTEGER NOT NULL, place TEXT NOT NULL DEFAULT 'disk');
      CREATE INDEX IF NOT EXISTS files_owner ON files (owner);
+     CREATE TABLE IF NOT EXISTS doomed (bucket_key TEXT PRIMARY KEY, place TEXT NOT NULL, at INTEGER NOT NULL);
      CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL);
      CREATE TABLE IF NOT EXISTS uploaders (
         did TEXT PRIMARY KEY, source TEXT NOT NULL, name TEXT, limits TEXT,
@@ -90,8 +107,9 @@ fn schema() -> Schema {
             r#"CREATE TABLE IF NOT EXISTS files (
                 id VARCHAR(64) NOT NULL PRIMARY KEY, owner {MYSQL_DID} NOT NULL, name VARCHAR(255) NOT NULL, media_type VARCHAR(255) NOT NULL,
                 byte_count BIGINT NOT NULL, hash VARCHAR(128) NOT NULL, state VARCHAR(16) NOT NULL, created BIGINT NOT NULL,
-                upload_expires BIGINT NOT NULL, expires BIGINT NOT NULL,
+                upload_expires BIGINT NOT NULL, expires BIGINT NOT NULL, place VARCHAR(64) NOT NULL DEFAULT 'disk',
                 INDEX files_owner (owner)) {MYSQL_TABLE};
+            CREATE TABLE IF NOT EXISTS doomed (bucket_key VARCHAR(512) NOT NULL PRIMARY KEY, place VARCHAR(64) NOT NULL, at BIGINT NOT NULL) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS settings (name VARCHAR(64) NOT NULL PRIMARY KEY, value TEXT NOT NULL) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS uploaders (
                 did {MYSQL_DID} NOT NULL PRIMARY KEY, source VARCHAR(16) NOT NULL, name VARCHAR(255), limits TEXT,
@@ -104,6 +122,30 @@ fn schema() -> Schema {
 pub struct Store {
     db: Db,
     dir: PathBuf,
+    /// Where stored files go from now on, if not on disk.
+    bucket: Option<Arc<Bucket>>,
+    /// Buckets files may still be in from before (another one moved away from).
+    known: Vec<Arc<Bucket>>,
+}
+
+/// Where a file's bytes are, as its record says.
+#[derive(Debug, Clone)]
+pub enum Kept {
+    Disk(PathBuf),
+    Bucket(Arc<Bucket>, String),
+    /// In a bucket this store isn't given: its tag.
+    Lost(String),
+}
+
+/// What [`Store::move_to_bucket`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Moved {
+    pub moved: usize,
+    pub bytes: u64,
+    /// Files whose bytes weren't what their record says, left where they were.
+    pub mismatched: Vec<String>,
+    /// Files that couldn't be read where they are, left there.
+    pub unreadable: Vec<String>,
 }
 
 /// A file's id: 20 random bytes, base64url. Unguessable, and safe in a path.
@@ -124,7 +166,31 @@ pub fn is_id(id: &str) -> bool {
 impl Store {
     pub fn open(location: &Location, dir: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir).map_err(|e| anyhow::anyhow!("making {}: {e}", dir.display()))?;
-        Ok(Self { db: Db::open(location, &schema(), "files")?, dir: dir.to_path_buf() })
+        let store = Self { db: Db::open(location, &schema(), "files")?, dir: dir.to_path_buf(), bucket: None, known: Vec::new() };
+        store.add_columns()?;
+        Ok(store)
+    }
+
+    /// Keeps stored files in `bucket` from now on, and reads them from it and
+    /// from `known` (buckets moved away from). What is on disk stays readable.
+    pub fn with_buckets(mut self, bucket: Option<Bucket>, known: Vec<Bucket>) -> Self {
+        self.bucket = bucket.map(Arc::new);
+        self.known = known.into_iter().map(Arc::new).collect();
+        self
+    }
+
+    /// The bucket stored files go to, if there is one.
+    pub fn bucket(&self) -> Option<&Arc<Bucket>> {
+        self.bucket.as_ref()
+    }
+
+    /// `place`, added to a store made before it (neither SQLite nor MySQL 8 has
+    /// `ADD COLUMN IF NOT EXISTS`, so "duplicate column" is taken as its being there).
+    fn add_columns(&self) -> anyhow::Result<()> {
+        match self.db.lock().execute("ALTER TABLE files ADD COLUMN place VARCHAR(64) NOT NULL DEFAULT 'disk'", params![]) {
+            Err(error) if error.to_string().to_ascii_lowercase().contains("duplicate column") => Ok(()),
+            said => said.map(|_| ()).map_err(Into::into),
+        }
     }
 
     /// For tests: records in memory, bytes in a directory of their own under the
@@ -132,7 +198,49 @@ impl Store {
     pub fn scratch() -> anyhow::Result<Self> {
         let dir = std::env::temp_dir().join(format!("wyvrn-files-test-{}-{}", std::process::id(), new_id()));
         std::fs::create_dir_all(&dir)?;
-        Ok(Self { db: Db::scratch(&schema())?, dir })
+        Ok(Self { db: Db::scratch(&schema())?, dir, bucket: None, known: Vec::new() })
+    }
+
+    /// Where `file`'s bytes are.
+    pub fn kept(&self, file: &FileRecord) -> Kept {
+        match file.place.strip_prefix("bucket:") {
+            None => Kept::Disk(self.path(&file.id)),
+            Some(tag) => match self.bucket_tagged(tag) {
+                Some(bucket) => Kept::Bucket(bucket.clone(), bucket.key(&file.id)),
+                None => Kept::Lost(tag.to_string()),
+            },
+        }
+    }
+
+    fn bucket_tagged(&self, tag: &str) -> Option<&Arc<Bucket>> {
+        self.bucket.iter().chain(self.known.iter()).find(|b| b.tag() == tag)
+    }
+
+    /// The whole of `file`, wherever it is.
+    pub async fn read(&self, file: &FileRecord) -> anyhow::Result<Vec<u8>> {
+        match self.kept(file) {
+            Kept::Disk(path) => Ok(tokio::fs::read(path).await?),
+            Kept::Bucket(bucket, key) => bucket.get(&key).await,
+            Kept::Lost(tag) => anyhow::bail!("{} is in a bucket ({tag}) this service isn't given", file.id),
+        }
+    }
+
+    /// The same, for a caller that isn't async: a bucket is read on a thread of
+    /// its own, with a runtime of its own.
+    pub fn read_now(&self, file: &FileRecord) -> anyhow::Result<Vec<u8>> {
+        match self.kept(file) {
+            Kept::Disk(path) => Ok(std::fs::read(path)?),
+            Kept::Bucket(bucket, key) => std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let bucket = bucket.detached()?;
+                        tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(bucket.get(&key))
+                    })
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("reading {} from the bucket panicked", file.id))?
+            }),
+            Kept::Lost(tag) => anyhow::bail!("{} is in a bucket ({tag}) this service isn't given", file.id),
+        }
     }
 
     /// Where a file's bytes are, or would be.
@@ -157,6 +265,11 @@ impl Store {
             params![owner, hash, byte_count as i64],
             file_row,
         )?)
+    }
+
+    /// Every file, by id.
+    pub fn every_file(&self) -> anyhow::Result<Vec<FileRecord>> {
+        Ok(self.db.lock().query(&format!("SELECT {COLUMNS} FROM files ORDER BY id"), params![], file_row)?)
     }
 
     /// Every file `owner` has, newest first.
@@ -188,10 +301,11 @@ impl Store {
             created: file.created,
             upload_expires: file.upload_expires,
             expires: file.expires,
+            place: "disk".into(),
         };
         std::fs::File::create(self.path(&record.id))?;
         self.db.lock().execute(
-            &format!("INSERT INTO files ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"),
+            &format!("INSERT INTO files ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"),
             params![
                 record.id,
                 record.owner,
@@ -202,7 +316,8 @@ impl Store {
                 record.state.as_str(),
                 record.created,
                 record.upload_expires,
-                record.expires
+                record.expires,
+                record.place
             ],
         )?;
         Ok(record)
@@ -217,9 +332,10 @@ impl Store {
         Ok(file.metadata()?.len())
     }
 
-    /// Marks `id` stored.
+    /// Marks `id` stored: on disk, to be moved to the bucket if there is one.
     pub fn mark_stored(&self, id: &str) -> anyhow::Result<()> {
-        self.db.lock().execute("UPDATE files SET state = 'stored' WHERE id = ?1", params![id])?;
+        let place = if self.bucket.is_some() { "spool" } else { "disk" };
+        self.db.lock().execute("UPDATE files SET state = 'stored', place = ?2 WHERE id = ?1", params![id, place])?;
         Ok(())
     }
 
@@ -228,15 +344,170 @@ impl Store {
         Ok(())
     }
 
-    /// Removes the record and the bytes. Whether there was one.
+    /// Removes the record and the bytes (or, in a bucket, has them removed:
+    /// [`Self::drain_doomed`]). Whether there was one.
     pub fn delete(&self, id: &str) -> anyhow::Result<bool> {
-        let removed = self.db.lock().execute("DELETE FROM files WHERE id = ?1", params![id])?;
+        let place: Option<String> = self.db.lock().query_row("SELECT place FROM files WHERE id = ?1", params![id], |row| row.get(0))?;
+        let removed = self.db.lock().transaction(|db| -> anyhow::Result<usize> {
+            if let Some(tag) = place.as_deref().and_then(|p| p.strip_prefix("bucket:")) {
+                let key = self.bucket_tagged(tag).map(|b| b.key(id)).unwrap_or_else(|| id.to_string());
+                db.execute("DELETE FROM doomed WHERE bucket_key = ?1", params![key])?;
+                db.execute("INSERT INTO doomed (bucket_key, place, at) VALUES (?1, ?2, ?3)", params![key, place.clone(), wyvrn_service::now()])?;
+            }
+            Ok(db.execute("DELETE FROM files WHERE id = ?1", params![id])?)
+        })?;
         match std::fs::remove_file(self.path(id)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
         Ok(removed > 0)
+    }
+
+    /// Tells the buckets to remove what was deleted here. How many went. A key
+    /// in a bucket this store isn't given stays, to be told once it is.
+    pub async fn drain_doomed(&self) -> anyhow::Result<usize> {
+        let doomed = self.db.lock().query("SELECT bucket_key, place FROM doomed ORDER BY at LIMIT 500", params![], |row| Ok((row.get::<String>(0)?, row.get::<String>(1)?)))?;
+        let mut gone = 0;
+        for (key, place) in doomed {
+            let Some(bucket) = place.strip_prefix("bucket:").and_then(|tag| self.bucket_tagged(tag)) else { continue };
+            bucket.delete(&key).await?;
+            self.db.lock().execute("DELETE FROM doomed WHERE bucket_key = ?1", params![key])?;
+            gone += 1;
+        }
+        Ok(gone)
+    }
+
+    /// Moves stored files waiting on disk (`spool`) to the bucket, a few at a
+    /// time: put there, its size checked, the record changed, and then removed
+    /// from disk. How many moved. A file deleted meanwhile is removed from the
+    /// bucket again.
+    pub async fn settle(&self) -> anyhow::Result<usize> {
+        let Some(bucket) = self.bucket.clone() else { return Ok(0) };
+        let waiting = self.db.lock().query(&format!("SELECT {COLUMNS} FROM files WHERE place = 'spool' AND state = 'stored' ORDER BY created LIMIT 20"), params![], file_row)?;
+        let mut moved = 0;
+        for file in waiting {
+            let key = bucket.key(&file.id);
+            let path = self.path(&file.id);
+            bucket.put_file(&key, &path, file.byte_count).await?;
+            let there = bucket.size(&key).await?;
+            if there != Some(file.byte_count) {
+                anyhow::bail!("{} went to the bucket as {there:?} bytes, not {}", file.id, file.byte_count);
+            }
+            let place = format!("bucket:{}", bucket.tag());
+            let changed = self.db.lock().execute("UPDATE files SET place = ?2 WHERE id = ?1 AND place = 'spool'", params![file.id, place])?;
+            if changed == 0 {
+                bucket.delete(&key).await?;
+                continue;
+            }
+            let _ = std::fs::remove_file(&path);
+            moved += 1;
+        }
+        Ok(moved)
+    }
+
+    /// Moves every stored file that isn't in the bucket there (from disk, or
+    /// from a bucket moved away from), checking its hash on the way: before, as
+    /// it is read, and after, read back from the bucket. Only then is the record
+    /// changed and the old copy removed. A file that doesn't match its record is
+    /// left where it is and named.
+    pub async fn move_to_bucket(&self, mut progress: impl FnMut(&FileRecord)) -> anyhow::Result<Moved> {
+        let Some(bucket) = self.bucket.clone() else { anyhow::bail!("there is no bucket to move files to") };
+        let here = format!("bucket:{}", bucket.tag());
+        let mut moved = Moved::default();
+        let mut done: std::collections::HashSet<String> = Default::default();
+        loop {
+            let batch = self.db.lock().query(
+                &format!("SELECT {COLUMNS} FROM files WHERE state = 'stored' AND place <> ?1 ORDER BY id LIMIT 100"),
+                params![here.clone()],
+                file_row,
+            )?;
+            let batch: Vec<_> = batch.into_iter().filter(|f| !done.contains(&f.id)).collect();
+            if batch.is_empty() {
+                return Ok(moved);
+            }
+            for file in batch {
+                done.insert(file.id.clone());
+                progress(&file);
+                let key = bucket.key(&file.id);
+                let was = self.kept(&file);
+                // The bytes on disk, or brought down to disk from the other bucket.
+                let (path, fetched) = match &was {
+                    Kept::Disk(path) => (path.clone(), false),
+                    Kept::Bucket(old, old_key) => {
+                        let path = self.dir.join(format!(".moving-{}", file.id));
+                        match old.get(old_key).await {
+                            Ok(bytes) => std::fs::write(&path, bytes)?,
+                            Err(_) => {
+                                moved.unreadable.push(file.id.clone());
+                                continue;
+                            }
+                        }
+                        (path, true)
+                    }
+                    Kept::Lost(_) => {
+                        moved.unreadable.push(file.id.clone());
+                        continue;
+                    }
+                };
+                let tidy = |fetched: bool| {
+                    if fetched {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                };
+                match crate::hash::of_file(&path) {
+                    Ok(hash) if hash == file.hash => {}
+                    Ok(_) => {
+                        moved.mismatched.push(file.id.clone());
+                        tidy(fetched);
+                        continue;
+                    }
+                    Err(_) => {
+                        moved.unreadable.push(file.id.clone());
+                        tidy(fetched);
+                        continue;
+                    }
+                }
+                let size = std::fs::metadata(&path)?.len();
+                let put = bucket.put_file(&key, &path, size).await;
+                tidy(fetched);
+                put?;
+                let (digest, there) = bucket.hash(&key).await?;
+                if there != size || crate::hash::multihash(&digest.as_slice().try_into()?) != file.hash {
+                    bucket.delete(&key).await?;
+                    moved.mismatched.push(file.id.clone());
+                    continue;
+                }
+                let changed = self.db.lock().execute("UPDATE files SET place = ?2 WHERE id = ?1 AND place = ?3", params![file.id, here.clone(), file.place.clone()])?;
+                if changed == 0 {
+                    // Deleted, or moved by the mover, meanwhile.
+                    if self.file(&file.id)?.is_none_or(|f| f.place != here) {
+                        bucket.delete(&key).await?;
+                    }
+                    continue;
+                }
+                match was {
+                    Kept::Disk(path) => {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    Kept::Bucket(old, old_key) => {
+                        let _ = old.delete(&old_key).await;
+                    }
+                    Kept::Lost(_) => {}
+                }
+                moved.moved += 1;
+                moved.bytes += size;
+            }
+        }
+    }
+
+    /// How many stored files, and bytes, are in each place.
+    pub fn places(&self) -> anyhow::Result<Vec<(String, u64, u64)>> {
+        Ok(self.db.lock().query(
+            "SELECT place, COUNT(*), SUM(byte_count) FROM files WHERE state = 'stored' GROUP BY place ORDER BY place",
+            params![],
+            |row| Ok((row.get::<String>(0)?, row.get::<i64>(1)?.max(0) as u64, row.get::<Option<i64>>(2)?.unwrap_or(0).max(0) as u64)),
+        )?)
     }
 
     /// Removes every file that is past its time at `now`. How many went.
@@ -350,6 +621,7 @@ fn file_row(row: &Row) -> db::Result<FileRecord> {
         created: row.get(7)?,
         upload_expires: row.get(8)?,
         expires: row.get(9)?,
+        place: row.get(10)?,
     })
 }
 
@@ -401,6 +673,29 @@ mod tests {
         assert!(store.rotate("did:example:alice", "did:example:alice2").unwrap());
         assert_eq!(store.files_of("did:example:alice2").unwrap().len(), 1);
         assert!(!store.rotate("did:example:nobody", "did:example:x").unwrap());
+    }
+
+    #[test]
+    fn a_store_from_before_places_is_given_them_its_files_on_disk() {
+        let dir = std::env::temp_dir().join(format!("wyvrn-files-places-{}", new_id()));
+        let location = Location::Sqlite(dir.join("files.sqlite"));
+        let id = {
+            let store = Store::open(&location, &dir).unwrap();
+            let file = store.create(new("did:example:alice", &crate::hash::of_bytes(b"hi"), 2)).unwrap();
+            store.append(&file.id, b"hi").unwrap();
+            store.mark_stored(&file.id).unwrap();
+            store.db.lock().execute("ALTER TABLE files DROP COLUMN place", params![]).unwrap();
+            file.id
+        };
+        let store = Store::open(&location, &dir).unwrap();
+        let file = store.file(&id).unwrap().unwrap();
+        assert_eq!(file.place, "disk");
+        assert!(matches!(store.kept(&file), Kept::Disk(path) if path == dir.join(&id)));
+        assert_eq!(store.read_now(&file).unwrap(), b"hi");
+        // Opened again, nothing more to add.
+        drop(store);
+        Store::open(&location, &dir).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

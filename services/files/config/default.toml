@@ -38,6 +38,17 @@ upload_deadline_seconds = 86400
 # How many uploads one uploader may have going at once.
 max_uploads_in_progress = 16
 
+# To keep stored files in an S3-compatible bucket rather than on disk (README,
+# "In a bucket"). The key and secret come from FILES_BUCKET_KEY and
+# FILES_BUCKET_SECRET, never from here.
+# [bucket]
+# endpoint = "https://us-east-1.linodeobjects.com"
+# name = "wyvrn-files"
+# region = "us-east-1"
+# prefix = "files"
+# downloads = "redirect"
+# link_seconds = 300
+
 # To have messages to the service arrive through a mediator instead of at public_url:
 # [mediator]
 # did = "did:web:mediator.wyvrn.app"

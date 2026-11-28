@@ -32,6 +32,8 @@ async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
 reqwest = "0.13"
+# S3-compatible object storage (Linode, MinIO, AWS): signs requests, sent with reqwest.
+rusty-s3 = "0.12"
 rusqlite = { version = "0.41", features = ["bundled"] }
 # A service's store in MySQL or MariaDB instead (crates/wyvrn-service's `db`).
 # Without the C zlib, and with the TLS the rest of the workspace already builds.
