@@ -1135,3 +1135,57 @@ async fn pictures_from_other_sites_show_through_the_community_only_once_an_admin
     assert_eq!(answer["body"]["web"]["outside_pictures"], false);
     assert_eq!(shown(&server.text(&format!("ch/{general}/general")).await.1), 0);
 }
+
+#[tokio::test]
+async fn a_member_who_asks_is_a_member_on_the_web_and_a_copy_of_a_post_shows_only_where_that_post_is_public() {
+    let server = start(Options { public: "everyone", ..Options::default() }).await;
+    let (admin, member) = with_channels(&server).await;
+    let (general, secret) = (server.channel_id("general"), server.channel_id("secret"));
+    server.state.community.store.set_override(&secret, wyvrn_community::roles::EVERYONE_ROLE, &[], &["view_channel".to_string()]).unwrap();
+    let png = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==").unwrap();
+    let profile = json!({
+        "type": "https://didcomm.org/user-profile/1.0/profile",
+        "body": { "profile": { "displayName": "Ada", "displayPicture": "#pfp" } },
+        "attachments": [{ "id": "pfp", "media_type": "image/png", "data": { "base64": base64::engine::general_purpose::STANDARD.encode(&png) } }],
+        "return_route": "all"
+    });
+    let _ = member.agent.send(&member.server, &profile).await;
+    say(&member, &server, "general", "hello from the workshop").await;
+    let (_, page) = server.text(&format!("ch/{general}/general")).await;
+    assert!(page.contains(">Ada<"), "named as ever until they ask");
+    let at = page.find("src=\"../../p/").expect("their picture");
+    let token: String = page[at + 13..].chars().take_while(|c| *c != '"').collect();
+
+    // Asked: "A member", no picture, everywhere the web shows the post.
+    member.community("set-member-profile", json!({ "web_anonymous": true })).await;
+    let (_, page) = server.text(&format!("ch/{general}/general")).await;
+    assert!(!page.contains(">Ada<") && page.contains(">A member<"), "{page}");
+    assert!(!page.contains("src=\"../../p/"));
+    assert_eq!(server.text(&format!("p/{token}")).await.0, 404, "an address given out before shows nothing now");
+    let (_, feed) = server.text(&format!("ch/{general}/feed.atom")).await;
+    assert!(feed.contains("<name>A member</name>") && !feed.contains("Ada"), "{feed}");
+    let widget: Value = server.http.get(format!("{}widget.json", server.url)).send().await.unwrap().json().await.unwrap();
+    assert!(!widget.to_string().contains("Ada"), "{widget}");
+    let (_, found) = server.text("search?q=workshop").await;
+    assert!(found.contains("workshop") && !found.contains(">Ada<"), "{found}");
+
+    // Copies of posts: one of a public post here is drawn, as the post now reads;
+    // one of a post nobody outside may read, or of another community's, isn't.
+    let news = say(&admin, &server, "general", "We ship on Friday").await;
+    let hidden = say(&admin, &server, "secret", "The launch code is 1234").await;
+    let link = |channel: &str, seq: &Value| format!("wyvrn://community?did={}&channel={channel}&seq={seq}", server.did);
+    let copy = |channel: &str, seq: &Value, text: &str| json!({ "community": server.did, "channel": channel, "seq": seq, "author_name": "Admin", "content": text, "posted_at": 1, "as_of": 2 });
+    let (public_link, secret_link) = (link(&general, &news["body"]["seq"]), link(&secret, &hidden["body"]["seq"]));
+    let elsewhere = "wyvrn://community?did=did:web:elsewhere.example&channel=news&seq=3";
+    let shared = admin
+        .community("post", json!({ "channel": general, "content": format!("Look {public_link} and {secret_link} and {elsewhere}"), "previews": [
+            { "url": public_link, "post": copy(&general, &news["body"]["seq"], "stale copy") },
+            { "url": secret_link, "post": copy(&secret, &hidden["body"]["seq"], "The launch code is 1234") },
+            { "url": elsewhere, "post": { "community": "did:web:elsewhere.example", "channel": "news", "seq": 3, "author_name": "Bea", "content": "Elsewhere's news", "posted_at": 1, "as_of": 2 } },
+        ] }))
+        .await;
+    assert_eq!(shared["type"], format!("{C}posted"), "{shared}");
+    let (_, page) = server.text(&format!("ch/{general}/general")).await;
+    assert!(page.contains("in #general") && page.contains("We ship on Friday"), "{page}");
+    assert!(!page.contains("stale copy") && !page.contains("1234") && !page.contains("Elsewhere's news"), "{page}");
+}

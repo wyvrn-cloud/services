@@ -43,6 +43,7 @@ const MAX_PREVIEW_TITLE: usize = 300;
 const MAX_PREVIEW_DESCRIPTION: usize = 1000;
 const MAX_PREVIEW_NAME: usize = 100;
 const MAX_ID: usize = 256;
+const MAX_DID: usize = 8192;
 
 /// What a `post` carries beyond its text, checked: `media` and `attachments`, a
 /// `poll`, a forum's `title` and `tags`. `Err` says what is wrong, as
@@ -194,7 +195,8 @@ pub fn edited_extra(held: Option<&Value>, body: &Value) -> Result<Option<Value>,
 /// A copy of a post, in a preview: its named fields only, each of its type.
 fn read_copy(post: &Value, name: &mut impl FnMut(&Value) -> Result<String, (&'static str, String)>) -> Result<Value, String> {
     let id = |field: &str| post[field].as_str().filter(|v| !v.is_empty() && v.len() <= MAX_ID && !v.chars().any(char::is_control)).map(str::to_string);
-    let community = id("community").filter(|did| did.starts_with("did:")).ok_or("A copy names the community by its DID.")?;
+    // (A community at a did:peer:4 is named by its long form: thousands of characters.)
+    let community = post["community"].as_str().filter(|did| did.starts_with("did:") && did.len() <= MAX_DID && !did.chars().any(char::is_control)).map(str::to_string).ok_or("A copy names the community by its DID.")?;
     let channel = id("channel").ok_or("A copy names its channel.")?;
     let seq = post["seq"].as_i64().filter(|seq| *seq >= 1).ok_or("A copy has the post's number.")?;
     let author_name = line(&post["author_name"], MAX_COPY_NAME).ok_or("A copy says who wrote it.")?;

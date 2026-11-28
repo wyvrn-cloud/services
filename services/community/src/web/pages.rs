@@ -446,7 +446,25 @@ pub fn voice_shown(state: &AppState, viewer: &Viewer) -> String {
 }
 
 fn name_of(state: &AppState, did: &str) -> String {
+    if hidden_on_web(state, did) {
+        return "A member".to_string();
+    }
     state.community.store.member(did).ok().flatten().and_then(|m| m.name).unwrap_or_else(|| "A member".to_string())
+}
+
+/// Whether a member asked to be shown on the web as "A member", with no picture
+/// (community/1.0's `web_anonymous`): on every page, feed and widget, their
+/// posts from before included.
+fn hidden_on_web(state: &AppState, did: &str) -> bool {
+    state.community.store.member_here(did).ok().flatten().is_some_and(|here| here.web_anonymous)
+}
+
+/// Who wrote `post`, as the web shows them: their name, or "A member".
+fn author_shown(state: &AppState, post: &Post) -> String {
+    if hidden_on_web(state, &post.author_did) {
+        return "A member".to_string();
+    }
+    post.author_name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "A member".to_string())
 }
 
 /// The picture a member is shown with here: the one they chose for this community
@@ -461,6 +479,9 @@ fn shown_picture(store: &crate::store::Store, did: &str) -> Option<(String, Stri
 /// A member's picture address, as the public pages show it.
 fn picture_href(state: &AppState, did: &str, root: &str) -> Option<String> {
     let store = &state.community.store;
+    if hidden_on_web(state, did) {
+        return None;
+    }
     shown_picture(store, did)?;
     let secret = super::secret(store, &state.community.sealing()).ok()?;
     let token = store.picture_token(&store.member_key(did).ok()?, "pages", &secret).ok()?;
@@ -479,7 +500,7 @@ fn custom_emoji(written: &str) -> Option<(String, String)> {
 
 fn post_view(state: &AppState, post: &Post, channel: &Channel, root: &str, focus: Option<i64>, previews: &HashMap<String, super::preview::Preview>) -> PostView {
     let ch = format!("{root}ch/{}", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>());
-    let author = post.author_name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "A member".to_string());
+    let author = author_shown(state, post);
     let extra = post.extra.clone().unwrap_or(Value::Null);
     let attachments: HashMap<&str, &Value> = extra["attachments"].as_array().into_iter().flatten().filter_map(|a| Some((a["id"].as_str()?, a))).collect();
     // Pack files (custom emoji, stickers) are shown through this server (outside.rs).
@@ -604,9 +625,9 @@ fn post_view(state: &AppState, post: &Post, channel: &Channel, root: &str, focus
                 None => ReactionView { raw: r.emoji.clone(), text: r.emoji.clone(), picture: None, count: r.count as usize },
             })
             .collect(),
-        cards: super::preview::links_in(&post.content)
+        cards: copied_cards(state, post, root)
             .into_iter()
-            .filter_map(|address| {
+            .chain(super::preview::links_in(&post.content).into_iter().filter(|address| !copied_here(state, post, address)).filter_map(|address| {
                 let preview = previews.get(&address).filter(|p| p.shows_something())?;
                 Some(Card {
                     kind: if preview.kind == "youtube" { "youtube" } else { "page" },
@@ -618,7 +639,7 @@ fn post_view(state: &AppState, post: &Post, channel: &Channel, root: &str, focus
                     pictures: preview.pictures.iter().filter_map(|picture| secret.as_deref().and_then(|secret| super::outside::picture_href(secret, root, picture))).collect(),
                     href: address,
                 })
-            })
+            }))
             .collect(),
         thread_href: thread.map(|t| format!("{ch}/t/{}", url::form_urlencoded::byte_serialize(t.id.as_bytes()).collect::<String>())),
         thread_count: thread.map_or(0, |t| t.count),
@@ -1047,7 +1068,7 @@ async fn channel(State(state): State<Arc<AppState>>, Path((id, name)): Path<(Str
     let previews = super::preview::prepare(&state, &shown).await;
     let mut views: Vec<PostView> = shown.iter().map(|p| post_view(&state, p, &channel, root, None, &previews)).collect();
     mark_runs(&mut views);
-    let json_ld = render::json_ld(&json!({ "@context": "https://schema.org", "@type": "CollectionPage", "name": channel.name, "url": canonical, "hasPart": shown.iter().take(20).map(|p| discussion(p, web, &channel, &p.author_name.clone().unwrap_or_default())).collect::<Vec<_>>() }));
+    let json_ld = render::json_ld(&json!({ "@context": "https://schema.org", "@type": "CollectionPage", "name": channel.name, "url": canonical, "hasPart": shown.iter().take(20).map(|p| discussion(p, web, &channel, &author_shown(&state, p))).collect::<Vec<_>>() }));
     let mut site = site(&state, &viewer, root, canonical);
     site.in_app.push_str(&format!("&channel={}", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>()));
     if is_public(&state, &channel.id) {
@@ -1095,7 +1116,7 @@ fn compose_for(state: &AppState, viewer: &Viewer, channel: &Channel, root: &str,
     if channel.forum.is_some() || !state.community.may_in(&member.did, channel, "post").unwrap_or(false) {
         return None;
     }
-    let answering = reply.and_then(|seq| state.community.store.post_at(&channel.id, seq).ok().flatten()).filter(|p| !p.deleted).map(|p| (p.seq, p.author_name.clone().unwrap_or_else(|| "A member".into()), render::excerpt(&p.content, 100)));
+    let answering = reply.and_then(|seq| state.community.store.post_at(&channel.id, seq).ok().flatten()).filter(|p| !p.deleted).map(|p| (p.seq, author_shown(&state, &p), render::excerpt(&p.content, 100)));
     Some(Compose { action: format!("{root}ch/{}/post", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>()), reply: answering, placeholder: format!("Post in #{}", channel.name) })
 }
 
@@ -1166,7 +1187,7 @@ async fn post_page(State(state): State<Arc<AppState>>, Path((id, seq)): Path<(St
     let previews = super::preview::prepare(&state, &listed).await;
     let mut views: Vec<PostView> = listed.iter().map(|p| post_view(&state, p, &channel, root, Some(seq), &previews)).collect();
     mark_runs(&mut views);
-    let author = post.author_name.clone().unwrap_or_else(|| "A member".to_string());
+    let author = author_shown(&state, &post);
     let canonical = web.absolute(&format!("ch/{}/m/{seq}", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>()));
     let mut ld = discussion(&post, web, &channel, &author);
     ld["@context"] = json!("https://schema.org");
@@ -1238,7 +1259,7 @@ async fn thread_page(State(state): State<Arc<AppState>>, Path((id, thread)): Pat
     mark_runs(&mut views);
     let name = root_post.grew.as_ref().and_then(|t| t.name.clone()).or_else(|| root_post.extra.as_ref().and_then(|e| e["title"].as_str().map(str::to_string))).unwrap_or_else(|| render::excerpt(&root_post.content, 60));
     let canonical = web.absolute(&format!("ch/{}/t/{}", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>(), url::form_urlencoded::byte_serialize(thread.as_bytes()).collect::<String>()));
-    let mut ld = discussion(&root_post, web, &channel, &root_post.author_name.clone().unwrap_or_default());
+    let mut ld = discussion(&root_post, web, &channel, &author_shown(&state, &root_post));
     ld["@context"] = json!("https://schema.org");
     ld["headline"] = json!(name);
     ld["url"] = json!(canonical);
@@ -1421,6 +1442,10 @@ fn picture_response(media_type: &str, base64_data: &str) -> Response {
 async fn picture(State(state): State<Arc<AppState>>, Path(token): Path<String>) -> Response {
     let store = &state.community.store;
     let Some(member) = store.picture_holder(&token).ok().flatten().and_then(|mkey| store.member_by_key(&mkey).ok().flatten()) else { return nothing() };
+    // (An address given out before they asked shows nothing now.)
+    if hidden_on_web(&state, &member.did) {
+        return nothing();
+    }
     match shown_picture(store, &member.did) {
         Some((media_type, data)) => picture_response(&media_type, &data),
         None => nothing(),
@@ -1498,6 +1523,56 @@ mod tests {
 
 /// A post in a private thread: never on the web, whoever asks (community/1.0's
 /// "A private thread").
+/// The posts of this community that `post`'s author sent copies of with links to
+/// them (its `previews`' `post`, community/1.0), each where it is on the web for
+/// anyone: with the link it was copied for. A copy of anything else -- another
+/// community's post, or one of a channel this page doesn't show everyone -- is
+/// never drawn here: the link is all there is of it.
+fn copied_public(state: &AppState, post: &Post) -> Vec<(String, Post)> {
+    let own = state.community.own_dids();
+    let previews = post.extra.as_ref().and_then(|extra| extra["previews"].as_array().cloned()).unwrap_or_default();
+    previews
+        .iter()
+        .filter_map(|preview| {
+            let copy = &preview["post"];
+            let url = preview["url"].as_str()?.to_string();
+            if !own.iter().any(|did| copy["community"].as_str() == Some(did.as_str())) {
+                return None;
+            }
+            let (channel, since) = visible_channel(state, &anyone(), copy["channel"].as_str()?)?;
+            let found = state.community.store.post_at(&channel.id, copy["seq"].as_i64()?).ok().flatten()?;
+            (!found.deleted && shows(&found, since) && !in_private_thread(state, &found)).then_some((url, found))
+        })
+        .collect()
+}
+
+/// Whether `address` in `post` is a link drawn as a copy of a post (above).
+fn copied_here(state: &AppState, post: &Post, address: &str) -> bool {
+    copied_public(state, post).iter().any(|(url, _)| url == address)
+}
+
+/// `post`'s copies of public posts here, as cards: who wrote it and where, and
+/// what it says now (the post itself, not the copy), going to its page.
+fn copied_cards(state: &AppState, post: &Post, root: &str) -> Vec<Card> {
+    copied_public(state, post)
+        .into_iter()
+        .map(|(_, found)| {
+            let channel = state.community.store.channel(&found.channel).ok().flatten().map(|c| c.name).unwrap_or_default();
+            let id = |text: &str| url::form_urlencoded::byte_serialize(text.as_bytes()).collect::<String>();
+            Card {
+                kind: "page",
+                href: format!("{root}ch/{}/m/{}", id(&found.channel), found.seq),
+                site: None,
+                title: Some(format!("{} in #{channel}", author_shown(state, &found))),
+                description: Some(render::excerpt(&found.content, 300)).filter(|text| !text.is_empty()),
+                channel: None,
+                channel_href: None,
+                pictures: first_picture(&found).map(|_| vec![format!("{root}media/{}/0", id(&found.id))]).unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
 fn in_private_thread(state: &AppState, post: &Post) -> bool {
     post.thread.as_deref().is_some_and(|thread| state.community.store.is_private_thread(thread).unwrap_or(true))
 }
@@ -1658,7 +1733,7 @@ fn widget_body(state: &AppState, web: &Web, asked: &WidgetAsked) -> anyhow::Resu
         let since = readable.get(&channel.id).copied().flatten();
         for post in state.community.store.channel_posts_by_time(&channel.id, None, None, 10)?.into_iter().filter(|p| !p.deleted && shows(p, since)).take(5) {
             recent.push(json!({
-                "author": post.author_name.clone().unwrap_or_else(|| "A member".into()),
+                "author": author_shown(&state, &post),
                 "text": render::excerpt(&post.content, 140),
                 "at": post.posted_at,
                 "url": web.absolute(&format!("ch/{}/m/{}", url::form_urlencoded::byte_serialize(channel.id.as_bytes()).collect::<String>(), post.seq)),
