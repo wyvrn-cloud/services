@@ -1522,7 +1522,8 @@ const SQLITE: &str = "CREATE TABLE IF NOT EXISTS members (
         picture_data TEXT,
         requests INTEGER NOT NULL DEFAULT 1,
         at INTEGER NOT NULL,
-        picture_hash TEXT
+        picture_hash TEXT,
+        web_anonymous TEXT
     );
     -- Message requests passed on, one a day from a member to the same member.
     CREATE TABLE IF NOT EXISTS message_requests (
@@ -2290,7 +2291,8 @@ fn schema() -> Schema {
                 picture_data MEDIUMTEXT,
                 requests BIGINT NOT NULL DEFAULT 1,
                 at BIGINT NOT NULL,
-                picture_hash VARCHAR(32)
+                picture_hash VARCHAR(32),
+                web_anonymous VARCHAR(32)
             ) {MYSQL_TABLE};
             CREATE TABLE IF NOT EXISTS message_requests (
                 from_did {MYSQL_DID} NOT NULL,
@@ -2415,6 +2417,8 @@ impl Store {
         ("member_pictures", "hash"),
         ("member_profiles", "banner_hash"),
         ("member_here", "picture_hash"),
+        // "A member" on the web (`web_anonymous`): "1", or none.
+        ("member_here", "web_anonymous"),
     ];
 
     /// Adds [`Self::ADDED_COLUMNS`] where they aren't yet, and gives every picture

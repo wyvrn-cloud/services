@@ -35,6 +35,14 @@ const MAX_TAGS: usize = 20;
 const MAX_TAG_NAME: usize = 20;
 const MAX_POST_TAGS: usize = 5;
 const STATUSES: &[&str] = &["online", "idle", "dnd"];
+const MAX_PREVIEWS: usize = 5;
+const MAX_COPY_MEDIA: usize = 4;
+const MAX_COPY_TEXT: usize = 4000;
+const MAX_COPY_NAME: usize = 64;
+const MAX_PREVIEW_TITLE: usize = 300;
+const MAX_PREVIEW_DESCRIPTION: usize = 1000;
+const MAX_PREVIEW_NAME: usize = 100;
+const MAX_ID: usize = 256;
 
 /// What a `post` carries beyond its text, checked: `media` and `attachments`, a
 /// `poll`, a forum's `title` and `tags`. `Err` says what is wrong, as
@@ -48,20 +56,20 @@ pub fn read_extra(body: &Value, channel: &Channel, in_thread: bool, now: i64) ->
         if media.is_empty() || media.len() > MAX_ATTACHMENTS || attachments.len() > MAX_ATTACHMENTS {
             return Err(("e.p.msg.invalid-media", "A post carries one to ten things.".into()));
         }
-        for attachment in attachments {
-            // (http as well as https: what is fetched is checked against the hash.)
-            let web = |link: &str| link.starts_with("https://") || link.starts_with("http://");
-            let by_reference = attachment["data"]["links"].as_array().is_some_and(|links| !links.is_empty() && links.iter().all(|l| l.as_str().is_some_and(web)));
-            if attachment["id"].as_str().is_none() || !by_reference || attachment["data"]["hash"].as_str().is_none() {
-                return Err(("e.p.msg.invalid-media", "Each attachment is by reference: an id, web links and a hash.".into()));
-            }
-        }
+        check_attachments(attachments)?;
         let ids: Vec<&str> = attachments.iter().filter_map(|a| a["id"].as_str()).collect();
         if !media.iter().all(|item| item["attachment"].as_str().is_some_and(|id| ids.contains(&id))) {
             return Err(("e.p.msg.invalid-media", "Each media item names one of the attachments.".into()));
         }
         extra.insert("media".into(), json!(media));
         extra.insert("attachments".into(), json!(attachments));
+    }
+    if let Some(given) = body.get("previews").filter(|v| !v.is_null()) {
+        let (previews, attachments) = read_previews(given, body)?;
+        if !previews.is_empty() {
+            extra.insert("previews".into(), json!(previews));
+            with_attachments(&mut extra, attachments);
+        }
     }
     if let Some(poll) = body.get("poll").filter(|v| !v.is_null()) {
         extra.insert("poll".into(), read_poll(poll, now).map_err(|why| ("e.p.msg.invalid-poll", why))?);
@@ -88,6 +96,143 @@ pub fn read_extra(body: &Value, channel: &Channel, in_thread: bool, now: i64) ->
         }
     }
     Ok((!extra.is_empty()).then_some(Value::Object(extra)))
+}
+
+/// Each of a post's attachments by reference: an id, web links and a hash.
+fn check_attachments(attachments: &[Value]) -> Result<(), (&'static str, String)> {
+    for attachment in attachments {
+        // (http as well as https: what is fetched is checked against the hash.)
+        let web = |link: &str| link.starts_with("https://") || link.starts_with("http://");
+        let by_reference = attachment["data"]["links"].as_array().is_some_and(|links| !links.is_empty() && links.iter().all(|l| l.as_str().is_some_and(web)));
+        if attachment["id"].as_str().is_none() || !by_reference || attachment["data"]["hash"].as_str().is_none() {
+            return Err(("e.p.msg.invalid-media", "Each attachment is by reference: an id, web links and a hash.".into()));
+        }
+    }
+    Ok(())
+}
+
+/// `attachments` among a post's extras, beside any its media named, each once.
+fn with_attachments(extra: &mut Map<String, Value>, more: Vec<Value>) {
+    if more.is_empty() {
+        return;
+    }
+    let mut held: Vec<Value> = extra.get("attachments").and_then(Value::as_array).cloned().unwrap_or_default();
+    for attachment in more {
+        if !held.iter().any(|a| a["id"] == attachment["id"]) {
+            held.push(attachment);
+        }
+    }
+    extra.insert("attachments".into(), json!(held));
+}
+
+/// A post's previews of its links, as its author built them (community/1.0's
+/// `previews`, chat-message/1.0's link previews), checked and with nothing in
+/// them but what is named: each for a link `content` has, and a copy of a post
+/// (`post`) as the spec gives it. With them, the attachments they name, out of
+/// `body`'s. Shown only as the author's say: nothing in them is the server's.
+pub fn read_previews(given: &Value, body: &Value) -> Result<(Vec<Value>, Vec<Value>), (&'static str, String)> {
+    let bad = |why: &str| ("e.p.msg.invalid-preview", why.to_string());
+    let given = given.as_array().ok_or_else(|| bad("Previews are a list."))?;
+    if given.len() > MAX_PREVIEWS {
+        return Err(bad("A post has at most five previews."));
+    }
+    let content = body["content"].as_str().unwrap_or_default();
+    let offered: Vec<Value> = body["attachments"].as_array().cloned().unwrap_or_default();
+    let mut named: Vec<String> = Vec::new();
+    let mut name = |id: &Value| -> Result<String, (&'static str, String)> {
+        let id = id.as_str().filter(|id| offered.iter().any(|a| a["id"] == *id)).ok_or_else(|| bad("A preview's picture is one of the attachments."))?;
+        if !named.iter().any(|n| n == id) {
+            named.push(id.to_string());
+        }
+        Ok(id.to_string())
+    };
+    let mut previews = Vec::new();
+    for preview in given {
+        let url = preview["url"].as_str().filter(|url| !url.is_empty() && url.len() <= 2048 && content.contains(*url)).ok_or_else(|| bad("A preview is of a link the post has."))?;
+        let mut cleaned = json!({ "url": url });
+        for (field, most) in [("title", MAX_PREVIEW_TITLE), ("description", MAX_PREVIEW_DESCRIPTION), ("site_name", MAX_PREVIEW_NAME)] {
+            if let Some(text) = line(&preview[field], most) {
+                cleaned[field] = json!(text);
+            }
+        }
+        if let Some(image) = preview.get("image").filter(|v| !v.is_null()) {
+            cleaned["image"] = json!(name(image)?);
+        }
+        if let Some(post) = preview.get("post").filter(|v| !v.is_null()) {
+            cleaned["post"] = read_copy(post, &mut name).map_err(|why| bad(&why))?;
+        }
+        previews.push(cleaned);
+    }
+    let attachments: Vec<Value> = offered.into_iter().filter(|a| a["id"].as_str().is_some_and(|id| named.iter().any(|n| n == id))).collect();
+    check_attachments(&attachments)?;
+    Ok((previews, attachments))
+}
+
+/// A post's extras once an edit says its previews again (`body`'s `previews`,
+/// present): those replaced, and its attachments those its media name and the new
+/// previews do. `None` where the edit leaves them as they were.
+pub fn edited_extra(held: Option<&Value>, body: &Value) -> Result<Option<Value>, (&'static str, String)> {
+    let Some(given) = body.get("previews") else { return Ok(None) };
+    let mut extra = held.and_then(Value::as_object).cloned().unwrap_or_default();
+    let media_ids: Vec<String> = extra.get("media").and_then(Value::as_array).into_iter().flatten().filter_map(|m| m["attachment"].as_str().map(str::to_string)).collect();
+    let kept: Vec<Value> = extra.get("attachments").and_then(Value::as_array).into_iter().flatten().filter(|a| a["id"].as_str().is_some_and(|id| media_ids.iter().any(|m| m == id))).cloned().collect();
+    extra.remove("previews");
+    extra.remove("attachments");
+    if !kept.is_empty() {
+        extra.insert("attachments".into(), json!(kept));
+    }
+    if !given.is_null() {
+        let (previews, attachments) = read_previews(given, body)?;
+        if !previews.is_empty() {
+            extra.insert("previews".into(), json!(previews));
+            with_attachments(&mut extra, attachments);
+        }
+    }
+    Ok(Some(Value::Object(extra)))
+}
+
+/// A copy of a post, in a preview: its named fields only, each of its type.
+fn read_copy(post: &Value, name: &mut impl FnMut(&Value) -> Result<String, (&'static str, String)>) -> Result<Value, String> {
+    let id = |field: &str| post[field].as_str().filter(|v| !v.is_empty() && v.len() <= MAX_ID && !v.chars().any(char::is_control)).map(str::to_string);
+    let community = id("community").filter(|did| did.starts_with("did:")).ok_or("A copy names the community by its DID.")?;
+    let channel = id("channel").ok_or("A copy names its channel.")?;
+    let seq = post["seq"].as_i64().filter(|seq| *seq >= 1).ok_or("A copy has the post's number.")?;
+    let author_name = line(&post["author_name"], MAX_COPY_NAME).ok_or("A copy says who wrote it.")?;
+    let content = post["content"].as_str().ok_or("A copy has what the post said.")?;
+    if content.chars().count() > MAX_COPY_TEXT {
+        return Err("A copy says at most 4,000 characters.".into());
+    }
+    let posted_at = post["posted_at"].as_i64().ok_or("A copy says when it was posted.")?;
+    let as_of = post["as_of"].as_i64().ok_or("A copy says when it was read.")?;
+    let mut copy = json!({ "community": community, "channel": channel, "seq": seq, "author_name": author_name, "content": content, "posted_at": posted_at, "as_of": as_of });
+    for field in ["community_name", "channel_name"] {
+        if let Some(text) = line(&post[field], MAX_PREVIEW_NAME) {
+            copy[field] = json!(text);
+        }
+    }
+    if let Some(thread) = id("thread") {
+        copy["thread"] = json!(thread);
+    }
+    if let Some(edited_at) = post["edited_at"].as_i64() {
+        copy["edited_at"] = json!(edited_at);
+    }
+    if post["deleted"] == true {
+        copy["deleted"] = json!(true);
+    }
+    if let Some(media) = post.get("media").filter(|v| !v.is_null()) {
+        let media = media.as_array().filter(|m| m.len() <= MAX_COPY_MEDIA).ok_or("A copy has at most four media.")?;
+        let mut items = Vec::new();
+        for item in media {
+            let mut item = item.as_object().cloned().ok_or("A copy's media are media items.")?;
+            let attachment = name(item.get("attachment").unwrap_or(&Value::Null)).map_err(|(_, why)| why)?;
+            item.insert("attachment".into(), json!(attachment));
+            items.push(Value::Object(item));
+        }
+        if !items.is_empty() {
+            copy["media"] = json!(items);
+        }
+    }
+    Ok(copy)
 }
 
 /// A poll as a post asks it, checked and with nothing in it but what is named.

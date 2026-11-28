@@ -427,6 +427,12 @@ pub(crate) fn text_channel_name(name: &str) -> bool {
 
 const INVALID_NAME: &str = "A text channel's name is one word in lowercase: letters, digits, _, . and -, and emoji, as in design-review or 📜rules.";
 
+/// Whether a post's previews carry pictures: copies of posts with media, or a
+/// picture of their own. Posting them takes `attach_files`, as media do.
+fn copies_carry_media(extra: &Value) -> bool {
+    extra["previews"].as_array().into_iter().flatten().any(|p| p.get("image").is_some() || p["post"].get("media").is_some())
+}
+
 pub(crate) fn line(value: &Value, max: usize) -> Option<String> {
     let text: String = value.as_str()?.split_whitespace().collect::<Vec<_>>().join(" ");
     let text: String = text.chars().take(max).collect();
@@ -745,6 +751,7 @@ impl Community {
             "owners": self.owners()?,
             "you": member.did,
             "message_requests": self.store.member_here(&member.did)?.is_none_or(|here| here.requests),
+            "web_anonymous": self.store.member_here(&member.did)?.is_some_and(|here| here.web_anonymous),
             // Where its short invite links are: an invite's code after it.
             "invite_url": format!("{}/invite/", self.public_url.trim_end_matches('/')),
             "roles": self.roles_body()?,
@@ -1541,7 +1548,7 @@ impl Community {
         if let Some(buttons) = crate::bots::buttons_from(&body["buttons"]).filter(|_| matches!(self.store.bot(sender), Ok(Some(_)))) {
             extra.get_or_insert_with(|| json!({}))["buttons"] = buttons;
         }
-        if extra.as_ref().is_some_and(|extra| extra.get("media").is_some()) && !self.may_in(sender, &channel, "attach_files")? {
+        if extra.as_ref().is_some_and(|extra| extra.get("media").is_some() || copies_carry_media(extra)) && !self.may_in(sender, &channel, "attach_files")? {
             return refuse(message, "e.p.trust.not-authorized", "You can't post files in this channel.");
         }
         let mentions = self.mentions_of(body, member, &channel)?;
@@ -2062,9 +2069,20 @@ impl Community {
                     }
                     // Who it calls on is said again with it; left out, it is as it was.
                     let mentions = if body.get("mentions").is_some() { self.mentions_of(body, &member, &channel)? } else { post.mentions.clone() };
+                    // Its previews too (with copies of posts): said again, replaced.
+                    let edited = match crate::posting::edited_extra(post.extra.as_ref(), body) {
+                        Ok(edited) => edited,
+                        Err((code, why)) => return refuse(message, code, &why),
+                    };
+                    if let Some(extra) = &edited {
+                        if copies_carry_media(extra) && !self.may_in(sender, &channel, "attach_files")? {
+                            return refuse(message, "e.p.trust.not-authorized", "You can't post files in this channel.");
+                        }
+                        self.store.set_post_extra(&post.id, extra)?;
+                    }
                     if content == post.content {
                         // (What AutoMod censored stays as it was, the original with it.)
-                        if mentions != post.mentions {
+                        if mentions != post.mentions || edited.is_some() {
                             self.store.edit_post(&post.id, content, &mentions, now)?;
                         }
                     } else {

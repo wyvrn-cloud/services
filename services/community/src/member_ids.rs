@@ -100,12 +100,15 @@ pub struct MemberHere {
     pub nickname: Option<String>,
     pub picture: Option<(String, String)>,
     pub requests: bool,
+    /// Shown on the web view as "A member", with no picture (community/1.0's
+    /// `web_anonymous`).
+    pub web_anonymous: bool,
     pub at: i64,
 }
 
 impl Default for MemberHere {
     fn default() -> Self {
-        Self { nickname: None, picture: None, requests: true, at: 0 }
+        Self { nickname: None, picture: None, requests: true, web_anonymous: false, at: 0 }
     }
 }
 
@@ -275,20 +278,33 @@ impl Store {
     }
 
     pub fn member_here(&self, did: &str) -> Result<Option<MemberHere>> {
-        self.db.lock().query_row("SELECT nickname, picture_type, picture_data, requests, at FROM member_here WHERE did = ?1", params![did], |row| {
+        self.db.lock().query_row("SELECT nickname, picture_type, picture_data, requests, at, web_anonymous FROM member_here WHERE did = ?1", params![did], |row| {
             let picture = match (row.get::<Option<String>>(1)?, row.get::<Option<String>>(2)?) {
                 (Some(media_type), Some(data)) => Some((media_type, data)),
                 _ => None,
             };
-            Ok(MemberHere { nickname: row.get(0)?, picture, requests: row.get::<i64>(3)? != 0, at: row.get(4)? })
+            Ok(MemberHere { nickname: row.get(0)?, picture, requests: row.get::<i64>(3)? != 0, web_anonymous: row.get::<Option<String>>(5)?.is_some(), at: row.get(4)? })
         })
+    }
+
+    /// Of `dids`, those shown on the web view as "A member".
+    pub fn web_anonymous_among(&self, dids: &[&str]) -> Result<std::collections::HashSet<String>> {
+        let mut found = std::collections::HashSet::new();
+        for did in dids {
+            if found.contains(*did) {
+                continue;
+            }
+            let hidden: Vec<String> = self.db.lock().query("SELECT did FROM member_here WHERE did = ?1 AND web_anonymous IS NOT NULL", params![did], |row| row.get(0))?;
+            found.extend(hidden);
+        }
+        Ok(found)
     }
 
     pub fn set_member_here(&self, did: &str, here: &MemberHere) -> Result<()> {
         let mut db = self.db.lock();
         db.execute("DELETE FROM member_here WHERE did = ?1", params![did])?;
         db.execute(
-            "INSERT INTO member_here (did, nickname, picture_type, picture_data, requests, at, picture_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO member_here (did, nickname, picture_type, picture_data, requests, at, picture_hash, web_anonymous) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 did,
                 here.nickname,
@@ -296,7 +312,8 @@ impl Store {
                 here.picture.as_ref().map(|(_, data)| data.clone()),
                 i64::from(here.requests),
                 here.at,
-                here.picture.as_ref().map(|(_, data)| picture_hash(data))
+                here.picture.as_ref().map(|(_, data)| picture_hash(data)),
+                here.web_anonymous.then_some("1")
             ],
         )?;
         Ok(())
@@ -760,6 +777,13 @@ impl Community {
                 return refuse(message, "e.p.msg.invalid-profile", "Whether you take requests is true or false.");
             };
             here.requests = requests;
+        }
+        if let Some(hidden) = body.get("web_anonymous") {
+            said = true;
+            let Some(hidden) = hidden.as_bool() else {
+                return refuse(message, "e.p.msg.invalid-profile", "Whether the web shows you as \"A member\" is true or false.");
+            };
+            here.web_anonymous = hidden;
         }
         if !said {
             return refuse(message, "e.p.msg.invalid-profile", "That changes nothing.");

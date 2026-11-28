@@ -2262,6 +2262,61 @@ async fn channels_are_ordered_in_categories_newcomers_are_onboarded_and_insights
 }
 
 #[tokio::test]
+async fn a_post_carries_its_authors_previews_and_copies_of_posts_kept_and_changed_by_an_edit() {
+    let server = start_server("").await;
+    let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);
+    server.admit(&[&owner, &member]);
+    let general = open_channel(&owner, "general").await;
+    for peer in [&owner, &member] {
+        peer.community("join", json!({})).await;
+    }
+    let link = "wyvrn://community?did=did:web:elsewhere.example&channel=news&seq=7";
+    let copy = json!({ "community": "did:web:elsewhere.example", "community_name": "Elsewhere", "channel": "news", "channel_name": "news", "seq": 7, "author_name": "Bea", "content": "We ship on Friday", "posted_at": 1_700_000_000, "as_of": 1_700_000_100,
+        "media": [{ "attachment": "c1", "width": 640, "height": 480 }], "who_knows": "dropped" });
+    let picture = json!({ "id": "c1", "media_type": "image/png", "data": { "links": ["https://elsewhere.example/f/x"], "hash": "Qm1" } });
+    let posted = member.community("post", json!({ "channel": general, "id": "p1", "content": format!("Look: {link}"),
+        "previews": [{ "url": link, "title": "Bea in #news", "description": "We ship on Friday", "post": copy }], "attachments": [picture.clone(), { "id": "unused", "data": { "links": ["https://elsewhere.example/f/y"], "hash": "Qm2" } }] })).await;
+    assert_eq!(kind(&posted), "posted", "{posted}");
+    let history = owner.community("history-request", json!({ "channel": general })).await;
+    let held = history["body"]["messages"].as_array().unwrap().iter().find(|m| m["id"] == "p1").unwrap().clone();
+    assert_eq!(held["previews"][0]["post"]["content"], "We ship on Friday", "{held}");
+    assert_eq!(held["previews"][0]["post"]["media"][0]["attachment"], "c1");
+    // Only what the spec names, and only the attachments the previews name.
+    assert!(held["previews"][0]["post"].get("who_knows").is_none());
+    assert_eq!(held["attachments"], json!([picture]));
+    assert!(held.get("media").is_none());
+
+    // A preview of a link the post hasn't, a copy without its author, a picture
+    // that isn't among the attachments: refused.
+    for previews in [
+        json!([{ "url": "https://other.example/" }]),
+        json!([{ "url": link, "post": { "community": "did:web:elsewhere.example", "channel": "news", "seq": 7, "content": "x", "posted_at": 1, "as_of": 2 } }]),
+        json!([{ "url": link, "image": "nope" }]),
+    ] {
+        let refused = member.community("post", json!({ "channel": general, "content": format!("Look: {link}"), "previews": previews })).await;
+        assert_eq!(refused["body"]["code"], "e.p.msg.invalid-preview", "{refused}");
+    }
+
+    // An edit says them again: replaced, or gone with `null`; left out, kept.
+    let edited = member.ask("https://wyvrn.app/message-edits/1.0/edit", json!({ "to": { "id": "p1" }, "content": format!("Look: {link}"), "previews": [{ "url": link, "title": "Bea in #news" }] })).await;
+    assert!(edited["body"]["previews"][0].get("post").is_none(), "{edited}");
+    assert!(edited["body"].get("attachments").is_none());
+    let kept = member.ask("https://wyvrn.app/message-edits/1.0/edit", json!({ "to": { "id": "p1" }, "content": format!("Look again: {link}") })).await;
+    assert_eq!(kept["body"]["previews"][0]["title"], "Bea in #news", "{kept}");
+    let gone = member.ask("https://wyvrn.app/message-edits/1.0/edit", json!({ "to": { "id": "p1" }, "content": format!("Look again: {link}"), "previews": null })).await;
+    assert!(gone["body"].get("previews").is_none(), "{gone}");
+
+    // A copy's picture is a file posted: it takes attach_files.
+    owner.workflow("start", json!({ "template_id": "channel-permissions", "instance_id": "cp", "context": { "channel": general } })).await;
+    advance(&owner, "cp", "edit", json!({ "role": "everyone" })).await;
+    advance(&owner, "cp", "save", json!({ "deny-attach_files": true })).await;
+    let denied = member.community("post", json!({ "channel": general, "content": format!("Look: {link}"), "previews": [{ "url": link, "post": copy }], "attachments": [picture] })).await;
+    assert_eq!(denied["body"]["code"], "e.p.trust.not-authorized");
+    let text_only = member.community("post", json!({ "channel": general, "content": format!("Look: {link}"), "previews": [{ "url": link, "title": "Bea in #news" }] })).await;
+    assert_eq!(kind(&text_only), "posted");
+}
+
+#[tokio::test]
 async fn polls_forums_media_search_and_the_member_list() {
     let server = start_server("").await;
     let (owner, member) = (Peer::start(&server).await, Peer::start(&server).await);
@@ -2681,6 +2736,12 @@ async fn a_message_request_carries_the_askers_did_to_that_one_member_once_a_day(
     assert_eq!(admin.community("join", json!({})).await["body"]["message_requests"], true);
     admin.community("set-member-profile", json!({ "requests": false })).await;
     assert_eq!(admin.community("join", json!({})).await["body"]["message_requests"], false);
+    // "A member" on the web: their own to say, and told back to them.
+    assert_eq!(admin.community("join", json!({})).await["body"]["web_anonymous"], false);
+    assert_eq!(admin.community("set-member-profile", json!({ "web_anonymous": "yes" })).await["body"]["code"], "e.p.msg.invalid-profile");
+    admin.community("set-member-profile", json!({ "web_anonymous": true })).await;
+    let told = admin.community("join", json!({})).await;
+    assert_eq!((told["body"]["web_anonymous"].as_bool(), told["body"]["message_requests"].as_bool()), (Some(true), Some(false)), "the rest as it was");
     let to_admin = bob.community("message-request", json!({ "id": "r3", "to": server.id(&admin) })).await;
     assert_eq!(kind(&to_admin), "message-request-sent");
     assert!(tokio::time::timeout(Duration::from_millis(500), admin.next_of(&format!("{C}message-request"))).await.is_err());
