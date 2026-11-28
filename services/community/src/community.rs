@@ -2513,8 +2513,13 @@ impl Community {
                 let page = body.get("page").filter(|v| !v.is_null());
                 let voice = body.get("voice").filter(|v| !v.is_null());
                 let public = body.get("public_channels").filter(|v| !v.is_null());
-                if page.is_none() && voice.is_none() && public.is_none() {
-                    return refuse(message, "e.p.msg.invalid-web", "Say page, voice or public_channels.");
+                let outside = body.get("outside_pictures").filter(|v| !v.is_null());
+                if page.is_none() && voice.is_none() && public.is_none() && outside.is_none() {
+                    return refuse(message, "e.p.msg.invalid-web", "Say page, voice, public_channels or outside_pictures.");
+                }
+                if let Some(outside) = outside {
+                    let Some(on) = outside.as_bool() else { return refuse(message, "e.p.msg.invalid-web", "outside_pictures is true or false.") };
+                    self.store.set_setting(crate::web::OUTSIDE, if on { "1" } else { "0" })?;
                 }
                 if let Some(public) = public {
                     let Some(choice) = public.as_str().filter(|v| crate::web::PUBLIC_CHOICES.contains(v)) else {

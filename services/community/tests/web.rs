@@ -1038,3 +1038,100 @@ async fn a_member_taken_out_is_signed_out_of_the_web_view() {
     assert!(store.session(cookie.trim_start_matches("wyvrn_web="), wyvrn_service::now()).unwrap().is_none());
 
 }
+
+/// The `seq`s of the posts a page shows, in order (`id="m<seq>"`).
+fn seqs_on(page: &str) -> Vec<i64> {
+    page.split("<li class=\"post").skip(1).filter_map(|li| li.split("id=\"m").nth(1)?.split('"').next()?.parse().ok()).collect()
+}
+
+#[tokio::test]
+async fn a_channel_is_paged_both_ways_a_little_at_a_time_and_a_post_page_goes_on_into_it() {
+    let server = start(Options { public: "everyone", ..Options::default() }).await;
+    let (admin, _) = with_channels(&server).await;
+    for n in 1..=60 {
+        say(&admin, &server, "general", &format!("post number {n}")).await;
+    }
+    let general = server.channel_id("general");
+
+    // The newest page: the newest 25, oldest first, older ones a link away, and
+    // what the page's script needs to go to the newest and to search the channel.
+    let (_, newest) = server.text(&format!("ch/{general}/general")).await;
+    assert_eq!(seqs_on(&newest), (36..=60).collect::<Vec<_>>());
+    assert!(newest.contains("href=\"?before=36\" rel=\"prev\""), "{newest}");
+    assert!(!newest.contains("rel=\"next\""));
+    assert!(newest.contains(&format!("data-newest=\"../../ch/{general}/general\"")), "{newest}");
+    assert!(newest.contains(&format!("data-search=\"../../search?channel={general}\"")));
+
+    // An older page leads on to the posts after it.
+    let (_, older) = server.text(&format!("ch/{general}/general?before=36")).await;
+    assert_eq!(seqs_on(&older), (11..=35).collect::<Vec<_>>());
+    assert!(older.contains("href=\"?before=11\" rel=\"prev\"") && older.contains("href=\"?after=35\" rel=\"next\""), "{older}");
+    // ...which are those after it, oldest first, with the newest the end.
+    let (_, after) = server.text(&format!("ch/{general}/general?after=35")).await;
+    assert_eq!(seqs_on(&after), (36..=60).collect::<Vec<_>>());
+    assert!(after.contains("href=\"?before=36\" rel=\"prev\"") && !after.contains("rel=\"next\""), "{after}");
+    let (_, middle) = server.text(&format!("ch/{general}/general?after=5")).await;
+    assert_eq!(seqs_on(&middle), (6..=30).collect::<Vec<_>>());
+    assert!(middle.contains("href=\"?after=30\" rel=\"next\""));
+
+    // A post's page: it and those around it, and the channel's pages both ways.
+    let (_, post) = server.text(&format!("ch/{general}/m/30")).await;
+    let around = seqs_on(&post);
+    assert!(around.contains(&30) && around.first() > Some(&1) && around.last() < Some(&60), "{around:?}");
+    assert!(post.contains("class=\"post focus"), "{post}");
+    assert!(post.contains(&format!("href=\"../../../ch/{general}/general?before={}\" rel=\"prev\"", around[0])), "{post}");
+    assert!(post.contains(&format!("href=\"../../../ch/{general}/general?after={}\" rel=\"next\"", around.last().unwrap())));
+    assert!(post.contains(&format!("data-newest=\"../../../ch/{general}/general\"")));
+}
+
+#[tokio::test]
+async fn search_takes_one_channel() {
+    let server = start(Options { public: "everyone", ..Options::default() }).await;
+    let (admin, _) = with_channels(&server).await;
+    let other = admin.community("create-channel", json!({ "name": "other" })).await;
+    assert_eq!(other["type"], format!("{C}community"), "{other}");
+    say(&admin, &server, "general", "a wyvern in general").await;
+    say(&admin, &server, "other", "a wyvern elsewhere").await;
+    let general = server.channel_id("general");
+    let (_, both) = server.text("search?q=wyvern").await;
+    assert!(both.contains("in general") && both.contains("elsewhere"), "{both}");
+    let (_, one) = server.text(&format!("search?q=wyvern&channel={general}")).await;
+    assert!(one.contains("in general") && !one.contains("elsewhere"), "{one}");
+    // A channel the visitor may not read finds nothing, rather than its posts.
+    let secret = server.channel_id("secret");
+    server.state.community.store.set_override(&secret, wyvrn_community::roles::EVERYONE_ROLE, &[], &["view_channel".to_string()]).unwrap();
+    say(&admin, &server, "secret", "a wyvern in secret").await;
+    let (_, none) = server.text(&format!("search?q=wyvern&channel={secret}")).await;
+    assert!(!none.contains("in secret") && !none.contains("in general"), "{none}");
+}
+
+#[tokio::test]
+async fn pictures_from_other_sites_show_through_the_community_only_once_an_admin_says() {
+    let server = start(Options { public: "everyone", ..Options::default() }).await;
+    let (admin, member) = with_channels(&server).await;
+    say(&member, &server, "general", "look https://pictures.example/cat.png and https://media.tenor.com/abc/dance").await;
+    let general = server.channel_id("general");
+    let shown = |page: &str| page.matches("src=\"../../i/u").count();
+    let (_, before) = server.text(&format!("ch/{general}/general")).await;
+    assert_eq!(shown(&before), 0, "{before}");
+    assert!(before.contains("href=\"https://pictures.example/cat.png\""));
+
+    // Off until an admin says, and only an admin; the setting goes with `community`.
+    let refused = member.community("set-web", json!({ "outside_pictures": true })).await;
+    assert_eq!(refused["body"]["code"], "e.p.trust.not-authorized");
+    let bad = admin.community("set-web", json!({ "outside_pictures": "yes" })).await;
+    assert_eq!(bad["body"]["code"], "e.p.msg.invalid-web");
+    let answer = admin.community("set-web", json!({ "voice": "counts" })).await;
+    assert_eq!(answer["body"]["web"]["outside_pictures"], false, "{answer}");
+    let answer = admin.community("set-web", json!({ "outside_pictures": true })).await;
+    assert_eq!(answer["body"]["web"]["outside_pictures"], true, "{answer}");
+
+    // Both shown, from this server, signed; the visitor's browser is sent nowhere else.
+    let (_, after) = server.text(&format!("ch/{general}/general")).await;
+    assert_eq!(shown(&after), 2, "{after}");
+    assert!(!after.contains("src=\"https://pictures.example"));
+    // A picture's own address is never a link preview's page.
+    let answer = admin.community("set-web", json!({ "outside_pictures": false })).await;
+    assert_eq!(answer["body"]["web"]["outside_pictures"], false);
+    assert_eq!(shown(&server.text(&format!("ch/{general}/general")).await.1), 0);
+}

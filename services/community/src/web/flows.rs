@@ -154,6 +154,12 @@ pub fn css_allowed(css: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The widget in a frame, as a website puts it in a page.
+pub fn widget_snippet(web_url: &str, name: &str) -> String {
+    let title = name.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;");
+    format!("<iframe src=\"{web_url}widget\" title=\"{title} on Wyvrn\" width=\"350\" height=\"500\" style=\"border:0\" loading=\"lazy\" referrerpolicy=\"no-referrer\"></iframe>")
+}
+
 fn button(label: &str, event: &str, input: Value) -> Value {
     json!({ "type": "submit-button", "label": label, "event": event, "input": input })
 }
@@ -212,8 +218,14 @@ impl Community {
             { "type": "title", "text": "Other websites signing members in" },
             { "type": "check-box", "form-id": "dynamic", "label": "Websites may register themselves (shown to members as unverified)", "value": self.store.setting(super::DYNAMIC)?.as_deref() == Some("1") },
             { "type": "check-box", "form-id": "indieauth", "label": "Websites may be known by their address, IndieAuth (shown as unverified)", "value": self.store.setting(super::INDIEAUTH)?.as_deref() == Some("1") },
+            { "type": "title", "text": "Pictures from other sites" },
+            { "type": "check-box", "form-id": "outside_pictures", "label": "Show pictures linked from other sites (an image's address, a GIF from Tenor or Giphy) in public posts, fetched through the community, so visitors' browsers still contact only this site", "value": super::outside_pictures(&self.store) },
             button("Save", "save", json!({})),
         ] }));
+        // The widget, for a website to show the community (`widget`, framable by any site).
+        items.push(json!({ "type": "title", "text": "The widget" }));
+        items.push(json!({ "type": "text", "text": "A website can show the community's name, who is here and its public channels, with a way to join, by putting this in its page. Add ?channel=<a public channel's id> after widget to show that channel's newest posts." }));
+        items.push(json!({ "type": "text", "copyable": true, "label": "To put in a page", "text": widget_snippet(&url, &self.changed().name.clone().unwrap_or_else(|| self.config.name.clone())) }));
         items.push(json!({ "type": "title", "text": "Websites" }));
         let clients = self.store.clients()?;
         if clients.is_empty() {
@@ -266,9 +278,16 @@ impl Community {
                 self.store.set_setting(super::CSS, &css).map_err(failed)?;
                 self.store.set_setting(super::DYNAMIC, if ticked(&input["dynamic"]) { "1" } else { "0" }).map_err(failed)?;
                 self.store.set_setting(super::INDIEAUTH, if ticked(&input["indieauth"]) { "1" } else { "0" }).map_err(failed)?;
-                self.audit(now, &flow.owner, "community.web", None, Some(json!({ "theme": theme, "css_bytes": css.len(), "dynamic": ticked(&input["dynamic"]), "indieauth": ticked(&input["indieauth"]) })));
+                // A form from before this field leaves it as it was.
+                let outside = input.get("outside_pictures").map(ticked);
+                let changed = outside.is_some_and(|on| on != super::outside_pictures(&self.store));
+                if let Some(on) = outside {
+                    self.store.set_setting(super::OUTSIDE, if on { "1" } else { "0" }).map_err(failed)?;
+                }
+                self.audit(now, &flow.owner, "community.web", None, Some(json!({ "theme": theme, "css_bytes": css.len(), "dynamic": ticked(&input["dynamic"]), "indieauth": ticked(&input["indieauth"]), "outside_pictures": outside })));
                 flow.data["note"] = json!("Saved.");
-                Ok(false)
+                // Members' `community` says whether pictures from elsewhere show.
+                Ok(changed)
             }
             ("form", "add") => {
                 flow.state = "add".into();
@@ -368,6 +387,13 @@ impl Community {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_widgets_snippet_frames_the_widget_and_escapes_the_name() {
+        let snippet = widget_snippet("https://c.example/c/x/", "Tom & \"Jerry\" <3");
+        assert!(snippet.starts_with("<iframe src=\"https://c.example/c/x/widget\""), "{snippet}");
+        assert!(snippet.contains("title=\"Tom &amp; &quot;Jerry&quot; &lt;3 on Wyvrn\""), "{snippet}");
+    }
+
     use super::*;
 
     #[test]
